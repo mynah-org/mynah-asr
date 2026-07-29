@@ -68,7 +68,7 @@ first-class citizen.
 
 ## Supported models
 
-**v0.5.0, feature-complete toward v1** — 10 working models
+**Feature-complete toward v1** ([latest release](https://github.com/mynah-org/mynah-asr/releases/latest)) — 10 working models
 (full catalog with verified configs: [docs/models.md](docs/models.md)):
 
 | Model | What it does | Status |
