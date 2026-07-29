@@ -49,7 +49,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0        # tags: `mynah --version` reports the release name
 
@@ -85,7 +85,7 @@ jobs:
           CFLAGS: ${{ matrix.cflags }}
         run: make tests/test_qmat && tests/test_qmat
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mynah-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/mynah-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -100,9 +100,9 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -122,7 +122,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.v.outputs.name }}
           name: "mynah ${{ steps.v.outputs.name }}"

@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/prepare-model
         with:
           model: ${{ env.MODEL }}
@@ -42,7 +42,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -67,7 +67,7 @@ jobs:
           model-url: ${{ env.MODEL_URL }}
 
       - name: Setup uv                # needed by test-samples (Python eval)
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9
 
       - name: Int8 checkpoint (exercises the quantize path)
         run: ./mynah quantize -m models/${{ env.MODEL }} --quant int8
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev nvidia-cuda-toolkit
       - name: Build (make cuda)

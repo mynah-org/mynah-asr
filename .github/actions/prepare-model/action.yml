@@ -18,7 +18,7 @@ runs:
   steps:
     - name: Cache converted model + goldens
       id: model-cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           models/${{ inputs.model }}
@@ -27,7 +27,7 @@ runs:
 
     - name: Setup uv
       if: steps.model-cache.outputs.cache-hit != 'true'
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v9
 
     - name: Download and convert the model (.nemo -> mynah), golden dump
       if: steps.model-cache.outputs.cache-hit != 'true'

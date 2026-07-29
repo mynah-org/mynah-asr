@@ -15,7 +15,7 @@ jobs:
       security-events: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev clang-tidy
