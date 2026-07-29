@@ -15,7 +15,7 @@
 | canary-180m-flash / 1b-flash | canary-aed | ASR en/de/es/fr + **translation** + word-ts |
 | canary-1b-v2 | canary-aed | ASR **25 EU languages** (it!) + translation en↔24, ITN; no word-ts (external aligner, TODO) |
 
-All with: int8/int4 (`mynah quantize`), Metal, batch, long-file segmentation,
+All with: int8/int4 (`mynah-asr quantize`), Metal, batch, long-file segmentation,
 REST/WS server. Measured RTFs in [benchmarks.md](benchmarks.md).
 
 ¹ The classic rnnt/ctc Parakeets ship an HF-native `model.safetensors` too, but

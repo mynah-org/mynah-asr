@@ -25,20 +25,20 @@ int main(int argc, char **argv) {
     if (!golden) return 77;
 
     snprintf(path, sizeof(path), "%s/mel_filters.safetensors", argv[1]);
-    mynah_safetensors *mf = mynah_st_open(path);
+    mynah_asr_safetensors *mf = mynah_asr_st_open(path);
     snprintf(path, sizeof(path), "%s/model.safetensors", argv[1]);
-    mynah_safetensors *st = mynah_st_open(path);
+    mynah_asr_safetensors *st = mynah_asr_st_open(path);
     if (!mf || !st) { free(golden); return 77; }
 
     size_t n_samples; int sr;
-    float *audio = mynah_wav_load(argv[2], &n_samples, &sr);
+    float *audio = mynah_asr_wav_load(argv[2], &n_samples, &sr);
     if (!audio || sr != 16000) return 2;
 
-    const mynah_tensor *fb = mynah_st_get(mf, "mel_fb");
-    const mynah_tensor *win = mynah_st_get(mf, "window");
+    const mynah_asr_tensor *fb = mynah_asr_st_get(mf, "mel_fb");
+    const mynah_asr_tensor *win = mynah_asr_st_get(mf, "window");
     int norm_pf = 0, left, right, prompt;
     if (test_model_cfg(argv[1], &norm_pf, &left, &right, &prompt) != 0) return 77;
-    mynah_feat_cfg cfg = {
+    mynah_asr_feat_cfg cfg = {
         .sample_rate = 16000, .n_mels = (int)fb->shape[1], .n_fft = (int)(fb->shape[0] - 1) * 2,
         .win_length = (int)win->shape[0], .hop_length = 160,
         .preemphasis = 0.97, .log_zero_guard = pow(2.0, -24.0),
@@ -46,13 +46,13 @@ int main(int argc, char **argv) {
         .mel_fb = (const float *)fb->data, .window = (const float *)win->data,
     };
     int T, valid;
-    float *feats = mynah_log_mel(&cfg, audio, n_samples, &T, &valid);
+    float *feats = mynah_asr_log_mel(&cfg, audio, n_samples, &T, &valid);
 
-    mynah_subsampling ss;
-    if (mynah_subsampling_init(&ss, st) != 0) { fprintf(stderr, "subsampling init failed\n"); return 2; }
+    mynah_asr_subsampling ss;
+    if (mynah_asr_subsampling_init(&ss, st) != 0) { fprintf(stderr, "subsampling init failed\n"); return 2; }
 
     int t_out;
-    float *out = mynah_subsampling_forward(&ss, feats, valid, cfg.n_mels, &t_out);
+    float *out = mynah_asr_subsampling_forward(&ss, feats, valid, cfg.n_mels, &t_out);
     if (!out) return 2;
 
     size_t n_c = (size_t)t_out * (size_t)ss.d_model;
@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
            t_out, ss.d_model, max_diff, mean / (double)n_c, scale, tol);
 
     free(audio); free(feats); free(out); free(golden);
-    mynah_st_close(mf); mynah_st_close(st);
+    mynah_asr_st_close(mf); mynah_asr_st_close(st);
     if (max_diff > tol) { fprintf(stderr, "FAIL\n"); return 1; }
     printf("OK\n");
     return 0;

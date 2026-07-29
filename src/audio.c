@@ -15,7 +15,7 @@ static uint32_t rd_u32(const uint8_t *p) {
 }
 static uint16_t rd_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-float *mynah_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
+float *mynah_asr_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
                        int *sample_rate) {
     if (len < 44 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
         fprintf(stderr, "audio: non è un WAV RIFF\n");
@@ -73,7 +73,7 @@ float *mynah_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
     return out;
 }
 
-float *mynah_wav_load(const char *path, size_t *n_samples, int *sample_rate) {
+float *mynah_asr_wav_load(const char *path, size_t *n_samples, int *sample_rate) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "audio: cannot open %s\n", path); return NULL; }
     fseek(f, 0, SEEK_END);
@@ -88,12 +88,12 @@ float *mynah_wav_load(const char *path, size_t *n_samples, int *sample_rate) {
         return NULL;
     }
     fclose(f);
-    float *out = mynah_wav_parse(buf, (size_t)len, n_samples, sample_rate);
+    float *out = mynah_asr_wav_parse(buf, (size_t)len, n_samples, sample_rate);
     free(buf);
     return out;
 }
 
-float *mynah_resample(const float *in, size_t n_in, int sr_in, int sr_out, size_t *n_out) {
+float *mynah_asr_resample(const float *in, size_t n_in, int sr_in, int sr_out, size_t *n_out) {
     if (sr_in == sr_out) {
         float *copy = malloc(n_in * sizeof(float));
         if (!copy) return NULL;

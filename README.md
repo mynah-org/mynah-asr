@@ -19,16 +19,16 @@ Today it runs the best open speech models (Parakeet, Canary, Nemotron); the
 engine layer is model-agnostic and built to host more families tomorrow.
 
 ```
-$ mynah transcribe -m models/parakeet-tdt-0.6b-v3 -i audio.wav --timestamps
+$ mynah-asr transcribe -m models/parakeet-tdt-0.6b-v3 -i audio.wav --timestamps
 [5.2s audio | load 0.04s | inference 0.48s | RTF 0.092 | lang=auto]
   0.00   0.56  Ciao,
   0.64   0.72  questo
   ...
 
-$ mynah transcribe -m models/canary-1b-v2 -i italian.wav --lang it --target-lang en
+$ mynah-asr transcribe -m models/canary-1b-v2 -i italian.wav --lang it --target-lang en
 The satellite, in space, receives the signal and then sends it back almost instantly.
 
-$ rec -q -t raw -r 16000 -e signed -b 16 -c 1 - | mynah stream -m models/nemotron-3.5-...
+$ rec -q -t raw -r 16000 -e signed -b 16 -c 1 - | mynah-asr stream -m models/nemotron-3.5-...
 (live cache-aware transcription, selectable 80 ms – 1.12 s latency)
 ```
 
@@ -59,7 +59,7 @@ first-class citizen.
   (F32/F16/BF16/Q8_0/Q4_0, `tools/export_gguf.py`) — same code path after load;
   can also **import third-party community GGUFs** without torch
   (`tools/import_gguf.py`, Parakeet/TDT — *WIP*)
-- **Lightweight bindings**: Python (ctypes) and **Node** (koffi) over `libmynah` —
+- **Lightweight bindings**: Python (ctypes) and **Node** (koffi) over `libmynah_asr` —
   thin FFI wrappers, no build step committed to the repo
 - Quality measured on **real audio**: CER 0.00–0.07 across 11 languages
   ([hear it below](#hear-it--11-languages-one-sentence)), translations scored
@@ -120,7 +120,7 @@ Every numeric stage is validated against a numpy reference oracle
 
 **1 — Get the binary.** Either grab a
 [prebuilt tarball](https://github.com/mynah-org/mynah-asr/releases/latest)
-(linux-x86_64, linux-aarch64, darwin-arm64 — CLI + server + `libmynah.a` +
+(linux-x86_64, linux-aarch64, darwin-arm64 — CLI + server + `libmynah_asr.a` +
 header, with `SHA256SUMS`), or build in a few seconds:
 
 ```sh
@@ -155,15 +155,15 @@ cd tools && uv sync && uv run python convert_nemo.py ../models/nemotron-3.5-asr-
 
 ```sh
 # offline file (any sample rate: WAV is resampled automatically)
-./mynah transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --lang auto
+./mynah-asr transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --lang auto
 
 # optional: int8 checkpoint — 0.79 GB instead of 2.55, instant load
-./mynah quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8
-./mynah transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --quant int8
+./mynah-asr quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8
+./mynah-asr transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --quant int8
 
 # live stream from mic or pipe (raw s16le 16 kHz mono on stdin)
 ffmpeg -v quiet -i anything.mp3 -f s16le -ar 16000 -ac 1 - | \
-  ./mynah stream -m models/nemotron-3.5-asr-streaming-0.6b --lookahead 3
+  ./mynah-asr stream -m models/nemotron-3.5-asr-streaming-0.6b --lookahead 3
 ```
 
 For mp3/m4a: `ffmpeg -i file.mp3 -ar 16000 -ac 1 out.wav`. Languages and latency
@@ -212,7 +212,7 @@ Full locale tables with quality tiers and prompt ids:
 ## CLI
 
 ```
-mynah transcribe -m <model_dir> -i <file.wav>
+mynah-asr transcribe -m <model_dir> -i <file.wav>
     --lang <tag|auto>        source language (it-IT, en, auto for detection)
     --target-lang <xx>       AED/Canary: OUTPUT language ≠ source = translation
     --timestamps             one word per line: t0 t1 word
@@ -223,19 +223,19 @@ mynah transcribe -m <model_dir> -i <file.wav>
     --backend cpu|metal|cuda GEMM backend (graceful CPU fallback)
     --caps auto|scalar|avx2|vnni   x86 SIMD level (default: cpuid)
 
-mynah stream -m <model_dir> [--lang auto] [--lookahead N] [--quant int8|int4]
+mynah-asr stream -m <model_dir> [--lang auto] [--lookahead N] [--quant int8|int4]
     live transcription from stdin (raw s16le 16 kHz mono), text never retracted
 
-mynah quantize -m <model_dir> --quant int8|int4
+mynah-asr quantize -m <model_dir> --quant int8|int4
     writes the pre-quantized checkpoint (⅓ of the RAM, zero-copy load)
 
-mynah --version
+mynah-asr --version
 ```
 
 ## Server (REST + WebSocket, OpenAI-compatible)
 
 ```sh
-./mynah-server -m models/canary-1b-v2 -p 8090 --threads 4 --batch 8
+./mynah-asr-server -m models/canary-1b-v2 -p 8090 --threads 4 --batch 8
 
 curl -F file=@audio.wav -F language=it http://localhost:8090/v1/audio/transcriptions
 curl -F file=@audio_de.wav -F language=de http://localhost:8090/v1/audio/translations
@@ -248,33 +248,33 @@ Details: [docs/server.md](docs/server.md).
 
 ## Bindings (Python · Node)
 
-Thin FFI wrappers over `libmynah` (`make shared` first) — no build step in the repo:
+Thin FFI wrappers over `libmynah_asr` (`make shared` first) — no build step in the repo:
 
 ```python
-# Python — pure ctypes, zero dependencies: bindings/python/mynah.py
-from mynah import Mynah
-m = Mynah("models/parakeet-tdt-0.6b-v3")
+# Python — pure ctypes, zero dependencies: bindings/python/mynah_asr.py
+from mynah_asr import MynahASR
+m = MynahASR("models/parakeet-tdt-0.6b-v3")
 text, words = m.transcribe("audio.wav", timestamps=True)
-Mynah("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translation
+MynahASR("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translation
 ```
 
 ```js
-// Node — koffi FFI (npm i koffi): bindings/node/mynah.js
-const { Mynah } = require("./mynah");
-const m = new Mynah("models/parakeet-tdt-0.6b-v3");
+// Node — koffi FFI (npm i koffi): bindings/node/mynah_asr.js
+const { MynahASR } = require("./mynah_asr");
+const m = new MynahASR("models/parakeet-tdt-0.6b-v3");
 const { text, words } = m.transcribe("audio.wav", { timestamps: true });
 ```
 
-## C API (libmynah)
+## C API (libmynah_asr)
 
 ```c
-#include "mynah.h"
+#include "mynah_asr.h"
 
-mynah_model *m = mynah_load("models/parakeet-tdt-0.6b-v3");
+mynah_asr_model *m = mynah_asr_load("models/parakeet-tdt-0.6b-v3");
 char lang[16];
-mynah_word *words; int n_words;
-char *text = mynah_transcribe_ts(m, samples, n_samples, "auto", -1, lang,
-                                 &words, &n_words);   /* or mynah_transcribe */
+mynah_asr_word *words; int n_words;
+char *text = mynah_asr_transcribe_ts(m, samples, n_samples, "auto", -1, lang,
+                                     &words, &n_words);  /* or mynah_asr_transcribe */
 printf("[%s] %s\n", lang, text);
 for (int i = 0; i < n_words; i++)
     printf("%.2f-%.2f %s\n", words[i].t0, words[i].t1, words[i].word);
@@ -282,15 +282,15 @@ for (int i = 0; i < n_words; i++)
 
 Complete buildable example: [`examples/minimal.c`](examples/minimal.c).
 Reference: [docs/api.md](docs/api.md) · streaming: [docs/streaming.md](docs/streaming.md).
-`make lib` builds `libmynah.a`.
+`make lib` builds `libmynah_asr.a`.
 
 ## Layout
 
 ```
-src/        C runtime (libmynah) — decoders behind a vtable (engine.h)
-cli/        `mynah` CLI
-server/     `mynah-server` REST + WebSocket
-bindings/   Python (ctypes) & Node (koffi) over libmynah
+src/        C runtime (libmynah_asr) — decoders behind a vtable (engine.h)
+cli/        `mynah-asr` CLI
+server/     `mynah-asr-server` REST + WebSocket
+bindings/   Python (ctypes) & Node (koffi) over libmynah_asr
 tools/      Python tooling (uv): weight converter, numpy oracle, eval
 tests/      per-stage parity vs oracle + e2e (make test; skips without models)
 samples/    real CC-BY audio (FLEURS, 11 languages) for the quality suite
@@ -302,7 +302,7 @@ reference/  configs/tokenizers extracted from checkpoints (for development)
 
 ```sh
 make              # CLI + server (separate build/, version from git)
-make lib          # libmynah.a        make shared   # .dylib/.so for bindings
+make lib          # libmynah_asr.a        make shared   # .dylib/.so for bindings
 make install      # PREFIX=/usr/local: bin + lib + include
 make test         # parity vs oracle + e2e (exit 77 = skip without models)
 make test-samples # quality on real audio: ASR CER + translations, cpu+metal
@@ -322,7 +322,7 @@ make golden-dump  # regenerate reference dumps (requires tools/ + model)
 | [docs/gguf.md](docs/gguf.md) | GGUF weight container (export, supported types, lookup order) |
 | [docs/backends.md](docs/backends.md) | CPU SIMD dispatch, Metal, CUDA |
 | [docs/server.md](docs/server.md) | REST + WebSocket server, OpenAI compatibility |
-| [docs/api.md](docs/api.md) | C API reference (libmynah) |
+| [docs/api.md](docs/api.md) | C API reference (libmynah_asr) |
 | [docs/nemotron-languages.md](docs/nemotron-languages.md) | the 40 Nemotron locales with quality tiers |
 | [docs/nemotron-arch.md](docs/nemotron-arch.md) · [parakeet-tdt-arch.md](docs/parakeet-tdt-arch.md) · [canary-arch.md](docs/canary-arch.md) | verified model architectures |
 | [docs/parakeet-en-family.md](docs/parakeet-en-family.md) · [canary-usage.md](docs/canary-usage.md) | per-family usage, features and limits |

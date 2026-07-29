@@ -12,7 +12,7 @@ PORT="${2:-8207}"
 N=8
 [ -f "$MODEL_DIR/mynah.json" ] || exit 77
 
-./mynah-server -m "$MODEL_DIR" -p "$PORT" --threads 4 --batch 4 2>/dev/null &
+./mynah-asr-server -m "$MODEL_DIR" -p "$PORT" --threads 4 --batch 4 2>/dev/null &
 SRV_PID=$!
 trap 'kill $SRV_PID 2>/dev/null' EXIT
 
@@ -23,7 +23,7 @@ for i in $(seq 1 150); do    # cold load del modello grande: fino a 30 s
 done
 [ $up -eq 1 ] || { echo "serve-repro FAIL: server mai pronto"; exit 1; }
 
-TMP=$(mktemp -d /tmp/mynah_repro.XXXXXX) || exit 1
+TMP=$(mktemp -d /tmp/mynah_asr_repro.XXXXXX) || exit 1
 trap 'kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null; rm -rf "$TMP"' EXIT
 
 req() {

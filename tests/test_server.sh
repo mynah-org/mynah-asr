@@ -1,11 +1,11 @@
 #!/bin/sh
-# Test end-to-end di mynah-server: REST + concorrenza + WebSocket streaming.
+# Test end-to-end di mynah-asr-server: REST + concorrenza + WebSocket streaming.
 # Exit: 0 ok, 1 fail, 77 skip (modello assente).
 MODEL_DIR="${1:-models/nemotron-3.5-asr-streaming-0.6b}"
 PORT="${2:-8199}"
 [ -f "$MODEL_DIR/mynah.json" ] || exit 77
 
-./mynah-server -m "$MODEL_DIR" -p "$PORT" --threads 4 --batch 4 2>/dev/null &
+./mynah-asr-server -m "$MODEL_DIR" -p "$PORT" --threads 4 --batch 4 2>/dev/null &
 SRV_PID=$!
 trap 'kill $SRV_PID 2>/dev/null' EXIT
 
@@ -48,7 +48,7 @@ check translations-no-aed \
 # /v1/audio/translations con un modello AED (Canary), se presente
 if [ -f models/canary-180m-flash/mynah.json ]; then
     PORT2=$((PORT + 1))
-    ./mynah-server -m models/canary-180m-flash -p "$PORT2" --threads 2 --batch 2 2>/dev/null &
+    ./mynah-asr-server -m models/canary-180m-flash -p "$PORT2" --threads 2 --batch 2 2>/dev/null &
     SRV2_PID=$!
     trap 'kill $SRV_PID $SRV2_PID 2>/dev/null' EXIT
     for i in $(seq 1 50); do
@@ -71,13 +71,13 @@ fi
 CURL_PIDS=""
 for i in 1 2 3 4; do
     curl -s -F file=@tests/audio/test_it.wav -F language=it-IT \
-        "http://localhost:$PORT/v1/audio/transcriptions" -o "/tmp/mynah_conc_$i.json" &
+        "http://localhost:$PORT/v1/audio/transcriptions" -o "/tmp/mynah_asr_conc_$i.json" &
     CURL_PIDS="$CURL_PIDS $!"
 done
 wait $CURL_PIDS
 conc_ok=1
 for i in 1 2 3 4; do
-    grep -q "riconoscimento vocale" "/tmp/mynah_conc_$i.json" || conc_ok=0
+    grep -q "riconoscimento vocale" "/tmp/mynah_asr_conc_$i.json" || conc_ok=0
 done
 [ $conc_ok -eq 1 ] && echo "server concurrent-4 OK" || { echo "server concurrent-4 FAIL"; fail=1; }
 

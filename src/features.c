@@ -47,7 +47,7 @@ static void fft_radix2(double *re, double *im, int n) {
  * 257). Saltare gli zeri è BIT-ESATTO rispetto al loop pieno: i prodotti
  * saltati valgono +0.0 e sommare +0.0 a un accumulatore non negativo è
  * l'identità. ~50x meno MAC nella proiezione. */
-static void mel_ranges(const mynah_feat_cfg *cfg, int *lo, int *hi) {
+static void mel_ranges(const mynah_asr_feat_cfg *cfg, int *lo, int *hi) {
     const int n_bins = cfg->n_fft / 2 + 1, n_mels = cfg->n_mels;
     for (int m = 0; m < n_mels; m++) {
         int a = n_bins, z = 0;
@@ -60,7 +60,7 @@ static void mel_ranges(const mynah_feat_cfg *cfg, int *lo, int *hi) {
     }
 }
 
-static void mel_project(const mynah_feat_cfg *cfg, const double *power,
+static void mel_project(const mynah_asr_feat_cfg *cfg, const double *power,
                         const int *lo, const int *hi, float *row) {
     const int n_mels = cfg->n_mels;
     for (int m = 0; m < n_mels; m++) {
@@ -74,7 +74,7 @@ static void mel_project(const mynah_feat_cfg *cfg, const double *power,
 /* Worker della fetta di frame mel (offline): frame indipendenti, righe di
  * output disgiunte -> bit-identico al loop seriale. Scratch FFT per-thread. */
 typedef struct {
-    const mynah_feat_cfg *cfg;
+    const mynah_asr_feat_cfg *cfg;
     const double *y, *win;
     const int *lo, *hi;
     float *feats;
@@ -83,7 +83,7 @@ typedef struct {
 
 static void mel_slice_worker(void *ctx, int w) {
     const mel_par *mp = ctx;
-    const mynah_feat_cfg *cfg = mp->cfg;
+    const mynah_asr_feat_cfg *cfg = mp->cfg;
     const int n_fft = cfg->n_fft, n_bins = n_fft / 2 + 1, hop = cfg->hop_length;
     const int t0 = (int)((long)mp->valid * w / mp->slices);
     const int t1 = (int)((long)mp->valid * (w + 1) / mp->slices);
@@ -103,7 +103,7 @@ static void mel_slice_worker(void *ctx, int w) {
     free(re); free(power);
 }
 
-float *mynah_log_mel(const mynah_feat_cfg *cfg, const float *audio, size_t n_samples,
+float *mynah_asr_log_mel(const mynah_asr_feat_cfg *cfg, const float *audio, size_t n_samples,
                      int *n_frames, int *valid_frames) {
     const int n_fft = cfg->n_fft, hop = cfg->hop_length, n_mels = cfg->n_mels;
     const int pad = n_fft / 2;
@@ -136,9 +136,9 @@ float *mynah_log_mel(const mynah_feat_cfg *cfg, const float *audio, size_t n_sam
     /* frame indipendenti -> fette parallele; i frame >= valid restano a zero */
     mel_par mp = {cfg, y, win, lo, hi, feats, valid, 1};
     if (valid > 0)
-        mp.slices = mynah_num_threads() < valid ? mynah_num_threads() : valid;
+        mp.slices = mynah_asr_num_threads() < valid ? mynah_asr_num_threads() : valid;
     if (valid > 0)
-        mynah_parallel_for(mp.slices, mel_slice_worker, &mp);
+        mynah_asr_parallel_for(mp.slices, mel_slice_worker, &mp);
 
     /* per_feature (Parakeet): media/std per bin sui frame validi, ddof=1,
      * x = (x - mu) / (std + 1e-5) — come ParakeetFeatureExtractor */
@@ -171,8 +171,8 @@ float *mynah_log_mel(const mynah_feat_cfg *cfg, const float *audio, size_t n_sam
 /* Calcola un singolo frame mel dal segnale preemfatizzato in finestra scorrevole
  * (indici assoluti; fuori da [base, base+len) si legge zero — pad sx/dx).
  * Frame t = finestra [t*hop - n_fft/2, t*hop + n_fft/2). */
-static void mel_one_frame(const mynah_mel_stream *ms, long t, float *row) {
-    const mynah_feat_cfg *cfg = ms->cfg;
+static void mel_one_frame(const mynah_asr_mel_stream *ms, long t, float *row) {
+    const mynah_asr_feat_cfg *cfg = ms->cfg;
     const int n_fft = cfg->n_fft, n_bins = n_fft / 2 + 1;
     const long start = t * cfg->hop_length - n_fft / 2;
 
@@ -189,7 +189,7 @@ static void mel_one_frame(const mynah_mel_stream *ms, long t, float *row) {
     mel_project(cfg, power, ms->mel_lo, ms->mel_hi, row);
 }
 
-int mynah_mel_stream_init(mynah_mel_stream *ms, const mynah_feat_cfg *cfg) {
+int mynah_asr_mel_stream_init(mynah_asr_mel_stream *ms, const mynah_asr_feat_cfg *cfg) {
     memset(ms, 0, sizeof(*ms));
     if (cfg->n_fft > 4096) return -1;
     ms->cfg = cfg;
@@ -205,13 +205,13 @@ int mynah_mel_stream_init(mynah_mel_stream *ms, const mynah_feat_cfg *cfg) {
     return 0;
 }
 
-void mynah_mel_stream_free(mynah_mel_stream *ms) {
+void mynah_asr_mel_stream_free(mynah_asr_mel_stream *ms) {
     free(ms->buf); free(ms->win); free(ms->mel_lo);
     ms->buf = NULL; ms->win = NULL; ms->mel_lo = ms->mel_hi = NULL;
 }
 
 /* Scarta dal buffer i campioni ormai inutili (prima di next_frame*hop - n_fft/2). */
-static void mel_stream_compact(mynah_mel_stream *ms) {
+static void mel_stream_compact(mynah_asr_mel_stream *ms) {
     const long min_keep = ms->next_frame * ms->cfg->hop_length - ms->cfg->n_fft / 2;
     if (min_keep <= (long)ms->base) return;
     const size_t drop = (size_t)min_keep - ms->base;
@@ -226,9 +226,9 @@ static void mel_stream_compact(mynah_mel_stream *ms) {
     ms->base += drop;
 }
 
-int mynah_mel_stream_feed(mynah_mel_stream *ms, const float *audio, size_t n,
+int mynah_asr_mel_stream_feed(mynah_asr_mel_stream *ms, const float *audio, size_t n,
                           float *out, int cap_frames) {
-    const mynah_feat_cfg *cfg = ms->cfg;
+    const mynah_asr_feat_cfg *cfg = ms->cfg;
     if (ms->buf_len + n > ms->buf_cap) {
         while (ms->buf_len + n > ms->buf_cap) ms->buf_cap *= 2;
         double *nb = realloc(ms->buf, ms->buf_cap * sizeof(double));
@@ -258,8 +258,8 @@ int mynah_mel_stream_feed(mynah_mel_stream *ms, const float *audio, size_t n,
     return emitted;
 }
 
-int mynah_mel_stream_finish(mynah_mel_stream *ms, float *out, int cap_frames) {
-    const mynah_feat_cfg *cfg = ms->cfg;
+int mynah_asr_mel_stream_finish(mynah_asr_mel_stream *ms, float *out, int cap_frames) {
+    const mynah_asr_feat_cfg *cfg = ms->cfg;
     const long valid = (long)(ms->total / (size_t)cfg->hop_length);
     int emitted = 0;
     while (ms->next_frame < valid && emitted < cap_frames) {

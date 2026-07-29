@@ -23,7 +23,7 @@ encoder (80 mel, non-causal) + RNNT/CTC/TDT decoders — details shared with
   normalization). The 0.6b/1.1b models are single-decoder.
 - **Timestamps** (`--timestamps`): accurate on the 110m TDT head (frame =
   cumsum of TDT durations); RNNT/CTC use the emission frame (~80 ms grain).
-- **Quantization**: `mynah quantize --quant int8` ≈ transparent on all;
+- **Quantization**: `mynah-asr quantize --quant int8` ≈ transparent on all;
   int8/int4 checkpoints load zero-copy (RAM ~⅓).
 - **Metal**: whole family runs on GPU (BatchNorm folded, 'same' depthwise,
   full attention) — see the RTF column; falls back to CPU for quantized
@@ -34,7 +34,7 @@ encoder (80 mel, non-causal) + RNNT/CTC/TDT decoders — details shared with
 
 - The 0.6b/1.1b write **lowercase without punctuation** by design (model
   cards): don't compare their output against PnC references.
-- No streaming: `mynah stream` rejects offline-only models — for live use
+- No streaming: `mynah-asr stream` rejects offline-only models — for live use
   pick nemotron (cache-aware) instead.
 - 1.1b models: converted from `.nemo` with zero code changes (42L is
   config-driven), but the `.nemo` archives are ~4.4 GB — deleted locally

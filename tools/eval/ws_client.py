@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Client WebSocket minimale (stdlib) per testare /v1/audio/stream di mynah-server.
+"""Client WebSocket minimale (stdlib) per testare /v1/audio/stream di mynah-asr-server.
 
 Uso: uv run python -m eval.ws_client <file.wav> [host=localhost] [port=8090]
                                      [lang=auto] [lookahead=3]

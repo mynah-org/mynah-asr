@@ -1,4 +1,4 @@
-#include "mynah.h"
+#include "mynah_asr.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -17,24 +17,24 @@
 #include "weights.h"
 #include "../vendor/cJSON.h"
 
-const char *mynah_version(void) { return MYNAH_VERSION; }
+const char *mynah_asr_version(void) { return MYNAH_ASR_VERSION; }
 
-#define MYNAH_AED_PROMPT_MAX 16
+#define MYNAH_ASR_AED_PROMPT_MAX 16
 
-struct mynah_model {
+struct mynah_asr_model {
     cJSON *cfg;                     /* mynah.json (vivo per il prompt dictionary) */
-    mynah_safetensors *weights;
-    mynah_safetensors *mel_filters;
-    mynah_encoder enc;
-    mynah_decoder dec;
-    mynah_ctc ctc;                  /* head CTC (hybrid o CTC puro); w NULL se assente */
-    const mynah_engine *engine;     /* decoder attivo (vtable, vedi engine.h)  */
-    const mynah_engine *engine_dflt;/* engine di default del modello           */
-    mynah_aed aed;                  /* decoder AED (Canary); layers NULL se assente */
+    mynah_asr_safetensors *weights;
+    mynah_asr_safetensors *mel_filters;
+    mynah_asr_encoder enc;
+    mynah_asr_decoder dec;
+    mynah_asr_ctc ctc;                  /* head CTC (hybrid o CTC puro); w NULL se assente */
+    const mynah_asr_engine *engine;     /* decoder attivo (vtable, vedi engine.h)  */
+    const mynah_asr_engine *engine_dflt;/* engine di default del modello           */
+    mynah_asr_aed aed;                  /* decoder AED (Canary); layers NULL se assente */
     int is_aed, aed_eos, aed_ts;    /* aed_ts: supporta i token <|timestamp|> */
     char aed_target[8];             /* lingua di uscita ("" = come la sorgente) */
-    mynah_tokenizer tok;
-    mynah_feat_cfg feat;
+    mynah_asr_tokenizer tok;
+    mynah_asr_feat_cfg feat;
     int left_ctx, default_right;    /* att context dal preset di default */
     int lookaheads[8], n_lookaheads;
     int default_prompt;
@@ -47,14 +47,14 @@ struct mynah_model {
  * (misurato su FLEURS 305 s: CER 0.68 a segmento unico, 0.29 a 60 s, 0.05 a
  * 30 s; Canary de>en overlap 0.16 -> 0.76). Nemotron ha l'attention finestrata
  * (chunked): non degrada, per lui il limite serve solo per la memoria. */
-#define MYNAH_SEG_DEFAULT 300.0
-#define MYNAH_SEG_OFFLINE 30.0
+#define MYNAH_ASR_SEG_DEFAULT 300.0
+#define MYNAH_ASR_SEG_OFFLINE 30.0
 
 static cJSON *load_json(const char *dir, const char *file) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s", dir, file);
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "mynah: missing %s\n", path); return NULL; }
+    if (!f) { fprintf(stderr, "mynah-asr: missing %s\n", path); return NULL; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -72,7 +72,7 @@ static cJSON *load_json(const char *dir, const char *file) {
 static const cJSON *jneed(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = o ? cJSON_GetObjectItem(o, k) : NULL;
     if (!j) {
-        fprintf(stderr, "mynah: mynah.json: missing \"%s\"\n", k);
+        fprintf(stderr, "mynah-asr: mynah.json: missing \"%s\"\n", k);
         if (bad) *bad = 1;
     }
     return j;
@@ -80,55 +80,55 @@ static const cJSON *jneed(const cJSON *o, const char *k, int *bad) {
 
 static int jint(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsNumber(j) ? j->valueint : 0;
 }
 
 static double jnum(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsNumber(j) ? j->valuedouble : 0.0;
 }
 
 static const char *jstr(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsString(j)) { fprintf(stderr, "mynah: \"%s\" non stringa\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsString(j)) { fprintf(stderr, "mynah-asr: \"%s\" non stringa\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsString(j) ? j->valuestring : "";
 }
 
-static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, int want_ts);
+static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids, int want_ts);
 
 /* --------------------------------------------------------- engine concreti
  * Decodificano l'output encoder di un segmento in token (vedi engine.h).
  * Vivono qui perché consumano gli internals del modello; quando arriverà un
  * engine con stato proprio (Whisper-style) migrerà in un suo modulo. */
 
-static int eng_decode_rnnt(struct mynah_model *m, const float *enc, int T,
+static int eng_decode_rnnt(struct mynah_asr_model *m, const float *enc, int T,
                            const char *lang, int want_ts, int **tokens, int **frames) {
     (void)lang;
-    mynah_dec_state *s = malloc(sizeof(*s));
+    mynah_asr_dec_state *s = malloc(sizeof(*s));
     if (!s) return -1;
-    mynah_dec_state_reset(&m->dec, s);
+    mynah_asr_dec_state_reset(&m->dec, s);
     const int cap = T * m->dec.max_symbols;
     *tokens = malloc((size_t)cap * sizeof(int));
     *frames = want_ts && *tokens ? malloc((size_t)cap * sizeof(int)) : NULL;
-    const int n = *tokens ? mynah_greedy_decode(&m->dec, s, enc, T, *tokens,
+    const int n = *tokens ? mynah_asr_greedy_decode(&m->dec, s, enc, T, *tokens,
                                                 *frames, cap) : -1;
     free(s);
     return n;
 }
 
-static int eng_decode_ctc(struct mynah_model *m, const float *enc, int T,
+static int eng_decode_ctc(struct mynah_asr_model *m, const float *enc, int T,
                           const char *lang, int want_ts, int **tokens, int **frames) {
     (void)lang;
     *tokens = malloc((size_t)T * sizeof(int));       /* CTC: <= 1 token/frame */
     *frames = want_ts && *tokens ? malloc((size_t)T * sizeof(int)) : NULL;
-    return *tokens ? mynah_ctc_decode(&m->ctc, enc, T, *tokens, *frames, T) : -1;
+    return *tokens ? mynah_asr_ctc_decode(&m->ctc, enc, T, *tokens, *frames, T) : -1;
 }
 
-static int eng_decode_aed(struct mynah_model *m, const float *enc, int T,
+static int eng_decode_aed(struct mynah_asr_model *m, const float *enc, int T,
                           const char *lang, int want_ts, int **tokens, int **frames) {
-    int pids[MYNAH_AED_PROMPT_MAX];
+    int pids[MYNAH_ASR_AED_PROMPT_MAX];
     const int ts = want_ts && m->aed_ts;             /* v2: niente <|timestamp|> */
     const int n_p = aed_build_prompt(m, lang, pids, ts);
     if (n_p <= 0) return -1;
@@ -136,18 +136,18 @@ static int eng_decode_aed(struct mynah_model *m, const float *enc, int T,
     const int cap = (ts ? 3 * T : T) + m->aed.max_gen_delta;
     *frames = NULL;                                  /* tempi nei token <|N|> */
     *tokens = malloc((size_t)cap * sizeof(int));
-    return *tokens ? mynah_aed_decode(&m->aed, enc, T, pids, n_p, m->aed_eos,
+    return *tokens ? mynah_asr_aed_decode(&m->aed, enc, T, pids, n_p, m->aed_eos,
                                       *tokens, cap) : -1;
 }
 
-static const mynah_engine ENG_RNNT = {"rnnt-tdt", 0, eng_decode_rnnt};
-static const mynah_engine ENG_CTC = {"ctc", 1, eng_decode_ctc};
-static const mynah_engine ENG_AED = {"aed", 0, eng_decode_aed};
+static const mynah_asr_engine ENG_RNNT = {"rnnt-tdt", 0, eng_decode_rnnt};
+static const mynah_asr_engine ENG_CTC = {"ctc", 1, eng_decode_ctc};
+static const mynah_asr_engine ENG_AED = {"aed", 0, eng_decode_aed};
 
-mynah_model *mynah_load(const char *model_dir) { return mynah_load_quant(model_dir, MYNAH_QUANT_F32); }
+mynah_asr_model *mynah_asr_load(const char *model_dir) { return mynah_asr_load_quant(model_dir, MYNAH_ASR_QUANT_F32); }
 
-mynah_model *mynah_load_quant(const char *model_dir, int quant) {
-    mynah_model *m = calloc(1, sizeof(*m));
+mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
+    mynah_asr_model *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
     char path[1024];
 
@@ -155,37 +155,37 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     if (!m->cfg) goto fail;
     int bad = 0;
 
-    /* pre-quantizzato su disco? (mynah quantize) -> load istantaneo, niente f32 */
+    /* pre-quantizzato su disco? (mynah-asr quantize) -> load istantaneo, niente f32 */
     const char *wfile = jstr(m->cfg, "weights", &bad);
     if (bad) goto fail;
     m->weights = NULL;
-    if (quant != MYNAH_QUANT_F32) {
+    if (quant != MYNAH_ASR_QUANT_F32) {
         snprintf(path, sizeof(path), "%s/model.%s.safetensors", model_dir,
-                 quant == MYNAH_QUANT_INT8 ? "int8" : "int4");
-        m->weights = mynah_st_open_quiet(path);
+                 quant == MYNAH_ASR_QUANT_INT8 ? "int8" : "int4");
+        m->weights = mynah_asr_st_open_quiet(path);
         if (m->weights)
-            fprintf(stderr, "mynah: checkpoint pre-quantizzato %s\n", path);
+            fprintf(stderr, "mynah-asr: checkpoint pre-quantizzato %s\n", path);
     }
     if (!m->weights) {
         snprintf(path, sizeof(path), "%s/%s", model_dir, wfile);
-        m->weights = mynah_st_open_quiet(path);
+        m->weights = mynah_asr_st_open_quiet(path);
         if (!m->weights) {   /* container alternativo GGUF (tools/export_gguf.py) */
             snprintf(path, sizeof(path), "%s/model.gguf", model_dir);
-            m->weights = mynah_st_open_quiet(path);
+            m->weights = mynah_asr_st_open_quiet(path);
             if (m->weights)
-                fprintf(stderr, "mynah: pesi dal container GGUF %s\n", path);
+                fprintf(stderr, "mynah-asr: pesi dal container GGUF %s\n", path);
         }
         if (!m->weights) {   /* riapre il path primario per il messaggio d'errore */
             snprintf(path, sizeof(path), "%s/%s", model_dir, wfile);
-            m->weights = mynah_st_open(path);
+            m->weights = mynah_asr_st_open(path);
         }
     }
     snprintf(path, sizeof(path), "%s/mel_filters.safetensors", model_dir);
-    m->mel_filters = mynah_st_open(path);
+    m->mel_filters = mynah_asr_st_open(path);
     if (!m->weights || !m->mel_filters) goto fail;
 
-    if (mynah_encoder_init(&m->enc, m->weights, quant) != 0) {
-        fprintf(stderr, "mynah: encoder init failed\n");
+    if (mynah_asr_encoder_init(&m->enc, m->weights, quant) != 0) {
+        fprintf(stderr, "mynah-asr: encoder init failed\n");
         goto fail;
     }
 
@@ -209,49 +209,49 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
         const int a_maxseq = jint(jdec, "max_seq", &bad);
         const int a_delta = jint(jdec, "max_generation_delta", &bad);
         if (bad) goto fail;
-        if (mynah_aed_init(&m->aed, m->weights, a_layers, a_heads, a_maxseq,
+        if (mynah_asr_aed_init(&m->aed, m->weights, a_layers, a_heads, a_maxseq,
                            a_delta, quant) != 0) {
-            fprintf(stderr, "mynah: AED decoder init failed\n");
+            fprintf(stderr, "mynah-asr: AED decoder init failed\n");
             goto fail;
         }
         m->is_aed = 1;
         m->engine_dflt = &ENG_AED;
     } else if (strcmp(dec_type, "ctc") == 0) {
         /* CTC puro: niente prednet/joint, la head È il decoder */
-        if (mynah_ctc_init(&m->ctc, m->weights) != 0) {
-            fprintf(stderr, "mynah: missing CTC head\n");
+        if (mynah_asr_ctc_init(&m->ctc, m->weights) != 0) {
+            fprintf(stderr, "mynah-asr: missing CTC head\n");
             goto fail;
         }
         m->engine_dflt = &ENG_CTC;
     } else {
-        int durations[MYNAH_MAX_DURATIONS];
+        int durations[MYNAH_ASR_MAX_DURATIONS];
         int n_durations = 0;
         const cJSON *jdur = cJSON_GetObjectItem(jdec, "durations");
-        for (cJSON *d = jdur ? jdur->child : NULL; d && n_durations < MYNAH_MAX_DURATIONS; d = d->next)
+        for (cJSON *d = jdur ? jdur->child : NULL; d && n_durations < MYNAH_ASR_MAX_DURATIONS; d = d->next)
             durations[n_durations++] = d->valueint;
         const int blank_id = jint(jdec, "blank_id", &bad);
         const int max_sym = jint(jdec, "max_symbols_per_step", &bad);
         if (bad) goto fail;
-        if (mynah_decoder_init(&m->dec, m->weights, blank_id, max_sym,
+        if (mynah_asr_decoder_init(&m->dec, m->weights, blank_id, max_sym,
                                quant, durations, n_durations) != 0) {
-            fprintf(stderr, "mynah: decoder init failed\n");
+            fprintf(stderr, "mynah-asr: decoder init failed\n");
             goto fail;
         }
-        mynah_ctc_init(&m->ctc, m->weights);   /* head ausiliaria hybrid, opzionale */
+        mynah_asr_ctc_init(&m->ctc, m->weights);   /* head ausiliaria hybrid, opzionale */
         m->engine_dflt = &ENG_RNNT;
     }
     m->engine = m->engine_dflt;
 
     snprintf(path, sizeof(path), "%s/tokens.json", model_dir);
-    if (mynah_tokenizer_load(&m->tok, path) != 0) goto fail;
+    if (mynah_asr_tokenizer_load(&m->tok, path) != 0) goto fail;
 
     /* feature config */
     const cJSON *jf = jneed(m->cfg, "features", &bad);
-    const mynah_tensor *fb = mynah_st_get(m->mel_filters, "mel_fb");
-    const mynah_tensor *win = mynah_st_get(m->mel_filters, "window");
+    const mynah_asr_tensor *fb = mynah_asr_st_get(m->mel_filters, "mel_fb");
+    const mynah_asr_tensor *win = mynah_asr_st_get(m->mel_filters, "window");
     if (!fb || !win) goto fail;
     const cJSON *jnorm = jf ? cJSON_GetObjectItem(jf, "normalize") : NULL;
-    m->feat = (mynah_feat_cfg){
+    m->feat = (mynah_asr_feat_cfg){
         .sample_rate = jint(jf, "sample_rate", &bad),
         .n_mels = jint(jf, "n_mels", &bad),
         .n_fft = jint(jf, "n_fft", &bad),
@@ -283,7 +283,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
         int i = 0;
         for (cJSON *p = presets->child; p && i < 8; p = p->next, i++) {
             const cJSON *pl = cJSON_GetArrayItem(p, 0), *pr = cJSON_GetArrayItem(p, 1);
-            if (!pl || !pr) { fprintf(stderr, "mynah: preset streaming malformato\n"); goto fail; }
+            if (!pl || !pr) { fprintf(stderr, "mynah-asr: preset streaming malformato\n"); goto fail; }
             m->lookaheads[i] = pr->valueint;
             if (i == def) {
                 m->left_ctx = pl->valueint;
@@ -292,8 +292,8 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
         }
         m->n_lookaheads = i;
     }
-    /* default segmentazione model-aware (vedi commento su MYNAH_SEG_OFFLINE) */
-    m->seg_sec = m->n_lookaheads > 0 ? MYNAH_SEG_DEFAULT : MYNAH_SEG_OFFLINE;
+    /* default segmentazione model-aware (vedi commento su MYNAH_ASR_SEG_OFFLINE) */
+    m->seg_sec = m->n_lookaheads > 0 ? MYNAH_ASR_SEG_DEFAULT : MYNAH_ASR_SEG_OFFLINE;
 
     /* prompt (Nemotron): assente nei modelli con LID implicita (Parakeet);
      * per l'AED (Canary) la sezione prompt è quella del DECODER (niente default_id) */
@@ -302,8 +302,8 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     m->default_prompt = jdid ? jdid->valueint : -1;
     if (m->is_aed) {
         const cJSON *jeos = cJSON_GetObjectItem(jdec, "eos_token");
-        m->aed_eos = jeos ? mynah_tok_find(&m->tok, jeos->valuestring) : -1;
-        if (m->aed_eos < 0) { fprintf(stderr, "mynah: AED EOS not found\n"); goto fail; }
+        m->aed_eos = jeos ? mynah_asr_tok_find(&m->tok, jeos->valuestring) : -1;
+        if (m->aed_eos < 0) { fprintf(stderr, "mynah-asr: AED EOS not found\n"); goto fail; }
         /* timestamp generativi <|N|>: non tutti gli AED li supportano (v2 usa
          * un allineatore esterno) — capability dal mynah.json, default sì */
         const cJSON *jts = cJSON_GetObjectItem(jdec, "timestamp_tokens");
@@ -312,27 +312,27 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     return m;
 
 fail:
-    mynah_free(m);
+    mynah_asr_free(m);
     return NULL;
 }
 
-void mynah_free(mynah_model *m) {
+void mynah_asr_free(mynah_asr_model *m) {
     if (!m) return;
-    mynah_qmat_free(&m->dec.head);
-    mynah_aed_free(&m->aed);
-    mynah_encoder_free(&m->enc);
-    mynah_tokenizer_free(&m->tok);
-#ifdef MYNAH_METAL
+    mynah_asr_qmat_free(&m->dec.head);
+    mynah_asr_aed_free(&m->aed);
+    mynah_asr_encoder_free(&m->enc);
+    mynah_asr_tokenizer_free(&m->tok);
+#ifdef MYNAH_ASR_METAL
     /* i pesi GPU cache-ati puntano nel mmap che stiamo per chiudere */
-    mynah_metal_weights_evict();
+    mynah_asr_metal_weights_evict();
 #endif
-    mynah_st_close(m->weights);
-    mynah_st_close(m->mel_filters);
+    mynah_asr_st_close(m->weights);
+    mynah_asr_st_close(m->mel_filters);
     cJSON_Delete(m->cfg);
     free(m);
 }
 
-int mynah_lang_id(const mynah_model *m, const char *lang) {
+int mynah_asr_lang_id(const mynah_asr_model *m, const char *lang) {
     const cJSON *jprompt = cJSON_GetObjectItem(m->cfg, "prompt");
     if (!jprompt) return -1;
     const cJSON *dict = cJSON_GetObjectItem(jprompt, "dictionary");
@@ -340,15 +340,15 @@ int mynah_lang_id(const mynah_model *m, const char *lang) {
     return e ? e->valueint : -1;
 }
 
-void mynah_set_segment_limit(mynah_model *m, double sec) {
-    const double def = m->n_lookaheads > 0 ? MYNAH_SEG_DEFAULT : MYNAH_SEG_OFFLINE;
+void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec) {
+    const double def = m->n_lookaheads > 0 ? MYNAH_ASR_SEG_DEFAULT : MYNAH_ASR_SEG_OFFLINE;
     m->seg_sec = sec <= 0.0 ? def : (sec < 5.0 ? 5.0 : sec);
 }
 
-int mynah_set_decoder(mynah_model *m, const char *name) {
+int mynah_asr_set_decoder(mynah_asr_model *m, const char *name) {
     if (strcmp(name, "ctc") == 0) {
         if (!m->ctc.w) {
-            fprintf(stderr, "mynah: this model has no CTC head\n");
+            fprintf(stderr, "mynah-asr: this model has no CTC head\n");
             return -1;
         }
         m->engine = &ENG_CTC;
@@ -360,17 +360,17 @@ int mynah_set_decoder(mynah_model *m, const char *name) {
 
 /* prompt id per la richiesta: -1 = modello senza prompt (valido, es. Parakeet),
  * -2 = lingua sconosciuta per un modello CON prompt (errore). */
-static int resolve_prompt(const mynah_model *m, const char *lang) {
+static int resolve_prompt(const mynah_asr_model *m, const char *lang) {
     if (m->default_prompt < 0) return -1;
     if (!lang) return m->default_prompt;
-    const int id = mynah_lang_id(m, lang);
+    const int id = mynah_asr_lang_id(m, lang);
     return id < 0 ? -2 : id;
 }
 
-static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, int want_ts);
+static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids, int want_ts);
 
 
-int mynah_lookaheads(const mynah_model *m, int out[8]) {
+int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]) {
     memcpy(out, m->lookaheads, sizeof(m->lookaheads));
     return m->n_lookaheads;
 }
@@ -378,7 +378,7 @@ int mynah_lookaheads(const mynah_model *m, int out[8]) {
 /* worker per-item del batch (features e decode sono indipendenti tra item:
  * regioni disgiunte, modello read-only -> parallel_for è sicura) */
 typedef struct {
-    mynah_model *m;
+    mynah_asr_model *m;
     const float *const *samples;
     const size_t *n_samples;
     const char *const *langs;
@@ -386,24 +386,24 @@ typedef struct {
     int *valids, *t_encs;
     char **texts;
     char (*langs_out)[16];
-    mynah_word **words;    /* per-item, NULL = niente timestamp */
+    mynah_asr_word **words;    /* per-item, NULL = niente timestamp */
     int *n_words;
 } batch_ctx;
 
 static void batch_feat_worker(void *ctx, int b) {
     batch_ctx *c = ctx;
     int T_mel;
-    c->feats[b] = mynah_log_mel(&c->m->feat, c->samples[b], c->n_samples[b],
+    c->feats[b] = mynah_asr_log_mel(&c->m->feat, c->samples[b], c->n_samples[b],
                                 &T_mel, &c->valids[b]);
 }
 
 static void batch_decode_worker(void *ctx, int b) {
     batch_ctx *c = ctx;
-    mynah_model *m = c->m;
+    mynah_asr_model *m = c->m;
     if (!c->encs[b]) return;
     /* il batch encoder produce l'output POST projector: l'engine CTC (che vuole
      * il raw) è valido solo quando post == raw (CTC puro, niente projector) */
-    const mynah_engine *eng = m->engine;
+    const mynah_asr_engine *eng = m->engine;
     if (eng->raw_encoder && m->ctc.d_in != m->enc.d_out)
         eng = m->engine_dflt;
     /* words nel batch SOLO per gli engine frame-based (RNNT/TDT/CTC): i frame
@@ -417,26 +417,26 @@ static void batch_decode_worker(void *ctx, int b) {
                                   c->langs ? c->langs[b] : NULL, want_ts,
                                   &tokens, &frames);
     if (n_tok >= 0)
-        c->texts[b] = mynah_detokenize(&m->tok, tokens, n_tok,
+        c->texts[b] = mynah_asr_detokenize(&m->tok, tokens, n_tok,
                                        c->langs_out ? c->langs_out[b] : NULL);
     if (n_tok >= 0 && c->texts[b] && c->words && frames)
-        mynah_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
+        mynah_asr_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
                                &c->words[b], &c->n_words[b]);
     free(tokens);
     free(frames);
 }
 
-int mynah_transcribe_batch(mynah_model *m, const float *const *samples,
+int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                            const size_t *n_samples, int batch, const char *const *langs,
                            int lookahead, char **texts, char (*langs_out)[16]) {
-    return mynah_transcribe_batch_ts(m, samples, n_samples, batch, langs, lookahead,
+    return mynah_asr_transcribe_batch_ts(m, samples, n_samples, batch, langs, lookahead,
                                      texts, langs_out, NULL, NULL);
 }
 
-int mynah_transcribe_batch_ts(mynah_model *m, const float *const *samples,
+int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *samples,
                               const size_t *n_samples, int batch, const char *const *langs,
                               int lookahead, char **texts, char (*langs_out)[16],
-                              mynah_word **words, int *n_words) {
+                              mynah_asr_word **words, int *n_words) {
     const int right = lookahead >= 0 ? lookahead : m->default_right;
     int rc = -1;
 
@@ -458,16 +458,16 @@ int mynah_transcribe_batch_ts(mynah_model *m, const float *const *samples,
         prompts[b] = resolve_prompt(m, langs ? langs[b] : NULL);
         if (prompts[b] == -2) goto done;
     }
-    mynah_parallel_for(batch, batch_feat_worker, &c);
+    mynah_asr_parallel_for(batch, batch_feat_worker, &c);
     for (int b = 0; b < batch; b++)
         if (!feats[b]) goto done;
 
-    if (mynah_encoder_forward_batch(&m->enc, (const float *const *)feats, valids, batch,
+    if (mynah_asr_encoder_forward_batch(&m->enc, (const float *const *)feats, valids, batch,
                                     m->feat.n_mels, prompts, m->left_ctx, right,
                                     encs, t_encs) != 0)
         goto done;
 
-    mynah_parallel_for(batch, batch_decode_worker, &c);
+    mynah_asr_parallel_for(batch, batch_decode_worker, &c);
     rc = 0;
 
 done:
@@ -481,11 +481,11 @@ done:
 
 /* ----------------------------------------------------------------- streaming */
 
-struct mynah_stream {
-    mynah_model *m;
-    mynah_mel_stream mel;
-    mynah_enc_stream es;
-    mynah_dec_state dec;
+struct mynah_asr_stream {
+    mynah_asr_model *m;
+    mynah_asr_mel_stream mel;
+    mynah_asr_enc_stream es;
+    mynah_asr_dec_state dec;
     int prompt;
     float *mel_buf;             /* buffer del chunk mel corrente */
     int mel_have;
@@ -497,49 +497,49 @@ struct mynah_stream {
     size_t samples_fed;
 };
 
-mynah_stream *mynah_stream_open(mynah_model *m, const char *lang, int lookahead) {
+mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead) {
     if (m->n_lookaheads == 0) {
-        fprintf(stderr, "mynah: this model is offline-only (no cache-aware streaming)\n");
+        fprintf(stderr, "mynah-asr: this model is offline-only (no cache-aware streaming)\n");
         return NULL;
     }
     const int prompt = resolve_prompt(m, lang);
-    if (prompt == -2) { fprintf(stderr, "mynah: language '%s' is not supported\n", lang); return NULL; }
+    if (prompt == -2) { fprintf(stderr, "mynah-asr: language '%s' is not supported\n", lang); return NULL; }
     const int right = lookahead >= 0 ? lookahead : m->default_right;
 
-    mynah_stream *s = calloc(1, sizeof(*s));
+    mynah_asr_stream *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->m = m;
     s->prompt = prompt;
-    if (mynah_mel_stream_init(&s->mel, &m->feat) != 0 ||
-        mynah_enc_stream_init(&s->es, &m->enc, m->left_ctx, right, m->feat.n_mels) != 0) {
-        mynah_stream_close(s);
+    if (mynah_asr_mel_stream_init(&s->mel, &m->feat) != 0 ||
+        mynah_asr_enc_stream_init(&s->es, &m->enc, m->left_ctx, right, m->feat.n_mels) != 0) {
+        mynah_asr_stream_close(s);
         return NULL;
     }
-    mynah_dec_state_reset(&m->dec, &s->dec);
+    mynah_asr_dec_state_reset(&m->dec, &s->dec);
     const int max_chunk = 8 * (right + 1) + 1;
     s->mel_buf = malloc((size_t)max_chunk * (size_t)m->feat.n_mels * sizeof(float));
     s->enc_buf = malloc((size_t)s->es.q * (size_t)m->enc.d_out * sizeof(float));
     s->cap_tokens = 4096;
     s->tokens = malloc((size_t)s->cap_tokens * sizeof(int));
-    if (!s->mel_buf || !s->enc_buf || !s->tokens) { mynah_stream_close(s); return NULL; }
+    if (!s->mel_buf || !s->enc_buf || !s->tokens) { mynah_asr_stream_close(s); return NULL; }
     return s;
 }
 
-void mynah_stream_close(mynah_stream *s) {
+void mynah_asr_stream_close(mynah_asr_stream *s) {
     if (!s) return;
-    mynah_mel_stream_free(&s->mel);
-    mynah_enc_stream_free(&s->es);
+    mynah_asr_mel_stream_free(&s->mel);
+    mynah_asr_enc_stream_free(&s->es);
     free(s->mel_buf); free(s->enc_buf); free(s->tokens);
     free(s);
 }
 
-const char *mynah_stream_lang(const mynah_stream *s) { return s->lang; }
+const char *mynah_asr_stream_lang(const mynah_asr_stream *s) { return s->lang; }
 
 /* Encoda il chunk mel corrente, decodifica, emette il delta di testo. */
-static int stream_flush_chunk(mynah_stream *s, int n_mel, int is_last,
-                              mynah_result_cb cb, void *ud) {
-    mynah_model *m = s->m;
-    const int q = mynah_enc_stream_step(&s->es, s->mel_buf, n_mel, m->feat.n_mels,
+static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
+                              mynah_asr_result_cb cb, void *ud) {
+    mynah_asr_model *m = s->m;
+    const int q = mynah_asr_enc_stream_step(&s->es, s->mel_buf, n_mel, m->feat.n_mels,
                                         s->prompt, is_last, s->enc_buf);
     if (q < 0) return -1;
 
@@ -549,20 +549,20 @@ static int stream_flush_chunk(mynah_stream *s, int n_mel, int is_last,
         if (!nb) return -1;
         s->tokens = nb;
     }
-    s->n_tokens += mynah_greedy_decode(&m->dec, &s->dec, s->enc_buf, q,
+    s->n_tokens += mynah_asr_greedy_decode(&m->dec, &s->dec, s->enc_buf, q,
                                        s->tokens + s->n_tokens, NULL,
                                        s->cap_tokens - s->n_tokens);
     s->mel_have = 0;
 
     if (cb) {
         char lang_tmp[16] = "";
-        char *text = mynah_detokenize(&m->tok, s->tokens, s->n_tokens, lang_tmp);
+        char *text = mynah_asr_detokenize(&m->tok, s->tokens, s->n_tokens, lang_tmp);
         if (!text) return -1;
         if (lang_tmp[0]) memcpy(s->lang, lang_tmp, sizeof(s->lang));
         const size_t total = strlen(text);
         if (total > s->chars_emitted) {
             const double t1 = (double)s->samples_fed / (double)m->feat.sample_rate;
-            mynah_result res = {
+            mynah_asr_result res = {
                 .text = text + s->chars_emitted,
                 .t0 = 0.0, .t1 = t1,
                 .is_final = true,
@@ -576,17 +576,17 @@ static int stream_flush_chunk(mynah_stream *s, int n_mel, int is_last,
     return 0;
 }
 
-int mynah_stream_feed(mynah_stream *s, const float *samples, size_t n,
-                      mynah_result_cb cb, void *ud) {
-    mynah_model *m = s->m;
+int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
+                      mynah_asr_result_cb cb, void *ud) {
+    mynah_asr_model *m = s->m;
     s->samples_fed += n;
     const float *src = samples;
     size_t left = n;
     int first_pass = 1;
 
     for (;;) {
-        const int need = mynah_enc_stream_need(&s->es);
-        const int got = mynah_mel_stream_feed(&s->mel, first_pass ? src : NULL,
+        const int need = mynah_asr_enc_stream_need(&s->es);
+        const int got = mynah_asr_mel_stream_feed(&s->mel, first_pass ? src : NULL,
                                               first_pass ? left : 0,
                                               s->mel_buf + (size_t)s->mel_have * (size_t)m->feat.n_mels,
                                               need - s->mel_have);
@@ -598,11 +598,11 @@ int mynah_stream_feed(mynah_stream *s, const float *samples, size_t n,
     return 0;
 }
 
-int mynah_stream_finish(mynah_stream *s, mynah_result_cb cb, void *ud) {
-    mynah_model *m = s->m;
+int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *ud) {
+    mynah_asr_model *m = s->m;
     for (;;) {
-        const int need = mynah_enc_stream_need(&s->es);
-        const int got = mynah_mel_stream_finish(&s->mel,
+        const int need = mynah_asr_enc_stream_need(&s->es);
+        const int got = mynah_asr_mel_stream_finish(&s->mel,
                                                 s->mel_buf + (size_t)s->mel_have * (size_t)m->feat.n_mels,
                                                 need - s->mel_have);
         s->mel_have += got;
@@ -621,10 +621,10 @@ int mynah_stream_finish(mynah_stream *s, mynah_result_cb cb, void *ud) {
 /* Prompt canary2 -> id globali (template dal mynah.json, token come stringhe;
  * slot vuoti = 0 token). lang sorgente ("auto"/NULL -> "en"); la forma
  * "src>tgt" (es. "en>de") chiede la traduzione PER-CHIAMATA (thread-safe, usata
- * dal server); altrimenti target da mynah_set_target_lang ("" = sorgente).
+ * dal server); altrimenti target da mynah_asr_set_target_lang ("" = sorgente).
  * want_ts: slot timestamp attivo (il modello bracketa ogni parola con <|N|>).
  * Ritorna n token, -1 = lingua ignota. */
-static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, int want_ts) {
+static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids, int want_ts) {
     char src[8] = "en", tgt_buf[8] = "";
     if (lang && *lang && strncmp(lang, "auto", 4) != 0) {
         int i = 0;
@@ -648,15 +648,15 @@ static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, in
         ok_tgt |= strcmp(e->valuestring, tgt) == 0;
     }
     if (!ok_src || !ok_tgt) {
-        fprintf(stderr, "mynah: language '%s' is not supported by the model\n",
+        fprintf(stderr, "mynah-asr: language '%s' is not supported by the model\n",
                 ok_src ? tgt : src);
         return -1;
     }
     const cJSON *jd = cJSON_GetObjectItem(jp, "defaults");
     const cJSON *jt = jp ? cJSON_GetObjectItem(jp, "template") : NULL;
-    if (!jt) { fprintf(stderr, "mynah: missing prompt.template\n"); return -1; }
+    if (!jt) { fprintf(stderr, "mynah-asr: missing prompt.template\n"); return -1; }
     int n = 0;
-    for (const cJSON *e = jt->child; e && n < MYNAH_AED_PROMPT_MAX; e = e->next) {
+    for (const cJSON *e = jt->child; e && n < MYNAH_ASR_AED_PROMPT_MAX; e = e->next) {
         if (!cJSON_IsString(e)) continue;
         const char *item = e->valuestring;
         char tok[32];
@@ -675,19 +675,19 @@ static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, in
         } else {
             snprintf(tok, sizeof(tok), "%s", item);
         }
-        const int id = mynah_tok_find(&m->tok, tok);
-        if (id < 0) { fprintf(stderr, "mynah: token prompt '%s' ignoto\n", tok); return -1; }
+        const int id = mynah_asr_tok_find(&m->tok, tok);
+        if (id < 0) { fprintf(stderr, "mynah-asr: token prompt '%s' ignoto\n", tok); return -1; }
         ids[n++] = id;
     }
     return n;
 }
 
-int mynah_can_translate(const mynah_model *m) { return m->is_aed; }
+int mynah_asr_can_translate(const mynah_asr_model *m) { return m->is_aed; }
 
-int mynah_set_target_lang(mynah_model *m, const char *lang) {
+int mynah_asr_set_target_lang(mynah_asr_model *m, const char *lang) {
     if (!lang || !*lang) { m->aed_target[0] = '\0'; return 0; }
     if (!m->is_aed) {
-        fprintf(stderr, "mynah: this model does not support translation (AED only)\n");
+        fprintf(stderr, "mynah-asr: this model does not support translation (AED only)\n");
         return -1;
     }
     const cJSON *jl = cJSON_GetObjectItem(cJSON_GetObjectItem(m->cfg, "prompt"), "languages");
@@ -696,7 +696,7 @@ int mynah_set_target_lang(mynah_model *m, const char *lang) {
             snprintf(m->aed_target, sizeof(m->aed_target), "%s", lang);
             return 0;
         }
-    fprintf(stderr, "mynah: target language '%s' is not supported\n", lang);
+    fprintf(stderr, "mynah-asr: target language '%s' is not supported\n", lang);
     return -1;
 }
 
@@ -717,11 +717,11 @@ static int aed_ts_frame(const char *piece) {
 /* Parole con timestamp dai token AED col formato canary: <|t0|> pezzi <|t1|>
  * per parola (i <|N|> consecutivi chiudono la parola precedente e aprono la
  * successiva). 0 = ok. */
-static int aed_words_from_tokens(const mynah_tokenizer *tk, const int *toks, int n,
-                                 double frame_sec, mynah_word **out, int *n_out) {
+static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks, int n,
+                                 double frame_sec, mynah_asr_word **out, int *n_out) {
     *out = NULL;
     *n_out = 0;
-    mynah_word *ws = malloc((size_t)(n + 1) * sizeof(*ws));
+    mynah_asr_word *ws = malloc((size_t)(n + 1) * sizeof(*ws));
     char buf[256];
     size_t blen = 0;
     int nw = 0, open_ts = -1, word_open = 0;
@@ -778,20 +778,20 @@ static int aed_words_from_tokens(const mynah_tokenizer *tk, const int *toks, int
 }
 
 /* Trascrizione di UN segmento (audio intero o fetta tra due silenzi). */
-static char *transcribe_segment(mynah_model *m, const float *samples, size_t n_samples,
+static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t n_samples,
                                 int prompt, int right, const char *lang, char *lang_out,
-                                mynah_word **words, int *n_words) {
+                                mynah_asr_word **words, int *n_words) {
     if (words) { *words = NULL; *n_words = 0; }
     int T_mel, valid;
-    float *feats = mynah_log_mel(&m->feat, samples, n_samples, &T_mel, &valid);
+    float *feats = mynah_asr_log_mel(&m->feat, samples, n_samples, &T_mel, &valid);
     if (!feats) return NULL;
 
-    const mynah_engine *eng = m->engine;
+    const mynah_asr_engine *eng = m->engine;
     int T_enc;
     float *enc = eng->raw_encoder
-        ? mynah_encoder_forward_raw(&m->enc, feats, valid, m->feat.n_mels,
+        ? mynah_asr_encoder_forward_raw(&m->enc, feats, valid, m->feat.n_mels,
                                     m->left_ctx, right, &T_enc)
-        : mynah_encoder_forward(&m->enc, feats, valid, m->feat.n_mels, prompt,
+        : mynah_asr_encoder_forward(&m->enc, feats, valid, m->feat.n_mels, prompt,
                                 m->left_ctx, right, &T_enc);
     free(feats);
     if (!enc) return NULL;
@@ -802,10 +802,10 @@ static char *transcribe_segment(mynah_model *m, const float *samples, size_t n_s
     free(enc);
     if (n_tok < 0) { free(tokens); free(frames); return NULL; }
 
-    char *text = mynah_detokenize(&m->tok, tokens, n_tok, lang_out);
+    char *text = mynah_asr_detokenize(&m->tok, tokens, n_tok, lang_out);
     if (text && words) {
         if (frames)
-            mynah_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
+            mynah_asr_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
                                    words, n_words);
         else if (m->is_aed && m->aed_ts)   /* AED: tempi nei token <|N|> */
             aed_words_from_tokens(&m->tok, tokens, n_tok, m->frame_sec,
@@ -832,13 +832,13 @@ static size_t find_split_point(const float *s, size_t lo, size_t hi, int sr) {
     return best_pos;
 }
 
-char *mynah_transcribe_ts(mynah_model *m, const float *samples, size_t n_samples,
+char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n_samples,
                           const char *lang, int lookahead, char *lang_out,
-                          mynah_word **words, int *n_words) {
+                          mynah_asr_word **words, int *n_words) {
     if (words) { *words = NULL; *n_words = 0; }
     if (lang_out) lang_out[0] = '\0';
     const int prompt = resolve_prompt(m, lang);
-    if (prompt == -2) { fprintf(stderr, "mynah: language '%s' is not supported\n", lang); return NULL; }
+    if (prompt == -2) { fprintf(stderr, "mynah-asr: language '%s' is not supported\n", lang); return NULL; }
     const int right = lookahead >= 0 ? lookahead : m->default_right;
 
     const int sr = m->feat.sample_rate;
@@ -862,18 +862,18 @@ char *mynah_transcribe_ts(mynah_model *m, const float *samples, size_t n_samples
         }
 
         char seg_lang[16] = "";
-        mynah_word *sw = NULL;
+        mynah_asr_word *sw = NULL;
         int sn = 0;
         char *seg = transcribe_segment(m, samples + cur, end - cur, prompt, right,
                                        lang, seg_lang, words ? &sw : NULL, &sn);
-        if (!seg) { free(text); if (words) mynah_words_free(*words, *n_words); return NULL; }
+        if (!seg) { free(text); if (words) mynah_asr_words_free(*words, *n_words); return NULL; }
         if (lang_out && seg_lang[0] && cur == 0) memcpy(lang_out, seg_lang, sizeof(seg_lang));
 
         const size_t sl = strlen(seg);
         char *nt = realloc(text, text_len + sl + 2);
         if (!nt) {
-            free(seg); free(text); mynah_words_free(sw, sn);
-            if (words) { mynah_words_free(*words, *n_words); *words = NULL; *n_words = 0; }
+            free(seg); free(text); mynah_asr_words_free(sw, sn);
+            if (words) { mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0; }
             return NULL;
         }
         text = nt;
@@ -883,11 +883,11 @@ char *mynah_transcribe_ts(mynah_model *m, const float *samples, size_t n_samples
         free(seg);
 
         if (words && sn > 0) {
-            mynah_word *nw = realloc(*words, ((size_t)*n_words + (size_t)sn) * sizeof(mynah_word));
+            mynah_asr_word *nw = realloc(*words, ((size_t)*n_words + (size_t)sn) * sizeof(mynah_asr_word));
             if (!nw) {
-                mynah_words_free(sw, sn); free(text);
+                mynah_asr_words_free(sw, sn); free(text);
                 /* realloc fallita NON libera il vecchio blocco */
-                mynah_words_free(*words, *n_words); *words = NULL; *n_words = 0;
+                mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0;
                 return NULL;
             }
             *words = nw;
@@ -900,15 +900,15 @@ char *mynah_transcribe_ts(mynah_model *m, const float *samples, size_t n_samples
             *n_words += sn;
             free(sw);   /* le stringhe sono state trasferite */
         } else if (sw) {
-            mynah_words_free(sw, sn);
+            mynah_asr_words_free(sw, sn);
         }
         cur = end;
     }
     return text ? text : calloc(1, 1);
 }
 
-char *mynah_transcribe(mynah_model *m, const float *samples, size_t n_samples,
+char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_samples,
                        const char *lang, int lookahead, char *lang_out) {
-    return mynah_transcribe_ts(m, samples, n_samples, lang, lookahead, lang_out,
+    return mynah_asr_transcribe_ts(m, samples, n_samples, lang, lookahead, lang_out,
                                NULL, NULL);
 }

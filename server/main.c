@@ -1,4 +1,4 @@
-/* mynah-server — API HTTP OpenAI-compatible + WebSocket streaming.
+/* mynah-asr-server — API HTTP OpenAI-compatible + WebSocket streaming.
  *
  * Endpoint:
  *   POST /v1/audio/translations     come sopra + target_language (default en) — solo AED
@@ -24,8 +24,8 @@
 
 #include "../src/audio.h"
 #include "../src/backend.h"
-#include "../src/mynah.h"
-#include "../src/qmat.h"      /* mynah_set_caps (--caps) */
+#include "../src/mynah_asr.h"
+#include "../src/qmat.h"      /* mynah_asr_set_caps (--caps) */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
 
@@ -33,14 +33,14 @@
 #define MAX_BODY (200u * 1024 * 1024)
 #define QUEUE_CAP 128
 
-static mynah_model *g_model;
+static mynah_asr_model *g_model;
 static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
 static int g_max_batch = 8;          /* --batch N; 1 = disabilitato */
-static int g_quant = MYNAH_QUANT_F32;
+static int g_quant = MYNAH_ASR_QUANT_F32;
 
 /* --------------------------------------------------- micro-batching scheduler
  * Le connessioni impacchettano il lavoro in job; un thread dedicato aggrega i
- * job pendenti (finestra 25 ms o batch pieno) e chiama mynah_transcribe_batch:
+ * job pendenti (finestra 25 ms o batch pieno) e chiama mynah_asr_transcribe_batch:
  * i pesi vengono letti una volta per layer per l'intero batch. */
 typedef struct trx_job {
     const float *samples;
@@ -49,7 +49,7 @@ typedef struct trx_job {
     int lookahead;
     char *text;                 /* risultato (malloc) */
     char lang_out[16];
-    mynah_word *words;          /* timestamp per parola (malloc, può essere NULL) */
+    mynah_asr_word *words;          /* timestamp per parola (malloc, può essere NULL) */
     int n_words;
     int done;
     pthread_mutex_t mu;
@@ -107,7 +107,7 @@ static void *batch_worker(void *arg) {
         const char *langs[64];
         char *texts[64];
         char louts[64][16];
-        mynah_word *wordsv[64];
+        mynah_asr_word *wordsv[64];
         int nwordsv[64];
         int lookahead = jobs[0]->lookahead;   /* batch omogeneo sul primo */
         for (int b = 0; b < B; b++) {
@@ -118,7 +118,7 @@ static void *batch_worker(void *arg) {
         }
         /* words sempre estratte: costo trascurabile vs inferenza, e il batch
          * può mischiare richieste json e verbose_json */
-        mynah_transcribe_batch_ts(g_model, samples, ns, B, langs, lookahead,
+        mynah_asr_transcribe_batch_ts(g_model, samples, ns, B, langs, lookahead,
                                   texts, louts, wordsv, nwordsv);
 
         for (int b = 0; b < B; b++) {
@@ -225,17 +225,17 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
     size_t remain = len;
 
     for (;;) {
-        const uint8_t *part = mynah_memmem(p, remain, (const uint8_t *)sep, sep_len);
+        const uint8_t *part = mynah_asr_memmem(p, remain, (const uint8_t *)sep, sep_len);
         if (!part) break;
         part += sep_len;
         remain = len - (size_t)(part - body);
         if (remain < 4 || part[0] == '-') break;   /* --boundary-- finale */
 
-        const uint8_t *hdr_end = mynah_memmem(part, remain, (const uint8_t *)"\r\n\r\n", 4);
+        const uint8_t *hdr_end = mynah_asr_memmem(part, remain, (const uint8_t *)"\r\n\r\n", 4);
         if (!hdr_end) break;
         const uint8_t *data = hdr_end + 4;
 
-        const uint8_t *next = mynah_memmem(data, len - (size_t)(data - body),
+        const uint8_t *next = mynah_asr_memmem(data, len - (size_t)(data - body),
                                            (const uint8_t *)sep, sep_len);
         if (!next) break;
         size_t data_len = (size_t)(next - data);
@@ -298,7 +298,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     char src_lang[24];
     snprintf(src_lang, sizeof(src_lang), "%s", f.language);
     if (translate || f.target_language[0]) {
-        if (!mynah_can_translate(g_model)) {
+        if (!mynah_asr_can_translate(g_model)) {
             send_error(fd, 400, "this model does not support translation (an AED engine is required, e.g. Canary)");
             return;
         }
@@ -308,11 +308,11 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
 
     size_t n_samples;
     int sr;
-    float *samples = mynah_wav_parse(f.file, f.file_len, &n_samples, &sr);
+    float *samples = mynah_asr_wav_parse(f.file, f.file_len, &n_samples, &sr);
     if (!samples) { send_error(fd, 400, "WAV non valido (serve PCM16)"); return; }
     if (sr != 16000) {
         size_t n2;
-        float *rs = mynah_resample(samples, n_samples, sr, 16000, &n2);
+        float *rs = mynah_asr_resample(samples, n_samples, sr, 16000, &n2);
         free(samples);
         if (!rs) { send_error(fd, 500, "resampling failed"); return; }
         samples = rs;
@@ -321,7 +321,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
 
     char lang_out[16] = "";
     char *text;
-    mynah_word *words = NULL;
+    mynah_asr_word *words = NULL;
     int n_words = 0;
     const int want_words = strcmp(f.response_format, "verbose_json") == 0;
     if (g_max_batch > 1) {
@@ -336,12 +336,12 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
             words = j.words;
             n_words = j.n_words;
         } else {
-            mynah_words_free(j.words, j.n_words);
+            mynah_asr_words_free(j.words, j.n_words);
         }
         pthread_mutex_destroy(&j.mu);
         pthread_cond_destroy(&j.cv);
     } else {
-        text = mynah_transcribe_ts(g_model, samples, n_samples, f.language, f.lookahead,
+        text = mynah_asr_transcribe_ts(g_model, samples, n_samples, f.language, f.lookahead,
                                    lang_out, want_words ? &words : NULL, &n_words);
     }
     const double duration = (double)n_samples / 16000.0;
@@ -372,7 +372,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         send_json(fd, 200, j);
         cJSON_Delete(j);
     }
-    mynah_words_free(words, n_words);
+    mynah_asr_words_free(words, n_words);
     free(text);
 }
 
@@ -409,7 +409,7 @@ static int read_exact(int fd, uint8_t *buf, size_t n) {
 
 typedef struct { int fd; int failed; } ws_ctx;
 
-static void ws_on_text(const mynah_result *res, void *ud) {
+static void ws_on_text(const mynah_asr_result *res, void *ud) {
     ws_ctx *c = ud;
     if (c->failed) return;
     cJSON *j = cJSON_CreateObject();
@@ -431,9 +431,9 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
     char accept_src[128];
     snprintf(accept_src, sizeof(accept_src), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
     uint8_t sha[20];
-    mynah_sha1((const uint8_t *)accept_src, strlen(accept_src), sha);
+    mynah_asr_sha1((const uint8_t *)accept_src, strlen(accept_src), sha);
     char accept[40];
-    mynah_b64(sha, 20, accept);
+    mynah_asr_b64(sha, 20, accept);
 
     char resp[256];
     int n = snprintf(resp, sizeof(resp),
@@ -451,7 +451,7 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
         if (qk) lookahead = atoi(qk + 10);
     }
 
-    mynah_stream *s = mynah_stream_open(g_model, lang, lookahead);
+    mynah_asr_stream *s = mynah_asr_stream_open(g_model, lang, lookahead);
     if (!s) { close(fd); return; }
     ws_ctx ctx = {.fd = fd};
 
@@ -494,7 +494,7 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
             while (off < ns) {
                 const size_t chunk = ns - off < 65536 ? ns - off : 65536;
                 for (size_t i = 0; i < chunk; i++) fbuf[i] = (float)pcm[off + i] / 32768.0f;
-                mynah_stream_feed(s, fbuf, chunk, ws_on_text, &ctx);
+                mynah_asr_stream_feed(s, fbuf, chunk, ws_on_text, &ctx);
                 off += chunk;
             }
         }
@@ -502,16 +502,16 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
         if (ctx.failed) break;
     }
 
-    mynah_stream_finish(s, ws_on_text, &ctx);
+    mynah_asr_stream_finish(s, ws_on_text, &ctx);
     cJSON *done = cJSON_CreateObject();
     cJSON_AddBoolToObject(done, "done", 1);
-    if (mynah_stream_lang(s)[0]) cJSON_AddStringToObject(done, "language", mynah_stream_lang(s));
+    if (mynah_asr_stream_lang(s)[0]) cJSON_AddStringToObject(done, "language", mynah_asr_stream_lang(s));
     char *ds = cJSON_PrintUnformatted(done);
     ws_send_frame(fd, 0x1, ds, strlen(ds));
     free(ds);
     cJSON_Delete(done);
     ws_send_frame(fd, 0x8, "", 0);
-    mynah_stream_close(s);
+    mynah_asr_stream_close(s);
 }
 
 /* ------------------------------------------------------------------- routing */
@@ -598,26 +598,26 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) g_max_batch = atoi(argv[++i]);
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             i++;
-            g_quant = strcmp(argv[i], "int8") == 0 ? MYNAH_QUANT_INT8
-                    : strcmp(argv[i], "int4") == 0 ? MYNAH_QUANT_INT4 : MYNAH_QUANT_F32;
+            g_quant = strcmp(argv[i], "int8") == 0 ? MYNAH_ASR_QUANT_INT8
+                    : strcmp(argv[i], "int4") == 0 ? MYNAH_ASR_QUANT_INT4 : MYNAH_ASR_QUANT_F32;
         }
-        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
-        else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_set_caps(argv[++i]);
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_asr_set_backend(argv[++i]);
+        else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_asr_set_caps(argv[++i]);
         else {
-            fprintf(stderr, "usage: mynah-server -m <model_dir> [-p 8090] [--threads 4] "
+            fprintf(stderr, "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] "
                             "[--batch 8] [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n");
             return 2;
         }
     }
     if (!model_dir) {
-        fprintf(stderr, "usage: mynah-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8]\n");
+        fprintf(stderr, "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8]\n");
         return 2;
     }
     if (g_max_batch < 1) g_max_batch = 1;
     if (g_max_batch > 64) g_max_batch = 64;
 
     signal(SIGPIPE, SIG_IGN);
-    g_model = mynah_load_quant(model_dir, g_quant);
+    g_model = mynah_asr_load_quant(model_dir, g_quant);
     if (!g_model) return 1;
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -626,7 +626,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
                                .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 64) != 0) {
-        fprintf(stderr, "mynah-server: bind/listen failed on port %d\n", port);
+        fprintf(stderr, "mynah-asr-server: bind/listen failed on port %d\n", port);
         return 1;
     }
 
@@ -640,9 +640,9 @@ int main(int argc, char **argv) {
         pthread_create(&t, NULL, batch_worker, NULL);
         pthread_detach(t);
     }
-    fprintf(stderr, "mynah-server %s: listening on :%d (%d workers, batch %d)\n"
+    fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d workers, batch %d)\n"
                     "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
-            mynah_version(), port, n_threads, g_max_batch);
+            mynah_asr_version(), port, n_threads, g_max_batch);
 
     for (;;) {
         int fd = accept(srv, NULL, NULL);

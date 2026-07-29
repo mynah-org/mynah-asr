@@ -10,7 +10,7 @@ WAV=tests/audio/test_en.wav
 command -v uv >/dev/null 2>&1 || exit 77
 
 ABS_MODEL=$(cd "$MODEL_DIR" && pwd)
-TMP=$(mktemp -d /tmp/mynah_gguf.XXXXXX) || exit 1
+TMP=$(mktemp -d /tmp/mynah_asr_gguf.XXXXXX) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 (cd tools && uv run python export_gguf.py "$ABS_MODEL" --out "$TMP/f32.gguf" >/dev/null && \
@@ -27,10 +27,10 @@ for f in "$ABS_MODEL"/*; do
 done
 
 fail=0
-ref=$(./mynah transcribe -m "$MODEL_DIR" -i "$WAV" 2>/dev/null)
+ref=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$WAV" 2>/dev/null)
 
 ln -s "$TMP/f32.gguf" "$TMP/model/model.gguf"
-got=$(./mynah transcribe -m "$TMP/model" -i "$WAV" 2>/dev/null)
+got=$(./mynah-asr transcribe -m "$TMP/model" -i "$WAV" 2>/dev/null)
 if [ "$ref" = "$got" ] && [ -n "$got" ]; then
     echo "gguf e2e f32  OK: $got"
 else
@@ -41,25 +41,25 @@ for q in q8:q8_0 q4k:q4_k; do
     file="${q%%:*}"; name="${q##*:}"
     rm "$TMP/model/model.gguf"
     ln -s "$TMP/$file.gguf" "$TMP/model/model.gguf"
-    got=$(./mynah transcribe -m "$TMP/model" -i "$WAV" 2>/dev/null)
+    got=$(./mynah-asr transcribe -m "$TMP/model" -i "$WAV" 2>/dev/null)
     case "$got" in
         *"speech recognition test"*) echo "gguf e2e $name OK: $got" ;;
         *) echo "gguf e2e $name FAIL: $got"; fail=1 ;;
     esac
 done
 
-# mynah quantize a partire dai pesi GGUF (stessa API f32 -> deve funzionare):
+# mynah-asr quantize a partire dai pesi GGUF (stessa API f32 -> deve funzionare):
 # scrive model.int8.safetensors nella dir tmp e ritrascrive col checkpoint
 rm "$TMP/model/model.gguf"
 ln -s "$TMP/f32.gguf" "$TMP/model/model.gguf"
-if ./mynah quantize -m "$TMP/model" --quant int8 >/dev/null 2>&1; then
-    got=$(./mynah transcribe -m "$TMP/model" -i "$WAV" --quant int8 2>/dev/null)
+if ./mynah-asr quantize -m "$TMP/model" --quant int8 >/dev/null 2>&1; then
+    got=$(./mynah-asr transcribe -m "$TMP/model" -i "$WAV" --quant int8 2>/dev/null)
     case "$got" in
         *"speech recognition test"*) echo "gguf quantize-int8 OK: $got" ;;
         *) echo "gguf quantize-int8 FAIL: $got"; fail=1 ;;
     esac
 else
-    echo "gguf quantize-int8 FAIL: mynah quantize fallito"; fail=1
+    echo "gguf quantize-int8 FAIL: mynah-asr quantize fallito"; fail=1
 fi
 
 exit $fail

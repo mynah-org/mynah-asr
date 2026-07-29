@@ -1,13 +1,13 @@
-"""Python bindings for libmynah (ctypes, zero dependencies).
+"""Python bindings for libmynah_asr (ctypes, zero dependencies).
 
-Prerequisite: `make shared` in the repo root (produces libmynah.dylib/.so).
+Prerequisite: `make shared` in the repo root (produces libmynah_asr.dylib/.so).
 
-    from mynah import Mynah
-    m = Mynah("models/parakeet-tdt-0.6b-v3")
+    from mynah_asr import MynahASR
+    m = MynahASR("models/parakeet-tdt-0.6b-v3")
     print(m.transcribe("audio.wav"))
     text, words = m.transcribe("audio.wav", timestamps=True)
     # translation (AED/Canary models):
-    print(Mynah("models/canary-180m-flash").transcribe("de.wav", lang="de>en"))
+    print(MynahASR("models/canary-180m-flash").transcribe("de.wav", lang="de>en"))
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ def _find_lib() -> ctypes.CDLL:
     here = Path(__file__).resolve()
     candidates = []
     for base in (here.parent, here.parent.parent.parent, Path.cwd()):
-        candidates += [base / "libmynah.dylib", base / "libmynah.so"]
-    candidates += [Path("libmynah.dylib"), Path("libmynah.so")]
+        candidates += [base / "libmynah_asr.dylib", base / "libmynah_asr.so"]
+    candidates += [Path("libmynah_asr.dylib"), Path("libmynah_asr.so")]
     for c in candidates:
         if c.exists():
             return ctypes.CDLL(str(c))
-    raise OSError("libmynah not found: build it with `make shared` in the repo root")
+    raise OSError("libmynah_asr not found: build it with `make shared` in the repo root")
 
 
 class _Word(ctypes.Structure):
@@ -43,23 +43,23 @@ def _api() -> ctypes.CDLL:
     global _lib
     if _lib is None:
         _lib = _find_lib()
-        _lib.mynah_load_quant.restype = ctypes.c_void_p
-        _lib.mynah_load_quant.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        _lib.mynah_free.argtypes = [ctypes.c_void_p]
-        _lib.mynah_transcribe_ts.restype = ctypes.c_void_p   # char* (we own it and must free it)
-        _lib.mynah_transcribe_ts.argtypes = [
+        _lib.mynah_asr_load_quant.restype = ctypes.c_void_p
+        _lib.mynah_asr_load_quant.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        _lib.mynah_asr_free.argtypes = [ctypes.c_void_p]
+        _lib.mynah_asr_transcribe_ts.restype = ctypes.c_void_p   # char* (we own it and must free it)
+        _lib.mynah_asr_transcribe_ts.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
             ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
             ctypes.POINTER(ctypes.POINTER(_Word)), ctypes.POINTER(ctypes.c_int)]
-        _lib.mynah_words_free.argtypes = [ctypes.POINTER(_Word), ctypes.c_int]
-        _lib.mynah_set_target_lang.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        _lib.mynah_can_translate.argtypes = [ctypes.c_void_p]
-        _lib.mynah_set_segment_limit.argtypes = [ctypes.c_void_p, ctypes.c_double]
-        _lib.mynah_resample.restype = ctypes.POINTER(ctypes.c_float)
-        _lib.mynah_resample.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
+        _lib.mynah_asr_words_free.argtypes = [ctypes.POINTER(_Word), ctypes.c_int]
+        _lib.mynah_asr_set_target_lang.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        _lib.mynah_asr_can_translate.argtypes = [ctypes.c_void_p]
+        _lib.mynah_asr_set_segment_limit.argtypes = [ctypes.c_void_p, ctypes.c_double]
+        _lib.mynah_asr_resample.restype = ctypes.POINTER(ctypes.c_float)
+        _lib.mynah_asr_resample.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
                                         ctypes.c_int, ctypes.c_int,
                                         ctypes.POINTER(ctypes.c_size_t)]
-        _lib.mynah_version.restype = ctypes.c_char_p
+        _lib.mynah_asr_version.restype = ctypes.c_char_p
     return _lib
 
 
@@ -80,18 +80,18 @@ def _load_wav(path: str) -> tuple[array.array, int]:
     return out, sr
 
 
-class Mynah:
+class MynahASR:
     """A loaded model. Thread-safety: use from one thread at a time."""
 
     def __init__(self, model_dir: str, quant: str = "f32"):
         self._lib = _api()
-        self._m = self._lib.mynah_load_quant(str(model_dir).encode(), QUANT[quant])
+        self._m = self._lib.mynah_asr_load_quant(str(model_dir).encode(), QUANT[quant])
         if not self._m:
             raise RuntimeError(f"load failed: {model_dir}")
 
     def close(self) -> None:
         if self._m:
-            self._lib.mynah_free(self._m)
+            self._lib.mynah_asr_free(self._m)
             self._m = None
 
     def __del__(self):  # noqa: D105
@@ -105,11 +105,11 @@ class Mynah:
 
     def set_target_lang(self, lang: str) -> None:
         """AED/Canary: output language (different from source = translation). '' = ASR."""
-        if self._lib.mynah_set_target_lang(self._m, lang.encode()) != 0:
+        if self._lib.mynah_asr_set_target_lang(self._m, lang.encode()) != 0:
             raise ValueError(f"unsupported target lang: {lang}")
 
     def set_segment_limit(self, sec: float) -> None:
-        self._lib.mynah_set_segment_limit(self._m, sec)
+        self._lib.mynah_asr_set_segment_limit(self._m, sec)
 
     def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
                    timestamps: bool = False):
@@ -121,7 +121,7 @@ class Mynah:
         n = ctypes.c_size_t(len(samples))
         if sr != 16000:
             n_out = ctypes.c_size_t()
-            p = self._lib.mynah_resample(buf, len(samples), sr, 16000,
+            p = self._lib.mynah_asr_resample(buf, len(samples), sr, 16000,
                                          ctypes.byref(n_out))
             if not p:
                 raise RuntimeError("resampling failed")
@@ -129,7 +129,7 @@ class Mynah:
         lang_out = ctypes.create_string_buffer(16)
         words_p = ctypes.POINTER(_Word)()
         n_words = ctypes.c_int(0)
-        raw = self._lib.mynah_transcribe_ts(
+        raw = self._lib.mynah_asr_transcribe_ts(
             self._m, buf, n, lang.encode(), lookahead, lang_out,
             ctypes.byref(words_p) if timestamps else None,
             ctypes.byref(n_words) if timestamps else None)
@@ -142,9 +142,9 @@ class Mynah:
             return text
         words = [(words_p[i].word.decode(), words_p[i].t0, words_p[i].t1)
                  for i in range(n_words.value)]
-        self._lib.mynah_words_free(words_p, n_words)
+        self._lib.mynah_asr_words_free(words_p, n_words)
         return text, words
 
 
 def version() -> str:
-    return _api().mynah_version().decode()
+    return _api().mynah_asr_version().decode()

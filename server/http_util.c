@@ -3,7 +3,7 @@
 #include <string.h>
 
 /* SHA-1 (RFC 3174) — compatta, solo per l'handshake WebSocket. */
-void mynah_sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
+void mynah_asr_sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
     uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
     const uint64_t total_bits = (uint64_t)len * 8;
 
@@ -55,7 +55,7 @@ void mynah_sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
     }
 }
 
-void mynah_b64(const uint8_t *data, size_t len, char *out) {
+void mynah_asr_b64(const uint8_t *data, size_t len, char *out) {
     static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t o = 0;
     for (size_t i = 0; i < len; i += 3) {
@@ -70,7 +70,7 @@ void mynah_b64(const uint8_t *data, size_t len, char *out) {
     out[o] = '\0';
 }
 
-const uint8_t *mynah_memmem(const uint8_t *hay, size_t hay_len,
+const uint8_t *mynah_asr_memmem(const uint8_t *hay, size_t hay_len,
                             const uint8_t *needle, size_t needle_len) {
     if (needle_len == 0 || hay_len < needle_len) return NULL;
     for (size_t i = 0; i + needle_len <= hay_len; i++)

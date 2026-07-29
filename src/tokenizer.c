@@ -6,7 +6,7 @@
 
 #include "../vendor/cJSON.h"
 
-int mynah_tokenizer_load(mynah_tokenizer *tk, const char *path) {
+int mynah_asr_tokenizer_load(mynah_asr_tokenizer *tk, const char *path) {
     memset(tk, 0, sizeof(*tk));
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return -1; }
@@ -31,13 +31,13 @@ int mynah_tokenizer_load(mynah_tokenizer *tk, const char *path) {
     return 0;
 }
 
-void mynah_tokenizer_free(mynah_tokenizer *tk) {
+void mynah_asr_tokenizer_free(mynah_asr_tokenizer *tk) {
     for (int i = 0; i < tk->n_pieces; i++) free(tk->pieces[i]);
     free(tk->pieces);
     tk->pieces = NULL;
 }
 
-void mynah_words_free(mynah_word *words, int n_words) {
+void mynah_asr_words_free(mynah_asr_word *words, int n_words) {
     if (!words) return;
     for (int i = 0; i < n_words; i++) free(words[i].word);
     free(words);
@@ -54,12 +54,12 @@ static int piece_starts_word(const char *p) {
            (unsigned char)p[2] == 0x81;
 }
 
-int mynah_detokenize_words(const mynah_tokenizer *tk, const int *tokens,
+int mynah_asr_detokenize_words(const mynah_asr_tokenizer *tk, const int *tokens,
                            const int *frames, int n, double frame_sec,
-                           mynah_word **out, int *n_out) {
+                           mynah_asr_word **out, int *n_out) {
     *out = NULL;
     *n_out = 0;
-    mynah_word *words = calloc((size_t)(n > 0 ? n : 1), sizeof(mynah_word));
+    mynah_asr_word *words = calloc((size_t)(n > 0 ? n : 1), sizeof(mynah_asr_word));
     char *wbuf = malloc(256);
     if (!words || !wbuf) { free(words); free(wbuf); return -1; }
     size_t wcap = 256, wlen = 0;
@@ -78,7 +78,7 @@ int mynah_detokenize_words(const mynah_tokenizer *tk, const int *tokens,
         /* chiudi la parola corrente a fine sequenza o all'inizio della prossima */
         if (wlen > 0 && (i == n || (!special && starts))) {
             char *w = malloc(wlen + 1);
-            if (!w) { mynah_words_free(words, nw); free(wbuf); return -1; }
+            if (!w) { mynah_asr_words_free(words, nw); free(wbuf); return -1; }
             memcpy(w, wbuf, wlen);
             w[wlen] = '\0';
             words[nw].word = w;
@@ -94,7 +94,7 @@ int mynah_detokenize_words(const mynah_tokenizer *tk, const int *tokens,
         if (wlen + pl + 1 > wcap) {
             wcap = (wcap + pl + 1) * 2;
             char *nb = realloc(wbuf, wcap);
-            if (!nb) { mynah_words_free(words, nw); free(wbuf); return -1; }
+            if (!nb) { mynah_asr_words_free(words, nw); free(wbuf); return -1; }
             wbuf = nb;
         }
         /* copia saltando il ▁ iniziale (e ogni ▁ interno -> niente: è un confine) */
@@ -106,7 +106,7 @@ int mynah_detokenize_words(const mynah_tokenizer *tk, const int *tokens,
     return 0;
 }
 
-char *mynah_detokenize(const mynah_tokenizer *tk, const int *tokens, int n,
+char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int n,
                        char *lang_out) {
     size_t cap = 256, len = 0;
     char *out = malloc(cap);
@@ -175,7 +175,7 @@ char *mynah_detokenize(const mynah_tokenizer *tk, const int *tokens, int n,
     return out;
 }
 
-int mynah_tok_find(const mynah_tokenizer *tk, const char *piece) {
+int mynah_asr_tok_find(const mynah_asr_tokenizer *tk, const char *piece) {
     for (int i = 0; i < tk->n_pieces; i++)
         if (strcmp(tk->pieces[i], piece) == 0) return i;
     return -1;

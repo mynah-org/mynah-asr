@@ -1,7 +1,7 @@
-# mynah-server — HTTP + WebSocket API
+# mynah-asr-server — HTTP + WebSocket API
 
 ```sh
-make && ./mynah-server -m models/nemotron-3.5-asr-streaming-0.6b -p 8090 --threads 4
+make && ./mynah-asr-server -m models/nemotron-3.5-asr-streaming-0.6b -p 8090 --threads 4
 ```
 
 ## Endpoints

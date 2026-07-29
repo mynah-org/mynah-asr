@@ -49,20 +49,20 @@ int main(int argc, char **argv) {
     free(probe);
 
     snprintf(path, sizeof(path), "%s/mel_filters.safetensors", argv[1]);
-    mynah_safetensors *mf = mynah_st_open(path);
+    mynah_asr_safetensors *mf = mynah_asr_st_open(path);
     snprintf(path, sizeof(path), "%s/model.safetensors", argv[1]);
-    mynah_safetensors *st = mynah_st_open(path);
+    mynah_asr_safetensors *st = mynah_asr_st_open(path);
     if (!mf || !st) return 77;
 
     size_t n_samples; int sr;
-    float *audio = mynah_wav_load(argv[2], &n_samples, &sr);
+    float *audio = mynah_asr_wav_load(argv[2], &n_samples, &sr);
     if (!audio || sr != 16000) return 2;
 
-    const mynah_tensor *fb = mynah_st_get(mf, "mel_fb");
-    const mynah_tensor *win = mynah_st_get(mf, "window");
+    const mynah_asr_tensor *fb = mynah_asr_st_get(mf, "mel_fb");
+    const mynah_asr_tensor *win = mynah_asr_st_get(mf, "window");
     int norm_pf = 0, left, right, prompt_it;
     if (test_model_cfg(argv[1], &norm_pf, &left, &right, &prompt_it) != 0) return 77;
-    mynah_feat_cfg fcfg = {
+    mynah_asr_feat_cfg fcfg = {
         .sample_rate = 16000, .n_mels = (int)fb->shape[1], .n_fft = (int)(fb->shape[0] - 1) * 2,
         .win_length = (int)win->shape[0], .hop_length = 160,
         .preemphasis = 0.97, .log_zero_guard = pow(2.0, -24.0),
@@ -70,10 +70,10 @@ int main(int argc, char **argv) {
         .mel_fb = (const float *)fb->data, .window = (const float *)win->data,
     };
     int T_mel, valid;
-    float *feats = mynah_log_mel(&fcfg, audio, n_samples, &T_mel, &valid);
+    float *feats = mynah_asr_log_mel(&fcfg, audio, n_samples, &T_mel, &valid);
 
-    mynah_encoder enc;
-    if (mynah_encoder_init(&enc, st, 0) != 0) { fprintf(stderr, "encoder init failed\n"); return 2; }
+    mynah_asr_encoder enc;
+    if (mynah_asr_encoder_init(&enc, st, 0) != 0) { fprintf(stderr, "encoder init failed\n"); return 2; }
     printf("encoder: %d layer, d=%d, heads=%d, ffn=%d, conv_k=%d, d_out=%d, causal=%d, "
            "att [%d,%d]\n", enc.n_layers, enc.d_model, enc.n_heads, enc.ffn_dim, enc.conv_k,
            enc.d_out, enc.causal, left, right);
@@ -81,14 +81,14 @@ int main(int argc, char **argv) {
     /* forward manuale per confrontare i layer intermedi (contesto/prompt dal config:
      * Nemotron preset default it-IT, Parakeet full [-1,-1] senza prompt) */
     int T;
-    float *x = mynah_subsampling_forward(&enc.ss, feats, valid, fcfg.n_mels, &T);
+    float *x = mynah_asr_subsampling_forward(&enc.ss, feats, valid, fcfg.n_mels, &T);
     float *pe = malloc((size_t)(2 * T - 1) * (size_t)enc.d_model * sizeof(float));
-    mynah_pos_emb(&enc, T, pe);
+    mynah_asr_pos_emb(&enc, T, pe);
 
     int fails = 0;
     const size_t nd = (size_t)T * (size_t)enc.d_model;
     for (int li = 0; li < enc.n_layers; li++) {
-        mynah_encoder_layer(&enc, li, x, T, pe, left, right);
+        mynah_asr_encoder_layer(&enc, li, x, T, pe, left, right);
         char name[32];
         snprintf(name, sizeof(name), "layer_%d", li);
         if (li == 0 || li == enc.n_layers / 2 || li == enc.n_layers - 1)
@@ -97,11 +97,11 @@ int main(int argc, char **argv) {
     free(pe);
 
     float *out = malloc((size_t)T * (size_t)enc.d_out * sizeof(float));
-    mynah_encoder_post(&enc, x, T, prompt_it, out);
+    mynah_asr_encoder_post(&enc, x, T, prompt_it, out);
     fails += check("enc_proj", out, argv[3], (size_t)T * (size_t)enc.d_out, 1e-4);
 
     free(audio); free(feats); free(x); free(out);
-    mynah_encoder_free(&enc); mynah_st_close(mf); mynah_st_close(st);
+    mynah_asr_encoder_free(&enc); mynah_asr_st_close(mf); mynah_asr_st_close(st);
     if (fails) { fprintf(stderr, "FAIL (%d stadi)\n", fails); return 1; }
     printf("OK\n");
     return 0;

@@ -7,7 +7,7 @@
 cd tools && uv run python export_gguf.py ../models/parakeet-tdt_ctc-110m --dtype q8_0
 
 # the runtime picks model.gguf up automatically when model.safetensors is absent
-./mynah transcribe -m models/parakeet-tdt_ctc-110m -i audio.wav
+./mynah-asr transcribe -m models/parakeet-tdt_ctc-110m -i audio.wav
 ```
 
 **safetensors stays the default.** GGUF is an *alternative container* for the
@@ -37,7 +37,7 @@ possible int4 files.
 File sizes for parakeet-tdt_ctc-110m: f32 459 MB · q8_0 164 MB · q4_k 117 · q4_0 114 MB.
 Note: GGUF quantized types are dequantized to f32 **at load** (RAM = f32 size);
 for lowest RAM and the native SDOT/VNNI kernels use mynah's own
-`mynah quantize` int8/int4 checkpoints ([quantization.md](quantization.md)).
+`mynah-asr quantize` int8/int4 checkpoints ([quantization.md](quantization.md)).
 
 ## Validation
 
@@ -62,7 +62,7 @@ filters, model.gguf with tensors renamed to the runtime's HF-verbatim naming
 ```sh
 curl -LO https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf/resolve/main/parakeet-tdt_ctc-110m-Q4_K_M.gguf
 cd tools && uv run python import_gguf.py ../parakeet-tdt_ctc-110m-Q4_K_M.gguf --out ../models/110m-q4k
-./mynah transcribe -m models/110m-q4k -i audio.wav
+./mynah-asr transcribe -m models/110m-q4k -i audio.wav
 ```
 
 Verified real file: **handy-computer/parakeet-tdt_ctc-110m-gguf Q4_K_M**

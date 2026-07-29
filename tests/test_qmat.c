@@ -44,13 +44,13 @@ static int check(const char *name, int qtype, int n, int k, int T, double tol) {
             ref[t * n + i] = (float)acc;
         }
 
-    mynah_qmat m;
-    mynah_qmat_init(&m, w, n, k, qtype);
-    mynah_qmat_mul(&m, x, out, T);
+    mynah_asr_qmat m;
+    mynah_asr_qmat_init(&m, w, n, k, qtype);
+    mynah_asr_qmat_mul(&m, x, out, T);
     const double e = rel_err(out, ref, T * n);
     printf("%-22s n=%d k=%d T=%-3d rel_err=%.4f (tol %.3f) %s\n",
            name, n, k, T, e, tol, e <= tol ? "OK" : "FAIL");
-    mynah_qmat_free(&m);
+    mynah_asr_qmat_free(&m);
     free(w); free(x); free(ref); free(out);
     return e <= tol ? 0 : 1;
 }
@@ -58,15 +58,15 @@ static int check(const char *name, int qtype, int n, int k, int T, double tol) {
 int main(void) {
     int fails = 0;
     /* small-T: percorso dot diretto (SDOT/VNNI/AVX2/NEON) */
-    fails += check("q8 small-T", MYNAH_Q_INT8, 96, 1024, 1, 0.03);
-    fails += check("q8 small-T multi", MYNAH_Q_INT8, 64, 4096, 4, 0.03);
-    fails += check("q4 small-T", MYNAH_Q_INT4, 96, 1024, 1, 0.08);
-    fails += check("q4 small-T multi", MYNAH_Q_INT4, 64, 4096, 4, 0.08);
+    fails += check("q8 small-T", MYNAH_ASR_Q_INT8, 96, 1024, 1, 0.03);
+    fails += check("q8 small-T multi", MYNAH_ASR_Q_INT8, 64, 4096, 4, 0.03);
+    fails += check("q4 small-T", MYNAH_ASR_Q_INT4, 96, 1024, 1, 0.08);
+    fails += check("q4 small-T multi", MYNAH_ASR_Q_INT4, 64, 4096, 4, 0.08);
     /* T grande: percorso dequant+GEMM */
-    fails += check("q8 large-T", MYNAH_Q_INT8, 96, 1024, 48, 0.02);
-    fails += check("q4 large-T", MYNAH_Q_INT4, 96, 1024, 48, 0.08);
+    fails += check("q8 large-T", MYNAH_ASR_Q_INT8, 96, 1024, 48, 0.02);
+    fails += check("q4 large-T", MYNAH_ASR_Q_INT4, 96, 1024, 48, 0.08);
     /* f32 passthrough */
-    fails += check("f32 passthrough", MYNAH_Q_F32, 96, 1024, 8, 1e-6);
+    fails += check("f32 passthrough", MYNAH_ASR_Q_F32, 96, 1024, 8, 1e-6);
     if (fails) { fprintf(stderr, "FAIL (%d)\n", fails); return 1; }
     printf("OK\n");
     return 0;

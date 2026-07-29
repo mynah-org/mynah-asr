@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0        # tags: `mynah --version` reports the release name
+          fetch-depth: 0        # tags: `mynah-asr --version` reports the release name
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'linux'
@@ -69,16 +69,16 @@ jobs:
       - name: Build release tarball
         env:
           CFLAGS: ${{ matrix.cflags }}
-        run: make dist MYNAH_BUILD=${{ steps.v.outputs.name }}
+        run: make dist MYNAH_ASR_BUILD=${{ steps.v.outputs.name }}
 
       - name: Smoke test the packaged binaries
         run: |
-          tar xzf dist/mynah-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz -C dist
-          D=dist/mynah-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}
+          tar xzf dist/mynah-asr-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz -C dist
+          D=dist/mynah-asr-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}
           # the version string must carry the tag, not a stale git describe
-          "$D/bin/mynah" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
-          # mynah-server exits 2 on --help by design: check the usage line instead
-          "$D/bin/mynah-server" --help 2>&1 | grep -q 'usage: mynah-server'
+          "$D/bin/mynah-asr" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
+          # mynah-asr-server exits 2 on --help by design: check the usage line instead
+          "$D/bin/mynah-asr-server" --help 2>&1 | grep -q 'usage: mynah-asr-server'
 
       - name: Kernel self-test (no model needed)
         env:
@@ -87,8 +87,8 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: mynah-${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/mynah-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          name: mynah-asr-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/mynah-asr-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -109,7 +109,7 @@ jobs:
       - name: Collect tarballs + checksums
         run: |
           mkdir -p release
-          find artifacts -type f -name 'mynah-*.tar.gz' -exec cp {} release/ \;
+          find artifacts -type f -name 'mynah-asr-*.tar.gz' -exec cp {} release/ \;
           cd release && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
 
       - name: Version string
@@ -125,7 +125,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.v.outputs.name }}
-          name: "mynah ${{ steps.v.outputs.name }}"
+          name: "mynah-asr ${{ steps.v.outputs.name }}"
           files: release/*
           generate_release_notes: true
           # a manual run never publishes on top of a tag: it stays a draft

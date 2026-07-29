@@ -4,12 +4,12 @@
 
 ```sh
 # once: save the pre-quantized checkpoints (built-in tool, zero dependencies)
-./mynah quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8   # 0.79 GB
-./mynah quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int4   # 0.57 GB
+./mynah-asr quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8   # 0.79 GB
+./mynah-asr quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int4   # 0.57 GB
 
 # then: INSTANT load (zero-copy mmap, the 2.55 GB f32 is no longer needed at runtime)
-./mynah transcribe -m <dir> -i audio.wav --quant int8
-./mynah-server -m <dir> --quant int8
+./mynah-asr transcribe -m <dir> -i audio.wav --quant int8
+./mynah-asr-server -m <dir> --quant int8
 ```
 
 ## Numbers (Apple Silicon, 5.2 s fixture, warm cache)

@@ -57,8 +57,8 @@ jobs:
       - name: Kernel self-test — explicit SIMD levels (x86)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          MYNAH_CAPS=scalar tests/test_qmat
-          MYNAH_CAPS=avx2   tests/test_qmat   # downgrades with a note if unsupported
+          MYNAH_ASR_CAPS=scalar tests/test_qmat
+          MYNAH_ASR_CAPS=avx2   tests/test_qmat   # downgrades with a note if unsupported
 
       - name: Restore converted model (cache warmed by prepare-model)
         uses: ./.github/actions/prepare-model
@@ -70,7 +70,7 @@ jobs:
         uses: astral-sh/setup-uv@v9.0.0   # no floating v9 tag: pin the exact release (node24)
 
       - name: Int8 checkpoint (exercises the quantize path)
-        run: ./mynah quantize -m models/${{ env.MODEL }} --quant int8
+        run: ./mynah-asr quantize -m models/${{ env.MODEL }} --quant int8
 
       - name: Tests (parity vs oracle + e2e; big models skip)
         run: make test
@@ -79,7 +79,7 @@ jobs:
         run: make test-samples
 
   # Compile-only CUDA build: no GPU on the runner, but it catches build/link
-  # regressions in the nvcc path (e.g. the MYNAH_BUILD quoting bug found on the
+  # regressions in the nvcc path (e.g. the MYNAH_ASR_BUILD quoting bug found on the
   # first real A100 build, 2026-07-20). The runtime falls back to CPU without a
   # device, so the kernel self-test still runs.
   build-cuda:
@@ -94,9 +94,9 @@ jobs:
         run: make cuda
       - name: Smoke test (CPU fallback, no GPU)
         # test binaries must link with the same variant flags as `make cuda`:
-        # backend.o was compiled with -DMYNAH_CUDA and needs cuda_gemm.o+cublas
+        # backend.o was compiled with -DMYNAH_ASR_CUDA and needs cuda_gemm.o+cublas
         run: |
-          ./mynah --version
-          make EXTRA_CFLAGS="-DMYNAH_CUDA" OBJ_EXTRA="build/src/cuda_gemm.o" \
+          ./mynah-asr --version
+          make EXTRA_CFLAGS="-DMYNAH_ASR_CUDA" OBJ_EXTRA="build/src/cuda_gemm.o" \
                EXTRA_LDFLAGS="-lcublas -lcudart" tests/test_qmat
           tests/test_qmat

@@ -12,7 +12,7 @@
 #
 # After downloading, the script prints the convert (and optional quantize) commands.
 # Note: mynah reads its own converted format (safetensors mmap), not GGUF —
-# quantized int8/int4 checkpoints are produced locally with `mynah quantize`.
+# quantized int8/int4 checkpoints are produced locally with `mynah-asr quantize`.
 set -euo pipefail
 
 # key | HF repo id | mode (hf = native port, nemo = .nemo archive) | ~download | description
@@ -130,7 +130,7 @@ if [[ "$MODE" == gguf ]]; then
   echo "  # 1. import (no torch! generates mynah.json/tokens/mel filters + renamed model.gguf)"
   echo "  cd tools && uv sync && uv run python import_gguf.py ../$DEST/*.gguf --out ../$DEST && cd .."
   echo "  # 2. transcribe"
-  echo "  ./mynah transcribe -m $DEST -i file.wav"
+  echo "  ./mynah-asr transcribe -m $DEST -i file.wav"
   exit 0
 fi
 echo "  # 1. convert in place (one-time; Python via uv, offline tooling only)"
@@ -139,7 +139,7 @@ if [[ "$MODE" == nemo ]]; then
   echo "  #    (the .nemo archive can be deleted after conversion)"
 fi
 echo "  # 2. optional: pre-quantized int8/int4 checkpoint (~1/3 RAM, instant load)"
-echo "  ./mynah quantize -m $DEST --quant int8"
+echo "  ./mynah-asr quantize -m $DEST --quant int8"
 echo "  #    or a GGUF container (docs/gguf.md): cd tools && uv run python export_gguf.py ../$DEST --dtype q8_0"
 echo "  # 3. transcribe"
-echo "  ./mynah transcribe -m $DEST -i file.wav --lang auto"
+echo "  ./mynah-asr transcribe -m $DEST -i file.wav --lang auto"

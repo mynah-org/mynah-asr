@@ -165,7 +165,7 @@ def main() -> int:
     canon = meta.get("general.repo_url", "").rstrip("/").rsplit("/", 1)[-1] \
         or meta.get("general.name", args.out.name)
     mynah = {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": canon,
         "arch": "fastconformer_tdt",
         "engine": "parakeet-tdt",
@@ -256,7 +256,7 @@ def main() -> int:
 
     size_mb = (args.out / "model.gguf").stat().st_size / 1e6
     print(f"OK {args.out}: {len(tensors)} tensors renamed, model.gguf {size_mb:.1f} MB")
-    print(f"   try it: ./mynah transcribe -m {args.out} -i file.wav")
+    print(f"   try it: ./mynah-asr transcribe -m {args.out} -i file.wav")
     return 0
 
 

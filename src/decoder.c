@@ -5,23 +5,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef MYNAH_BLAS_ACCELERATE
+#ifdef MYNAH_ASR_BLAS_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
 #endif
 
-int mynah_decoder_init(mynah_decoder *dec, const mynah_safetensors *st,
+int mynah_asr_decoder_init(mynah_asr_decoder *dec, const mynah_asr_safetensors *st,
                        int blank, int max_symbols, int quantize,
                        const int *durations, int n_durations) {
     memset(dec, 0, sizeof(*dec));
-    if (n_durations > MYNAH_MAX_DURATIONS) return -1;
+    if (n_durations > MYNAH_ASR_MAX_DURATIONS) return -1;
     dec->n_durations = n_durations;
     for (int i = 0; i < n_durations; i++) dec->durations[i] = durations[i];
-    const mynah_tensor *emb = mynah_st_get(st, "decoder.embedding.weight");
-    const mynah_tensor *proj_w = mynah_st_get(st, "decoder.decoder_projector.weight");
-    const mynah_tensor *proj_b = mynah_st_get(st, "decoder.decoder_projector.bias");
-    const mynah_tensor *head_b = mynah_st_get(st, "joint.head.bias");
+    const mynah_asr_tensor *emb = mynah_asr_st_get(st, "decoder.embedding.weight");
+    const mynah_asr_tensor *proj_w = mynah_asr_st_get(st, "decoder.decoder_projector.weight");
+    const mynah_asr_tensor *proj_b = mynah_asr_st_get(st, "decoder.decoder_projector.bias");
+    const mynah_asr_tensor *head_b = mynah_asr_st_get(st, "joint.head.bias");
     if (!emb || !proj_w || !proj_b || !head_b) return -1;
 
     dec->embedding = (const float *)emb->data;
@@ -30,27 +30,27 @@ int mynah_decoder_init(mynah_decoder *dec, const mynah_safetensors *st,
     dec->head_b = (const float *)head_b->data;
     dec->vocab = (int)emb->shape[0];
     dec->hidden = (int)emb->shape[1];
-    if (mynah_qmat_init_st(&dec->head, st, "joint.head.weight", quantize) != 0) return -1;
+    if (mynah_asr_qmat_init_st(&dec->head, st, "joint.head.weight", quantize) != 0) return -1;
     dec->blank = blank;
     dec->max_symbols = max_symbols;
 
     int n = 0;
-    for (; n < MYNAH_MAX_PRED_LAYERS; n++) {
+    for (; n < MYNAH_ASR_MAX_PRED_LAYERS; n++) {
         char name[64];
         snprintf(name, sizeof(name), "decoder.lstm.weight_ih_l%d", n);
-        const mynah_tensor *w = mynah_st_get(st, name);
+        const mynah_asr_tensor *w = mynah_asr_st_get(st, name);
         if (!w) break;
         dec->w_ih[n] = (const float *)w->data;
         /* layer parziale (checkpoint corrotto): errore pulito, non null-deref */
-        const mynah_tensor *whh, *bih, *bhh;
+        const mynah_asr_tensor *whh, *bih, *bhh;
         snprintf(name, sizeof(name), "decoder.lstm.weight_hh_l%d", n);
-        whh = mynah_st_get(st, name);
+        whh = mynah_asr_st_get(st, name);
         snprintf(name, sizeof(name), "decoder.lstm.bias_ih_l%d", n);
-        bih = mynah_st_get(st, name);
+        bih = mynah_asr_st_get(st, name);
         snprintf(name, sizeof(name), "decoder.lstm.bias_hh_l%d", n);
-        bhh = mynah_st_get(st, name);
+        bhh = mynah_asr_st_get(st, name);
         if (!whh || !bih || !bhh) {
-            fprintf(stderr, "mynah: LSTM layer %d is incomplete in the checkpoint\n", n);
+            fprintf(stderr, "mynah-asr: LSTM layer %d is incomplete in the checkpoint\n", n);
             return -1;
         }
         dec->w_hh[n] = (const float *)whh->data;
@@ -61,16 +61,16 @@ int mynah_decoder_init(mynah_decoder *dec, const mynah_safetensors *st,
     return (n > 0 && dec->hidden <= 1024) ? 0 : -1;
 }
 
-void mynah_dec_state_reset(const mynah_decoder *dec, mynah_dec_state *s) {
+void mynah_asr_dec_state_reset(const mynah_asr_decoder *dec, mynah_asr_dec_state *s) {
     memset(s, 0, sizeof(*s));
     (void)dec;
     s->last_token = -1;
 }
 
-static inline float sigmoid_f(float x) { return mynah_sigmoid(x); }
+static inline float sigmoid_f(float x) { return mynah_asr_sigmoid(x); }
 
 /* Un passo LSTM stacked + projector: input = embedding[token]. Aggiorna h/c e s->g. */
-static void pred_step(const mynah_decoder *dec, mynah_dec_state *s, int token) {
+static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int token) {
     const int H = dec->hidden;
     const float *x = dec->embedding + (size_t)token * (size_t)H;
     float z[4 * 1024];
@@ -126,7 +126,7 @@ static int argmax_bias(const float *lg, const float *bias, int V) {
  * non-blank con duration 0 riemette sullo stesso frame (guardia max_symbols).
  * Niente blocking sulle run di blank: il TDT salta già i frame (dur>1) e la
  * griglia visitata non è contigua. */
-static int greedy_decode_tdt(const mynah_decoder *dec, mynah_dec_state *s,
+static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                              const float *enc, int T, int *tokens, int *frames, int cap) {
     const int H = dec->hidden, V = dec->vocab, ND = dec->n_durations;
     const int VL = V + ND;
@@ -136,11 +136,11 @@ static int greedy_decode_tdt(const mynah_decoder *dec, mynah_dec_state *s,
 
     /* head f32 per la GEMM BLAS (deterministica tra backend); se quantizzata e
      * T grande si dequantizza una volta per chiamata, come il percorso RNNT */
-    const float *W = dec->head.qtype == MYNAH_Q_F32 ? dec->head.f32 : NULL;
+    const float *W = dec->head.qtype == MYNAH_ASR_Q_F32 ? dec->head.f32 : NULL;
     float *wd = NULL;
     if (!W && T > 16) {
         wd = malloc((size_t)VL * (size_t)H * sizeof(float));
-        if (wd) { mynah_qmat_dequant(&dec->head, wd); W = wd; }
+        if (wd) { mynah_asr_qmat_dequant(&dec->head, wd); W = wd; }
     }
 
     if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, stato zero */
@@ -156,7 +156,7 @@ static int greedy_decode_tdt(const mynah_decoder *dec, mynah_dec_state *s,
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, VL, H,
                         1.0f, joint, H, W, H, 0.0f, logits, VL);
         else
-            mynah_qmat_mul(&dec->head, joint, logits, 1);
+            mynah_asr_qmat_mul(&dec->head, joint, logits, 1);
 
         const int k = argmax_bias(logits, dec->head_b, V);
         int dur = dec->durations[argmax_bias(logits + V, dec->head_b + V, ND)];
@@ -180,7 +180,7 @@ static int greedy_decode_tdt(const mynah_decoder *dec, mynah_dec_state *s,
     return n_out;
 }
 
-int mynah_greedy_decode(const mynah_decoder *dec, mynah_dec_state *s,
+int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                         const float *enc, int T, int *tokens, int *frames, int cap) {
     if (dec->n_durations > 0)
         return greedy_decode_tdt(dec, s, enc, T, tokens, frames, cap);
@@ -196,11 +196,11 @@ int mynah_greedy_decode(const mynah_decoder *dec, mynah_dec_state *s,
      * (offline) si dequantizza UNA volta per chiamata: 33 MB letti/scritti una
      * volta contro la matrice int8 riletta per ogni frame. Per T piccolo
      * (chunk streaming) resta il dot quantizzato per-frame di qmat. */
-    const float *W = dec->head.qtype == MYNAH_Q_F32 ? dec->head.f32 : NULL;
+    const float *W = dec->head.qtype == MYNAH_ASR_Q_F32 ? dec->head.f32 : NULL;
     float *wd = NULL;
     if (!W && T > 16) {
         wd = malloc((size_t)V * (size_t)H * sizeof(float));
-        if (wd) { mynah_qmat_dequant(&dec->head, wd); W = wd; }
+        if (wd) { mynah_asr_qmat_dequant(&dec->head, wd); W = wd; }
     }
 
     if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, stato zero */
@@ -220,7 +220,7 @@ int mynah_greedy_decode(const mynah_decoder *dec, mynah_dec_state *s,
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Bc, V, H,
                         1.0f, jin, H, W, H, 0.0f, logits, V);
         else
-            mynah_qmat_mul(&dec->head, jin, logits, Bc);
+            mynah_asr_qmat_mul(&dec->head, jin, logits, Bc);
 
         int first = -1, best = -1;
         for (int b = 0; b < Bc; b++) {
@@ -246,7 +246,7 @@ int mynah_greedy_decode(const mynah_decoder *dec, mynah_dec_state *s,
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, H,
                                 1.0f, joint, H, W, H, 0.0f, logits, V);
                 else
-                    mynah_qmat_mul(&dec->head, joint, logits, 1);
+                    mynah_asr_qmat_mul(&dec->head, joint, logits, 1);
                 best = argmax_bias(logits, dec->head_b, V);
                 if (best == dec->blank) break;
             }

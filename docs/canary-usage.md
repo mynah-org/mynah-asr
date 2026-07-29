@@ -15,8 +15,8 @@ tokenizer, prompt format) in [canary-arch.md](canary-arch.md); catalog in
 Output language ≠ source language = translation:
 
 ```sh
-./mynah transcribe -m models/canary-1b-v2 -i italian.wav --lang it --target-lang en
-# API: mynah_set_target_lang(m, "en")  o  lang "it>en" per-chiamata (thread-safe)
+./mynah-asr transcribe -m models/canary-1b-v2 -i italian.wav --lang it --target-lang en
+# API: mynah_asr_set_target_lang(m, "en")  o  lang "it>en" per-chiamata (thread-safe)
 # server: POST /v1/audio/translations  (target_language, default en)
 ```
 

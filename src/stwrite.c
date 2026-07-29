@@ -13,14 +13,14 @@ typedef struct {
     size_t bytes, offset;
 } stw_entry;
 
-struct mynah_stw {
+struct mynah_asr_stw {
     stw_entry *entries;
     size_t n, cap, total;
 };
 
-mynah_stw *mynah_stw_new(void) { return calloc(1, sizeof(mynah_stw)); }
+mynah_asr_stw *mynah_asr_stw_new(void) { return calloc(1, sizeof(mynah_asr_stw)); }
 
-int mynah_stw_add(mynah_stw *w, const char *name, const char *dtype,
+int mynah_asr_stw_add(mynah_asr_stw *w, const char *name, const char *dtype,
                   const int64_t *shape, int n_dims, const void *data, size_t bytes) {
     if (w->n == w->cap) {
         w->cap = w->cap ? w->cap * 2 : 64;
@@ -63,7 +63,7 @@ static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ..
     }
 }
 
-int mynah_stw_write(mynah_stw *w, const char *path) {
+int mynah_asr_stw_write(mynah_asr_stw *w, const char *path) {
     /* header JSON costruito a mano: nomi controllati (tensori HF), niente escaping
      * esotico da gestire. Il buffer cresce da solo via stw_appendf, quindi la
      * capacità iniziale è solo una stima. */
@@ -99,7 +99,7 @@ int mynah_stw_write(mynah_stw *w, const char *path) {
     return fclose(f) == 0 && ok ? 0 : -1;
 }
 
-void mynah_stw_free(mynah_stw *w) {
+void mynah_asr_stw_free(mynah_asr_stw *w) {
     if (!w) return;
     free(w->entries);
     free(w);

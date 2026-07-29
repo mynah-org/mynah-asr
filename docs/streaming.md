@@ -42,27 +42,27 @@ causal right-pad, identical to the offline math.
 ## C API
 
 ```c
-mynah_model *m = mynah_load("models/nemotron-3.5-asr-streaming-0.6b");
-mynah_stream *s = mynah_stream_open(m, "auto" /* or "it-IT", ... */, 3 /* lookahead */);
+mynah_asr_model *m = mynah_asr_load("models/nemotron-3.5-asr-streaming-0.6b");
+mynah_asr_stream *s = mynah_asr_stream_open(m, "auto" /* or "it-IT", ... */, 3 /* lookahead */);
 
-void on_text(const mynah_result *r, void *ud) {
+void on_text(const mynah_asr_result *r, void *ud) {
     fputs(r->text, stdout);          /* text delta, already final */
     /* r->lang = detected language (with "auto"), r->t1 = seconds of audio consumed */
 }
 
 while (have_audio) {
     /* float32 [-1,1], 16 kHz mono, any feed size */
-    mynah_stream_feed(s, samples, n, on_text, NULL);
+    mynah_asr_stream_feed(s, samples, n, on_text, NULL);
 }
-mynah_stream_finish(s, on_text, NULL);   /* process the tail */
-mynah_stream_close(s);
-mynah_free(m);
+mynah_asr_stream_finish(s, on_text, NULL);   /* process the tail */
+mynah_asr_stream_close(s);
+mynah_asr_free(m);
 ```
 
 Notes:
 - `feed` accepts any number of samples; internal chunking is automatic.
 - With `lang="auto"` the language tag arrives when the model emits it
-  (`mynah_stream_lang()` to read it at any time).
+  (`mynah_asr_stream_lang()` to read it at any time).
 - Memory cost per stream: ~12 MB of cache (24 layers × K/V 56×1024 + conv).
 - Realtime: ~26 ms of compute per 80 ms chunk on Apple Silicon (~3× headroom).
 
@@ -70,8 +70,8 @@ Notes:
 
 ```sh
 # microphone (sox example) → partials on stdout as they arrive
-rec -q -t raw -r 16000 -e signed -b 16 -c 1 - | mynah stream -m <model_dir> --lang auto
+rec -q -t raw -r 16000 -e signed -b 16 -c 1 - | mynah-asr stream -m <model_dir> --lang auto
 
 # file, via ffmpeg
-ffmpeg -v quiet -i audio.mp3 -f s16le -ar 16000 -ac 1 - | mynah stream -m <model_dir>
+ffmpeg -v quiet -i audio.mp3 -f s16le -ar 16000 -ac 1 - | mynah-asr stream -m <model_dir>
 ```

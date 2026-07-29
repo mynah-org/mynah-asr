@@ -7,10 +7,10 @@
 
 #define PF_MAX_THREADS 64
 
-int mynah_num_threads(void) {
+int mynah_asr_num_threads(void) {
     static int nth = 0;
     if (nth == 0) {
-        const char *env = getenv("MYNAH_THREADS");
+        const char *env = getenv("MYNAH_ASR_THREADS");
         long n = env ? atol(env) : sysconf(_SC_NPROCESSORS_ONLN);
         if (n < 1) n = 1;
         if (n > PF_MAX_THREADS) n = PF_MAX_THREADS;
@@ -68,7 +68,7 @@ static void *pool_worker(void *arg) {
 }
 
 static void pool_init(void) {
-    const int nth = mynah_num_threads();
+    const int nth = mynah_asr_num_threads();
     for (int k = 0; k < nth - 1; k++) {
         pthread_t tid;
         if (pthread_create(&tid, NULL, pool_worker, NULL) == 0) {
@@ -98,9 +98,9 @@ static void blas_set_threads(int n) {
 #endif
 }
 
-void mynah_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
+void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
-    const int nth = mynah_num_threads();
+    const int nth = mynah_asr_num_threads();
     if (nth <= 1 || n == 1) {
         for (int i = 0; i < n; i++) fn(ctx, i);
         return;

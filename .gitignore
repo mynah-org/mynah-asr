@@ -1,8 +1,8 @@
 # Build artifacts
 *.o
 *.d
-mynah
-mynah-server
+mynah-asr
+mynah-asr-server
 dist/
 
 # Models & audio di lavoro
@@ -40,7 +40,7 @@ tests/golden/
 
 # sample per-lingua scaricati (Tatoeba, licenze varie): non committare
 tests/audio/langs/
-libmynah.a
+libmynah_asr.a
 tests/test_qmat
 tests/test_gguf
 tests/test_features
@@ -51,6 +51,6 @@ tests/test_batch
 tests/bench_throughput
 examples/minimal
 *.dSYM/
-libmynah.dylib
+libmynah_asr.dylib
 *.dylib
 *.so

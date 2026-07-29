@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Suite multilingua: trascrive i sample per-lingua (tests/audio/langs/) con
-`mynah transcribe --lang auto` e verifica (a) language detection, (b) CER vs testo
+`mynah-asr transcribe --lang auto` e verifica (a) language detection, (b) CER vs testo
 di riferimento (normalizzato: lowercase, senza punteggiatura).
 
-Uso: uv run python -m eval.test_langs [--cer-max 0.3] [--mynah ../mynah] [--model DIR]
+Uso: uv run python -m eval.test_langs [--cer-max 0.3] [--mynah-asr ../mynah-asr] [--model DIR]
                                       [--quant int8|int4]
 --quant: regression della quantizzazione — stessa suite sul checkpoint
-pre-quantizzato (richiede model.int8/int4.safetensors da `mynah quantize`).
+pre-quantizzato (richiede model.int8/int4.safetensors da `mynah-asr quantize`).
 Exit: 0 tutte le lingue ok, 1 fallimenti, 77 skip (sample o modello assenti).
 """
 
@@ -54,7 +54,7 @@ def cer(ref: str, hyp: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cer-max", type=float, default=0.3)
-    ap.add_argument("--mynah", default=str(ROOT / "mynah"))
+    ap.add_argument("--mynah-asr", dest="mynah_asr", default=str(ROOT / "mynah-asr"))
     ap.add_argument("--model", default=str(ROOT / "models/nemotron-3.5-asr-streaming-0.6b"))
     ap.add_argument("--quant", choices=["int8", "int4"], default=None)
     ap.add_argument("--only", default=None,
@@ -67,7 +67,7 @@ def main() -> None:
         print("SKIP: sample (tools/fetch_lang_samples.py) o modello assenti")
         sys.exit(77)
     if args.quant and not Path(args.model, f"model.{args.quant}.safetensors").exists():
-        print(f"SKIP: checkpoint {args.quant} assente (mynah quantize --quant {args.quant})")
+        print(f"SKIP: checkpoint {args.quant} assente (mynah-asr quantize --quant {args.quant})")
         sys.exit(77)
     manifest = json.loads(manifest_path.read_text())
     model_cfg = json.loads(Path(args.model, "mynah.json").read_text())
@@ -75,7 +75,7 @@ def main() -> None:
     only = set(args.only.split(",")) if args.only else None
 
     def transcribe(wav: Path, lang: str) -> tuple[str, str]:
-        cmd = [args.mynah, "transcribe", "-m", args.model, "-i", str(wav), "--lang", lang]
+        cmd = [args.mynah_asr, "transcribe", "-m", args.model, "-i", str(wav), "--lang", lang]
         if args.quant:
             cmd += ["--quant", args.quant]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)

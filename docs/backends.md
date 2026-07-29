@@ -14,7 +14,7 @@ it is the fastest backend today (AMX): offline RTF 0.10 (int8).
 **Runtime ISA dispatch (x86)**: the VNNI and AVX2 kernels are always compiled with
 target-attribute (no `-march` required: a single multi-target release binary)
 and selected via cpuid+xgetbv on first call. Override with `--caps
-auto|scalar|avx2|vnni` (CLI and server) or the `MYNAH_CAPS` env var — the `--caps`
+auto|scalar|avx2|vnni` (CLI and server) or the `MYNAH_ASR_CAPS` env var — the `--caps`
 pattern from qwen-tts; a level above what the CPU supports is downgraded with a note.
 On ARM, NEON/SDOT remain compile-time (Apple Silicon always has dotprod).
 ⚠️ As with CUDA: the AVX2/VNNI paths are validated by `tests/test_qmat` in Linux x86
@@ -49,7 +49,7 @@ Measured **in-process warm** (server scenario, 63 s, best-of-N within the same
 minute — the per-process measurement is dominated by page-in and weight conversion):
 encoder 0.70 s vs 2.1 s for v3; total **RTF 0.051 vs 0.068 CPU (−25%)**
 (v3: 0.072). Identical text IT/EN/DE/FR/ES, 0 leaks. Under 24 rows (streaming
-chunks) it stays on CPU. `MYNAH_METAL_PROF=1` prints encode/wait/GPU time.
+chunks) it stays on CPU. `MYNAH_ASR_METAL_PROF=1` prints encode/wait/GPU time.
 
 With the optimized CPU pipeline (blocked greedy, im2col subsampling, sparse
 mel — see TODO M5 2026-07-17), warm totals on the 63 s drop to

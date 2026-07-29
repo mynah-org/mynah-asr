@@ -115,7 +115,7 @@ def build_nemotron(model_dir: Path, cfg: dict, proc: dict) -> dict:
     frame_ms = fe["hop_length"] / fe["sampling_rate"] * sub * 1000.0
 
     return {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": model_dir.name,
         "arch": "fastconformer_rnnt_streaming",
         "engine": "nemotron-streaming",
@@ -170,7 +170,7 @@ def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
     fe = proc["feature_extractor"]
 
     return {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": model_dir.name,
         "arch": "fastconformer_tdt",
         "engine": "parakeet-tdt",
@@ -324,7 +324,7 @@ def build_parakeet_tdt_from_yaml(model_dir: Path, y: dict) -> dict:
     dec = y["decoder"]
     durations = y["decoding"].get("durations") or []
     return {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": model_dir.name,
         "arch": "fastconformer_tdt" if durations else "fastconformer_rnnt",
         "engine": "parakeet-tdt" if durations else "parakeet-rnnt",
@@ -349,7 +349,7 @@ def build_parakeet_tdt_from_yaml(model_dir: Path, y: dict) -> dict:
 def build_parakeet_ctc_from_yaml(model_dir: Path, y: dict) -> dict:
     """Parakeet CTC puro (ConvASRDecoder): niente prednet/joint, solo ctc_head."""
     return {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": model_dir.name,
         "arch": "fastconformer_ctc",
         "engine": "parakeet-ctc",
@@ -385,7 +385,7 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
     assert y["prompt_format"] == "canary2", f"prompt_format non supportato: {y['prompt_format']}"
     assert dcfg["pre_ln"] and dcfg["hidden_act"] == "relu"
     return {
-        "mynah_format": 1,
+        "mynah_asr_format": 1,
         "name": model_dir.name,
         "arch": "fastconformer_aed",
         "engine": "canary-aed",

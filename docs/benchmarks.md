@@ -54,7 +54,7 @@ Key takeaways:
 
 First hardware validation of `make cuda` (Ubuntu 24.04, CUDA 12.8, OpenBLAS).
 **All 10 supported models + the 2 community GGUFs: e2e green, CPU and CUDA
-transcripts byte-identical.** Same protocol as above (`mynah bench`, f32,
+transcripts byte-identical.** Same protocol as above (`mynah-asr bench`, f32,
 2 warm-ups + 5 runs short / 1 + 3 long); long audio = LibriSpeech dev-clean
 (CC-BY 4.0) concatenated to 60 s and 300 s, 16 kHz mono — not committed,
 regenerate with `scripts/make_long_fixtures.sh`.
@@ -107,15 +107,15 @@ CUDA): 1×=35, 2×=24.6 aggregate — but **N≥4 collapses** (1.9×): N callers
 BLAS for the whole process: with `OPENBLAS_NUM_THREADS=3` → N=4 24.5×,
 N=8 19.6×, no collapse (single-request latency drops to 17× — the usual
 latency/throughput tradeoff). Adaptive per-request BLAS sizing in
-mynah-server is future work; for parallel throughput today, the batch API
+mynah-asr-server is future work; for parallel throughput today, the batch API
 is the fast path.
 
 ### CUDA v2a — GEMM precision (same day)
 
 TF32 tensor-core math is now the **default** on CUDA: 300 s transcript
 byte-identical to CPU on nemotron, all e2e green, ~4–8% RTF
-(`MYNAH_CUDA_TF32=0` restores strict f32). Resident **bf16** weights via
-cublasGemmEx are available with `MYNAH_CUDA_BF16=1`: half the VRAM and half
+(`MYNAH_ASR_CUDA_TF32=0` restores strict f32). Resident **bf16** weights via
+cublasGemmEx are available with `MYNAH_ASR_CUDA_BF16=1`: half the VRAM and half
 the PCIe on activations, but perf-neutral today (the host-side f32→bf16
 conversion offsets the transfer saving) and with minor wording differences
 on 300 s audio — it stays opt-in until the resident-activation encoder
@@ -129,12 +129,12 @@ on 300 s audio — it stays opt-in until the resident-activation encoder
   ~170 MB/layer: RTF cuda 0.052→0.028, cpu 0.083→0.054. Parity vs oracle,
   streaming and batch outputs unchanged.
 - **Nested OpenBLAS** (`threads.c`): on Linux OpenBLAS defaults to all cores;
-  called from `mynah_parallel_for` workers it oversubscribes catastrophically
+  called from `mynah_asr_parallel_for` workers it oversubscribes catastrophically
   (batch 4×60 s: **257 s → 10 s** after pinning BLAS to 1 thread inside
   parallel regions — weak-symbol pattern from qwen-tts, `OPENBLAS_NUM_THREADS`
   still wins). macOS/Accelerate is unaffected.
 
-Known issue (TODO): `mynah_transcribe_batch` skips long-file segmentation, so
+Known issue (TODO): `mynah_asr_transcribe_batch` skips long-file segmentation, so
 full-attention models drift slightly vs the single path on >30 s items (caught
 by the `bench_throughput` consistency check; windowed nemotron is identical).
 

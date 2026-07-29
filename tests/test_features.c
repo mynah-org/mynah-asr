@@ -19,25 +19,25 @@ int main(int argc, char **argv) {
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/mel_filters.safetensors", argv[1]);
-    mynah_safetensors *mf = mynah_st_open(path);
+    mynah_asr_safetensors *mf = mynah_asr_st_open(path);
     if (!mf) return 77;
 
     snprintf(path, sizeof(path), "%s/mel.npy", argv[3]);
     size_t n_golden;
     double *golden = npy_load_f(path, &n_golden);
-    if (!golden) { mynah_st_close(mf); return 77; }
+    if (!golden) { mynah_asr_st_close(mf); return 77; }
 
     size_t n_samples; int sr;
-    float *audio = mynah_wav_load(argv[2], &n_samples, &sr);
+    float *audio = mynah_asr_wav_load(argv[2], &n_samples, &sr);
     if (!audio || sr != 16000) { fprintf(stderr, "wav non valido o non 16 kHz\n"); return 2; }
 
-    const mynah_tensor *fb = mynah_st_get(mf, "mel_fb");
-    const mynah_tensor *win = mynah_st_get(mf, "window");
+    const mynah_asr_tensor *fb = mynah_asr_st_get(mf, "mel_fb");
+    const mynah_asr_tensor *win = mynah_asr_st_get(mf, "window");
     if (!fb || !win) { fprintf(stderr, "mel_filters.safetensors incompleto\n"); return 2; }
 
     int norm_pf = 0, left, right, prompt;
     if (test_model_cfg(argv[1], &norm_pf, &left, &right, &prompt) != 0) return 77;
-    mynah_feat_cfg cfg = {
+    mynah_asr_feat_cfg cfg = {
         .sample_rate = 16000, .n_mels = (int)fb->shape[1], .n_fft = (int)(fb->shape[0] - 1) * 2,
         .win_length = (int)win->shape[0], .hop_length = 160,
         .preemphasis = 0.97, .log_zero_guard = pow(2.0, -24.0),
@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     };
 
     int T, valid;
-    float *feats = mynah_log_mel(&cfg, audio, n_samples, &T, &valid);
+    float *feats = mynah_asr_log_mel(&cfg, audio, n_samples, &T, &valid);
     if (!feats) return 2;
 
     size_t n_c = (size_t)T * (size_t)cfg.n_mels;
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     printf("mel parity: T=%d valid=%d n_mels=%d | max|d|=%.3e mean|d|=%.3e (tol %.0e)\n",
            T, valid, cfg.n_mels, max_diff, sum_diff / (double)n_c, tol);
 
-    free(audio); free(feats); free(golden); mynah_st_close(mf);
+    free(audio); free(feats); free(golden); mynah_asr_st_close(mf);
     if (max_diff > tol) { fprintf(stderr, "FAIL\n"); return 1; }
     printf("OK\n");
     return 0;

@@ -12,10 +12,10 @@
  * niente cleanup esplicito, come i pool BLAS.
  *
  * v2a precisione (2026-07-20): TF32 math mode di default (tensor core, I/O
- * f32 — MYNAH_CUDA_TF32=0 per il f32 stretto) e pesi residenti bf16 con
- * cublasGemmEx opt-in via MYNAH_CUDA_BF16=1 (metà VRAM e metà PCIe su x;
+ * f32 — MYNAH_ASR_CUDA_TF32=0 per il f32 stretto) e pesi residenti bf16 con
+ * cublasGemmEx opt-in via MYNAH_ASR_CUDA_BF16=1 (metà VRAM e metà PCIe su x;
  * mantissa 8 bit: vedi gate di validazione in docs/benchmarks.md). */
-#ifdef MYNAH_CUDA
+#ifdef MYNAH_ASR_CUDA
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -25,8 +25,8 @@
 #include <string.h>
 
 static int g_ready = -1;
-static int g_bf16 = 0;  /* MYNAH_CUDA_BF16=1: pesi residenti bf16 + GemmEx */
-static int g_tf32 = 1;  /* MYNAH_CUDA_TF32=0 per spegnere i tensor core TF32 */
+static int g_bf16 = 0;  /* MYNAH_ASR_CUDA_BF16=1: pesi residenti bf16 + GemmEx */
+static int g_tf32 = 1;  /* MYNAH_ASR_CUDA_TF32=0 per spegnere i tensor core TF32 */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; /* init + weight cache */
 
 typedef struct {
@@ -58,17 +58,17 @@ typedef struct {
 } cu_tls;
 static __thread cu_tls t_cu;
 
-extern "C" int mynah_cuda_available(void) {
+extern "C" int mynah_asr_cuda_available(void) {
     pthread_mutex_lock(&g_mu);
     if (g_ready < 0) {
         int n = 0;
         g_ready = cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-        const char *bf = getenv("MYNAH_CUDA_BF16");
+        const char *bf = getenv("MYNAH_ASR_CUDA_BF16");
         g_bf16 = bf && *bf == '1';
-        const char *tf = getenv("MYNAH_CUDA_TF32");
+        const char *tf = getenv("MYNAH_ASR_CUDA_TF32");
         g_tf32 = !(tf && *tf == '0');
         if (g_ready && g_bf16)
-            fprintf(stderr, "mynah: CUDA bf16 (pesi residenti bf16, GemmEx)\n");
+            fprintf(stderr, "mynah-asr: CUDA bf16 (pesi residenti bf16, GemmEx)\n");
     }
     pthread_mutex_unlock(&g_mu);
     return g_ready == 1;
@@ -81,7 +81,7 @@ static cu_tls *tls_ctx(void) {
         if (t_cu.state == 1) {
             cublasSetStream(t_cu.blas, t_cu.stream);
             /* TF32: tensor core con I/O f32 (mantissa 10 bit nel prodotto).
-             * Validato sui fixture e2e; MYNAH_CUDA_TF32=0 per il f32 stretto. */
+             * Validato sui fixture e2e; MYNAH_ASR_CUDA_TF32=0 per il f32 stretto. */
             if (g_tf32) cublasSetMathMode(t_cu.blas, CUBLAS_TF32_TENSOR_OP_MATH);
         }
     }
@@ -139,9 +139,9 @@ static float *io_dev(float **slot, size_t *cap, size_t bytes) {
 }
 
 /* out[T,n] = x[T,k] @ W[n,k]^T. 0 = ok, -1 = fallback CPU. */
-extern "C" int mynah_cuda_gemm_wt(const float *x, const float *w, float *out,
+extern "C" int mynah_asr_cuda_gemm_wt(const float *x, const float *w, float *out,
                                   int T, int n, int k) {
-    if (!mynah_cuda_available()) return -1;
+    if (!mynah_asr_cuda_available()) return -1;
     cu_tls *c = tls_ctx();
     if (!c) return -1;
 
@@ -187,4 +187,4 @@ extern "C" int mynah_cuda_gemm_wt(const float *x, const float *w, float *out,
     return 0;
 }
 
-#endif /* MYNAH_CUDA */
+#endif /* MYNAH_ASR_CUDA */

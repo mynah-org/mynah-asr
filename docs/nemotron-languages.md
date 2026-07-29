@@ -64,7 +64,7 @@ the base language) all OK; th-TH WEAK (expected); mt-MT and nn-NO with no audio.
 
 - With `auto` (id 101) the model detects the language and **emits the locale tag** (e.g. `<it-IT>`)
   as a token in the output, after the terminal punctuation — the runtime strips it from the text
-  and exposes it as `mynah_result.lang`.
+  and exposes it as `mynah_asr_result.lang`.
 - The 39 language tags are special vocabulary tokens (e.g. `<it-IT>` = id 1279); the
   complete list is in the `added_tokens` of `tokenizer.json`.
 - Aliases accepted in the dictionary: short forms (`it`, `de`, `fr`, …) map to the same id

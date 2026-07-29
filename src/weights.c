@@ -11,34 +11,34 @@
 #include "../vendor/cJSON.h"
 #include "gguf.h"
 
-struct mynah_safetensors {
+struct mynah_asr_safetensors {
     void *map;
     size_t map_len;
     cJSON *header;         /* mantiene vive le stringhe dei nomi */
-    mynah_tensor *tensors;
+    mynah_asr_tensor *tensors;
     size_t n_tensors;
-    mynah_gguf *gguf;      /* container alternativo: se set, tensors punta lì */
+    mynah_asr_gguf *gguf;      /* container alternativo: se set, tensors punta lì */
 };
 
-static int dtype_of(const char *s, mynah_dtype *out) {
-    if (strcmp(s, "F32") == 0) { *out = MYNAH_DT_F32; return 0; }
-    if (strcmp(s, "F64") == 0) { *out = MYNAH_DT_F64; return 0; }
-    if (strcmp(s, "BF16") == 0) { *out = MYNAH_DT_BF16; return 0; }
-    if (strcmp(s, "F16") == 0) { *out = MYNAH_DT_F16; return 0; }
-    if (strcmp(s, "I8") == 0) { *out = MYNAH_DT_I8; return 0; }
-    if (strcmp(s, "U8") == 0) { *out = MYNAH_DT_U8; return 0; }
-    if (strcmp(s, "I64") == 0) { *out = MYNAH_DT_I64; return 0; } /* BatchNorm num_batches_tracked */
+static int dtype_of(const char *s, mynah_asr_dtype *out) {
+    if (strcmp(s, "F32") == 0) { *out = MYNAH_ASR_DT_F32; return 0; }
+    if (strcmp(s, "F64") == 0) { *out = MYNAH_ASR_DT_F64; return 0; }
+    if (strcmp(s, "BF16") == 0) { *out = MYNAH_ASR_DT_BF16; return 0; }
+    if (strcmp(s, "F16") == 0) { *out = MYNAH_ASR_DT_F16; return 0; }
+    if (strcmp(s, "I8") == 0) { *out = MYNAH_ASR_DT_I8; return 0; }
+    if (strcmp(s, "U8") == 0) { *out = MYNAH_ASR_DT_U8; return 0; }
+    if (strcmp(s, "I64") == 0) { *out = MYNAH_ASR_DT_I64; return 0; } /* BatchNorm num_batches_tracked */
     return -1;
 }
 
-mynah_safetensors *mynah_st_open_quiet(const char *path) {
+mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     close(fd);
-    return mynah_st_open(path);
+    return mynah_asr_st_open(path);
 }
 
-mynah_safetensors *mynah_st_open(const char *path) {
+mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "weights: cannot open %s\n", path); return NULL; }
     struct stat sb;
@@ -48,12 +48,12 @@ mynah_safetensors *mynah_st_open(const char *path) {
     char magic[4] = {0};
     if (pread(fd, magic, 4, 0) == 4 && memcmp(magic, "GGUF", 4) == 0) {
         close(fd);
-        mynah_gguf *g = mynah_gguf_open(path);
+        mynah_asr_gguf *g = mynah_asr_gguf_open(path);
         if (!g) return NULL;
-        mynah_safetensors *st = calloc(1, sizeof(*st));
-        if (!st) { mynah_gguf_close(g); return NULL; }
+        mynah_asr_safetensors *st = calloc(1, sizeof(*st));
+        if (!st) { mynah_asr_gguf_close(g); return NULL; }
         st->gguf = g;
-        st->tensors = (mynah_tensor *)mynah_gguf_tensors(g, &st->n_tensors);
+        st->tensors = (mynah_asr_tensor *)mynah_asr_gguf_tensors(g, &st->n_tensors);
         return st;
     }
 
@@ -80,7 +80,7 @@ mynah_safetensors *mynah_st_open(const char *path) {
         return NULL;
     }
 
-    mynah_safetensors *st = calloc(1, sizeof(*st));
+    mynah_asr_safetensors *st = calloc(1, sizeof(*st));
     st->map = map;
     st->map_len = (size_t)sb.st_size;
     st->header = header;
@@ -88,13 +88,13 @@ mynah_safetensors *mynah_st_open(const char *path) {
     size_t count = 0;
     for (cJSON *it = header->child; it; it = it->next)
         if (strcmp(it->string, "__metadata__") != 0) count++;
-    st->tensors = calloc(count, sizeof(mynah_tensor));
+    st->tensors = calloc(count, sizeof(mynah_asr_tensor));
 
     const uint8_t *base = (const uint8_t *)map + 8 + hlen;
     size_t i = 0;
     for (cJSON *it = header->child; it; it = it->next) {
         if (strcmp(it->string, "__metadata__") == 0) continue;
-        mynah_tensor *t = &st->tensors[i];
+        mynah_asr_tensor *t = &st->tensors[i];
         t->name = it->string;
 
         const cJSON *jd = cJSON_GetObjectItemCaseSensitive(it, "dtype");
@@ -104,7 +104,7 @@ mynah_safetensors *mynah_st_open(const char *path) {
             dtype_of(jd->valuestring, &t->dtype) != 0) {
             fprintf(stderr, "weights: voce '%s' non valida (dtype %s)\n", it->string,
                     cJSON_IsString(jd) ? jd->valuestring : "?");
-            mynah_st_close(st);
+            mynah_asr_st_close(st);
             return NULL;
         }
         t->n_dims = cJSON_GetArraySize(js);
@@ -121,10 +121,10 @@ mynah_safetensors *mynah_st_open(const char *path) {
     return st;
 }
 
-void mynah_st_close(mynah_safetensors *st) {
+void mynah_asr_st_close(mynah_asr_safetensors *st) {
     if (!st) return;
     if (st->gguf) {           /* i tensori appartengono al handle GGUF */
-        mynah_gguf_close(st->gguf);
+        mynah_asr_gguf_close(st->gguf);
         free(st);
         return;
     }
@@ -134,14 +134,14 @@ void mynah_st_close(mynah_safetensors *st) {
     free(st);
 }
 
-const mynah_tensor *mynah_st_get(const mynah_safetensors *st, const char *name) {
+const mynah_asr_tensor *mynah_asr_st_get(const mynah_asr_safetensors *st, const char *name) {
     for (size_t i = 0; i < st->n_tensors; i++)
         if (strcmp(st->tensors[i].name, name) == 0) return &st->tensors[i];
     return NULL;
 }
 
-size_t mynah_st_count(const mynah_safetensors *st) { return st->n_tensors; }
+size_t mynah_asr_st_count(const mynah_asr_safetensors *st) { return st->n_tensors; }
 
-const mynah_tensor *mynah_st_at(const mynah_safetensors *st, size_t i) {
+const mynah_asr_tensor *mynah_asr_st_at(const mynah_asr_safetensors *st, size_t i) {
     return i < st->n_tensors ? &st->tensors[i] : NULL;
 }

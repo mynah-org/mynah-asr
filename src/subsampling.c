@@ -5,29 +5,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef MYNAH_BLAS_ACCELERATE
+#ifdef MYNAH_ASR_BLAS_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
 #endif
 
-int mynah_subsampling_init(mynah_subsampling *ss, const mynah_safetensors *st) {
+int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safetensors *st) {
     memset(ss, 0, sizeof(*ss));
-    ss->conv_in_w = mynah_st_get(st, "encoder.subsampling.conv_in.weight");
+    ss->conv_in_w = mynah_asr_st_get(st, "encoder.subsampling.conv_in.weight");
     if (ss->conv_in_w) {
         /* naming Nemotron: conv_in + layers.{i}.{depthwise,pointwise}_conv (causale) */
         ss->causal = 1;
-        ss->conv_in_b = mynah_st_get(st, "encoder.subsampling.conv_in.bias");
+        ss->conv_in_b = mynah_asr_st_get(st, "encoder.subsampling.conv_in.bias");
         for (int i = 0; i < 2; i++) {
             char name[96];
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.depthwise_conv.weight", i);
-            ss->dw_w[i] = mynah_st_get(st, name);
+            ss->dw_w[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.depthwise_conv.bias", i);
-            ss->dw_b[i] = mynah_st_get(st, name);
+            ss->dw_b[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.pointwise_conv.weight", i);
-            ss->pw_w[i] = mynah_st_get(st, name);
+            ss->pw_w[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.pointwise_conv.bias", i);
-            ss->pw_b[i] = mynah_st_get(st, name);
+            ss->pw_b[i] = mynah_asr_st_get(st, name);
             if (!ss->dw_w[i] || !ss->dw_b[i] || !ss->pw_w[i] || !ss->pw_b[i]) return -1;
         }
     } else {
@@ -35,22 +35,22 @@ int mynah_subsampling_init(mynah_subsampling *ss, const mynah_safetensors *st) {
         ss->causal = 0;
         static const int dw_idx[2] = {2, 5}, pw_idx[2] = {3, 6};
         char name[96];
-        ss->conv_in_w = mynah_st_get(st, "encoder.subsampling.layers.0.weight");
-        ss->conv_in_b = mynah_st_get(st, "encoder.subsampling.layers.0.bias");
+        ss->conv_in_w = mynah_asr_st_get(st, "encoder.subsampling.layers.0.weight");
+        ss->conv_in_b = mynah_asr_st_get(st, "encoder.subsampling.layers.0.bias");
         for (int i = 0; i < 2; i++) {
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.weight", dw_idx[i]);
-            ss->dw_w[i] = mynah_st_get(st, name);
+            ss->dw_w[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.bias", dw_idx[i]);
-            ss->dw_b[i] = mynah_st_get(st, name);
+            ss->dw_b[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.weight", pw_idx[i]);
-            ss->pw_w[i] = mynah_st_get(st, name);
+            ss->pw_w[i] = mynah_asr_st_get(st, name);
             snprintf(name, sizeof(name), "encoder.subsampling.layers.%d.bias", pw_idx[i]);
-            ss->pw_b[i] = mynah_st_get(st, name);
+            ss->pw_b[i] = mynah_asr_st_get(st, name);
             if (!ss->dw_w[i] || !ss->dw_b[i] || !ss->pw_w[i] || !ss->pw_b[i]) return -1;
         }
     }
-    ss->lin_w = mynah_st_get(st, "encoder.subsampling.linear.weight");
-    ss->lin_b = mynah_st_get(st, "encoder.subsampling.linear.bias");
+    ss->lin_w = mynah_asr_st_get(st, "encoder.subsampling.linear.weight");
+    ss->lin_b = mynah_asr_st_get(st, "encoder.subsampling.linear.bias");
     if (!ss->conv_in_w || !ss->conv_in_b || !ss->lin_w || !ss->lin_b) return -1;
     ss->channels = (int)ss->conv_in_w->shape[0];
     ss->d_model = (int)ss->lin_w->shape[0];
@@ -160,8 +160,8 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
         atomic_init(&dp.failed, 0);
         const size_t work = (size_t)C_out * (size_t)To * (size_t)Fo;
         if (work > 500000)
-            dp.slices = mynah_num_threads() < C_out ? mynah_num_threads() : C_out;
-        mynah_parallel_for(dp.slices, dw_slice_worker, &dp);
+            dp.slices = mynah_asr_num_threads() < C_out ? mynah_asr_num_threads() : C_out;
+        mynah_asr_parallel_for(dp.slices, dw_slice_worker, &dp);
         if (!atomic_load(&dp.failed)) return;
         /* malloc fallita in un worker: prosegue col loop diretto */
     }
@@ -205,7 +205,7 @@ static void relu_inplace(float *x, size_t n) {
         if (x[i] < 0.0f) x[i] = 0.0f;
 }
 
-float *mynah_subsampling_forward(const mynah_subsampling *ss, const float *feats,
+float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const float *feats,
                                  int T, int n_mels, int *t_out) {
     const int C = ss->channels;
 
@@ -270,7 +270,7 @@ float *mynah_subsampling_forward(const mynah_subsampling *ss, const float *feats
 
 /* ------------------------------------------------------------------ streaming */
 
-int mynah_ss_stream_init(mynah_ss_stream *sst, const mynah_subsampling *ss, int n_mels) {
+int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampling *ss, int n_mels) {
     memset(sst, 0, sizeof(*sst));
     sst->first = 1;
     int F = n_mels;
@@ -284,7 +284,7 @@ int mynah_ss_stream_init(mynah_ss_stream *sst, const mynah_subsampling *ss, int 
     return 0;
 }
 
-void mynah_ss_stream_free(mynah_ss_stream *sst) {
+void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst) {
     for (int s = 0; s < 3; s++) { free(sst->cache[s]); sst->cache[s] = NULL; }
 }
 
@@ -317,7 +317,7 @@ static void stream_stage(const float *x, int C_in, int T, int F, int first, int 
     free(xp);
 }
 
-int mynah_ss_stream_step(const mynah_subsampling *ss, mynah_ss_stream *sst,
+int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_stream *sst,
                          const float *mel, int n_mel, int n_mels, int is_last, float *out) {
     const int C = ss->channels;
     int To = 0, Fo = 0;

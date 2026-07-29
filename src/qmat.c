@@ -9,14 +9,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifdef MYNAH_BLAS_ACCELERATE
+#ifdef MYNAH_ASR_BLAS_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
 #endif
 
 /* ------------------------------------------------------------ quantizzatori */
-void mynah_quantize_int8(const float *w, int n, int k, int8_t *out_q, float *out_scales) {
+void mynah_asr_quantize_int8(const float *w, int n, int k, int8_t *out_q, float *out_scales) {
     for (int i = 0; i < n; i++) {
         const float *row = w + (size_t)i * (size_t)k;
         float amax = 0.0f;
@@ -35,8 +35,8 @@ void mynah_quantize_int8(const float *w, int n, int k, int8_t *out_q, float *out
     }
 }
 
-void mynah_quantize_int4(const float *w, int n, int k, uint8_t *out_q, float *out_scales) {
-    const int G = MYNAH_Q4_GROUP;
+void mynah_asr_quantize_int4(const float *w, int n, int k, uint8_t *out_q, float *out_scales) {
+    const int G = MYNAH_ASR_Q4_GROUP;
     const int groups = k / G;
     for (int i = 0; i < n; i++) {
         const float *row = w + (size_t)i * (size_t)k;
@@ -77,99 +77,99 @@ static void release_f32_pages(const float *w, size_t bytes) {
     if (hi > lo) madvise((void *)lo, hi - lo, MADV_DONTNEED);
 }
 
-int mynah_qmat_init(mynah_qmat *m, const float *w, int n, int k, int qtype) {
+int mynah_asr_qmat_init(mynah_asr_qmat *m, const float *w, int n, int k, int qtype) {
     memset(m, 0, sizeof(*m));
     m->f32 = w;
     m->n = n;
     m->k = k;
-    m->qtype = MYNAH_Q_F32;
-    if (qtype == MYNAH_Q_F32 || !w) return 0;
+    m->qtype = MYNAH_ASR_Q_F32;
+    if (qtype == MYNAH_ASR_Q_F32 || !w) return 0;
 
-    if (qtype == MYNAH_Q_INT8) {
+    if (qtype == MYNAH_ASR_Q_INT8) {
         int8_t *q = malloc((size_t)n * (size_t)k);
         float *s = malloc((size_t)n * sizeof(float));
         if (!q || !s) { free(q); free(s); return -1; }
-        mynah_quantize_int8(w, n, k, q, s);
+        mynah_asr_quantize_int8(w, n, k, q, s);
         m->q8 = q;
         m->scales = s;
         m->owned_q = q;
         m->owned_s = s;
-        m->qtype = MYNAH_Q_INT8;
+        m->qtype = MYNAH_ASR_Q_INT8;
     } else {
-        if (k % MYNAH_Q4_GROUP != 0) return 0;   /* resta f32 */
+        if (k % MYNAH_ASR_Q4_GROUP != 0) return 0;   /* resta f32 */
         uint8_t *q = malloc((size_t)n * (size_t)k / 2);
-        float *s = malloc((size_t)n * (size_t)(k / MYNAH_Q4_GROUP) * sizeof(float));
+        float *s = malloc((size_t)n * (size_t)(k / MYNAH_ASR_Q4_GROUP) * sizeof(float));
         if (!q || !s) { free(q); free(s); return -1; }
-        mynah_quantize_int4(w, n, k, q, s);
+        mynah_asr_quantize_int4(w, n, k, q, s);
         m->q4 = q;
         m->scales = s;
         m->owned_q = q;
         m->owned_s = s;
-        m->qtype = MYNAH_Q_INT4;
+        m->qtype = MYNAH_ASR_Q_INT4;
     }
     release_f32_pages(w, (size_t)n * (size_t)k * 4u);
     return 0;
 }
 
-int mynah_qmat_init_st(mynah_qmat *m, const mynah_safetensors *st, const char *name,
+int mynah_asr_qmat_init_st(mynah_asr_qmat *m, const mynah_asr_safetensors *st, const char *name,
                        int qtype) {
     memset(m, 0, sizeof(*m));
     char qname[192];
 
-    if (qtype != MYNAH_Q_F32) {
-        snprintf(qname, sizeof(qname), "%s.%s", name, qtype == MYNAH_Q_INT8 ? "q8" : "q4");
-        const mynah_tensor *tq = mynah_st_get(st, qname);
+    if (qtype != MYNAH_ASR_Q_F32) {
+        snprintf(qname, sizeof(qname), "%s.%s", name, qtype == MYNAH_ASR_Q_INT8 ? "q8" : "q4");
+        const mynah_asr_tensor *tq = mynah_asr_st_get(st, qname);
         snprintf(qname, sizeof(qname), "%s.scales", name);
-        const mynah_tensor *ts = mynah_st_get(st, qname);
+        const mynah_asr_tensor *ts = mynah_asr_st_get(st, qname);
         if (tq && ts) {                       /* pre-quantizzato: zero-copy dal mmap */
             m->n = (int)tq->shape[0];
             m->scales = (const float *)ts->data;
-            if (qtype == MYNAH_Q_INT8) {
+            if (qtype == MYNAH_ASR_Q_INT8) {
                 m->k = (int)tq->shape[1];
                 m->q8 = (const int8_t *)tq->data;
-                m->qtype = MYNAH_Q_INT8;
+                m->qtype = MYNAH_ASR_Q_INT8;
             } else {
                 m->k = (int)tq->shape[1] * 2;
                 m->q4 = (const uint8_t *)tq->data;
-                m->qtype = MYNAH_Q_INT4;
+                m->qtype = MYNAH_ASR_Q_INT4;
             }
             return 0;
         }
     }
-    const mynah_tensor *tf = mynah_st_get(st, name);
+    const mynah_asr_tensor *tf = mynah_asr_st_get(st, name);
     if (!tf || tf->shape[0] <= 0) return -1;
-    return mynah_qmat_init(m, (const float *)tf->data, (int)tf->shape[0],
+    return mynah_asr_qmat_init(m, (const float *)tf->data, (int)tf->shape[0],
                            (int)(tf->n_elems / (size_t)tf->shape[0]), qtype);
 }
 
-void mynah_qmat_free(mynah_qmat *m) {
+void mynah_asr_qmat_free(mynah_asr_qmat *m) {
     free(m->owned_q);
     free(m->owned_s);
     memset(m, 0, sizeof(*m));
 }
 
 /* ------------------------------------------------------------------ dequant */
-static void dequant_row(const mynah_qmat *m, int i, float *dst) {
-    if (m->qtype == MYNAH_Q_INT8) {
+static void dequant_row(const mynah_asr_qmat *m, int i, float *dst) {
+    if (m->qtype == MYNAH_ASR_Q_INT8) {
         const int8_t *qrow = m->q8 + (size_t)i * (size_t)m->k;
         const float s = m->scales[i];
         for (int j = 0; j < m->k; j++) dst[j] = (float)qrow[j] * s;
     } else {
         const uint8_t *qrow = m->q4 + (size_t)i * (size_t)(m->k / 2);
-        const float *srow = m->scales + (size_t)i * (size_t)(m->k / MYNAH_Q4_GROUP);
-        for (int g = 0; g < m->k / MYNAH_Q4_GROUP; g++) {
+        const float *srow = m->scales + (size_t)i * (size_t)(m->k / MYNAH_ASR_Q4_GROUP);
+        for (int g = 0; g < m->k / MYNAH_ASR_Q4_GROUP; g++) {
             const float s = srow[g];
-            for (int j = 0; j < MYNAH_Q4_GROUP; j += 2) {
-                const uint8_t b = qrow[(g * MYNAH_Q4_GROUP + j) / 2];
-                dst[g * MYNAH_Q4_GROUP + j] = (float)((int)(b & 0x0F) - 8) * s;
-                dst[g * MYNAH_Q4_GROUP + j + 1] = (float)((int)(b >> 4) - 8) * s;
+            for (int j = 0; j < MYNAH_ASR_Q4_GROUP; j += 2) {
+                const uint8_t b = qrow[(g * MYNAH_ASR_Q4_GROUP + j) / 2];
+                dst[g * MYNAH_ASR_Q4_GROUP + j] = (float)((int)(b & 0x0F) - 8) * s;
+                dst[g * MYNAH_ASR_Q4_GROUP + j + 1] = (float)((int)(b >> 4) - 8) * s;
             }
         }
     }
 }
 
-void mynah_qmat_dequant(const mynah_qmat *m, float *wd) {
-    if (m->qtype == MYNAH_Q_F32) {
+void mynah_asr_qmat_dequant(const mynah_asr_qmat *m, float *wd) {
+    if (m->qtype == MYNAH_ASR_Q_F32) {
         memcpy(wd, m->f32, (size_t)m->n * (size_t)m->k * sizeof(float));
         return;
     }
@@ -224,7 +224,7 @@ static float dot_q4_sdot(const int8_t *qx, float sx, const uint8_t *q,
     const int8x16_t off = vdupq_n_s8(8);
     const uint8x16_t maskv = vdupq_n_u8(0x0F);
     float acc = 0.0f;
-    for (int g = 0; g < k / MYNAH_Q4_GROUP; g++) {
+    for (int g = 0; g < k / MYNAH_ASR_Q4_GROUP; g++) {
         const uint8x16_t b = vld1q_u8(q + g * 16);
         const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, maskv)), off);
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
@@ -234,22 +234,22 @@ static float dot_q4_sdot(const int8_t *qx, float sx, const uint8_t *q,
     }
     return acc * sx;
 }
-#define MYNAH_HAVE_SDOT 1
+#define MYNAH_ASR_HAVE_SDOT 1
 #endif
 
 /* --------------------------------------------- kernel x86 (q8 VNNI/AVX2, q4 AVX2)
  * DISPATCH A RUNTIME (pattern --caps di qwen-tts): i kernel sono compilati
  * sempre con target-attribute (nessun -march richiesto: binari release
  * multi-target), la selezione avviene via cpuid+xgetbv alla prima chiamata.
- * Override con mynah_set_caps("scalar"|"avx2"|"vnni") o env MYNAH_CAPS.
+ * Override con mynah_asr_set_caps("scalar"|"avx2"|"vnni") o env MYNAH_ASR_CAPS.
  * dpbusd/maddubs moltiplicano u8 x s8: ua = qx+128 e correzione -128*Σw
  * (pattern qwen-tts int8_matvec_vnni). Validati da tests/test_qmat in CI. */
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <cpuid.h>
-#define MYNAH_HAVE_X86 1
+#define MYNAH_ASR_HAVE_X86 1
 
-enum { MYNAH_CAPS_SCALAR = 0, MYNAH_CAPS_AVX2 = 1, MYNAH_CAPS_VNNI = 2 };
+enum { MYNAH_ASR_CAPS_SCALAR = 0, MYNAH_ASR_CAPS_AVX2 = 1, MYNAH_ASR_CAPS_VNNI = 2 };
 
 static unsigned long long xgetbv0(void) {
     unsigned lo, hi;
@@ -260,23 +260,23 @@ static unsigned long long xgetbv0(void) {
 static int x86_detect_caps(void) {
     unsigned a, b, c, d;
     if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27))) /* OSXSAVE */
-        return MYNAH_CAPS_SCALAR;
+        return MYNAH_ASR_CAPS_SCALAR;
     const unsigned long long xcr0 = xgetbv0();
-    if ((xcr0 & 0x6) != 0x6) return MYNAH_CAPS_SCALAR;        /* xmm+ymm dall'OS */
+    if ((xcr0 & 0x6) != 0x6) return MYNAH_ASR_CAPS_SCALAR;        /* xmm+ymm dall'OS */
     if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !((b >> 5) & 1)) /* AVX2 */
-        return MYNAH_CAPS_SCALAR;
+        return MYNAH_ASR_CAPS_SCALAR;
     const int avx512f = (b >> 16) & 1, avx512bw = (b >> 30) & 1, vnni = (c >> 11) & 1;
     if (avx512f && avx512bw && vnni && (xcr0 & 0xE0) == 0xE0) /* zmm+opmask */
-        return MYNAH_CAPS_VNNI;
-    return MYNAH_CAPS_AVX2;
+        return MYNAH_ASR_CAPS_VNNI;
+    return MYNAH_ASR_CAPS_AVX2;
 }
 
 static int g_x86_caps = -1;
 
 static int x86_caps(void) {
     if (g_x86_caps < 0) {
-        const char *env = getenv("MYNAH_CAPS");
-        if (env) mynah_set_caps(env);
+        const char *env = getenv("MYNAH_ASR_CAPS");
+        if (env) mynah_asr_set_caps(env);
         if (g_x86_caps < 0) g_x86_caps = x86_detect_caps();
     }
     return g_x86_caps;
@@ -328,7 +328,7 @@ static float dot_q8_avx2(const int8_t *qx, float sx, const int8_t *w, float ws, 
 
 /* xq -> xq_perm: per ogni gruppo di 32, prima i pari poi i dispari */
 static void q4_permute_act(const int8_t *qx, int8_t *xp, int k) {
-    for (int g = 0; g < k / MYNAH_Q4_GROUP; g++) {
+    for (int g = 0; g < k / MYNAH_ASR_Q4_GROUP; g++) {
         const int8_t *src = qx + g * 32;
         int8_t *dst = xp + g * 32;
         for (int j = 0; j < 16; j++) {
@@ -345,7 +345,7 @@ static float dot_q4_x86(const int8_t *xp /* permutate */, float sx, const uint8_
     const __m128i off8 = _mm_set1_epi8(8);
     const __m256i ones16 = _mm256_set1_epi16(1);
     float acc = 0.0f;
-    for (int g = 0; g < k / MYNAH_Q4_GROUP; g++) {
+    for (int g = 0; g < k / MYNAH_ASR_Q4_GROUP; g++) {
         const __m128i b = _mm_loadu_si128((const __m128i *)(q + g * 16));
         const __m128i lo = _mm_sub_epi8(_mm_and_si128(b, mask4), off8);
         const __m128i hi = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(b, 4), mask4), off8);
@@ -364,17 +364,17 @@ static float dot_q4_x86(const int8_t *xp /* permutate */, float sx, const uint8_
 }
 #endif /* x86 */
 
-int mynah_set_caps(const char *name) {
-#ifdef MYNAH_HAVE_X86
+int mynah_asr_set_caps(const char *name) {
+#ifdef MYNAH_ASR_HAVE_X86
     const int detected = x86_detect_caps();
     int want = detected;
-    if (name && strcmp(name, "scalar") == 0) want = MYNAH_CAPS_SCALAR;
-    else if (name && strcmp(name, "avx2") == 0) want = MYNAH_CAPS_AVX2;
-    else if (name && strcmp(name, "vnni") == 0) want = MYNAH_CAPS_VNNI;
+    if (name && strcmp(name, "scalar") == 0) want = MYNAH_ASR_CAPS_SCALAR;
+    else if (name && strcmp(name, "avx2") == 0) want = MYNAH_ASR_CAPS_AVX2;
+    else if (name && strcmp(name, "vnni") == 0) want = MYNAH_ASR_CAPS_VNNI;
     else if (name && strcmp(name, "auto") != 0)
-        fprintf(stderr, "mynah: caps ignoti '%s' (scalar|avx2|vnni|auto) -> auto\n", name);
+        fprintf(stderr, "mynah-asr: caps ignoti '%s' (scalar|avx2|vnni|auto) -> auto\n", name);
     if (want > detected) {
-        fprintf(stderr, "mynah: caps '%s' not supported by this CPU -> level %d\n",
+        fprintf(stderr, "mynah-asr: caps '%s' not supported by this CPU -> level %d\n",
                 name, detected);
         want = detected;
     }
@@ -413,7 +413,7 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
     const int8x16_t off = vdupq_n_s8(8);
     const uint8x16_t maskv = vdupq_n_u8(0x0F);
     float acc = 0.0f;
-    for (int g = 0; g < k / MYNAH_Q4_GROUP; g++) {
+    for (int g = 0; g < k / MYNAH_ASR_Q4_GROUP; g++) {
         const uint8x16_t b = vld1q_u8(q + g * 16);
         const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, maskv)), off);
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
@@ -441,7 +441,7 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
     }
     return acc;
 }
-#define MYNAH_HAVE_NEON 1
+#define MYNAH_ASR_HAVE_NEON 1
 #endif
 
 /* --------------------------------------------- GEMM int8xint8 per T grande
@@ -450,11 +450,11 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
  * cache). I task scrivono colonne disgiunte di out -> bit-identico al seriale. */
 #define QGEMM_ROWS 32
 
-#if defined(MYNAH_HAVE_SDOT) || defined(MYNAH_HAVE_X86)
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
 #include "threads.h"
 
 typedef struct {
-    const mynah_qmat *m;
+    const mynah_asr_qmat *m;
     const int8_t *qx;      /* [T, k] attivazioni int8 (x86-q4: pre-permutate) */
     const float *sx;       /* [T] scale attivazioni */
     float *out;            /* [T, n] */
@@ -463,33 +463,33 @@ typedef struct {
 
 static void qgemm_block(void *ctx, int blk) {
     const qgemm_ctx *c = ctx;
-    const mynah_qmat *m = c->m;
+    const mynah_asr_qmat *m = c->m;
     const int i0 = blk * QGEMM_ROWS;
     const int i1 = i0 + QGEMM_ROWS < m->n ? i0 + QGEMM_ROWS : m->n;
-#ifdef MYNAH_HAVE_X86
+#ifdef MYNAH_ASR_HAVE_X86
     const int caps = x86_caps();
 #endif
     for (int i = i0; i < i1; i++) {
-        if (m->qtype == MYNAH_Q_INT8) {
+        if (m->qtype == MYNAH_ASR_Q_INT8) {
             const int8_t *qrow = m->q8 + (size_t)i * (size_t)m->k;
             const float ws = m->scales[i];
             for (int t = 0; t < c->T; t++) {
                 const int8_t *qxt = c->qx + (size_t)t * (size_t)m->k;
-#ifdef MYNAH_HAVE_SDOT
+#ifdef MYNAH_ASR_HAVE_SDOT
                 c->out[(size_t)t * (size_t)m->n + i] = dot_q8_sdot(qxt, c->sx[t], qrow, ws, m->k);
 #else
-                c->out[(size_t)t * (size_t)m->n + i] = caps >= MYNAH_CAPS_VNNI
+                c->out[(size_t)t * (size_t)m->n + i] = caps >= MYNAH_ASR_CAPS_VNNI
                     ? dot_q8_vnni(qxt, c->sx[t], qrow, ws, m->k)
                     : dot_q8_avx2(qxt, c->sx[t], qrow, ws, m->k);
 #endif
             }
         } else {
-            const int groups = m->k / MYNAH_Q4_GROUP;
+            const int groups = m->k / MYNAH_ASR_Q4_GROUP;
             const uint8_t *qrow = m->q4 + (size_t)i * (size_t)(m->k / 2);
             const float *srow = m->scales + (size_t)i * (size_t)groups;
             for (int t = 0; t < c->T; t++) {
                 const int8_t *qxt = c->qx + (size_t)t * (size_t)m->k;
-#ifdef MYNAH_HAVE_SDOT
+#ifdef MYNAH_ASR_HAVE_SDOT
                 c->out[(size_t)t * (size_t)m->n + i] = dot_q4_sdot(qxt, c->sx[t], qrow, srow, m->k);
 #else
                 c->out[(size_t)t * (size_t)m->n + i] = dot_q4_x86(qxt, c->sx[t], qrow, srow, m->k);
@@ -500,19 +500,19 @@ static void qgemm_block(void *ctx, int blk) {
 }
 #endif
 
-void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
-    if (m->qtype == MYNAH_Q_F32) {
-        mynah_gemm_wt(x, m->f32, out, T, m->n, m->k);
+void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int T) {
+    if (m->qtype == MYNAH_ASR_Q_F32) {
+        mynah_asr_gemm_wt(x, m->f32, out, T, m->n, m->k);
         return;
     }
     if (T <= QMAT_SMALL_T) {
         /* dot int8xint8 nativo (SDOT compile-time su ARM; VNNI/AVX2 a RUNTIME
          * su x86): quantizza le attivazioni una volta per riga (per-riga
          * absmax, ricetta qwen-tts) */
-#if defined(MYNAH_HAVE_SDOT) || defined(MYNAH_HAVE_X86)
-#ifdef MYNAH_HAVE_X86
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+#ifdef MYNAH_ASR_HAVE_X86
         const int caps = x86_caps();
-        const int native = caps >= MYNAH_CAPS_AVX2 && m->k <= QMAT_K_MAX;
+        const int native = caps >= MYNAH_ASR_CAPS_AVX2 && m->k <= QMAT_K_MAX;
 #else
         const int native = m->k <= QMAT_K_MAX;
 #endif
@@ -522,20 +522,20 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
                 float *o = out + (size_t)t * (size_t)m->n;
                 const float sx = quantize_act_int8(qx, xr, m->k);
-                if (m->qtype == MYNAH_Q_INT8) {
+                if (m->qtype == MYNAH_ASR_Q_INT8) {
                     for (int i = 0; i < m->n; i++) {
                         const int8_t *qrow = m->q8 + (size_t)i * (size_t)m->k;
-#ifdef MYNAH_HAVE_SDOT
+#ifdef MYNAH_ASR_HAVE_SDOT
                         o[i] = dot_q8_sdot(qx, sx, qrow, m->scales[i], m->k);
 #else
-                        o[i] = caps >= MYNAH_CAPS_VNNI
+                        o[i] = caps >= MYNAH_ASR_CAPS_VNNI
                                    ? dot_q8_vnni(qx, sx, qrow, m->scales[i], m->k)
                                    : dot_q8_avx2(qx, sx, qrow, m->scales[i], m->k);
 #endif
                     }
                 } else {
-                    const int groups = m->k / MYNAH_Q4_GROUP;
-#ifdef MYNAH_HAVE_SDOT
+                    const int groups = m->k / MYNAH_ASR_Q4_GROUP;
+#ifdef MYNAH_ASR_HAVE_SDOT
                     for (int i = 0; i < m->n; i++)
                         o[i] = dot_q4_sdot(qx, sx, m->q4 + (size_t)i * (size_t)(m->k / 2),
                                            m->scales + (size_t)i * (size_t)groups, m->k);
@@ -551,13 +551,13 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
             return;
         }
 #endif
-        if (m->qtype == MYNAH_Q_INT8) {
+        if (m->qtype == MYNAH_ASR_Q_INT8) {
             for (int t = 0; t < T; t++) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
                 float *o = out + (size_t)t * (size_t)m->n;
                 for (int i = 0; i < m->n; i++) {
                     const int8_t *qrow = m->q8 + (size_t)i * (size_t)m->k;
-#ifdef MYNAH_HAVE_NEON
+#ifdef MYNAH_ASR_HAVE_NEON
                     o[i] = dot_q8_neon(xr, qrow, m->k) * m->scales[i];
 #else
                     float acc = 0.0f;
@@ -570,19 +570,19 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
             for (int t = 0; t < T; t++) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
                 float *o = out + (size_t)t * (size_t)m->n;
-                const int groups = m->k / MYNAH_Q4_GROUP;
+                const int groups = m->k / MYNAH_ASR_Q4_GROUP;
                 for (int i = 0; i < m->n; i++) {
                     const uint8_t *qrow = m->q4 + (size_t)i * (size_t)(m->k / 2);
                     const float *srow = m->scales + (size_t)i * (size_t)groups;
-#ifdef MYNAH_HAVE_NEON
+#ifdef MYNAH_ASR_HAVE_NEON
                     o[i] = dot_q4_neon(xr, qrow, srow, m->k);
 #else
                     float acc = 0.0f;
                     for (int g = 0; g < groups; g++) {
                         float ga = 0.0f;
-                        const float *xg = xr + g * MYNAH_Q4_GROUP;
-                        for (int j = 0; j < MYNAH_Q4_GROUP; j += 2) {
-                            const uint8_t b = qrow[(g * MYNAH_Q4_GROUP + j) / 2];
+                        const float *xg = xr + g * MYNAH_ASR_Q4_GROUP;
+                        for (int j = 0; j < MYNAH_ASR_Q4_GROUP; j += 2) {
+                            const uint8_t b = qrow[(g * MYNAH_ASR_Q4_GROUP + j) / 2];
                             ga += xg[j] * (float)((int)(b & 0x0F) - 8);
                             ga += xg[j + 1] * (float)((int)(b >> 4) - 8);
                         }
@@ -595,7 +595,7 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
         }
         return;
     }
-    /* T grande, OPT-IN via env MYNAH_QGEMM=1: GEMM int8xint8 threaded —
+    /* T grande, OPT-IN via env MYNAH_ASR_QGEMM=1: GEMM int8xint8 threaded —
      * attivazioni quantizzate UNA volta (T righe int8 + scale), parallel-for a
      * blocchi sulle righe peso (peso letto una volta in int8 = 4x meno banda
      * del dequant f32, attivazioni calde in cache).
@@ -603,14 +603,14 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
      * Accelerate domina) e l'act-quant cambia la numerica -> default OFF.
      * Il margine atteso è su x86 VNNI (niente AMX): validare lì prima di
      * considerare un default per piattaforma. */
-#if defined(MYNAH_HAVE_SDOT) || defined(MYNAH_HAVE_X86)
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
     static int g_qgemm = -1;
     if (g_qgemm < 0) {
-        const char *e = getenv("MYNAH_QGEMM");
+        const char *e = getenv("MYNAH_ASR_QGEMM");
         g_qgemm = e && e[0] == '1';
     }
-#ifdef MYNAH_HAVE_X86
-    const int gnative = g_qgemm && x86_caps() >= MYNAH_CAPS_AVX2 && m->k <= QMAT_K_MAX;
+#ifdef MYNAH_ASR_HAVE_X86
+    const int gnative = g_qgemm && x86_caps() >= MYNAH_ASR_CAPS_AVX2 && m->k <= QMAT_K_MAX;
 #else
     const int gnative = g_qgemm && m->k <= QMAT_K_MAX;
 #endif
@@ -621,8 +621,8 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
             for (int t = 0; t < T; t++)
                 sx[t] = quantize_act_int8(qx + (size_t)t * (size_t)m->k,
                                           x + (size_t)t * (size_t)m->k, m->k);
-#if defined(MYNAH_HAVE_X86) && !defined(MYNAH_HAVE_SDOT)
-            if (m->qtype == MYNAH_Q_INT4) {
+#if defined(MYNAH_ASR_HAVE_X86) && !defined(MYNAH_ASR_HAVE_SDOT)
+            if (m->qtype == MYNAH_ASR_Q_INT4) {
                 /* il kernel q4 AVX2 vuole le attivazioni pre-permutate */
                 for (int t = 0; t < T; t++) {
                     int8_t xp[QMAT_K_MAX];
@@ -632,7 +632,7 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
             }
 #endif
             qgemm_ctx c = {.m = m, .qx = qx, .sx = sx, .out = out, .T = T};
-            mynah_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
+            mynah_asr_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
             free(qx);
             free(sx);
             return;
@@ -651,24 +651,24 @@ void mynah_qmat_mul(const mynah_qmat *m, const float *x, float *out, int T) {
 }
 
 /* ------------------------------------------------------------ helper fusi */
-void mynah_qmat_ffn(const mynah_qmat *w1, const mynah_qmat *w2, const float *x,
+void mynah_asr_qmat_ffn(const mynah_asr_qmat *w1, const mynah_asr_qmat *w2, const float *x,
                     float *out, int T, float *scratch) {
-    if (w1->qtype == MYNAH_Q_F32 && w2->qtype == MYNAH_Q_F32) {
-        mynah_ffn_wt(x, w1->f32, w1->n, w2->f32, w2->n, out, T, w1->k, scratch);
+    if (w1->qtype == MYNAH_ASR_Q_F32 && w2->qtype == MYNAH_ASR_Q_F32) {
+        mynah_asr_ffn_wt(x, w1->f32, w1->n, w2->f32, w2->n, out, T, w1->k, scratch);
         return;
     }
-    mynah_qmat_mul(w1, x, scratch, T);
-    mynah_silu(scratch, (size_t)T * (size_t)w1->n);
-    mynah_qmat_mul(w2, scratch, out, T);
+    mynah_asr_qmat_mul(w1, x, scratch, T);
+    mynah_asr_silu(scratch, (size_t)T * (size_t)w1->n);
+    mynah_asr_qmat_mul(w2, scratch, out, T);
 }
 
-void mynah_qmat_qkv(const mynah_qmat *wq, const mynah_qmat *wk, const mynah_qmat *wv,
+void mynah_asr_qmat_qkv(const mynah_asr_qmat *wq, const mynah_asr_qmat *wk, const mynah_asr_qmat *wv,
                     const float *x, float *oq, float *ok, float *ov, int T) {
-    if (wq->qtype == MYNAH_Q_F32 && wk->qtype == MYNAH_Q_F32 && wv->qtype == MYNAH_Q_F32) {
-        mynah_gemm3_wt(x, wq->f32, wk->f32, wv->f32, oq, ok, ov, T, wq->n, wq->k);
+    if (wq->qtype == MYNAH_ASR_Q_F32 && wk->qtype == MYNAH_ASR_Q_F32 && wv->qtype == MYNAH_ASR_Q_F32) {
+        mynah_asr_gemm3_wt(x, wq->f32, wk->f32, wv->f32, oq, ok, ov, T, wq->n, wq->k);
         return;
     }
-    mynah_qmat_mul(wq, x, oq, T);
-    mynah_qmat_mul(wk, x, ok, T);
-    mynah_qmat_mul(wv, x, ov, T);
+    mynah_asr_qmat_mul(wq, x, oq, T);
+    mynah_asr_qmat_mul(wk, x, ok, T);
+    mynah_asr_qmat_mul(wv, x, ov, T);
 }

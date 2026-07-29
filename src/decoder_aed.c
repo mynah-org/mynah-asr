@@ -5,15 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef MYNAH_BLAS_ACCELERATE
+#ifdef MYNAH_ASR_BLAS_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
 #endif
 
 /* y = W x + b (T=1 sui qmat: kernel dot diretto per int8/int4) */
-static void mv(const mynah_qmat *w, const float *b, const float *x, float *y) {
-    mynah_qmat_mul(w, x, y, 1);
+static void mv(const mynah_asr_qmat *w, const float *b, const float *x, float *y) {
+    mynah_asr_qmat_mul(w, x, y, 1);
     if (b)
         for (int i = 0; i < w->n; i++) y[i] += b[i];
 }
@@ -36,13 +36,13 @@ static void softmax_inplace(float *s, int n) {
     for (int i = 0; i < n; i++) s[i] *= inv;
 }
 
-#define T_(st, name) ((const float *)(mynah_st_get((st), (name)) ? mynah_st_get((st), (name))->data : NULL))
+#define T_(st, name) ((const float *)(mynah_asr_st_get((st), (name)) ? mynah_asr_st_get((st), (name))->data : NULL))
 
-int mynah_aed_init(mynah_aed *a, const mynah_safetensors *st,
+int mynah_asr_aed_init(mynah_asr_aed *a, const mynah_asr_safetensors *st,
                    int n_layers, int n_heads, int max_seq, int max_gen_delta,
                    int quantize) {
     memset(a, 0, sizeof(*a));
-    const mynah_tensor *emb = mynah_st_get(st, "aed.embedding.weight");
+    const mynah_asr_tensor *emb = mynah_asr_st_get(st, "aed.embedding.weight");
     if (!emb) return -1;
     a->emb = (const float *)emb->data;
     a->vocab = (int)emb->shape[0];
@@ -58,8 +58,8 @@ int mynah_aed_init(mynah_aed *a, const mynah_safetensors *st,
     a->fin_b = T_(st, "aed.final_norm.bias");
     a->head_b = T_(st, "aed.head.bias");
     if (!a->pos || !a->embln_w || !a->fin_w || !a->head_b) return -1;
-    if (mynah_qmat_init_st(&a->head, st, "aed.head.weight", quantize) != 0) return -1;
-    if (mynah_qmat_init_st(&a->proj, st, "enc_dec_proj.weight", quantize) == 0) {
+    if (mynah_asr_qmat_init_st(&a->head, st, "aed.head.weight", quantize) != 0) return -1;
+    if (mynah_asr_qmat_init_st(&a->proj, st, "enc_dec_proj.weight", quantize) == 0) {
         a->proj_b = T_(st, "enc_dec_proj.bias");
         a->d_enc = a->proj.k;
     } else {
@@ -69,16 +69,16 @@ int mynah_aed_init(mynah_aed *a, const mynah_safetensors *st,
     a->layers = calloc((size_t)n_layers, sizeof(*a->layers));
     if (!a->layers) return -1;
     for (int li = 0; li < n_layers; li++) {
-        mynah_aed_layer *L = &a->layers[li];
+        mynah_asr_aed_layer *L = &a->layers[li];
         char n[96];
 #define GF(field, suffix) \
         snprintf(n, sizeof(n), "aed.layers.%d." suffix, li); \
         L->field = T_(st, n); \
-        if (!L->field) { fprintf(stderr, "mynah: aed is missing %s\n", n); return -1; }
+        if (!L->field) { fprintf(stderr, "mynah-asr: aed is missing %s\n", n); return -1; }
 #define GQ(field, suffix) \
         snprintf(n, sizeof(n), "aed.layers.%d." suffix, li); \
-        if (mynah_qmat_init_st(&L->field, st, n, quantize) != 0) { \
-            fprintf(stderr, "mynah: aed is missing %s\n", n); return -1; }
+        if (mynah_asr_qmat_init_st(&L->field, st, n, quantize) != 0) { \
+            fprintf(stderr, "mynah-asr: aed is missing %s\n", n); return -1; }
         GF(ln_self_w, "ln_self.weight")   GF(ln_self_b, "ln_self.bias")
         GQ(sq, "self_attn.q_proj.weight") GF(sq_b, "self_attn.q_proj.bias")
         GQ(sk, "self_attn.k_proj.weight") GF(sk_b, "self_attn.k_proj.bias")
@@ -99,17 +99,17 @@ int mynah_aed_init(mynah_aed *a, const mynah_safetensors *st,
     return 0;
 }
 
-void mynah_aed_free(mynah_aed *a) {
+void mynah_asr_aed_free(mynah_asr_aed *a) {
     for (int li = 0; li < a->n_layers && a->layers; li++) {
-        mynah_aed_layer *L = &a->layers[li];
-        mynah_qmat_free(&L->sq); mynah_qmat_free(&L->sk);
-        mynah_qmat_free(&L->sv); mynah_qmat_free(&L->so);
-        mynah_qmat_free(&L->cq); mynah_qmat_free(&L->ck);
-        mynah_qmat_free(&L->cv); mynah_qmat_free(&L->co);
-        mynah_qmat_free(&L->ff1); mynah_qmat_free(&L->ff2);
+        mynah_asr_aed_layer *L = &a->layers[li];
+        mynah_asr_qmat_free(&L->sq); mynah_asr_qmat_free(&L->sk);
+        mynah_asr_qmat_free(&L->sv); mynah_asr_qmat_free(&L->so);
+        mynah_asr_qmat_free(&L->cq); mynah_asr_qmat_free(&L->ck);
+        mynah_asr_qmat_free(&L->cv); mynah_asr_qmat_free(&L->co);
+        mynah_asr_qmat_free(&L->ff1); mynah_asr_qmat_free(&L->ff2);
     }
-    mynah_qmat_free(&a->head);
-    mynah_qmat_free(&a->proj);
+    mynah_asr_qmat_free(&a->head);
+    mynah_asr_qmat_free(&a->proj);
     free(a->layers);
     a->layers = NULL;
 }
@@ -136,7 +136,7 @@ static void add_bias_rows(float *x, const float *b, int T, int d) {
         for (int i = 0; i < d; i++) x[(size_t)t * (size_t)d + i] += b[i];
 }
 
-int mynah_aed_decode(const mynah_aed *a, const float *enc, int T,
+int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
                      const int *prompt, int n_prompt, int eos,
                      int *tokens, int cap) {
     const int d = a->d, H = a->n_heads, dk = d / H, nl = a->n_layers;
@@ -150,7 +150,7 @@ int mynah_aed_decode(const mynah_aed *a, const float *enc, int T,
     if (a->proj.n) {
         encp = malloc((size_t)T * (size_t)d * sizeof(float));
         if (!encp) return -1;
-        mynah_qmat_mul(&a->proj, enc, encp, T);
+        mynah_asr_qmat_mul(&a->proj, enc, encp, T);
         add_bias_rows(encp, a->proj_b, T, d);
     } else {
         encp = (float *)enc;
@@ -169,10 +169,10 @@ int mynah_aed_decode(const mynah_aed *a, const float *enc, int T,
           *scores = scr + 6 * d + a->ffn;
 
     for (int li = 0; li < nl; li++) {
-        const mynah_aed_layer *L = &a->layers[li];
+        const mynah_asr_aed_layer *L = &a->layers[li];
         float *CK = ckv + (size_t)(2 * li) * td, *CV = CK + td;
-        mynah_qmat_mul(&L->ck, encp, CK, T);
-        mynah_qmat_mul(&L->cv, encp, CV, T);
+        mynah_asr_qmat_mul(&L->ck, encp, CK, T);
+        mynah_asr_qmat_mul(&L->cv, encp, CV, T);
         add_bias_rows(CK, L->ck_b, T, d);
         add_bias_rows(CV, L->cv_b, T, d);
     }
@@ -185,7 +185,7 @@ int mynah_aed_decode(const mynah_aed *a, const float *enc, int T,
         ln(x, a->embln_w, a->embln_b, x, d);
 
         for (int li = 0; li < nl; li++) {
-            const mynah_aed_layer *L = &a->layers[li];
+            const mynah_asr_aed_layer *L = &a->layers[li];
             float *SK = skv + (size_t)(2 * li) * md, *SV = SK + md;
             /* self-attention causale: nuova k/v in cache, attention su [0..p] */
             ln(x, L->ln_self_w, L->ln_self_b, xn, d);

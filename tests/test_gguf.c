@@ -55,7 +55,7 @@ static uint16_t f32_to_f16(float f) { /* solo per i fixture (valori normali) */
 }
 
 static const char *write_tmp(const buf *b, char *path_out) {
-    strcpy(path_out, "/tmp/mynah_test_gguf_XXXXXX");
+    strcpy(path_out, "/tmp/mynah_asr_test_gguf_XXXXXX");
     int fd = mkstemp(path_out);
     if (fd < 0) return NULL;
     ssize_t w = write(fd, b->p, b->len);
@@ -176,11 +176,11 @@ int main(void) {
     }
 
     CHECK(write_tmp(&b, path) != NULL, "fixture scritto");
-    mynah_safetensors *st = mynah_st_open(path);
-    CHECK(st != NULL, "GGUF valido aperto (via mynah_st_open)");
+    mynah_asr_safetensors *st = mynah_asr_st_open(path);
+    CHECK(st != NULL, "GGUF valido aperto (via mynah_asr_st_open)");
     if (st) {
-        CHECK(mynah_st_count(st) == 6, "count == 6");
-        const mynah_tensor *f32 = mynah_st_get(st, "t.f32");
+        CHECK(mynah_asr_st_count(st) == 6, "count == 6");
+        const mynah_asr_tensor *f32 = mynah_asr_st_get(st, "t.f32");
         CHECK(f32 && f32->n_dims == 2 && f32->shape[0] == 4 && f32->shape[1] == 8,
               "dims ggml invertite -> [4][8]");
         CHECK(f32 && f32->n_elems == 32 && memcmp(f32->data, vals, 32 * 4) == 0,
@@ -189,7 +189,7 @@ int main(void) {
             {"t.f16", 1e-3}, {"t.bf16", 8e-3}, {"t.q8", 1.5e-2}, {"t.q4", 1e-1},
         };
         for (size_t k = 0; k < sizeof(deq) / sizeof(deq[0]); k++) {
-            const mynah_tensor *t = mynah_st_get(st, deq[k].name);
+            const mynah_asr_tensor *t = mynah_asr_st_get(st, deq[k].name);
             double worst = 1e9;
             if (t && t->n_elems == N) {
                 worst = 0;
@@ -203,7 +203,7 @@ int main(void) {
                      deq[k].name, worst, deq[k].tol);
             CHECK(worst <= deq[k].tol, msg);
         }
-        const mynah_tensor *tqk = mynah_st_get(st, "t.q4k");
+        const mynah_asr_tensor *tqk = mynah_asr_st_get(st, "t.q4k");
         double worst_k = 1e9;
         if (tqk && tqk->n_elems == NK) {
             worst_k = 0;
@@ -215,7 +215,7 @@ int main(void) {
         char kmsg[128];
         snprintf(kmsg, sizeof(kmsg), "dequant t.q4k vs formula spec (max err %.2e)", worst_k);
         CHECK(worst_k <= 1e-6, kmsg);   /* d/dmin esatti in f16: atteso 0 */
-        mynah_st_close(st);
+        mynah_asr_st_close(st);
     }
     unlink(path);
 
@@ -223,26 +223,26 @@ int main(void) {
     struct { const char *what; buf f; } bad[7];
     memset(bad, 0, sizeof(bad));
 
-    bad[0].what = "magic errato";
+    bad[0].what = "wrong magic";
     hdr(&bad[0].f, 3, 0);
     bad[0].f.p[0] = 'X';
 
-    bad[1].what = "versione 1 (layout u32)";
+    bad[1].what = "version 1 (u32 layout)";
     hdr(&bad[1].f, 1, 0);
 
-    bad[2].what = "troncato a meta' header";
+    bad[2].what = "truncated mid-header";
     hdr(&bad[2].f, 3, 1);
     bad[2].f.len = 30;
 
-    bad[3].what = "offset tensore oltre EOF";
+    bad[3].what = "tensor offset past EOF";
     hdr(&bad[3].f, 3, 1);
     { const uint64_t ne[1] = {8}; tinfo(&bad[3].f, "t", 1, ne, 0, 1u << 30); pad_to(&bad[3].f, 32); }
 
-    bad[4].what = "lunghezza stringa abnorme";
+    bad[4].what = "absurd string length";
     hdr(&bad[4].f, 3, 1);
     put_u64(&bad[4].f, (uint64_t)1 << 60);
 
-    bad[5].what = "alignment non potenza di 2";
+    bad[5].what = "alignment not a power of 2";
     put_u32(&bad[5].f, 0x46554747u);
     put_u32(&bad[5].f, 3);
     put_u64(&bad[5].f, 0);
@@ -251,7 +251,7 @@ int main(void) {
     put_u32(&bad[5].f, 4);
     put_u32(&bad[5].f, 33);
 
-    bad[6].what = "tipo ggml non supportato (Q6_K: milestone interop)";
+    bad[6].what = "unsupported ggml type (Q6_K: interop milestone)";
     hdr(&bad[6].f, 3, 1);
     { const uint64_t ne[1] = {256}; tinfo(&bad[6].f, "t", 1, ne, 14, 0); pad_to(&bad[6].f, 32);
       static const unsigned char blk[210] = {0}; put(&bad[6].f, blk, 210); }
@@ -259,9 +259,9 @@ int main(void) {
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
         CHECK(write_tmp(&bad[k].f, junk) != NULL, "fixture malformato scritto");
         fprintf(stderr, "--- expected error (%s):\n", bad[k].what);
-        mynah_safetensors *s = mynah_st_open(junk);
+        mynah_asr_safetensors *s = mynah_asr_st_open(junk);
         CHECK(s == NULL, bad[k].what);
-        if (s) mynah_st_close(s);
+        if (s) mynah_asr_st_close(s);
         unlink(junk);
         free(bad[k].f.p);
     }

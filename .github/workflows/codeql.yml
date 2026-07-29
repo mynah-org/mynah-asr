@@ -48,5 +48,5 @@ jobs:
             -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone' \
             -warnings-as-errors='' \
             src/*.c cli/main.c server/main.c server/http_util.c \
-            -- -std=c11 -iquote src -D_DEFAULT_SOURCE -DMYNAH_BLAS_OPENBLAS \
-               -DMYNAH_BUILD='"ci"'
+            -- -std=c11 -iquote src -D_DEFAULT_SOURCE -DMYNAH_ASR_BLAS_OPENBLAS \
+               -DMYNAH_ASR_BUILD='"ci"'

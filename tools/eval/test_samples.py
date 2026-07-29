@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--overlap-min", type=float, default=0.35)
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--backend", default=None, help="cpu|metal|cuda (default: cpu+metal su macOS)")
-    ap.add_argument("--mynah", default=str(ROOT / "mynah"))
+    ap.add_argument("--mynah-asr", dest="mynah_asr", default=str(ROOT / "mynah-asr"))
     args = ap.parse_args()
 
     manifest_path = ROOT / "samples/manifest.json"
@@ -92,7 +92,7 @@ def main() -> None:
         ["cpu", "metal"] if platform.system() == "Darwin" else ["cpu"])
 
     def run(model: str, wav: str, lang: str, backend: str, target: str | None = None) -> str:
-        cmd = [args.mynah, "transcribe", "-m", str(ROOT / "models" / model),
+        cmd = [args.mynah_asr, "transcribe", "-m", str(ROOT / "models" / model),
                "-i", str(ROOT / "samples" / wav), "--lang", lang, "--backend", backend]
         if target:
             cmd += ["--target-lang", target]
@@ -153,7 +153,7 @@ def main() -> None:
             # long transcribe / long translate: default di segmentazione
             # model-aware (misura la qualità out-of-the-box) + RTF
             if s["lang"] == "en" and "parakeet-tdt-0.6b-v3" in models:
-                p = subprocess.run([args.mynah, "transcribe", "-m",
+                p = subprocess.run([args.mynah_asr, "transcribe", "-m",
                                     str(ROOT / "models/parakeet-tdt-0.6b-v3"),
                                     "-i", wav], capture_output=True, text=True,
                                    timeout=1200)
@@ -164,7 +164,7 @@ def main() -> None:
                       f"RTF {rtf_of(p.stderr)}")
                 fails += 0 if ok else 1
             if s.get("en_ref") and "canary-180m-flash" in models:
-                p = subprocess.run([args.mynah, "transcribe", "-m",
+                p = subprocess.run([args.mynah_asr, "transcribe", "-m",
                                     str(ROOT / "models/canary-180m-flash"),
                                     "-i", wav, "--lang", s["lang"],
                                     "--target-lang", "en"], capture_output=True,
@@ -179,7 +179,7 @@ def main() -> None:
                 fails += 0 if ok else 1
             continue
         if "parakeet-tdt-0.6b-v3" in models:
-            p = subprocess.run([args.mynah, "transcribe", "-m",
+            p = subprocess.run([args.mynah_asr, "transcribe", "-m",
                                 str(ROOT / "models/parakeet-tdt-0.6b-v3"), "-i", wav,
                                 "--segment-sec", "30"],
                                capture_output=True, text=True, timeout=600)
@@ -189,7 +189,7 @@ def main() -> None:
                   f"{s['file']} ({s['duration_sec']}s, segmenti da 30s) CER {c:.3f}")
             fails += 0 if ok else 1
 
-            p = subprocess.run([args.mynah, "transcribe", "-m",
+            p = subprocess.run([args.mynah_asr, "transcribe", "-m",
                                 str(ROOT / "models/parakeet-tdt-0.6b-v3"), "-i", wav,
                                 "--timestamps"],
                                capture_output=True, text=True, timeout=600)
@@ -204,7 +204,7 @@ def main() -> None:
         if "nemotron-3.5-asr-streaming-0.6b" in models:
             import soundfile as sf
             audio, _sr = sf.read(ROOT / "samples" / s["file"], dtype="int16")
-            p = subprocess.run([args.mynah, "stream", "-m",
+            p = subprocess.run([args.mynah_asr, "stream", "-m",
                                 str(ROOT / "models/nemotron-3.5-asr-streaming-0.6b"),
                                 "--lang", "en-US"],
                                input=audio.tobytes(), capture_output=True, timeout=600)

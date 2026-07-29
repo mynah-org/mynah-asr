@@ -18,9 +18,9 @@ for m in models/*/; do
     case "$name" in *rnnt-0.6b|*ctc-0.6b|*110m) wav="$WAV_EN" ;; esac
     # 2 warm-up: con molti modelli grandi la page cache viene riciclata tra un
     # modello e l'altro e una sola run non basta a ripaginare tutto l'mmap
-    ./mynah transcribe -m "$m" -i "$wav" >/dev/null 2>&1
-    ./mynah transcribe -m "$m" -i "$wav" >/dev/null 2>&1
-    out=$($TIME ./mynah transcribe -m "$m" -i "$wav" 2>&1 >/dev/null)
+    ./mynah-asr transcribe -m "$m" -i "$wav" >/dev/null 2>&1
+    ./mynah-asr transcribe -m "$m" -i "$wav" >/dev/null 2>&1
+    out=$($TIME ./mynah-asr transcribe -m "$m" -i "$wav" 2>&1 >/dev/null)
     rtf=$(printf '%s' "$out" | sed -n 's/.*RTF \([0-9.]*\).*/\1/p')
     secs=$(printf '%s' "$out" | sed -n 's/.*inferenza \([0-9.]*\)s.*/\1/p')
     rss=$(printf '%s' "$out" | grep "$RSS_KEY" | sed 's/[^0-9]//g')

@@ -10,8 +10,8 @@
  * Un command buffer per layer, commit senza wait: la GPU esegue il layer i
  * mentre la CPU encoda il layer i+1; si aspetta solo l'ultimo.
  *
- * Sotto MYNAH_METAL_MIN_T (chunk streaming) si ritorna -1 -> CPU. */
-#ifdef MYNAH_METAL
+ * Sotto MYNAH_ASR_METAL_MIN_T (chunk streaming) si ritorna -1 -> CPU. */
+#ifdef MYNAH_ASR_METAL
 
 #include "backend.h"
 
@@ -24,7 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MYNAH_METAL_MIN_T 24
+#define MYNAH_ASR_METAL_MIN_T 24
 
 typedef _Float16 f16;
 
@@ -196,7 +196,7 @@ static const char *SHADER_SRC =
     "        row[i] = (row[i] - mu) * inv * float(gm[i]) + float(bt[i]);\n"
     "}\n";
 
-int mynah_metal_available(void) {
+int mynah_asr_metal_available(void) {
     static int checked = 0;
     pthread_mutex_lock(&g_mu);
     if (!checked) {
@@ -261,10 +261,10 @@ static id<MTLBuffer> weight_buffer_f16(const float *w, size_t n_elems) {
 }
 
 /* Svuota la cache pesi residenti. Da chiamare quando i puntatori host cessano di
- * essere validi (mynah_free: i safetensors vengono munmap-ati e un load successivo
+ * essere validi (mynah_asr_free: i safetensors vengono munmap-ati e un load successivo
  * può riusare gli stessi indirizzi virtuali -> la GPU userebbe i pesi VECCHI).
  * I forward successivi ri-caricano i pesi alla prima chiamata. */
-void mynah_metal_weights_evict(void) {
+void mynah_asr_metal_weights_evict(void) {
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_wc_n; i++) CFBridgingRelease(g_wc[i].buf);
     free(g_wc);
@@ -351,8 +351,8 @@ static void encode_silu(id<MTLCommandBuffer> cb, id<MTLBuffer> buf, size_t n) {
 }
 
 /* out[T,n] = x[T,k] @ W^T — singola GEMM fp16 */
-int mynah_metal_gemm_wt(const float *x, const float *w, float *out, int T, int n, int k) {
-    if (T < MYNAH_METAL_MIN_T || !mynah_metal_available()) return -1;
+int mynah_asr_metal_gemm_wt(const float *x, const float *w, float *out, int T, int n, int k) {
+    if (T < MYNAH_ASR_METAL_MIN_T || !mynah_asr_metal_available()) return -1;
     pthread_mutex_lock(&g_mu);
     int rc = -1;
     @autoreleasepool {
@@ -376,9 +376,9 @@ int mynah_metal_gemm_wt(const float *x, const float *w, float *out, int T, int n
 }
 
 /* FFN fusa: out[T,n2] = SiLU(x[T,k] @ W1^T) @ W2^T — un solo wait */
-int mynah_metal_ffn_wt(const float *x, const float *w1, int n1, const float *w2, int n2,
+int mynah_asr_metal_ffn_wt(const float *x, const float *w1, int n1, const float *w2, int n2,
                        float *out, int T, int k) {
-    if (T < MYNAH_METAL_MIN_T || !mynah_metal_available()) return -1;
+    if (T < MYNAH_ASR_METAL_MIN_T || !mynah_asr_metal_available()) return -1;
     pthread_mutex_lock(&g_mu);
     int rc = -1;
     @autoreleasepool {
@@ -406,10 +406,10 @@ int mynah_metal_ffn_wt(const float *x, const float *w1, int n1, const float *w2,
 }
 
 /* QKV: tre GEMM sullo stesso input, un solo wait */
-int mynah_metal_gemm3_wt(const float *x, const float *wa, const float *wb_,
+int mynah_asr_metal_gemm3_wt(const float *x, const float *wa, const float *wb_,
                          const float *wc_, float *oa, float *ob_, float *oc,
                          int T, int n, int k) {
-    if (T < MYNAH_METAL_MIN_T || !mynah_metal_available()) return -1;
+    if (T < MYNAH_ASR_METAL_MIN_T || !mynah_asr_metal_available()) return -1;
     pthread_mutex_lock(&g_mu);
     int rc = -1;
     @autoreleasepool {
@@ -521,7 +521,7 @@ static void encode_ffn16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
  * (GEMM su viste strided) -> softmax+rel_shift+finestra -> ctx -> o_proj.
  * Scratch in g_att: q,k,v,qu,qv [5*td] ++ rk [pd] ++ ctx [td] ++ scores ++ bd. */
 static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer> out16,
-                         const mynah_metal_layer_w *L, int T, int d, int H,
+                         const mynah_asr_metal_layer_w *L, int T, int d, int H,
                          int left, int right) {
     const int dk = d / H, P = 2 * T - 1, K = T;
     const size_t td = (size_t)T * (size_t)d * sizeof(f16);
@@ -620,7 +620,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
  * -> LN | BN-affine -> SiLU -> pw2(+b).
  * Scratch in g_mid: h2 [T,2d] @0, g [T,d] @2td, c [T,d] @3td. */
 static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer> out16,
-                          const mynah_metal_layer_w *L, int T, int d, int conv_pad) {
+                          const mynah_asr_metal_layer_w *L, int T, int d, int conv_pad) {
     const size_t td = (size_t)T * (size_t)d * sizeof(f16);
     id<MTLBuffer> b1 = weight_buffer_f16(L->pw1, (size_t)2 * (size_t)d * (size_t)d);
     id<MTLBuffer> bw = weight_buffer_f16(L->dw9, (size_t)d * 9u);
@@ -688,10 +688,10 @@ static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffe
 /* Encoder intero su GPU: x [T,d] f32 aggiornato in place, un solo wait finale.
  * Per layer: LN->FFN1(+0.5) -> LN->MHSA(+1) -> LN->conv(+1) -> LN->FFN2(+0.5)
  * -> LN out. Residuo f32 (come CPU), blocchi f16 (come v3). */
-int mynah_metal_encoder_layers(const mynah_metal_layer_w *Ls, int n_layers,
+int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_layers,
                                float *x, const float *pe, int T, int d, int H,
                                int ffn, int left, int right, int conv_pad) {
-    if (T < MYNAH_METAL_MIN_T || n_layers <= 0 || !mynah_metal_available()) return -1;
+    if (T < MYNAH_ASR_METAL_MIN_T || n_layers <= 0 || !mynah_asr_metal_available()) return -1;
     const int P = 2 * T - 1;
     const double tf0 = CFAbsoluteTimeGetCurrent();
     pthread_mutex_lock(&g_mu);
@@ -717,7 +717,7 @@ int mynah_metal_encoder_layers(const mynah_metal_layer_w *Ls, int n_layers,
 
         /* i pesi vanno in cache PRIMA di encodare (weight_buffer_f16 può fallire) */
         for (int li = 0; ok && li < n_layers; li++) {
-            const mynah_metal_layer_w *L = &Ls[li];
+            const mynah_asr_metal_layer_w *L = &Ls[li];
             const float *big[] = {L->ff1_w1, L->ff1_w2, L->ff2_w1, L->ff2_w2,
                                   L->wq, L->wk, L->wv, L->wo, L->relk, L->pw1, L->pw2};
             const size_t bign[] = {(size_t)ffn * (size_t)d, (size_t)d * (size_t)ffn,
@@ -753,7 +753,7 @@ int mynah_metal_encoder_layers(const mynah_metal_layer_w *Ls, int n_layers,
             const double t0 = CFAbsoluteTimeGetCurrent();
             id<MTLCommandBuffer> last = nil;
             for (int li = 0; li < n_layers; li++) {
-                const mynah_metal_layer_w *L = &Ls[li];
+                const mynah_asr_metal_layer_w *L = &Ls[li];
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
                 if (li == 0) {   /* pe f32 -> f16 una volta per forward */
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -790,7 +790,7 @@ int mynah_metal_encoder_layers(const mynah_metal_layer_w *Ls, int n_layers,
             }
             const double t1 = CFAbsoluteTimeGetCurrent();
             [last waitUntilCompleted];
-            if (getenv("MYNAH_METAL_PROF"))
+            if (getenv("MYNAH_ASR_METAL_PROF"))
                 fprintf(stderr, "metal v4: T=%d encode %.3fs wait %.3fs gpu(last) %.3fs\n",
                         T, t1 - t0, CFAbsoluteTimeGetCurrent() - t1,
                         last.GPUEndTime - last.GPUStartTime);
@@ -801,10 +801,10 @@ int mynah_metal_encoder_layers(const mynah_metal_layer_w *Ls, int n_layers,
         }
     }
     pthread_mutex_unlock(&g_mu);
-    if (getenv("MYNAH_METAL_PROF"))
+    if (getenv("MYNAH_ASR_METAL_PROF"))
         fprintf(stderr, "metal v4: funzione intera %.3fs\n",
                 CFAbsoluteTimeGetCurrent() - tf0);
     return rc;
 }
 
-#endif /* MYNAH_METAL */
+#endif /* MYNAH_ASR_METAL */

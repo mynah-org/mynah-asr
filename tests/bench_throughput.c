@@ -1,6 +1,6 @@
 /* Throughput batch: replica lo stesso wav B volte (B = 1,2,4,...,max-batch) e
  * misura l'aggregato audio-s/s della trascrizione batch weight-stationary
- * (mynah_transcribe_batch). Pensato per stimare quante richieste parallele
+ * (mynah_asr_transcribe_batch). Pensato per stimare quante richieste parallele
  * regge un backend GPU (make cuda / metal), ma gira anche su cpu.
  * Verifica anche che ogni item del batch produca il testo del run B=1.
  *
@@ -20,7 +20,7 @@
 
 #include "../src/audio.h"
 #include "../src/backend.h"
-#include "../src/mynah.h"
+#include "../src/mynah_asr.h"
 
 static double now_sec(void) {
     struct timespec ts;
@@ -30,7 +30,7 @@ static double now_sec(void) {
 
 /* --------------------------- modalità --threads (richieste concorrenti) */
 typedef struct {
-    mynah_model *m;
+    mynah_asr_model *m;
     const float *samples;
     size_t ns;
     const char *lang;
@@ -42,7 +42,7 @@ typedef struct {
 static void *thr_worker(void *p) {
     thr_arg *a = (thr_arg *)p;
     for (int r = 0; r < a->reps; r++) {
-        char *t = mynah_transcribe(a->m, a->samples, a->ns, a->lang, -1, NULL);
+        char *t = mynah_asr_transcribe(a->m, a->samples, a->ns, a->lang, -1, NULL);
         if (!t || strcmp(t, a->ref) != 0) a->mismatch = 1;
         free(t);
     }
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
     int max_batch = 32, runs = 2, max_threads = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) lang = argv[++i];
-        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_asr_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--max-batch") == 0 && i + 1 < argc) max_batch = atoi(argv[++i]);
         else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) max_threads = atoi(argv[++i]);
@@ -70,25 +70,25 @@ int main(int argc, char **argv) {
     if (max_batch < 1) max_batch = 1;
     if (runs < 1) runs = 1;
 
-    mynah_model *m = mynah_load(model_dir);
+    mynah_asr_model *m = mynah_asr_load(model_dir);
     if (!m) return 77;
 
     size_t ns;
     int sr;
-    float *samples = mynah_wav_load(wav, &ns, &sr);
-    if (!samples) { mynah_free(m); return 77; }
+    float *samples = mynah_asr_wav_load(wav, &ns, &sr);
+    if (!samples) { mynah_asr_free(m); return 77; }
     if (sr != 16000) {
         size_t n_rs;
-        float *rs = mynah_resample(samples, ns, sr, 16000, &n_rs);
+        float *rs = mynah_asr_resample(samples, ns, sr, 16000, &n_rs);
         free(samples);
-        if (!rs) { mynah_free(m); return 77; }
+        if (!rs) { mynah_asr_free(m); return 77; }
         samples = rs; ns = n_rs;
     }
     const double dur = (double)ns / 16000.0;
 
     /* riferimento B=1 (e warm-up: pesi su device, buffer allocati) */
-    char *ref = mynah_transcribe(m, samples, ns, lang, -1, NULL);
-    if (!ref) { free(samples); mynah_free(m); return 1; }
+    char *ref = mynah_asr_transcribe(m, samples, ns, lang, -1, NULL);
+    if (!ref) { free(samples); mynah_asr_free(m); return 1; }
 
     if (max_threads > 0) {
         /* N richieste concorrenti stile server, ognuna `runs` trascrizioni */
@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
             printf("%8d %10.3f %12.3f %14.1f\n", N, dt, dt / reqs, reqs * dur / dt);
             fflush(stdout);
         }
-        free(ref); free(samples); mynah_free(m);
+        free(ref); free(samples); mynah_asr_free(m);
         return rc;
     }
 
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
         for (int r = 0; r < runs; r++) {
             for (int b = 0; b < B; b++) out[b] = NULL;
             double t0 = now_sec();
-            if (mynah_transcribe_batch(m, sv, nv, B, lv, -1, out, NULL) != 0) {
+            if (mynah_asr_transcribe_batch(m, sv, nv, B, lv, -1, out, NULL) != 0) {
                 fprintf(stderr, "FAIL: transcribe_batch B=%d\n", B);
                 rc = 1;
                 break;
@@ -155,6 +155,6 @@ int main(int argc, char **argv) {
 
     free(ref); free(samples);
     free(sv); free(nv); free(lv); free(out);
-    mynah_free(m);
+    mynah_asr_free(m);
     return rc;
 }

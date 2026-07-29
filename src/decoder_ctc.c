@@ -2,17 +2,17 @@
 
 #include <stdlib.h>
 
-#ifdef MYNAH_BLAS_ACCELERATE
+#ifdef MYNAH_ASR_BLAS_ACCELERATE
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
 #endif
 
-int mynah_ctc_init(mynah_ctc *c, const mynah_safetensors *st) {
+int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st) {
     c->w = NULL;
     c->b = NULL;
-    const mynah_tensor *w = mynah_st_get(st, "ctc_head.weight");
-    const mynah_tensor *b = mynah_st_get(st, "ctc_head.bias");
+    const mynah_asr_tensor *w = mynah_asr_st_get(st, "ctc_head.weight");
+    const mynah_asr_tensor *b = mynah_asr_st_get(st, "ctc_head.bias");
     if (!w || !b) return -1;
     c->w = (const float *)w->data;      /* [V, d, 1] (conv1d k=1) == linear [V, d] */
     c->b = (const float *)b->data;
@@ -21,7 +21,7 @@ int mynah_ctc_init(mynah_ctc *c, const mynah_safetensors *st) {
     return 0;
 }
 
-int mynah_ctc_decode(const mynah_ctc *c, const float *enc_out, int T,
+int mynah_asr_ctc_decode(const mynah_asr_ctc *c, const float *enc_out, int T,
                      int *tokens, int *frames, int cap) {
     const int V = c->vocab, d = c->d_in, blank = V - 1;
     float *logits = malloc((size_t)T * (size_t)V * sizeof(float));
