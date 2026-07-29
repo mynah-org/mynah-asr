@@ -20,7 +20,7 @@ function main() {
   const m = new MynahASR(modelDir);
   try {
     const { text, words, lang: detected } = m.transcribe(wav, { lang, timestamps: true });
-    console.error(`[lang=${detected}]`);
+    console.error(`[lang=${detected || lang}]`);   // empty on models without LID
     console.log(text);
     for (const w of words) {
       console.log(`${w.t0.toFixed(2).padStart(6)} ${w.t1.toFixed(2).padStart(6)}  ${w.word}`);

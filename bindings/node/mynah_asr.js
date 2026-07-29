@@ -8,7 +8,7 @@
 //   const { MynahASR } = require('./mynah_asr');
 //   const m = new MynahASR('models/parakeet-tdt-0.6b-v3');
 //   console.log(m.transcribe('audio.wav'));
-//   const { text, words } = m.transcribe('audio.wav', { timestamps: true });
+//   const { text, words, lang } = m.transcribe('audio.wav', { timestamps: true });
 //   // translation (AED/Canary models): lang "src>tgt"
 //   console.log(new MynahASR('models/canary-180m-flash').transcribe('de.wav', { lang: 'de>en' }));
 //   m.close();

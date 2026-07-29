@@ -5,7 +5,7 @@ Prerequisite: `make shared` in the repo root (produces libmynah_asr.dylib/.so).
     from mynah_asr import MynahASR
     m = MynahASR("models/parakeet-tdt-0.6b-v3")
     print(m.transcribe("audio.wav"))
-    text, words = m.transcribe("audio.wav", timestamps=True)
+    text, words, lang = m.transcribe("audio.wav", timestamps=True)
     # translation (AED/Canary models):
     print(MynahASR("models/canary-180m-flash").transcribe("de.wav", lang="de>en"))
 """
@@ -114,8 +114,10 @@ class MynahASR:
     def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
                    timestamps: bool = False):
         """Transcribe a WAV (resampled automatically). lang also accepts "src>tgt"
-        for AED translation. Returns str, or (str, [(word, t0, t1), ...])
-        with timestamps=True."""
+        for AED translation. Returns str, or (str, [(word, t0, t1), ...], lang)
+        with timestamps=True — lang is the detected language, "" when the model
+        does not emit one (English-only models have no LID). Same shape as the
+        Node binding's { text, words, lang }."""
         samples, sr = _load_wav(wav)
         buf = (ctypes.c_float * len(samples)).from_buffer(samples)
         n = ctypes.c_size_t(len(samples))
@@ -143,7 +145,7 @@ class MynahASR:
         words = [(words_p[i].word.decode(), words_p[i].t0, words_p[i].t1)
                  for i in range(n_words.value)]
         self._lib.mynah_asr_words_free(words_p, n_words)
-        return text, words
+        return text, words, lang_out.value.decode()
 
 
 def version() -> str:

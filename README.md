@@ -254,7 +254,7 @@ Thin FFI wrappers over `libmynah_asr` (`make shared` first) — no build step in
 # Python — pure ctypes, zero dependencies: bindings/python/mynah_asr.py
 from mynah_asr import MynahASR
 m = MynahASR("models/parakeet-tdt-0.6b-v3")
-text, words = m.transcribe("audio.wav", timestamps=True)
+text, words, lang = m.transcribe("audio.wav", timestamps=True)
 MynahASR("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translation
 ```
 
@@ -262,7 +262,7 @@ MynahASR("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translati
 // Node — koffi FFI (npm i koffi): bindings/node/mynah_asr.js
 const { MynahASR } = require("./mynah_asr");
 const m = new MynahASR("models/parakeet-tdt-0.6b-v3");
-const { text, words } = m.transcribe("audio.wav", { timestamps: true });
+const { text, words, lang } = m.transcribe("audio.wav", { timestamps: true });
 ```
 
 ## C API (libmynah_asr)
