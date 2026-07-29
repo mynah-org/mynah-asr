@@ -9,7 +9,7 @@
 #include "weights.h"
 
 typedef struct {
-    const float *w, *b;    /* ctc_head [V, d, 1] + [V]; NULL se il modello non ha CTC */
+    const float *w, *b;    /* ctc_head [V, d, 1] + [V]; NULL when the model has no CTC */
     int vocab, d_in;       /* V include il blank (ultimo indice) */
 } mynah_asr_ctc;
 

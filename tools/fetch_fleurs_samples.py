@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Build samples/ from the FLEURS dataset (google/fleurs, CC-BY 4.0).
 
-Frasi PARALLELE tra le lingue (stesso id FLEURS = stessa frase tradotta):
-l'inglese fa da riferimento per valutare la speech translation di Canary.
+PARALLEL sentences across languages (same FLEURS id = same sentence, translated):
+the English one is the reference for scoring Canary's speech translation.
 I wav (16 kHz mono PCM16) vengono COMMITTATI nel repo: pochi e leggeri.
 
-Uso: uv run python fetch_fleurs_samples.py            # dalla dir tools/
+Usage: uv run python fetch_fleurs_samples.py          # from the tools/ dir
 Riscarica i tsv, estrae in streaming SOLO i wav scelti dai dev.tar.gz
 (--fast-read), scrive samples/<lang>/fleurs_<id>.wav + manifest.json.
 """
@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = "https://huggingface.co/datasets/google/fleurs/resolve/main/data"
 CACHE = Path("/tmp/fleurs")
 
-# lingua mynah -> config FLEURS. Le prime 5 coprono Canary (traduzione) e i
+# mynah language -> FLEURS config. The first 5 cover Canary (translation) and the
 # historical fixtures; the others exercise Nemotron's 40 locales and v3's 25 EU
 # languages (alphabets included: Cyrillic, Japanese).
 LANGS = {"it": "it_it", "en": "en_us", "de": "de_de", "es": "es_419", "fr": "fr_fr",
@@ -74,8 +74,8 @@ def main() -> None:
     manifest: dict = {
         "source": "FLEURS (google/fleurs) — Conneau et al., CC-BY 4.0",
         "url": "https://huggingface.co/datasets/google/fleurs",
-        "note": "frasi parallele tra lingue: stesso id = stessa frase; l'inglese "
-                "è il riferimento per la speech translation",
+        "note": "sentences parallel across languages: same id = same sentence; English "
+                "is the reference for speech translation",
         "samples": [],
     }
     texts = {lang: tsv_rows(cfg) for lang, cfg in LANGS.items()}
@@ -89,7 +89,7 @@ def main() -> None:
         for i in IDS:
             src = CACHE / cfg / "dev" / rows[i]["file"]
             dst = samples_dir / lang / f"fleurs_{i}.wav"
-            # FLEURS distribuisce float32: riscrittura in PCM16 (metà peso,
+            # FLEURS ships float32: rewritten as PCM16 (half the size,
             # universal support — the runtime reads WAV PCM16)
             import soundfile as sf
             audio, sr = sf.read(src, dtype="float32")

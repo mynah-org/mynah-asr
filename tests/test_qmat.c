@@ -36,7 +36,7 @@ static int check(const char *name, int qtype, int n, int k, int T, double tol) {
     for (int i = 0; i < n * k; i++) w[i] = frand();
     for (int i = 0; i < T * k; i++) x[i] = frand();
 
-    for (int t = 0; t < T; t++)          /* riferimento f32 in double */
+    for (int t = 0; t < T; t++)          /* f32 reference computed in double */
         for (int i = 0; i < n; i++) {
             double acc = 0.0;
             for (int j = 0; j < k; j++)

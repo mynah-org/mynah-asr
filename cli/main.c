@@ -194,7 +194,7 @@ static int cmd_quantize(int argc, char **argv) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);
     mynah_asr_safetensors *st = mynah_asr_st_open_quiet(path);
-    if (!st) {   /* container alternativo GGUF (stesso fallback di mynah_asr_load) */
+    if (!st) {   /* alternative GGUF container (same fallback as mynah_asr_load) */
         snprintf(path, sizeof(path), "%s/model.gguf", model_dir);
         st = mynah_asr_st_open_quiet(path);
     }

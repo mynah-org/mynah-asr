@@ -67,7 +67,7 @@ else
     echo "server translate SKIP (canary-180m-flash assente)"
 fi
 
-# 4 richieste concorrenti (wait SOLO sulle curl: wait nudo aspetterebbe anche il server)
+# 4 concurrent requests (wait ONLY on the curls: a bare wait would also wait on the server)
 CURL_PIDS=""
 for i in 1 2 3 4; do
     curl -s -F file=@tests/audio/test_it.wav -F language=it-IT \

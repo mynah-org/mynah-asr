@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Compare two directories of .npy dumps with per-stage tolerances (M0.4).
 
-Casi d'uso: diffare i golden dell'oracolo tra versioni del converter/oracolo
-(rigenera in una dir nuova e confronta con la vecchia), o qualunque coppia di
+Use cases: diffing the oracle goldens across converter/oracle versions
+(regenerate into a new dir and compare with the old one), or any pair of
 dump omogenei (stessi nomi file). La metrica segue i test C: errore assoluto
 massimo SCALATO per max|ref| dello stadio (err_rel = max|a-b| / max|ref|).
 
-Uso: uv run python -m eval.compare <dir_ref> <dir_test> [--tol nome=1e-4 ...]
-Exit: 0 tutti gli stadi entro tolleranza, 1 altrimenti, 77 dir vuote/assenti.
+Usage: uv run python -m eval.compare <dir_ref> <dir_test> [--tol nome=1e-4 ...]
+Exit: 0 every stage within tolerance, 1 otherwise, 77 empty/missing dirs.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def main() -> int:
 
     fail = 0
     print(f"{'stadio':16} {'shape':>16} {'max|d|':>10} {'mean|d|':>10} "
-          f"{'err_rel':>10} {'tol':>9}  esito")
+          f"{'err_rel':>10} {'tol':>9}  result")
     for ref_path in refs:
         name = ref_path.stem
         test_path = args.dir_test / ref_path.name

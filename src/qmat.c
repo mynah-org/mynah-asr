@@ -381,7 +381,7 @@ int mynah_asr_set_caps(const char *name) {
     g_x86_caps = want;
     return g_x86_caps;
 #else
-    (void)name;   /* ARM: NEON/SDOT sono compile-time (Apple ha sempre dotprod) */
+    (void)name;   /* ARM: NEON/SDOT are compile-time (Apple always has dotprod) */
     return 0;
 #endif
 }

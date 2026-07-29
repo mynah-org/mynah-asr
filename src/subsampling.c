@@ -216,7 +216,7 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
     float *bbuf = malloc((size_t)C * (size_t)To_max * (size_t)Fo_max * sizeof(float));
     if (!a || !bbuf) { free(a); free(bbuf); return NULL; }
 
-    /* padding tempo/freq: causale (2,1) o simmetrico 'same' (1,1) */
+    /* time/freq padding: causal (2,1) or symmetric 'same' (1,1) */
     const int pl = ss->causal ? 2 : 1, pr = 1;
 
     /* stadio 0: conv piena 1 -> C su [1, T, n_mels] */
@@ -294,7 +294,7 @@ static void stream_stage(const float *x, int C_in, int T, int F, int first, int 
                          float *cache, const float *w, const float *b, int C_out,
                          int depthwise, float *out, int *To_, int *Fo_) {
     const int lp = first ? 2 : 1; /* cache(1) + init_pad(1) al primo chunk */
-    const int rp = last ? 1 : 0;  /* ultimo chunk: right-pad causale come offline */
+    const int rp = last ? 1 : 0;  /* last chunk: causal right-pad, as offline */
     const int Tp = T + lp + rp;
     float *xp = malloc((size_t)C_in * (size_t)Tp * (size_t)F * sizeof(float));
     if (!xp) { *To_ = 0; *Fo_ = 0; return; }

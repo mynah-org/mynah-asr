@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
         if (d > max_diff) max_diff = d;
         sum_diff += d;
     }
-    double tol = 5e-4; /* tolleranza feature vs riferimento (prior-art §B.4) */
+    double tol = 5e-4; /* feature tolerance vs the reference (prior art §B.4) */
     printf("mel parity: T=%d valid=%d n_mels=%d | max|d|=%.3e mean|d|=%.3e (tol %.0e)\n",
            T, valid, cfg.n_mels, max_diff, sum_diff / (double)n_c, tol);
 

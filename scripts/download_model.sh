@@ -86,7 +86,7 @@ if [[ -z "$ENTRY" ]]; then
 fi
 
 IFS='|' read -r KEY REPO_ID MODE SIZE DESC <<<"$ENTRY"
-NAME="${REPO_ID##*/}"   # basename del repo (vale per nvidia/* e per i gguf community)
+NAME="${REPO_ID##*/}"   # repo basename (holds for nvidia/* and for the community ggufs)
 DEST="${DEST:-models/$NAME}"
 BASE="https://huggingface.co/$REPO_ID/resolve/main"
 
@@ -116,7 +116,7 @@ if [[ "$MODE" == hf ]]; then
   for f in "${HF_REQUIRED[@]}"; do fetch "$f" yes; done
   for f in "${HF_OPTIONAL[@]}"; do fetch "$f" no;  done
 elif [[ "$MODE" == gguf ]]; then
-  # naming handy-computer: <basename-senza-suffisso-gguf>-Q4_K_M.gguf
+  # handy-computer naming: <basename-without-gguf-suffix>-Q4_K_M.gguf
   fetch "${NAME%-gguf}-Q4_K_M.gguf" yes
 else
   fetch "$NAME.nemo" yes

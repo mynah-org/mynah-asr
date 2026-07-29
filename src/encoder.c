@@ -764,12 +764,12 @@ static void update_kv_cache(float *cache, const float *fresh, int valid, int Q,
                             int left, int d) {
     const int total = valid + Q;
     const int keep = total < left ? total : left;
-    const int from_old = keep - Q > 0 ? keep - Q : 0;      /* righe vecchie da tenere */
-    const int drop_old = valid - from_old;                  /* righe vecchie da scartare */
+    const int from_old = keep - Q > 0 ? keep - Q : 0;      /* old rows to keep */
+    const int drop_old = valid - from_old;                  /* old rows to drop */
     if (from_old > 0 && drop_old > 0)
         memmove(cache, cache + (size_t)drop_old * (size_t)d,
                 (size_t)from_old * (size_t)d * sizeof(float));
-    const int fresh_keep = keep - from_old;                 /* righe nuove da tenere (<= Q) */
+    const int fresh_keep = keep - from_old;                 /* new rows to keep (<= Q) */
     memcpy(cache + (size_t)from_old * (size_t)d,
            fresh + (size_t)(Q - fresh_keep) * (size_t)d,
            (size_t)fresh_keep * (size_t)d * sizeof(float));

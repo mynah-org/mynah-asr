@@ -21,10 +21,10 @@ extern "C" {
 /* Incremental transcription result (streaming and offline).
  * text is UTF-8 and only valid for the duration of the callback. */
 typedef struct {
-    const char *text;      /* testo del segmento/parziale                   */
+    const char *text;      /* text of the segment/partial                   */
     double      t0, t1;    /* finestra temporale in secondi (se disponibile) */
     bool        is_final;  /* false = partial (può cambiare), true = commit  */
-    const char *lang;      /* tag lingua rilevata, NULL se non disponibile   */
+    const char *lang;      /* detected language tag, NULL when unavailable   */
 } mynah_asr_result;
 
 typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata);
@@ -83,7 +83,7 @@ char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_sa
 /* A word with its time window (from the greedy emission encoder frames:
  * resolution = 1 encoder frame, typically 80 ms). */
 typedef struct {
-    char  *word;           /* UTF-8, senza marcatori (malloc) */
+    char  *word;           /* UTF-8, markers stripped (malloc'd) */
     double t0, t1;         /* secondi dall'inizio dell'audio   */
 } mynah_asr_word;
 

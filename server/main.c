@@ -50,7 +50,7 @@ typedef struct trx_job {
     int lookahead;
     char *text;                 /* risultato (malloc) */
     char lang_out[16];
-    mynah_asr_word *words;          /* timestamp per parola (malloc, può essere NULL) */
+    mynah_asr_word *words;          /* per-word timestamps (malloc'd, may be NULL) */
     int n_words;
     int done;
     pthread_mutex_t mu;
@@ -240,7 +240,7 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
                                            (const uint8_t *)sep, sep_len);
         if (!next) break;
         size_t data_len = (size_t)(next - data);
-        if (data_len >= 2) data_len -= 2;          /* \r\n prima del boundary */
+        if (data_len >= 2) data_len -= 2;          /* the \r\n before the boundary */
 
         char hdrs[512] = {0};
         size_t hl = (size_t)(hdr_end - part);
@@ -310,7 +310,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     size_t n_samples;
     int sr;
     float *samples = mynah_asr_wav_parse(f.file, f.file_len, &n_samples, &sr);
-    if (!samples) { send_error(fd, 400, "WAV non valido (serve PCM16)"); return; }
+    if (!samples) { send_error(fd, 400, "invalid WAV (PCM16 required)"); return; }
     if (sr != 16000) {
         size_t n2;
         float *rs = mynah_asr_resample(samples, n_samples, sr, 16000, &n2);
@@ -359,7 +359,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
                                               ? "translate" : "transcribe");
             cJSON_AddStringToObject(j, "language", lang_out[0] ? lang_out : src_lang);
             cJSON_AddNumberToObject(j, "duration", duration);
-            if (words) {   /* timestamp per parola (anche dal batch scheduler) */
+            if (words) {   /* per-word timestamps (from the batch scheduler too) */
                 cJSON *jw = cJSON_AddArrayToObject(j, "words");
                 for (int i = 0; i < n_words; i++) {
                     cJSON *w = cJSON_CreateObject();

@@ -1,5 +1,5 @@
 /* Parità subsampling: C (f32+BLAS) vs oracolo numpy (f64).
- * Uso: test_subsampling <model_dir> <file.wav> <golden_dir>
+ * Usage: test_subsampling <model_dir> <file.wav> <golden_dir>
  * Exit: 0 ok, 1 mismatch, 77 skip. */
 #include <math.h>
 #include <stdio.h>

@@ -1,4 +1,4 @@
-"""Log-mel NeMo in numpy puro — replica esatta degli extractor HF
+"""NeMo log-mel in pure numpy — an exact replica of the HF extractors
 (reference/transformers-nemotron_asr_streaming/ e reference/transformers-parakeet/)
 con torch.stft(center=True, pad_mode="constant") e finestra Hann simmetrica.
 
@@ -23,9 +23,9 @@ def log_mel(
     preemphasis: float = 0.97,
     normalize: str = "NA",
 ) -> tuple[np.ndarray, int]:
-    """Ritorna (features [T, n_mels] float32, valid_len).
+    """Returns (features [T, n_mels] float32, valid_len).
 
-    T = 1 + S//hop (center=True); i frame >= valid_len (= S//hop) sono azzerati,
+    T = 1 + S//hop (center=True); frames >= valid_len (= S//hop) are zeroed,
     come fa il feature extractor HF.
     """
     x = audio.astype(np.float64)

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Import a third-party GGUF (parakeet.cpp ecosystem) into a model directory
-mynah completa — SENZA torch e senza scaricare il .nemo: dal solo file GGUF
-genera mynah.json (dai metadata stt.*), tokens.json (tokenizer embedded),
-mel_filters.safetensors (calcolate) e model.gguf (tensori RINOMINATI nel
-naming HF-verbatim del runtime; payload quantizzati copiati verbatim).
+"""Import a third-party GGUF (parakeet.cpp ecosystem) into a complete mynah
+model directory — WITHOUT torch and without downloading the .nemo: from the GGUF
+file alone it generates mynah.json (from the stt.* metadata), tokens.json (the
+embedded tokenizer), mel_filters.safetensors (computed) and model.gguf (tensors
+RENAMED to the runtime's HF-verbatim naming; quantized payloads copied verbatim).
 
-Uso: uv run python import_gguf.py <file.gguf> --out <model_dir>
+Usage: uv run python import_gguf.py <file.gguf> --out <model_dir>
 
-v1: architettura "parakeet" con head TDT (es. handy-computer/parakeet-*-gguf).
-La config resta autorità di mynah.json (regola repo): i metadata GGUF vengono
-tradotti una volta all'import, il runtime non li legge mai direttamente.
+v1: the "parakeet" architecture with a TDT head (e.g. handy-computer/parakeet-*-gguf).
+mynah.json stays the authority on the config (repo rule): the GGUF metadata are
+translated once at import; the runtime never reads them directly.
 """
 
 from __future__ import annotations

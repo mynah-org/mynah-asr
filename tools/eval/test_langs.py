@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Multilingual suite: transcribes the per-language samples (tests/audio/langs/) with
 `mynah-asr transcribe --lang auto` e verifica (a) language detection, (b) CER vs testo
-di riferimento (normalizzato: lowercase, senza punteggiatura).
+reference text (normalized: lowercase, no punctuation).
 
-Uso: uv run python -m eval.test_langs [--cer-max 0.3] [--mynah-asr ../mynah-asr] [--model DIR]
+Usage: uv run python -m eval.test_langs [--cer-max 0.3] [--mynah-asr ../mynah-asr] [--model DIR]
                                       [--quant int8|int4]
---quant: regression della quantizzazione — stessa suite sul checkpoint
+--quant: quantization regression — the same suite over the pre-quantized
 pre-quantizzato (richiede model.int8/int4.safetensors da `mynah-asr quantize`).
-Exit: 0 tutte le lingue ok, 1 fallimenti, 77 skip (sample o modello assenti).
+Exit: 0 every language ok, 1 failures, 77 skip (samples or model missing).
 """
 
 from __future__ import annotations
@@ -26,13 +26,13 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 # fine-tuning). Reported as WEAK; they do not count as suite failures.
 ADAPTATION_TIER = {"el-GR", "lt-LT", "lv-LV", "mt-MT", "sl-SI", "he-IL", "th-TH", "nn-NO"}
 
-# Varianti regionali (prompt id diversi, stessa lingua): testate riusando i
+# Regional variants (different prompt ids, same language): tested by reusing the
 # samples of the base language with the variant's prompt. 40 locales = 36 languages.
 VARIANTS = {"en-GB": "en-US", "es-US": "es-ES", "fr-CA": "fr-FR", "pt-PT": "pt-BR"}
 
 
 def normalize(s: str) -> str:
-    s = re.sub(r"<[^<>]{1,12}>", " ", s)   # tag lingua spelled-out dal modello
+    s = re.sub(r"<[^<>]{1,12}>", " ", s)   # language tag spelled out by the model
     s = unicodedata.normalize("NFKC", s).lower()
     s = "".join(c for c in s if not unicodedata.category(c).startswith("P"))
     return re.sub(r"\s+", " ", s).strip()
@@ -58,20 +58,20 @@ def main() -> None:
     ap.add_argument("--model", default=str(ROOT / "models/nemotron-3.5-asr-streaming-0.6b"))
     ap.add_argument("--quant", choices=["int8", "int4"], default=None)
     ap.add_argument("--only", default=None,
-                    help="filtra i locale (csv, es. it-IT,de-DE) — per i modelli "
-                         "che supportano un sottoinsieme di lingue; implica tier strict")
+                    help="filter the locales (csv, e.g. it-IT,de-DE) — for models "
+                         "supporting a subset of the languages; implies strict tier")
     args = ap.parse_args()
 
     manifest_path = ROOT / "tests/audio/langs/manifest.json"
     if not manifest_path.exists() or not Path(args.model, "mynah.json").exists():
-        print("SKIP: sample (tools/fetch_lang_samples.py) o modello assenti")
+        print("SKIP: samples (tools/fetch_lang_samples.py) or model missing")
         sys.exit(77)
     if args.quant and not Path(args.model, f"model.{args.quant}.safetensors").exists():
         print(f"SKIP: checkpoint {args.quant} assente (mynah-asr quantize --quant {args.quant})")
         sys.exit(77)
     manifest = json.loads(manifest_path.read_text())
     model_cfg = json.loads(Path(args.model, "mynah.json").read_text())
-    has_prompt = "prompt" in model_cfg   # senza prompt (Parakeet): --lang ignorato, LID implicita
+    has_prompt = "prompt" in model_cfg   # without a prompt (Parakeet): --lang ignored, implicit LID
     only = set(args.only.split(",")) if args.only else None
 
     def transcribe(wav: Path, lang: str) -> tuple[str, str]:
@@ -87,19 +87,19 @@ def main() -> None:
     # model may fail to detect the language and emit nothing: known behaviour).
     # regional variants: same samples as the base language, the variant's prompt
     jobs = dict(sorted(manifest.items()))
-    if has_prompt:   # le varianti differiscono solo per il prompt: senza prompt sono doppioni
+    if has_prompt:   # the variants differ only by prompt: without one they are duplicates
         for variant, base in VARIANTS.items():
             if base in manifest:
                 jobs[variant] = manifest[base]
     if only:
         missing = only - set(jobs)
         if missing:
-            print(f"ATTENZIONE: locale richiesti senza sample: {sorted(missing)}")
+            print(f"WARNING: requested locales without samples: {sorted(missing)}")
         jobs = {k: v for k, v in jobs.items() if k in only}
 
     n_lang_ok = n_lang_fail = 0
     failures = []
-    print(f"{'locale':8} {'sample':>6} {'CER ok':>7} {'CER medio':>10} {'auto-lang':>10}  esito")
+    print(f"{'locale':8} {'sample':>6} {'CER ok':>7} {'mean CER':>10} {'auto-lang':>10}  result")
     for locale, entries in jobs.items():
         cers, auto_hits = [], 0
         for e in entries:
@@ -117,23 +117,23 @@ def main() -> None:
                                 f"    ref: {e['text']}\n    hyp: {hyp}")
         n_ok = sum(1 for c in cers if c <= args.cer_max)
         avg = sum(cers) / len(cers)
-        ok = n_ok * 2 > len(cers)   # maggioranza dei sample sotto soglia
+        ok = n_ok * 2 > len(cers)   # a majority of the samples below threshold
         if ok:
-            esito = "OK"
+            result = "OK"
             n_lang_ok += 1
         elif locale in ADAPTATION_TIER and not only:
-            esito = "WEAK (tier adattamento: atteso)"
+            result = "WEAK (adaptation tier: expected)"
         else:
-            esito = "FAIL"
+            result = "FAIL"
             n_lang_fail += 1
         auto_col = f"{auto_hits}/{len(entries)}" if has_prompt else "n/a"
         print(f"{locale:8} {len(entries):>6} {n_ok}/{len(cers):>5} {avg:>10.3f} "
-              f"{auto_col:>10}  {esito}")
+              f"{auto_col:>10}  {result}")
 
-    print(f"\n[{args.quant or 'f32'}] {n_lang_ok} lingue OK, {n_lang_fail} FAIL "
-          f"(soglia CER {args.cer_max}, criterio: maggioranza)")
+    print(f"\n[{args.quant or 'f32'}] {n_lang_ok} languages OK, {n_lang_fail} FAIL "
+          f"(CER threshold {args.cer_max}, criterion: majority)")
     if failures:
-        print("\nDettaglio sample sopra soglia:")
+        print("\nSamples above threshold, in detail:")
         print("\n".join(failures))
     sys.exit(0 if n_lang_fail == 0 else 1)
 

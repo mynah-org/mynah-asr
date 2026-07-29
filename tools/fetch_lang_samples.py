@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Download real per-language audio samples from Tatoeba (short CC-audio sentences).
 
-Per ogni lingua supportata da Nemotron 3.5 prende fino a N frasi con audio,
+For every language Nemotron 3.5 supports it takes up to N sentences with audio,
 le converte a WAV 16 kHz mono (ffmpeg) e scrive un manifest con testo di
-riferimento e attribuzione. I sample NON vanno committati (solo fixture locali,
+reference and attribution. The samples must NOT be committed (local fixtures only,
 licenze audio Tatoeba variabili): tests/audio/langs/ è in .gitignore.
 
-Uso: uv run python fetch_lang_samples.py [n_per_lingua=3]
+Usage: uv run python fetch_lang_samples.py [n_per_language=3]
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def main() -> None:
         except Exception:
             data = []   # nessun continue: lascia lavorare il fallback FLEURS
 
-        # CJK/Thai: frasi brevi in caratteri ma dense — soglia ridotta
+        # CJK/Thai: short in characters but dense — lowered threshold
         min_len = 4 if code in {"jpn", "cmn", "kor", "tha"} else 12
         entries = []
         for a in data:
@@ -158,7 +158,7 @@ def main() -> None:
         json.dumps(manifest, ensure_ascii=False, indent=1))
     print("\n".join(report))
     total = sum(len(v) for v in manifest.values())
-    print(f"\nTotale: {total} sample in {len(manifest)} lingue -> {OUT_DIR}")
+    print(f"\nTotal: {total} samples across {len(manifest)} languages -> {OUT_DIR}")
 
 
 if __name__ == "__main__":

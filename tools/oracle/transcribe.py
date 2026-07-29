@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline transcription with the numpy oracle (slow: it is a reference, not a runtime).
 
-Uso:
+Usage:
   uv run python -m oracle.transcribe <model_dir> <file.wav> [--lang it-IT] [--lookahead N]
                                      [--dump-dir DIR]
 """
@@ -26,11 +26,11 @@ def main() -> None:
     ap.add_argument("wav")
     ap.add_argument("--lang", default="auto")
     ap.add_argument("--lookahead", type=int, default=None, help="right context (0|1|3|6|13)")
-    ap.add_argument("--dump-dir", default=None, help="salva attivazioni intermedie .npy")
+    ap.add_argument("--dump-dir", default=None, help="dump the intermediate activations as .npy")
     ap.add_argument("--decoder", choices=["default", "ctc"], default="default",
-                    help="ctc: head ausiliaria dei modelli hybrid (tdt_ctc)")
+                    help="ctc: the auxiliary head of hybrid models (tdt_ctc)")
     ap.add_argument("--target-lang", default=None,
-                    help="AED (Canary): lingua di uscita (≠ --lang = traduzione)")
+                    help="AED (Canary): output language (different from --lang = translation)")
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)

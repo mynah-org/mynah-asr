@@ -114,7 +114,7 @@ class MynahASR:
     def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
                    timestamps: bool = False):
         """Transcribe a WAV (resampled automatically). lang also accepts "src>tgt"
-        per la traduzione AED. Ritorna str, o (str, [(word, t0, t1), ...])
+        for AED translation. Returns str, or (str, [(word, t0, t1), ...])
         with timestamps=True."""
         samples, sr = _load_wav(wav)
         buf = (ctypes.c_float * len(samples)).from_buffer(samples)

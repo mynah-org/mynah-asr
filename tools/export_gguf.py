@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Esporta i pesi convertiti (model.safetensors, f32) in un container GGUF v3.
+"""Export the converted weights (model.safetensors, f32) into a GGUF v3 container.
 
-Il GGUF trasporta SOLO i pesi: mynah.json, mel_filters e tokens restano gli
-stessi — il runtime li legge dalla dir del modello come sempre. Uso:
+GGUF carries ONLY the weights: mynah.json, mel_filters and tokens stay the same
+— the runtime reads them from the model directory as always. Usage:
 
     uv run python export_gguf.py ../models/parakeet-tdt_ctc-110m [--dtype q8_0]
 
---dtype f32   (default) round-trip bit-esatto, stessa RAM
---dtype f16 | q8_0 | q4_0   file più piccolo; i tensori con l'ultima dim non
-        multipla di 32 (bias, norm) restano f32, come fa llama.cpp.
-Convenzioni ggml: dims invertite (ne[0] = la più veloce), alignment 32.
+--dtype f32   (default) bit-exact round-trip, same RAM
+--dtype f16 | q8_0 | q4_0   smaller file; tensors whose last dim is not a
+        multiple of 32 (bias, norm) stay f32, as llama.cpp does.
+ggml conventions: reversed dims (ne[0] = the fastest one), alignment 32.
 """
 import argparse
 import json
@@ -61,14 +61,14 @@ def quantize_q4_0(x: np.ndarray) -> bytes:
 
 def quantize_q4_k(x: np.ndarray) -> bytes:
     """Super-blocchi da 256 (8 sotto-blocchi da 32): x = d*sc*q - dmin*m.
-    Quantizzatore semplice non-iterativo (ggml usa una ricerca più fine): basta
+    A simple non-iterative quantizer (ggml uses a finer search): enough
     to validate the C dequant layout against the oracle rule."""
     blocks = x.reshape(-1, 8, 32).astype(np.float64)
     lo = np.minimum(blocks.min(axis=2), 0.0)              # m_j >= 0
     hi = np.maximum(blocks.max(axis=2), 0.0)
     scale = (hi - lo) / 15.0                              # per sotto-blocco
     mins = -lo
-    d = scale.max(axis=1) / 63.0                          # globali del super-blocco
+    d = scale.max(axis=1) / 63.0                          # super-block globals
     dmin = mins.max(axis=1) / 63.0
     d16 = d.astype(np.float16).astype(np.float64)         # arrotonda come su file
     dmin16 = dmin.astype(np.float16).astype(np.float64)
@@ -84,7 +84,7 @@ def quantize_q4_k(x: np.ndarray) -> bytes:
     out = bytearray()
     for b in range(blocks.shape[0]):
         scales = bytearray(12)
-        for j in range(4):                                # layout ggml dei 6-bit
+        for j in range(4):                                # ggml 6-bit layout
             scales[j] = sc6[b, j] | ((sc6[b, j + 4] >> 4) << 6)
             scales[j + 4] = mn6[b, j] | ((mn6[b, j + 4] >> 4) << 6)
             scales[j + 8] = (sc6[b, j + 4] & 0x0F) | ((mn6[b, j + 4] & 0x0F) << 4)

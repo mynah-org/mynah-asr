@@ -92,7 +92,7 @@ extern void openblas_set_num_threads(int) __attribute__((weak));
 
 static void blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    if (getenv("OPENBLAS_NUM_THREADS")) return;   /* scelta esplicita dell'utente */
+    if (getenv("OPENBLAS_NUM_THREADS")) return;   /* an explicit choice by the user */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
 #else
     (void)n;
@@ -128,7 +128,7 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     g_gen++;
     pthread_cond_broadcast(&g_job_cv);
     pthread_mutex_unlock(&g_job_mu);
-    pf_run(&st);                  /* il chiamante lavora anche lui */
+    pf_run(&st);                  /* the caller does its share too */
     pthread_mutex_lock(&g_job_mu);
     while (g_pending > 0) pthread_cond_wait(&g_done_cv, &g_job_mu);
     pthread_mutex_unlock(&g_job_mu);

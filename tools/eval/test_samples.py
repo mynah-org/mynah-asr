@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """QUALITY test on real audio (samples/ — FLEURS, CC-BY 4.0).
 
-Per ogni modello presente e ogni sample applicabile:
-- ASR: CER normalizzato vs trascrizione di riferimento (soglia --cer-max)
-- Speech translation (modelli AED/Canary): X->en vs riferimento inglese
-  PARALLELO (stessa frase FLEURS) + en->de vs riferimento tedesco, con
-  word-overlap sulle parole di contenuto (soglia --overlap-min: le
+For every model present and every applicable sample:
+- ASR: normalized CER against the reference transcription (--cer-max threshold)
+- Speech translation (AED/Canary models): X->en against the English reference
+  PARALLEL to it (same FLEURS sentence) + en->de against the German reference, with
+  word overlap over the content words (--overlap-min threshold: the
   traduzioni legittime variano, il CER sarebbe ingiusto)
 - Backend: cpu e, su macOS, metal (--backend per restringere; "cuda" per
   la validazione Linux futura)
 
-Exit: 0 ok, 1 fail, 77 skip (samples o modelli assenti).
-Uso: uv run python -m eval.test_samples [--models a,b] [--backend cpu]
+Exit: 0 ok, 1 fail, 77 skip (samples or models missing).
+Usage: uv run python -m eval.test_samples [--models a,b] [--backend cpu]
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from eval.test_langs import cer, normalize
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
-# modello -> (lingue ASR coperte dai sample, formato tag lingua)
+# model -> (ASR languages covered by the samples, language tag format)
 # nemotron: 40 locales (11 with samples here); v3: 25 EU languages (no ja)
 MODELS = {
     "nemotron-3.5-asr-streaming-0.6b": {
@@ -86,7 +86,7 @@ def main() -> None:
     models = [m for m in args.models.split(",")
               if (ROOT / "models" / m / "mynah.json").exists()]
     if not models:
-        print("SKIP: nessun modello presente")
+        print("SKIP: no model present")
         sys.exit(77)
     backends = [args.backend] if args.backend else (
         ["cpu", "metal"] if platform.system() == "Darwin" else ["cpu"])
@@ -116,7 +116,7 @@ def main() -> None:
                         print(f"     ref: {s['text']}\n     hyp: {hyp}")
                         fails += 1
             if is_aed:
-                # traduzione X->en (riferimento = frase inglese parallela)
+                # X->en translation (reference = the parallel English sentence)
                 for lang in ("de", "es", "fr"):
                     for s in by_lang.get(lang, []):
                         hyp = run(model, s["file"], lang, backend, target="en")
@@ -127,7 +127,7 @@ def main() -> None:
                         if not ok:
                             print(f"     ref: {s['en_ref']}\n     hyp: {hyp}")
                             fails += 1
-                # en->de (riferimento = frase tedesca parallela)
+                # en->de (reference = the parallel German sentence)
                 de_by_id = {x["fleurs_id"]: x for x in by_lang.get("de", [])}
                 for s in by_lang.get("en", []):
                     ref = de_by_id.get(s["fleurs_id"])
@@ -198,7 +198,7 @@ def main() -> None:
             ok = (len(rows) > 50 and t0s == sorted(t0s)
                   and float(rows[-1][1]) <= s["duration_sec"] + 1.0)
             print(f"{'OK ' if ok else 'FAIL'} ts   parakeet-tdt-0.6b-v3 "
-                  f"{s['file']} {len(rows)} parole, monotoni, entro durata")
+                  f"{s['file']} {len(rows)} words, monotonic, within duration")
             fails += 0 if ok else 1
 
         if "nemotron-3.5-asr-streaming-0.6b" in models:
@@ -214,7 +214,7 @@ def main() -> None:
                   f"{s['file']} CER {c:.3f}")
             fails += 0 if ok else 1
 
-    print(f"\n{'FAIL' if fails else 'OK'}: {fails} problemi su {len(models)} modelli, "
+    print(f"\n{'FAIL' if fails else 'OK'}: {fails} problems across {len(models)} models, "
           f"backend {backends}")
     sys.exit(1 if fails else 0)
 

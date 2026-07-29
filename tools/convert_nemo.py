@@ -53,9 +53,9 @@ def mel_to_hz_slaney(m: np.ndarray) -> np.ndarray:
 def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sample_rate: int) -> np.ndarray:
     """Clone of torchaudio.functional.melscale_fbanks(norm='slaney', mel_scale='slaney').
 
-    Identica alla costruzione NeMo (librosa htk=False, norm slaney); vedi
+    Identical to the NeMo construction (librosa htk=False, norm slaney); see
     docs/prior-art.md §B.2 (onnx-asr la valida vs NeMo con atol 5e-7).
-    Ritorna [n_freqs, n_mels] float64.
+    Returns [n_freqs, n_mels] float64.
     """
     all_freqs = np.linspace(0.0, sample_rate // 2, n_freqs, dtype=np.float64)
     m_pts = mel_to_hz_slaney(np.linspace(hz_to_mel_slaney(f_min), hz_to_mel_slaney(f_max), n_mels + 2))
@@ -73,9 +73,9 @@ def load_pieces(model_dir: Path, vocab_size: int, blank_id: int, blank_token: st
     """Extract the id -> piece array from tokenizer.json (HF tokenizers format).
 
     Nota (verificato sul checkpoint): il tokenizer.json elenca <pad>=13087 e <blank>=13088,
-    ma nello spazio di output del modello (joint = vocab_size=13088 logit, blank_as_pad)
+    but in the model's output space (joint = vocab_size=13088 logits, blank_as_pad)
     l'id 13087 È il blank/pad e 13088 non esiste. Normalizziamo: pieces[blank_id]=blank_token,
-    gli added token oltre vocab_size vengono ignorati.
+    added tokens beyond vocab_size are ignored.
     """
     tok = json.loads((model_dir / "tokenizer.json").read_text())
     pieces: list[str | None] = [None] * vocab_size
@@ -86,7 +86,7 @@ def load_pieces(model_dir: Path, vocab_size: int, blank_id: int, blank_token: st
             pieces[added["id"]] = added["content"]
     pieces[blank_id] = blank_token
     missing = [i for i, p in enumerate(pieces) if p is None]
-    assert not missing, f"{len(missing)} id senza piece (primi: {missing[:5]})"
+    assert not missing, f"{len(missing)} ids without a piece (first: {missing[:5]})"
     return pieces  # type: ignore[return-value]
 
 
@@ -165,7 +165,7 @@ def build_nemotron(model_dir: Path, cfg: dict, proc: dict) -> dict:
 
 def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
     """parakeet-tdt (offline, non-causal, batch_norm conv, TDT decoder).
-    Riferimento numerico: docs/parakeet-tdt-arch.md + reference/transformers-parakeet/."""
+    Numeric reference: docs/parakeet-tdt-arch.md + reference/transformers-parakeet/."""
     enc = cfg["encoder_config"]
     fe = proc["feature_extractor"]
 
@@ -184,7 +184,7 @@ def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
             "ffn_dim": enc["intermediate_size"],
             "conv_kernel": enc["conv_kernel_size"],
             "conv_norm": "batch_norm",                # foldata in scale+shift al load
-            "subsampling": "dw_striding",             # NON causale: padding simmetrico
+            "subsampling": "dw_striding",             # NOT causal: symmetric padding
             "subsampling_factor": enc["subsampling_factor"],
             "subsampling_conv_channels": enc["subsampling_conv_channels"],
             "use_bias": enc["attention_bias"],
@@ -204,7 +204,7 @@ def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
             "max_symbols_per_step": cfg["max_symbols_per_step"],
             "durations": cfg["durations"],            # [0, 1, 2, 3, 4]
         },
-        # niente sezione "streaming" (modello offline) ne' "prompt" (LID implicita)
+        # no "streaming" section (offline model) and no "prompt" (implicit LID)
         "tokenizer": {"type": "spe_bpe", "pieces": "tokens.json"},
     }
 
@@ -307,7 +307,7 @@ def yaml_encoder_section(enc: dict) -> dict:
         "ffn_dim": enc["d_model"] * enc["ff_expansion_factor"],
         "conv_kernel": enc["conv_kernel_size"],
         "conv_norm": enc["conv_norm_type"],
-        "subsampling": enc["subsampling"],            # dw_striding (non causale)
+        "subsampling": enc["subsampling"],            # dw_striding (non-causal)
         "subsampling_factor": enc["subsampling_factor"],
         "subsampling_conv_channels": enc["subsampling_conv_channels"],
         "use_bias": enc.get("use_bias", True),        # default NeMo: bias presenti
@@ -366,7 +366,7 @@ def build_parakeet_ctc_from_yaml(model_dir: Path, y: dict) -> dict:
     }
 
 
-# canary-1b-v2 (tokenizer unificato): lingue dalla model card, validate contro
+# canary-1b-v2 (unified tokenizer): languages from the model card, validated against
 # the vocab at conversion time (the <|xx|> token must exist)
 CANARY_V2_LANGS = ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
                    "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro",
@@ -411,7 +411,7 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
                          "{emotion}", "{source_lang}", "{target_lang}", "{pnc}",
                          "{itn}", "{timestamp}", "{diarize}"],
             "defaults": {k: v for k, v in slots.items()},
-            "languages": langs,          # <|xx|> come token; xx = codice lingua
+            "languages": langs,          # <|xx|> as tokens; xx = language code
         },
         "tokenizer": {"type": "spe_bpe_agg", "pieces": "tokens.json"},
     }
@@ -419,7 +419,7 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
 
 def canary_pieces(tar, names, y: dict) -> tuple[list[str], int]:
     """Canary tokenizer: aggregate (flash — pieces in GLOBAL id order,
-    sub-tokenizer nell'ordine dello yaml, offset cumulativi) o unificato (v2 —
+    sub-tokenizers in yaml order, cumulative offsets) or unified (v2 —
     a single SPE model). Returns (pieces, spl_size; 0 = unified)."""
     import sentencepiece as spm
 

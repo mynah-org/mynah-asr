@@ -20,7 +20,7 @@ typedef struct {
 typedef struct mynah_asr_safetensors mynah_asr_safetensors;
 
 mynah_asr_safetensors *mynah_asr_st_open(const char *path);
-mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path); /* niente errore se assente */
+mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path); /* no error when absent */
 void mynah_asr_st_close(mynah_asr_safetensors *st);
 
 /* Exact-name lookup. NULL when absent. */

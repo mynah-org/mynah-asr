@@ -1,20 +1,21 @@
-/* Backend CUDA per le GEMM grandi — pattern da qwen-tts (qwen_tts_cuda.c):
- * WEIGHT CACHE RESIDENTE condivisa (ogni pointer di peso caricato sul device
- * UNA volta) + CONTESTO PER-THREAD (handle cuBLAS, stream, buffer I/O in TLS):
- * N richieste server concorrenti fanno GEMM su stream indipendenti senza
- * serializzarsi — prima c'era un mutex globale attorno all'intera chiamata e
- * il throughput multi-richiesta era piatto (misurato A100 2026-07-20).
+/* CUDA backend for the large GEMMs — pattern from qwen-tts (qwen_tts_cuda.c):
+ * a shared RESIDENT WEIGHT CACHE (every weight pointer uploaded to the device
+ * ONCE) + a PER-THREAD CONTEXT (cuBLAS handle, stream, I/O buffers in TLS):
+ * N concurrent server requests issue GEMMs on independent streams without
+ * serializing — before this there was a global mutex around the whole call and
+ * multi-request throughput was flat (measured on an A100, 2026-07-20).
  *
- * Validato su hardware 2026-07-20 (A100-SXM4-40GB, CUDA 12.8, Ubuntu 24.04):
- * trascrizioni identiche a CPU su tutti i 10 modelli supportati, e2e verdi,
- * RTF in docs/benchmarks.md. Fallback CPU automatico su ogni errore.
- * I contesti TLS vivono fino all'exit del thread (server: pool persistente);
- * niente cleanup esplicito, come i pool BLAS.
+ * Validated on hardware 2026-07-20 (A100-SXM4-40GB, CUDA 12.8, Ubuntu 24.04):
+ * transcriptions identical to CPU on all 10 supported models, e2e green,
+ * RTF in docs/benchmarks.md. Automatic CPU fallback on any error.
+ * The TLS contexts live until the thread exits (server: persistent pool); no
+ * explicit cleanup, like the BLAS pools.
  *
- * v2a precisione (2026-07-20): TF32 math mode di default (tensor core, I/O
- * f32 — MYNAH_ASR_CUDA_TF32=0 per il f32 stretto) e pesi residenti bf16 con
- * cublasGemmEx opt-in via MYNAH_ASR_CUDA_BF16=1 (metà VRAM e metà PCIe su x;
- * mantissa 8 bit: vedi gate di validazione in docs/benchmarks.md). */
+ * v2a precision (2026-07-20): TF32 math mode by default (tensor cores, f32
+ * I/O — MYNAH_ASR_CUDA_TF32=0 for strict f32) and resident bf16 weights with
+ * cublasGemmEx, opt-in through MYNAH_ASR_CUDA_BF16=1 (half the VRAM and half
+ * the PCIe traffic on x; 8-bit mantissa: see the validation gate in
+ * docs/benchmarks.md). */
 #ifdef MYNAH_ASR_CUDA
 
 #include <cublas_v2.h>
@@ -25,8 +26,8 @@
 #include <string.h>
 
 static int g_ready = -1;
-static int g_bf16 = 0;  /* MYNAH_ASR_CUDA_BF16=1: pesi residenti bf16 + GemmEx */
-static int g_tf32 = 1;  /* MYNAH_ASR_CUDA_TF32=0 per spegnere i tensor core TF32 */
+static int g_bf16 = 0;  /* MYNAH_ASR_CUDA_BF16=1: resident bf16 weights + GemmEx */
+static int g_tf32 = 1;  /* MYNAH_ASR_CUDA_TF32=0 turns the TF32 tensor cores off */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; /* init + weight cache */
 
 typedef struct {
@@ -36,7 +37,7 @@ typedef struct {
 static wc_ent *g_wc;
 static int g_wc_n, g_wc_cap;
 
-/* f32 -> bf16 round-to-nearest-even (pesi finiti: niente casi NaN/inf) */
+/* f32 -> bf16 round-to-nearest-even (finite weights: no NaN/inf cases) */
 static void f32_to_bf16(const float *src, unsigned short *dst, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned int u;
@@ -46,7 +47,7 @@ static void f32_to_bf16(const float *src, unsigned short *dst, size_t n) {
     }
 }
 
-/* contesto per-thread: handle+stream+buffer. Creato lazy alla prima GEMM. */
+/* per-thread context: handle+stream+buffers. Created lazily on the first GEMM. */
 typedef struct {
     cublasHandle_t blas;
     cudaStream_t stream;
@@ -68,7 +69,7 @@ extern "C" int mynah_asr_cuda_available(void) {
         const char *tf = getenv("MYNAH_ASR_CUDA_TF32");
         g_tf32 = !(tf && *tf == '0');
         if (g_ready && g_bf16)
-            fprintf(stderr, "mynah-asr: CUDA bf16 (pesi residenti bf16, GemmEx)\n");
+            fprintf(stderr, "mynah-asr: CUDA bf16 (resident bf16 weights, GemmEx)\n");
     }
     pthread_mutex_unlock(&g_mu);
     return g_ready == 1;
@@ -88,9 +89,10 @@ static cu_tls *tls_ctx(void) {
     return t_cu.state == 1 ? &t_cu : NULL;
 }
 
-/* upload once, condiviso tra i thread: lookup lock-free non serve (la cache è
- * append-only ma realloc sposta l'array) -> mutex, tenuto solo per la cache.
- * Con g_bf16 il peso viene convertito f32->bf16 all'upload (metà VRAM). */
+/* upload once, shared across threads: a lock-free lookup is not worth it (the
+ * cache is append-only but realloc moves the array) -> a mutex, held only for
+ * the cache. With g_bf16 the weight is converted f32->bf16 on upload (half the
+ * VRAM). */
 static void *weight_dev(const void *w, size_t n_elems) {
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_wc_n; i++)

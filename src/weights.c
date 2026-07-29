@@ -14,7 +14,7 @@
 struct mynah_asr_safetensors {
     void *map;
     size_t map_len;
-    cJSON *header;         /* mantiene vive le stringhe dei nomi */
+    cJSON *header;         /* keeps the name strings alive */
     mynah_asr_tensor *tensors;
     size_t n_tensors;
     mynah_asr_gguf *gguf;      /* container alternativo: se set, tensors punta lì */

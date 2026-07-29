@@ -17,7 +17,7 @@ typedef struct {
     int hop_length;        /* 160 */
     double preemphasis;    /* 0.97 */
     double log_zero_guard; /* 2^-24 */
-    int normalize_per_feature; /* 0 = NA, 1 = per_feature (solo offline) */
+    int normalize_per_feature; /* 0 = NA, 1 = per_feature (offline only) */
     const float *mel_fb;   /* [n_fft/2+1, n_mels] da mel_filters.safetensors */
     const float *window;   /* [win_length] */
 } mynah_asr_feat_cfg;
@@ -38,8 +38,8 @@ typedef struct {
     const mynah_asr_feat_cfg *cfg;
     double *buf;            /* finestra scorrevole di segnale preemfatizzato   */
     size_t buf_len, buf_cap;
-    size_t base;            /* indice assoluto del campione buf[0]             */
-    size_t total;           /* campioni totali visti                           */
+    size_t base;            /* absolute index of sample buf[0]                 */
+    size_t total;           /* total samples seen                              */
     double *win;            /* finestra Hann center-paddata a n_fft (precomp.) */
     int *mel_lo, *mel_hi;   /* range bin non-zero per filtro (precomputati)    */
     float last_raw;         /* carry per la preemphasis tra feed               */

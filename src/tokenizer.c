@@ -170,7 +170,7 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
     size_t skip = 0;
     while (out[skip] == ' ') skip++;
     if (skip) memmove(out, out + skip, len - skip + 1);
-    /* strip degli spazi finali */
+    /* strip the trailing spaces */
     len = strlen(out);
     while (len > 0 && out[len - 1] == ' ') out[--len] = '\0';
     return out;

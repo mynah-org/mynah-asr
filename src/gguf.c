@@ -27,7 +27,7 @@ struct mynah_asr_gguf {
     unsigned char *map;
     mynah_asr_tensor *tensors;
     char **names;          /* proprietà nostra (in safetensors puntano nel JSON) */
-    float **dequant;       /* buffer f32 dei tensori non-F32 (NULL se zero-copy) */
+    float **dequant;       /* f32 buffers of the non-F32 tensors (NULL when zero-copy) */
     uint32_t *ggml_type;
     size_t count;
 };
@@ -305,18 +305,18 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
         for (uint32_t d = 0; d < rank; d++)
             if (ne[d] == 0 || mul_u64(elems, ne[d], &elems) != 0) goto fail_off;
         if (type_geometry(type, &be, &bb) != 0 || elems % be != 0 ||
-            (be > 1 && rank > 0 && ne[0] % be != 0)) { /* i blocchi non attraversano le righe */
+            (be > 1 && rank > 0 && ne[0] % be != 0)) { /* blocks never straddle rows */
             fprintf(stderr, "gguf: tensor '%s' has unsupported ggml type %u\n",
                     g->names[i], type);
             goto fail_off;
         }
         t->name = g->names[i];
-        t->dtype = MYNAH_ASR_DT_F32;                /* dopo il load è sempre f32 */
+        t->dtype = MYNAH_ASR_DT_F32;                /* after the load it is always f32 */
         t->n_dims = (int)rank;
         for (uint32_t d = 0; d < rank; d++) t->shape[d] = (int64_t)ne[rank - 1 - d];
         t->n_elems = (size_t)elems;
         g->ggml_type[i] = type;
-        (void)bb;   /* i byte reali si validano dopo il mmap, col range del file */
+        (void)bb;   /* the real byte count is validated after the mmap, against the file range */
     }
 
     int valid;

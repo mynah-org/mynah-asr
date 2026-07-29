@@ -29,10 +29,10 @@ struct mynah_asr_model {
     mynah_asr_decoder dec;
     mynah_asr_ctc ctc;                  /* head CTC (hybrid o CTC puro); w NULL se assente */
     const mynah_asr_engine *engine;     /* decoder attivo (vtable, vedi engine.h)  */
-    const mynah_asr_engine *engine_dflt;/* engine di default del modello           */
+    const mynah_asr_engine *engine_dflt;/* the model's default engine              */
     mynah_asr_aed aed;                  /* decoder AED (Canary); layers NULL se assente */
     int is_aed, aed_eos, aed_ts;    /* aed_ts: supporta i token <|timestamp|> */
-    char aed_target[8];             /* lingua di uscita ("" = come la sorgente) */
+    char aed_target[8];             /* output language ("" = same as source)   */
     mynah_asr_tokenizer tok;
     mynah_asr_feat_cfg feat;
     int left_ctx, default_right;    /* att context dal preset di default */
@@ -130,7 +130,7 @@ static int eng_decode_ctc(struct mynah_asr_model *m, const float *enc, int T,
 static int eng_decode_aed(struct mynah_asr_model *m, const float *enc, int T,
                           const char *lang, int want_ts, int **tokens, int **frames) {
     int pids[MYNAH_ASR_AED_PROMPT_MAX];
-    const int ts = want_ts && m->aed_ts;             /* v2: niente <|timestamp|> */
+    const int ts = want_ts && m->aed_ts;             /* v2: no <|timestamp|> */
     const int n_p = aed_build_prompt(m, lang, pids, ts);
     if (n_p <= 0) return -1;
     /* with timestamps every word costs 2 extra <|N|> tokens */
@@ -174,7 +174,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
             snprintf(path, sizeof(path), "%s/model.gguf", model_dir);
             m->weights = mynah_asr_st_open_quiet(path);
             if (m->weights)
-                fprintf(stderr, "mynah-asr: pesi dal container GGUF %s\n", path);
+                fprintf(stderr, "mynah-asr: weights from the GGUF container %s\n", path);
         }
         if (!m->weights) {   /* riapre il path primario per il messaggio d'errore */
             snprintf(path, sizeof(path), "%s/%s", model_dir, wfile);
@@ -270,7 +270,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
     const cJSON *jsf = jenc ? cJSON_GetObjectItem(jenc, "subsampling_factor") : NULL;
     m->frame_sec = (double)m->feat.hop_length * (jsf ? jsf->valueint : 8)
                    / (double)m->feat.sample_rate;
-    m->seg_sec = 0.0;   /* risolto DOPO il parse della sezione streaming */
+    m->seg_sec = 0.0;   /* resolved AFTER parsing the streaming section */
 
     /* streaming presets [[left, right], ...] — the section is absent for offline
      * models (Parakeet): full attention [-1,-1], no stream API */
@@ -355,7 +355,7 @@ int mynah_asr_set_decoder(mynah_asr_model *m, const char *name) {
         m->engine = &ENG_CTC;
         return 0;
     }
-    m->engine = m->engine_dflt;   /* CTC puro: il default È già la head CTC */
+    m->engine = m->engine_dflt;   /* pure CTC: the default IS already the CTC head */
     return strcmp(name, "default") == 0 ? 0 : -1;
 }
 
@@ -387,7 +387,7 @@ typedef struct {
     int *valids, *t_encs;
     char **texts;
     char (*langs_out)[16];
-    mynah_asr_word **words;    /* per-item, NULL = niente timestamp */
+    mynah_asr_word **words;    /* per item, NULL = no timestamps */
     int *n_words;
 } batch_ctx;
 
@@ -490,12 +490,12 @@ struct mynah_asr_stream {
     mynah_asr_enc_stream es;
     mynah_asr_dec_state dec;
     int prompt;
-    float *mel_buf;             /* buffer del chunk mel corrente */
+    float *mel_buf;             /* buffer of the current mel chunk */
     int mel_have;
     float *enc_buf;             /* [q, d_out] output encoder per chunk */
     int *tokens;
     int n_tokens, cap_tokens;
-    size_t chars_emitted;       /* byte di testo già consegnati alla callback */
+    size_t chars_emitted;       /* bytes of text already handed to the callback */
     char lang[16];
     size_t samples_fed;
 };
@@ -595,7 +595,7 @@ int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                                               need - s->mel_have);
         first_pass = 0;
         s->mel_have += got;
-        if (s->mel_have < need) break;          /* servono altri campioni */
+        if (s->mel_have < need) break;          /* more samples needed */
         if (stream_flush_chunk(s, need, 0, cb, ud) != 0) return -1;
     }
     return 0;
@@ -735,7 +735,7 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
         const char *piece = tk->pieces[toks[i]];
         const int ts = aed_ts_frame(piece);
         if (ts >= 0) {
-            if (word_open && blen > 0) {          /* chiude la parola corrente */
+            if (word_open && blen > 0) {          /* closes the current word */
                 buf[blen] = '\0';
                 ws[nw].word = strdup(buf[0] == ' ' ? buf + 1 : buf);
                 ws[nw].t0 = (open_ts >= 0 ? open_ts : 0) * frame_sec;
@@ -749,8 +749,8 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
             continue;
         }
         if (piece[0] == '<') continue;            /* altri speciali */
-        if (strncmp(piece, "\xe2\x96\x81", 3) == 0) {   /* ▁: nuova parola */
-            if (word_open && blen > 0) {          /* senza ts di chiusura: chiudi */
+        if (strncmp(piece, "\xe2\x96\x81", 3) == 0) {   /* ▁: new word */
+            if (word_open && blen > 0) {          /* no closing ts: close it */
                 buf[blen] = '\0';
                 ws[nw].word = strdup(buf[0] == ' ' ? buf + 1 : buf);
                 ws[nw].t0 = (open_ts >= 0 ? open_ts : 0) * frame_sec;
@@ -762,7 +762,7 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
             if (blen < sizeof(buf) - 2) { buf[blen++] = ' '; }
             piece += 3;
         } else if (!word_open) {
-            word_open = 1;                        /* continuazione senza ▁ */
+            word_open = 1;                        /* continuation without ▁ */
         }
         const size_t pl = strlen(piece);
         if (blen + pl < sizeof(buf) - 1) { memcpy(buf + blen, piece, pl); blen += pl; }
@@ -901,7 +901,7 @@ char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n
                 nw[*n_words + i].t1 += off;
             }
             *n_words += sn;
-            free(sw);   /* le stringhe sono state trasferite */
+            free(sw);   /* the strings have been transferred */
         } else if (sw) {
             mynah_asr_words_free(sw, sn);
         }

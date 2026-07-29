@@ -1,16 +1,16 @@
-"""Oracolo FastConformer in numpy puro (forward offline + greedy RNNT/TDT),
-config-driven dal mynah.json del modello convertito.
+"""FastConformer oracle in pure numpy (offline forward + greedy RNNT/TDT),
+config-driven from the converted model's mynah.json.
 
-Replica 1:1 le reference transformers:
-- Nemotron (reference/transformers-nemotron_asr_streaming/): subsampling/conv causali,
-  attention chunked_limited, conv norm layer_norm, prompt post-encoder, greedy RNNT.
-- Parakeet TDT (reference/transformers-parakeet/): tutto non-causale (padding simmetrico),
-  attention full, conv norm batch_norm (inference: affine con running stats),
-  niente prompt, greedy TDT (duration head).
+It replicates the transformers references 1:1:
+- Nemotron (reference/transformers-nemotron_asr_streaming/): causal subsampling/conv,
+  chunked_limited attention, layer_norm conv norm, post-encoder prompt, greedy RNNT.
+- Parakeet TDT (reference/transformers-parakeet/): everything non-causal (symmetric
+  padding), full attention, batch_norm conv norm (inference: affine with the running
+  stats), no prompt, greedy TDT (duration head).
 
-Scopo: riferimento numerico leggibile per il runtime C (dump per stadio via `dumps`),
-NON performance. Convenzioni: pesi dal model.safetensors HF con nomi verbatim;
-attivazioni [T, d]; batch = 1 implicito.
+Purpose: a readable numeric reference for the C runtime (per-stage dumps through
+`dumps`), NOT performance. Conventions: weights from the HF model.safetensors with
+verbatim names; activations [T, d]; batch = 1 implicit.
 """
 
 from __future__ import annotations
@@ -88,8 +88,8 @@ class Oracle:
 
     # ------------------------------------------------------------- subsampling
     def _conv2d_s2(self, x, weight, bias, groups=1):
-        """x [C_in, T, F]; stride 2. Padding causale (2,1)x(2,1) o simmetrico (1,1)x(1,1)
-        secondo self.causal. Ritorna [C_out, T', F']."""
+        """x [C_in, T, F]; stride 2. Causal padding (2,1)x(2,1) or symmetric (1,1)x(1,1)
+        depending on self.causal. Returns [C_out, T', F']."""
         k = weight.shape[2]
         stride = 2
         pad = (k - 1, stride - 1) if self.causal else ((k - 1) // 2, (k - 1) // 2)
@@ -148,7 +148,7 @@ class Oracle:
         """bd [H, T, P] -> shift Transformer-XL -> [H, T, P]."""
         H, T, P = bd.shape
         bd = np.pad(bd, ((0, 0), (0, 0), (1, 0)))                      # [H, T, P+1]
-        bd = bd.reshape(H, -1)[:, T:].reshape(H, T, P)                 # drop prima "riga"
+        bd = bd.reshape(H, -1)[:, T:].reshape(H, T, P)                 # drop the first "row"
         return bd
 
     def _attn_mask(self, T: int, left: int, right: int) -> np.ndarray:
@@ -251,7 +251,7 @@ class Oracle:
         x = self.subsampling(feats)
         if dumps is not None:
             dumps["subsampling"] = x.copy()
-        x = x * self.xscale        # xscaling (NeMo: dentro il pos_enc, prima dei layer)
+        x = x * self.xscale        # xscaling (NeMo: inside pos_enc, before the layers)
         T = x.shape[0]
         pos = self.rel_pos_emb(T)
         if "streaming" in self.cfg:
@@ -278,7 +278,7 @@ class Oracle:
             x = fused @ w["prompt_projector.linear_2.weight"].T.astype(np.float64) \
                 + w["prompt_projector.linear_2.bias"]
         if "encoder_projector.weight" not in w:
-            return x               # CTC puro: niente joint, la head lavora sull'encoder out
+            return x               # pure CTC: no joint, the head works on the encoder out
         enc = x @ w["encoder_projector.weight"].T.astype(np.float64) + w["encoder_projector.bias"]
         if dumps is not None:
             dumps["enc_proj"] = enc.copy()
@@ -286,7 +286,7 @@ class Oracle:
 
     # ---------------------------------------------------------------- decoder
     def _lstm_step(self, x, state):
-        """x [640]; state = [(h0,c0),(h1,c1)]. Ritorna (out [640], new_state)."""
+        """x [640]; state = [(h0,c0),(h1,c1)]. Returns (out [640], new_state)."""
         w = self.w
         new_state = []
         inp = x
@@ -339,8 +339,8 @@ class Oracle:
         return tokens
 
     def greedy_decode_ctc(self, enc_out: np.ndarray) -> list[int]:
-        """Greedy CTC sulla head ausiliaria (modelli hybrid, es. tdt_ctc-110m):
-        logits per frame dall'ENCODER OUT (pre-projector), argmax, collapse dei
+        """Greedy CTC over the auxiliary head (hybrid models, e.g. tdt_ctc-110m):
+        per-frame logits from the ENCODER OUT (pre-projector), argmax, collapse of
         repeats, blanks removed (= last index)."""
         w = self.w["ctc_head.weight"][:, :, 0].astype(np.float64)   # [V+1, d, 1]
         b = self.w["ctc_head.bias"].astype(np.float64)
@@ -356,7 +356,7 @@ class Oracle:
     def greedy_decode_tdt(self, enc: np.ndarray) -> list[int]:
         """Greedy TDT over enc [T, 640] (ParakeetTDTGenerationMixin): at each step the joint
         predice token (argmax sui primi V logit, blank incluso) E duration (argmax sugli
-        ultimi len(durations)); il puntatore frame avanza della duration a OGNI step
+        last len(durations)); the frame pointer advances by the duration at EVERY step
         (blank con duration 0 -> forzata a 1); lo stato LSTM avanza solo su non-blank.
         Per-frame max_symbols guard as in NeMo (forces progress on a dur=0 loop)."""
         H = self.cfg["decoder"]["pred_hidden"]
@@ -425,7 +425,7 @@ class Oracle:
 
     def _aed_forward(self, ids: list[int], enc: np.ndarray) -> np.ndarray:
         """Decoder Transformer pre-LN sull'intera sequenza (oracolo: chiarezza).
-        Ritorna i logits dell'ULTIMA posizione."""
+        Returns the logits of the LAST position."""
         w = self.w
         dec = self.cfg["decoder"]
         x = w["aed.embedding.weight"][ids].astype(np.float64) \
@@ -446,7 +446,7 @@ class Oracle:
     def greedy_decode_aed(self, enc_out: np.ndarray, source_lang: str = "en",
                           target_lang: str | None = None) -> list[int]:
         """Greedy AED: enc_out [T, d_enc] -> proiezione -> loop autoregressivo
-        col prompt canary2; stop a <|endoftext|> o alla guardia di lunghezza."""
+        with the canary2 prompt; stops at <|endoftext|> or on the length guard."""
         w = self.w
         dec = self.cfg["decoder"]
         if "enc_dec_proj.weight" in w:
@@ -467,7 +467,7 @@ class Oracle:
 
     # ------------------------------------------------------------------ testo
     def detokenize(self, tokens: list[int]) -> tuple[str, str | None]:
-        """Testo + tag lingua (None se il modello non li emette, es. Parakeet)."""
+        """Text + language tag (None when the model does not emit them, e.g. Parakeet)."""
         lang = None
         parts = []
         for t in tokens:

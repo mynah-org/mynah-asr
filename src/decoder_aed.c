@@ -210,7 +210,7 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
             for (int i = 0; i < d; i++) x[i] += tmp[i];
         }
 
-        if (p + 1 < n_prompt) {          /* ancora nel prompt: niente sampling */
+        if (p + 1 < n_prompt) {          /* still inside the prompt: no sampling */
             cur = prompt[p + 1];
             continue;
         }

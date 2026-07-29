@@ -175,7 +175,7 @@ int main(void) {
             }
     }
 
-    CHECK(write_tmp(&b, path) != NULL, "fixture scritto");
+    CHECK(write_tmp(&b, path) != NULL, "fixture written");
     mynah_asr_safetensors *st = mynah_asr_st_open(path);
     CHECK(st != NULL, "GGUF valido aperto (via mynah_asr_st_open)");
     if (st) {
@@ -219,7 +219,7 @@ int main(void) {
     }
     unlink(path);
 
-    /* ---- malformati: tutti rifiutati senza crash ---- */
+    /* ---- malformed: all rejected without crashing ---- */
     struct { const char *what; buf f; } bad[7];
     memset(bad, 0, sizeof(bad));
 
@@ -257,7 +257,7 @@ int main(void) {
       static const unsigned char blk[210] = {0}; put(&bad[6].f, blk, 210); }
 
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
-        CHECK(write_tmp(&bad[k].f, junk) != NULL, "fixture malformato scritto");
+        CHECK(write_tmp(&bad[k].f, junk) != NULL, "malformed fixture written");
         fprintf(stderr, "--- expected error (%s):\n", bad[k].what);
         mynah_asr_safetensors *s = mynah_asr_st_open(junk);
         CHECK(s == NULL, bad[k].what);

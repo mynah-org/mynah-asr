@@ -64,7 +64,7 @@ static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ..
 }
 
 int mynah_asr_stw_write(mynah_asr_stw *w, const char *path) {
-    /* header JSON costruito a mano: nomi controllati (tensori HF), niente escaping
+    /* hand-built JSON header: the names are controlled (HF tensors), so no escaping
      * exotic to handle. The buffer grows on its own through stw_appendf, so the
      * initial capacity is only an estimate. */
     size_t hcap = 256 + w->n * 256;

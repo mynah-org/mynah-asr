@@ -37,7 +37,7 @@ static inline float mynah_asr_sigmoid(float x) {
 #define MYNAH_ASR_Q4_GROUP 32
 
 typedef struct {
-    const float *f32;       /* pesi originali [n, k] — usati se qtype == F32 */
+    const float *f32;       /* original weights [n, k] — used when qtype == F32 */
     const int8_t *q8;       /* INT8 [n, k] */
     const uint8_t *q4;      /* INT4 packed [n, k/2] */
     const float *scales;    /* INT8: [n]; INT4: [n, k/32] */

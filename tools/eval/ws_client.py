@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal WebSocket client (stdlib) to exercise mynah-asr-server's /v1/audio/stream.
 
-Uso: uv run python -m eval.ws_client <file.wav> [host=localhost] [port=8090]
+Usage: uv run python -m eval.ws_client <file.wav> [host=localhost] [port=8090]
                                      [lang=auto] [lookahead=3]
 Invia il PCM in chunk da 100 ms come frame binari e stampa i delta JSON ricevuti.
 """

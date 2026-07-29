@@ -1,7 +1,7 @@
 [project]
 name = "mynah-tools"
 version = "0.0.1"
-description = "Tooling offline per Mynah: conversione pesi, oracolo di riferimento, eval"
+description = "Offline tooling for Mynah: weight conversion, reference oracle, eval"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# l'oracolo torch e la generazione dei golden richiedono extra pesanti:
+# the torch oracle and the golden generation need heavy extras:
 #   uv sync --extra oracle
 oracle = [
     "torch>=2.4",

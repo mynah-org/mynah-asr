@@ -102,7 +102,7 @@ float *mynah_asr_resample(const float *in, size_t n_in, int sr_in, int sr_out, s
         return copy;
     }
     const double ratio = (double)sr_out / (double)sr_in;
-    /* in downsampling il sinc va tagliato alla nuova Nyquist */
+    /* when downsampling the sinc must be cut at the new Nyquist */
     const double fc = ratio < 1.0 ? ratio : 1.0;
     const int taps = 32;
     const size_t N = (size_t)((double)n_in * ratio);

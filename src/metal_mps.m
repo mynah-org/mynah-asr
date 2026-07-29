@@ -64,7 +64,7 @@ static const char *SHADER_SRC =
     "    g[i] = half(a / (1.0f + exp(-b)));\n"
     "}\n"
     /* depthwise conv k=9: c[t,i] = b[i] + sum_j w[i,j] * g[t-pad+j, i]
-       (pad 8 = causale, 4 = 'same'; has_b 0 -> bias non letto) */
+       (pad 8 = causal, 4 = 'same'; has_b 0 -> bias not read) */
     "kernel void dwconv9(device const half *g [[buffer(0)]], device const half *w [[buffer(1)]],\n"
     "                    device half *c [[buffer(2)]], constant uint &d [[buffer(3)]],\n"
     "                    constant uint &T [[buffer(4)]], constant uint &pad [[buffer(5)]],\n"
@@ -86,8 +86,8 @@ static const char *SHADER_SRC =
     "    x[i] = half(float(x[i]) * float(s[ch]) + float(b[ch]));\n"
     "}\n"
     /* Per-row reduction shared by the layernorms: one THREADGROUP per row
-       (letture coalescenti + simd_sum), non un thread per riga (stride d,
-       ~128B di traffico per elemento: era il collo di bottiglia della v4). */
+       (coalesced reads + simd_sum), not one thread per row (stride d,
+       ~128B of traffic per element: it was v4's bottleneck). */
     "static float row_moment(float part, threadgroup float *sh, uint tid, uint tpt) {\n"
     "    part = simd_sum(part);\n"
     "    uint nsg = (tpt + 31) / 32;\n"
@@ -122,7 +122,7 @@ static const char *SHADER_SRC =
     "    o[i] = half(float(q[i]) + float(b[i % d]));\n"
     "}\n"
     /* softmax with rel_shift in closed form and the chunked_limited window
-       (chunk == 0 -> attention full, modelli offline).
+       (chunk == 0 -> full attention, offline models).
        scores [H,T,K] (ac), bd [H,T,P]; P = 2L-1, gq = cached + t (qui cached=0). */
     "kernel void smax_shift(device half *sc [[buffer(0)]], device const half *bd [[buffer(1)]],\n"
     "                       constant uint &T [[buffer(2)]], constant uint &K [[buffer(3)]],\n"
@@ -252,7 +252,7 @@ static id<MTLBuffer> weight_buffer_f16(const float *w, size_t n_elems) {
     if (g_wc_n == g_wc_cap) {
         const int cap = g_wc_cap ? g_wc_cap * 2 : 256;
         wc_ent *wc = realloc(g_wc, (size_t)cap * sizeof(wc_ent));
-        if (!wc) return buf;      /* niente cache: il buffer resta valido per la chiamata */
+        if (!wc) return buf;      /* no cache: the buffer stays valid for this call */
         g_wc = wc;
         g_wc_cap = cap;
     }
@@ -755,7 +755,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
             for (int li = 0; li < n_layers; li++) {
                 const mynah_asr_metal_layer_w *L = &Ls[li];
                 id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-                if (li == 0) {   /* pe f32 -> f16 una volta per forward */
+                if (li == 0) {   /* pe f32 -> f16 once per forward */
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                     [enc setBuffer:pe32 offset:0 atIndex:0];
                     [enc setBuffer:pe16 offset:0 atIndex:1];
@@ -785,7 +785,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
                 encode_resadd(cb, x32, blk, 0.5f, nd);
                 encode_ln32(cb, x32, nil, LNW(ln_out_w), LNW(ln_out_b), T, d);
                 #undef LNW
-                [cb commit];        /* niente wait: la GPU parte, la CPU encoda il prossimo */
+                [cb commit];        /* no wait: the GPU starts, the CPU encodes the next one */
                 last = cb;
             }
             const double t1 = CFAbsoluteTimeGetCurrent();
