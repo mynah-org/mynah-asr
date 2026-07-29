@@ -12,7 +12,7 @@
 #define MYNAH_ASR_VERSION_MAJOR 0
 #define MYNAH_ASR_VERSION_MINOR 6
 #define MYNAH_ASR_VERSION_PATCH 0
-#define MYNAH_ASR_VERSION "0.6.0-dev"
+#define MYNAH_ASR_VERSION "0.6.0"
 
 #ifdef __cplusplus
 extern "C" {
