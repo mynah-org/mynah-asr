@@ -180,7 +180,9 @@ test-server: mynah-asr-server
 # language, checking language detection + CER against the reference text.
 # First time: make fetch-lang-samples (needs ffmpeg + tools/ uv).
 test-nemo-langs: mynah-asr
-	cd tools && uv run python -m eval.test_langs
+	@cd tools && uv run python -m eval.test_langs; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-nemo-langs: samples or model missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 fetch-lang-samples:
 	cd tools && uv run python fetch_lang_samples.py 3
