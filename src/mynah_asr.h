@@ -10,9 +10,9 @@
 #include <stdbool.h>
 
 #define MYNAH_ASR_VERSION_MAJOR 0
-#define MYNAH_ASR_VERSION_MINOR 6
+#define MYNAH_ASR_VERSION_MINOR 7
 #define MYNAH_ASR_VERSION_PATCH 0
-#define MYNAH_ASR_VERSION "0.6.0"
+#define MYNAH_ASR_VERSION "0.7.0-dev"
 
 #ifdef __cplusplus
 extern "C" {
