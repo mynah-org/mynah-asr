@@ -12,7 +12,7 @@
 #define MYNAH_VERSION_MAJOR 0
 #define MYNAH_VERSION_MINOR 5
 #define MYNAH_VERSION_PATCH 0
-#define MYNAH_VERSION "0.5.0-dev"
+#define MYNAH_VERSION "0.5.0"
 
 #ifdef __cplusplus
 extern "C" {

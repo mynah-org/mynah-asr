@@ -4,9 +4,10 @@
 
 # Mynah ASR
 
-[![CI](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/ci.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/ci.yml)
-[![Code Quality](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/codeql.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/codeql.yml)
-[![Memory Safety](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/safety.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/mynah/actions/workflows/safety.yml)
+[![CI](https://github.com/mynah-org/mynah-asr/actions/workflows/ci.yml/badge.svg)](https://github.com/mynah-org/mynah-asr/actions/workflows/ci.yml)
+[![Code Quality](https://github.com/mynah-org/mynah-asr/actions/workflows/codeql.yml/badge.svg)](https://github.com/mynah-org/mynah-asr/actions/workflows/codeql.yml)
+[![Memory Safety](https://github.com/mynah-org/mynah-asr/actions/workflows/safety.yml/badge.svg)](https://github.com/mynah-org/mynah-asr/actions/workflows/safety.yml)
+[![Release](https://img.shields.io/github/v/release/mynah-org/mynah-asr?color=blueviolet)](https://github.com/mynah-org/mynah-asr/releases/latest)
 [![Models](https://img.shields.io/badge/models-10-blue)](docs/models.md)
 [![Languages](https://img.shields.io/badge/languages-40-brightgreen)](docs/nemotron-languages.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -119,17 +120,17 @@ mynah's output matches it with **CER 0.00–0.07** (`make test-samples`).
 
 | | clip | reference transcription |
 |---|---|---|
-| 🇮🇹 it | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/it_fleurs_1521.wav) | Il satellite nello spazio riceve il segnale e poi lo rimanda indietro quasi all'istante. |
-| 🇺🇸 en | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/en_fleurs_1521.wav) | The satellite in space gets the call and then reflects it back down, almost instantly. |
-| 🇩🇪 de | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/de_fleurs_1521.wav) | Der Satellit im Weltraum empfängt den Anruf und reflektiert ihn dann fast sofort zurück nach unten. |
-| 🇪🇸 es | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/es_fleurs_1521.wav) | El satélite en el espacio recibe la llamada y, luego, la refleja de vuelta casi de forma instantánea. |
-| 🇫🇷 fr | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/fr_fleurs_1521.wav) | Le satellite reçoit l'appel dans l'espace puis le renvoie sur Terre, presque instantanément. |
-| 🇵🇹 pt | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/pt_fleurs_1521.wav) | O satélite no espaço recebe a chamada e depois a redireciona de volta, quase instantaneamente. |
-| 🇳🇱 nl | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/nl_fleurs_1521.wav) | Zodra de ruimtesatelliet de oproep ontvangt, wordt deze meteen teruggezonden. |
-| 🇵🇱 pl | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/pl_fleurs_1521.wav) | Połączenie trafia do satelity w przestrzeni kosmicznej, po czym niemal natychmiast odbija go z powrotem. |
-| 🇷🇺 ru | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/ru_fleurs_1521.wav) | Спутник в космосе принимает звонок и практически мгновенно отражает его обратно вниз. |
-| 🇺🇦 uk | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/uk_fleurs_1521.wav) | Супутник у космосі отримує виклик і потім майже одразу відображає його назад. |
-| 🇯🇵 ja | [⬇ fleurs_1521](https://github.com/gabriele-mastrapasqua/mynah/releases/download/v0.1-samples/ja_fleurs_1521.wav) | 宇宙にある人工衛星は通話を受信して、ほぼ瞬時にそれを反映します。 |
+| 🇮🇹 it | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/it_fleurs_1521.wav) | Il satellite nello spazio riceve il segnale e poi lo rimanda indietro quasi all'istante. |
+| 🇺🇸 en | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/en_fleurs_1521.wav) | The satellite in space gets the call and then reflects it back down, almost instantly. |
+| 🇩🇪 de | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/de_fleurs_1521.wav) | Der Satellit im Weltraum empfängt den Anruf und reflektiert ihn dann fast sofort zurück nach unten. |
+| 🇪🇸 es | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/es_fleurs_1521.wav) | El satélite en el espacio recibe la llamada y, luego, la refleja de vuelta casi de forma instantánea. |
+| 🇫🇷 fr | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/fr_fleurs_1521.wav) | Le satellite reçoit l'appel dans l'espace puis le renvoie sur Terre, presque instantanément. |
+| 🇵🇹 pt | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/pt_fleurs_1521.wav) | O satélite no espaço recebe a chamada e depois a redireciona de volta, quase instantaneamente. |
+| 🇳🇱 nl | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/nl_fleurs_1521.wav) | Zodra de ruimtesatelliet de oproep ontvangt, wordt deze meteen teruggezonden. |
+| 🇵🇱 pl | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/pl_fleurs_1521.wav) | Połączenie trafia do satelity w przestrzeni kosmicznej, po czym niemal natychmiast odbija go z powrotem. |
+| 🇷🇺 ru | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/ru_fleurs_1521.wav) | Спутник в космосе принимает звонок и практически мгновенно отражает его обратно вниз. |
+| 🇺🇦 uk | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/uk_fleurs_1521.wav) | Супутник у космосі отримує виклик і потім майже одразу відображає його назад. |
+| 🇯🇵 ja | [⬇ fleurs_1521](https://github.com/mynah-org/mynah-asr/releases/download/v0.1-samples/ja_fleurs_1521.wav) | 宇宙にある人工衛星は通話を受信して、ほぼ瞬時にそれを反映します。 |
 
 Because the sentences are parallel, the English clip doubles as the reference
 for scoring Canary's **speech translation** (e.g. it→en at the top of this page).
@@ -153,6 +154,7 @@ Full locale tables with quality tiers and prompt ids:
 ```sh
 # 1. build (macOS: Accelerate, zero deps; Linux: needs OpenBLAS first)
 #    Linux: sudo apt install libopenblas-dev   (Fedora: sudo dnf install openblas-devel)
+git clone https://github.com/mynah-org/mynah-asr.git && cd mynah-asr
 make
 
 # 2. pick a model from the interactive menu (or --model <alias> to script it)
@@ -169,6 +171,10 @@ cd tools && uv sync && uv run python convert_nemo.py ../models/nemotron-3.5-asr-
 ffmpeg -v quiet -i anything.mp3 -f s16le -ar 16000 -ac 1 - | \
   ./mynah stream -m models/nemotron-3.5-asr-streaming-0.6b --lookahead 3
 ```
+
+Prefer not to build? Every tagged release ships stripped tarballs (CLI + server +
+`libmynah.a` + header) for linux-x86_64, linux-aarch64 and darwin-arm64, with
+`SHA256SUMS`: [github.com/mynah-org/mynah-asr/releases/latest](https://github.com/mynah-org/mynah-asr/releases/latest).
 
 WAV files at other sample rates are resampled automatically
 (for mp3/m4a: `ffmpeg -i file.mp3 -ar 16000 -ac 1 out.wav`).
