@@ -83,18 +83,24 @@ first-class citizen.
 
 ## Performance — one runtime, four backends
 
-Warm RTF on ~60 s audio, f32; **lower is faster** (0.05 ≈ 20× faster than
-realtime). Full matrix, int8/int4 numbers and methodology in
-[docs/benchmarks.md](docs/benchmarks.md).
+Every cell is an **RTF** (real-time factor) = *seconds of compute per second of
+audio*, so **lower is faster**: RTF 0.05 means a 60-second recording is
+transcribed in 3 seconds, i.e. **20× faster than realtime**. Warm runs on ~60 s
+of audio, f32 weights, one request at a time. Full matrix, int8/int4 numbers and
+methodology in [docs/benchmarks.md](docs/benchmarks.md).
 
-| model | Apple M1 CPU (NEON) | Apple M1 Metal | EPYC 22c (x86 AVX2) | A100 (CUDA) |
-|---|---|---|---|---|
-| parakeet-tdt_ctc-110m | 0.015 | 0.010 | 0.015 | 0.011 |
-| parakeet-ctc-0.6b | 0.042 | **0.022** | 0.040 | **0.022** |
-| parakeet-tdt-0.6b-v3 | 0.047 | 0.030 | 0.065 | **0.028** |
-| nemotron-3.5-asr-streaming-0.6b¹ | 0.055 | 0.040 | 0.059 | **0.022** |
-| parakeet-rnnt-1.1b | 0.068 | **0.041** | 0.066 | **0.038** |
-| canary-1b-flash (AED, +translation) | 0.143 | **0.081** | 0.113 | 0.063 |
+| model | M1 CPU (NEON) | M1 Metal | EPYC 22c (x86 AVX2) | A100 (CUDA) | best ⇒ ×realtime |
+|---|:---:|:---:|:---:|:---:|:---:|
+| parakeet-tdt_ctc-110m | 0.015 | **0.010** | 0.015 | 0.011 | **100×** |
+| parakeet-ctc-0.6b | 0.042 | **0.022** | 0.040 | **0.022** | **45×** |
+| parakeet-tdt-0.6b-v3 | 0.047 | 0.030 | 0.065 | **0.028** | **36×** |
+| nemotron-3.5-asr-streaming-0.6b¹ | 0.055 | 0.040 | 0.059 | **0.022** | **45×** |
+| parakeet-rnnt-1.1b | 0.068 | 0.041 | 0.066 | **0.038** | **26×** |
+| canary-1b-flash (AED, +translation) | 0.143 | 0.081 | 0.113 | **0.063** | **16×** |
+
+Bold marks the fastest backend of the row; the last column is that same number
+inverted (1 / RTF) for whoever reads speed as "× realtime" — e.g. the 110m
+model transcribes an hour of audio in ~36 seconds on Metal.
 
 ¹ A100/EPYC measured after the banded-attention fix (2026-07-20); the M1
 columns predate it and will improve on re-measure.
