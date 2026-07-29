@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scarica sample audio reali per lingua da Tatoeba (frasi brevi con audio CC).
+"""Download real per-language audio samples from Tatoeba (short CC-audio sentences).
 
 Per ogni lingua supportata da Nemotron 3.5 prende fino a N frasi con audio,
 le converte a WAV 16 kHz mono (ffmpeg) e scrive un manifest con testo di
@@ -20,8 +20,8 @@ from pathlib import Path
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "tests" / "audio" / "langs"
 
-# locale Nemotron -> codice ISO 639-3 Tatoeba (le varianti regionali condividono
-# la lingua: en-GB testata via eng, ecc.)
+# Nemotron locale -> Tatoeba ISO 639-3 code (regional variants share the
+# language: en-GB is tested through eng, and so on)
 LOCALES = {
     "en-US": "eng", "es-ES": "spa", "fr-FR": "fra", "it-IT": "ita", "pt-BR": "por",
     "nl-NL": "nld", "de-DE": "deu", "tr-TR": "tur", "ru-RU": "rus", "ar-AR": "ara",
@@ -36,8 +36,8 @@ LOCALES = {
 API = "https://api.tatoeba.org/unstable/audios?lang={code}&limit=80"
 AUDIO = "https://tatoeba.org/en/audio/download/{aid}"
 
-# Fallback per lingue senza audio su Tatoeba: FLEURS (CC-BY-4.0), split validation
-# via datasets-server rows API (il test split supera il limite di scan).
+# Fallback for languages without audio on Tatoeba: FLEURS (CC-BY-4.0), validation
+# split through the datasets-server rows API (the test split exceeds the scan limit).
 FLEURS = {
     "hi-IN": "hi_in", "ko-KR": "ko_kr", "vi-VN": "vi_vn", "nb-NO": "nb_no",
     "da-DK": "da_dk", "bg-BG": "bg_bg", "hr-HR": "hr_hr", "sk-SK": "sk_sk",

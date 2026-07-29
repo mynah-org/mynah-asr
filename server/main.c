@@ -1,16 +1,16 @@
-/* mynah-asr-server — API HTTP OpenAI-compatible + WebSocket streaming.
+/* mynah-asr-server — OpenAI-compatible HTTP API + WebSocket streaming.
  *
- * Endpoint:
- *   POST /v1/audio/translations     come sopra + target_language (default en) — solo AED
+ * Endpoints:
+ *   POST /v1/audio/translations     as above + target_language (default en) — AED only
  *   POST /v1/audio/transcriptions   multipart (file=..., language, response_format,
  *                                   lookahead) -> json | text | verbose_json
  *   GET  /v1/models, /v1/health     info
- *   GET  /v1/audio/stream           WebSocket: binario s16le 16kHz in -> JSON delta out
+ *   GET  /v1/audio/stream           WebSocket: binary s16le 16kHz in -> JSON deltas out
  *                                   (query: ?lang=auto&lookahead=3)
  *
- * Concorrenza: il modello è read-only (pesi mmap) e condiviso; ogni richiesta ha
- * solo il proprio stato di decode -> pool di worker thread, nessun clone.
- * Il batching cross-richiesta (kernel B>1) è in backlog (vedi TODO M4).
+ * Concurrency: the model is read-only (mmap'd weights) and shared; each request
+ * only owns its decode state -> a pool of worker threads, no clones.
+ * Cross-request batching (B>1 kernels) is in the backlog (see TODO M4).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -39,9 +39,10 @@ static int g_max_batch = 8;          /* --batch N; 1 = disabilitato */
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
 /* --------------------------------------------------- micro-batching scheduler
- * Le connessioni impacchettano il lavoro in job; un thread dedicato aggrega i
- * job pendenti (finestra 25 ms o batch pieno) e chiama mynah_asr_transcribe_batch:
- * i pesi vengono letti una volta per layer per l'intero batch. */
+ * Connections wrap their work into jobs; a dedicated thread aggregates the
+ * pending jobs (a 25 ms window, or a full batch) and calls
+ * mynah_asr_transcribe_batch: the weights are read once per layer for the whole
+ * batch. */
 typedef struct trx_job {
     const float *samples;
     size_t n_samples;
@@ -82,7 +83,7 @@ static void *batch_worker(void *arg) {
         pthread_mutex_lock(&bq_mu);
         while (!bq_head) pthread_cond_wait(&bq_cv, &bq_mu);
 
-        /* finestra di aggregazione: aspetta fino a 25 ms che arrivino altri job */
+        /* aggregation window: wait up to 25 ms for more jobs to arrive */
         struct timespec dl;
         clock_gettime(CLOCK_REALTIME, &dl);
         dl.tv_nsec += 25 * 1000000;
@@ -116,8 +117,8 @@ static void *batch_worker(void *arg) {
             langs[b] = jobs[b]->lang;
             texts[b] = NULL;
         }
-        /* words sempre estratte: costo trascurabile vs inferenza, e il batch
-         * può mischiare richieste json e verbose_json */
+        /* words are always extracted: negligible next to inference, and a batch
+         * can mix json and verbose_json requests */
         mynah_asr_transcribe_batch_ts(g_model, samples, ns, B, langs, lookahead,
                                   texts, louts, wordsv, nwordsv);
 
@@ -272,10 +273,10 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
     }
 }
 
-/* -------------------------------------- POST /transcriptions e /translations
- * translate = 1: endpoint /v1/audio/translations (solo modelli AED) — la lingua
- * di uscita è target_language (default "en", stile OpenAI/Whisper); la
- * traduzione per-richiesta viaggia nel lang come "src>tgt" (thread-safe). */
+/* -------------------------------------- POST /transcriptions and /translations
+ * translate = 1: the /v1/audio/translations endpoint (AED models only) — the
+ * output language is target_language (default "en", OpenAI/Whisper style); the
+ * per-request translation travels inside lang as "src>tgt" (thread-safe). */
 static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
                               size_t body_len, int translate) {
     form_data f = {.lookahead = -1, .language = "auto", .response_format = "json"};
@@ -441,7 +442,7 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
                      "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept);
     if (write_all(fd, resp, (size_t)n) != 0) return;
 
-    /* parametri da query string */
+    /* parameters from the query string */
     char lang[24] = "auto";
     int lookahead = -1;
     if (query) {

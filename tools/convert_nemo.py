@@ -51,7 +51,7 @@ def mel_to_hz_slaney(m: np.ndarray) -> np.ndarray:
 
 
 def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sample_rate: int) -> np.ndarray:
-    """Clone di torchaudio.functional.melscale_fbanks(norm='slaney', mel_scale='slaney').
+    """Clone of torchaudio.functional.melscale_fbanks(norm='slaney', mel_scale='slaney').
 
     Identica alla costruzione NeMo (librosa htk=False, norm slaney); vedi
     docs/prior-art.md §B.2 (onnx-asr la valida vs NeMo con atol 5e-7).
@@ -70,7 +70,7 @@ def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sampl
 
 # ------------------------------------------------------------------ tokenizer
 def load_pieces(model_dir: Path, vocab_size: int, blank_id: int, blank_token: str) -> list[str]:
-    """Estrae l'array id -> piece dal tokenizer.json (formato HF tokenizers).
+    """Extract the id -> piece array from tokenizer.json (HF tokenizers format).
 
     Nota (verificato sul checkpoint): il tokenizer.json elenca <pad>=13087 e <blank>=13088,
     ma nello spazio di output del modello (joint = vocab_size=13088 logit, blank_as_pad)
@@ -120,7 +120,7 @@ def build_nemotron(model_dir: Path, cfg: dict, proc: dict) -> dict:
         "arch": "fastconformer_rnnt_streaming",
         "engine": "nemotron-streaming",
         "weights": "model.safetensors",
-        # normalize "NA" dal model_config.yaml nel .nemo (vedi docs/nemotron-arch.md)
+        # normalize "NA" from the model_config.yaml inside the .nemo (see docs/nemotron-arch.md)
         "features": features_section(fe, "NA"),
         "encoder": {
             "n_layers": enc["num_hidden_layers"],
@@ -164,7 +164,7 @@ def build_nemotron(model_dir: Path, cfg: dict, proc: dict) -> dict:
 
 
 def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
-    """parakeet-tdt (offline, non-causale, conv batch_norm, decoder TDT).
+    """parakeet-tdt (offline, non-causal, batch_norm conv, TDT decoder).
     Riferimento numerico: docs/parakeet-tdt-arch.md + reference/transformers-parakeet/."""
     enc = cfg["encoder_config"]
     fe = proc["feature_extractor"]
@@ -175,7 +175,7 @@ def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
         "arch": "fastconformer_tdt",
         "engine": "parakeet-tdt",
         "weights": "model.safetensors",
-        # normalize per_feature dal model_config.yaml nel .nemo (parakeet-tdt-arch.md)
+        # normalize per_feature from the model_config.yaml inside the .nemo (parakeet-tdt-arch.md)
         "features": features_section(fe, "per_feature"),
         "encoder": {
             "n_layers": enc["num_hidden_layers"],
@@ -216,8 +216,8 @@ BUILDERS = {
 
 
 # ------------------------------------------------------------- ingresso .nemo
-# Rename NeMo -> canonico (naming del porting HF, quello che il runtime legge).
-# Verificato su parakeet-tdt_ctc-110m (docs/parakeet-tdt-arch.md per la mappa v3).
+# NeMo -> canonical rename (the HF port naming, the one the runtime reads).
+# Verified on parakeet-tdt_ctc-110m (docs/parakeet-tdt-arch.md for the v3 map).
 _NEMO_RENAMES = [
     ("encoder.pre_encode.conv.", "encoder.subsampling.layers."),
     ("encoder.pre_encode.out.", "encoder.subsampling.linear."),
@@ -235,7 +235,7 @@ _NEMO_RENAMES = [
     ("joint.pred.", "decoder.decoder_projector."),
 ]
 
-# Rename del ramo AED (EncDecMultiTaskModel: Canary) — docs/canary-arch.md.
+# Rename of the AED branch (EncDecMultiTaskModel: Canary) — docs/canary-arch.md.
 _AED_RENAMES = [
     ("encoder_decoder_proj.", "enc_dec_proj."),
     ("transf_decoder._embedding.token_embedding.weight", "aed.embedding.weight"),
@@ -270,8 +270,8 @@ def rename_nemo_key(k: str) -> str | None:
     m = re.fullmatch(r"joint\.joint_net\.\d+\.(weight|bias)", k)
     if m:
         return f"joint.head.{m.group(1)}"
-    # head CTC: ausiliaria dei modelli hybrid (ctc_decoder.*) o decoder principale
-    # dei modelli CTC puri (decoder.decoder_layers.*)
+    # CTC head: auxiliary in hybrid models (ctc_decoder.*) or the main decoder of
+    # the pure CTC models (decoder.decoder_layers.*)
     m = re.fullmatch(r"(?:ctc_)?decoder\.decoder_layers\.0\.(weight|bias)", k)
     if m:
         return f"ctc_head.{m.group(1)}"
@@ -314,13 +314,13 @@ def yaml_encoder_section(enc: dict) -> dict:
         "activation": "silu",
         "att_context_style": enc.get("att_context_style", "regular"),
         "pos_emb_max_len": enc["pos_emb_max_len"],
-        # xscaling: input dei layer scalato per sqrt(d_model) (modelli piu' vecchi)
+        # xscaling: layer input scaled by sqrt(d_model) (older models)
         "xscaling": bool(enc.get("xscaling", False)),
     }
 
 
 def build_parakeet_tdt_from_yaml(model_dir: Path, y: dict) -> dict:
-    """mynah.json dal model_config.yaml del .nemo — Parakeet RNNT/TDT (anche hybrid)."""
+    """mynah.json from the .nemo model_config.yaml — Parakeet RNNT/TDT (hybrid too)."""
     dec = y["decoder"]
     durations = y["decoding"].get("durations") or []
     return {
@@ -347,7 +347,7 @@ def build_parakeet_tdt_from_yaml(model_dir: Path, y: dict) -> dict:
 
 
 def build_parakeet_ctc_from_yaml(model_dir: Path, y: dict) -> dict:
-    """Parakeet CTC puro (ConvASRDecoder): niente prednet/joint, solo ctc_head."""
+    """Pure CTC Parakeet (ConvASRDecoder): no prednet/joint, only ctc_head."""
     return {
         "mynah_asr_format": 1,
         "name": model_dir.name,
@@ -367,18 +367,18 @@ def build_parakeet_ctc_from_yaml(model_dir: Path, y: dict) -> dict:
 
 
 # canary-1b-v2 (tokenizer unificato): lingue dalla model card, validate contro
-# il vocab alla conversione (il token <|xx|> deve esistere)
+# the vocab at conversion time (the <|xx|> token must exist)
 CANARY_V2_LANGS = ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
                    "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro",
                    "ru", "sk", "sl", "sv", "uk"]
 
 
 def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
-    """Canary Flash/v2 (EncDecMultiTaskModel): AED con decoder Transformer.
-    docs/canary-arch.md. I token del prompt restano STRINGHE nel mynah.json:
-    il runtime li risolve in id via tokens.json (niente doppia contabilità)."""
+    """Canary Flash/v2 (EncDecMultiTaskModel): AED with a Transformer decoder.
+    docs/canary-arch.md. The prompt tokens stay STRINGS in mynah.json: the
+    runtime resolves them into ids through tokens.json (no double bookkeeping)."""
     dcfg = y["transf_decoder"]["config_dict"]
-    # aggregato (flash): lingue = chiavi dei sub-tokenizer; unificato (v2): model card
+    # aggregate (flash): languages = sub-tokenizer keys; unified (v2): model card
     langs = ([l for l in y["tokenizer"]["langs"] if l != "spl_tokens"]
              if y["tokenizer"].get("type") == "agg" else CANARY_V2_LANGS)
     slots = y["prompt_defaults"][0]["slots"]
@@ -405,8 +405,8 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
         },
         "prompt": {
             "format": "canary2",
-            # template canary2 (Canary2PromptFormatter): boctx, contesto (vuoto di
-            # default), bos, poi gli slot in quest'ordine
+            # canary2 template (Canary2PromptFormatter): boctx, context (empty by
+            # default), bos, then the slots in this order
             "template": ["<|startofcontext|>", "{decodercontext}", "<|startoftranscript|>",
                          "{emotion}", "{source_lang}", "{target_lang}", "{pnc}",
                          "{itn}", "{timestamp}", "{diarize}"],
@@ -418,9 +418,9 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
 
 
 def canary_pieces(tar, names, y: dict) -> tuple[list[str], int]:
-    """Tokenizer Canary: aggregato (flash — pezzi in ordine di id GLOBALE,
+    """Canary tokenizer: aggregate (flash — pieces in GLOBAL id order,
     sub-tokenizer nell'ordine dello yaml, offset cumulativi) o unificato (v2 —
-    un solo modello SPE). Ritorna (pieces, spl_size; 0 = unificato)."""
+    a single SPE model). Returns (pieces, spl_size; 0 = unified)."""
     import sentencepiece as spm
 
     def load(member: str) -> "spm.SentencePieceProcessor":
@@ -468,8 +468,8 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
     aed = ycfg.get("target", "").endswith("EncDecMultiTaskModel")
     if aed:
         mynah = build_canary_from_yaml(model_dir, ycfg)
-        # v2 bundla un ALLINEATORE separato per i timestamp: il token
-        # <|timestamp|> generativo non funziona (il modello emette EOS subito)
+        # v2 bundles a separate ALIGNER for the timestamps: the generative
+        # <|timestamp|> token does not work (the model emits EOS immediately)
         if any(n.endswith("timestamps_asr_model_config.yaml") for n in names):
             mynah["decoder"]["timestamp_tokens"] = False
     elif "ConvASRDecoder" in ycfg["decoder"]["_target_"]:
@@ -489,7 +489,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
         tensors[nk] = v.float().numpy()
     save_file(tensors, model_dir / "model.safetensors")
 
-    # filterbank e finestra DAL checkpoint (bit-esatte con NeMo)
+    # filterbank and window FROM the checkpoint (bit-exact against NeMo)
     fb = sd["preprocessor.featurizer.fb"].numpy()[0].T          # [1,M,257] -> [257,M]
     window = sd["preprocessor.featurizer.window"].numpy()
     save_file({"mel_fb": np.ascontiguousarray(fb.astype(np.float32)),
@@ -497,10 +497,10 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
               model_dir / "mel_filters.safetensors")
 
     if aed:
-        # tokenizer (aggregato o unificato) dai modelli SPE nel tar
+        # tokenizer (aggregate or unified) from the SPE models inside the tar
         pieces, spl_size = canary_pieces(tar, names, ycfg)
         mynah["tokenizer"]["spl_size"] = spl_size
-        # i token che il runtime risolverà per nome DEVONO esistere nel vocab
+        # the tokens the runtime resolves by name MUST exist in the vocab
         pset = set(pieces)
         need = [mynah["decoder"]["eos_token"]]
         need += [f"<|{l}|>" for l in mynah["prompt"]["languages"]]
@@ -508,7 +508,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
         missing = [t for t in need if t not in pset]
         assert not missing, f"token assenti dal vocab: {missing}"
     else:
-        # pieces dallo yaml (in ordine di id) + blank in coda
+        # pieces from the yaml (in id order) + blank appended last
         vocab = ycfg.get("joint", {}).get("vocabulary") or ycfg["decoder"]["vocabulary"]
         pieces = list(vocab) + ["<blank>"]
     assert len(pieces) == mynah["decoder"]["vocab_size"]

@@ -38,7 +38,7 @@ static void layer_norm_f(const float *x, const float *w, const float *b, float *
 
 static void silu_inplace(float *x, size_t n) { mynah_asr_silu(x, n); }
 
-/* x[T, n] += b (broadcast per riga); no-op se b == NULL (modelli senza bias) */
+/* x[T, n] += b (broadcast over rows); no-op when b == NULL (models without bias) */
 static void add_bias_rows(float *x, const float *b, int T, int n) {
     if (!b) return;
     for (int t = 0; t < T; t++) {
@@ -47,7 +47,7 @@ static void add_bias_rows(float *x, const float *b, int T, int n) {
     }
 }
 
-/* out[T,n] = x[T,k] @ W[n,k]^T (row-major, layout linear PyTorch) */
+/* out[T,n] = x[T,k] @ W[n,k]^T (row-major, PyTorch linear layout) */
 static void matmul_wt(const float *x, const float *w, float *out, int T, int n, int k) {
     mynah_asr_gemm_wt(x, w, out, T, n, k);
 }
@@ -57,8 +57,8 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
     memset(enc, 0, sizeof(*enc));
     if (mynah_asr_subsampling_init(&enc->ss, st) != 0) return -1;
 
-    /* dimensioni dalle shape (ffn_dim dopo l'init del primo qmat: nel file
-     * pre-quantizzato il f32 di linear1 non esiste) */
+    /* dimensions from the shapes (ffn_dim after the first qmat init: in the
+     * pre-quantized file the f32 of linear1 does not exist) */
     const mynah_asr_tensor *bu = mynah_asr_st_get(st, "encoder.layers.0.self_attn.bias_u");
     const mynah_asr_tensor *dw = mynah_asr_st_get(st, "encoder.layers.0.conv.depthwise_conv.weight");
     const mynah_asr_tensor *ep = mynah_asr_st_get(st, "encoder_projector.weight");  /* opzionale (CTC puro) */
@@ -77,7 +77,7 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
         enc->num_prompts = (int)p1->shape[1] - enc->d_model;
     }
 
-    /* conta i layer */
+    /* count the layers */
     int n = 0;
     while (T_(st, "encoder.layers.%d.%s", n, "norm_out.weight")) n++;
     enc->n_layers = n;
@@ -103,7 +103,7 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
         L->ln_ff2_b = T_(st, F, li, "norm_feed_forward2.bias");
         L->ln_out_w = T_(st, F, li, "norm_out.weight");
         L->ln_out_b = T_(st, F, li, "norm_out.bias");
-        /* bias opzionali (use_bias true, es. parakeet-110m): NULL se assenti */
+        /* optional biases (use_bias true, e.g. parakeet-110m): NULL when absent */
         L->ff1_b1 = T_(st, F, li, "feed_forward1.linear1.bias");
         L->ff1_b2 = T_(st, F, li, "feed_forward1.linear2.bias");
         L->ff2_b1 = T_(st, F, li, "feed_forward2.linear1.bias");
@@ -119,7 +119,7 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
             fprintf(stderr, "encoder: missing tensors at layer %d\n", li);
             return -1;
         }
-        /* grandi linear: qmat — cerca prima la forma pre-quantizzata (.q8/.q4) */
+        /* large linears: qmat — looks for the pre-quantized form (.q8/.q4) first */
         int rc = 0;
         char qn[160];
         #define QM(field, suffix) \
@@ -144,8 +144,8 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
 
     enc->ffn_dim = enc->layers[0].ff1_w1.n;
 
-    /* conv norm = BatchNorm (Parakeet): fold delle running stats in scale+shift
-     * per-canale (inference: y = (x-mu)/sqrt(var+eps)*gamma+beta, eps 1e-5) */
+    /* conv norm = BatchNorm (Parakeet): fold the running stats into a per-channel
+     * scale+shift (inference: y = (x-mu)/sqrt(var+eps)*gamma+beta, eps 1e-5) */
     if (mynah_asr_st_get(st, "encoder.layers.0.conv.norm.running_mean")) {
         const int d = enc->d_model;
         enc->bn_fold = malloc((size_t)n * 2u * (size_t)d * sizeof(float));
@@ -211,12 +211,12 @@ void mynah_asr_pos_emb(const mynah_asr_encoder *enc, int T, float *pe) {
 }
 
 /* ------------------------------------------------------------- attention */
-/* Attention windowed (left >= 0) a BLOCCHI di righe: le GEMM ac/bd/ctx toccano
- * solo la banda di chiavi visibile dal blocco invece dell'intera T×T — il costo
- * torna lineare in T. Trovato sul primo bench A100 (300 s: RTF cuda 0.052 vs
- * 0.028 a 60 s, +1.3 GB RAM): a T=3750 le GEMM full sprecavano ~2 TFLOP e
- * ~170 MB/layer per usare ~60 colonne per riga. Stessa matematica del path
- * full: bd_shifted[t,j] = bd[t, T-1+j-t], softmax solo su [j0,j1). */
+/* Windowed attention (left >= 0) in BLOCKS of rows: the ac/bd/ctx GEMMs touch
+ * only the band of keys visible to the block instead of the whole T×T — the cost
+ * goes back to linear in T. Found on the first A100 bench (300 s: cuda RTF 0.052
+ * vs 0.028 at 60 s, +1.3 GB RAM): at T=3750 the full GEMMs wasted ~2 TFLOP and
+ * ~170 MB/layer to use ~60 columns per row. Same math as the full path:
+ * bd_shifted[t,j] = bd[t, T-1+j-t], softmax only over [j0,j1). */
 static void attention_banded(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L,
                              float *q, float *k, float *v, const float *pe,
                              float *ctx, int T, int left, int right) {
@@ -228,7 +228,7 @@ static void attention_banded(const mynah_asr_encoder *enc, const mynah_asr_enc_l
     const int Wb_max = (lc + B) * chunk;
     const int pW_max = Wb_max + Rb_max - 1;
 
-    /* rk serve solo nella banda |j-t| < finestra+blocco intorno a p = T-1 */
+    /* rk is only needed in the band |j-t| < window+block around p = T-1 */
     int pu0 = T - (lc + B + 1) * chunk, pu1 = T + (B + 1) * chunk;
     if (pu0 < 0) pu0 = 0;
     if (pu1 > P) pu1 = P;
@@ -347,26 +347,27 @@ static void attention(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L
 
     for (int h = 0; h < H; h++) {
         const size_t ho = (size_t)h * (size_t)dk;
-        /* q + bias_v (per matrix_bd): gemm su viste strided per head */
+        /* q + bias_v (for matrix_bd): gemm over per-head strided views */
         for (int t = 0; t < T; t++)
             for (int i = 0; i < dk; i++)
                 qb[(size_t)t * (size_t)dk + (size_t)i] = q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_v[ho + (size_t)i];
-        /* bd_full[t, p] = qv[t] . rk[p]  — rk per head è strided: gemm con lda=d */
+        /* bd_full[t, p] = qv[t] . rk[p]  — rk is strided per head: gemm with lda=d */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, P, dk,
                     1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
 
-        /* q + bias_u (per matrix_ac) */
+        /* q + bias_u (for matrix_ac) */
         for (int t = 0; t < T; t++)
             for (int i = 0; i < dk; i++)
                 qb[(size_t)t * (size_t)dk + (size_t)i] = q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_u[ho + (size_t)i];
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, dk,
                     1.0f, qb, dk, k + ho, d, 0.0f, scores, T);
 
-        /* scores = (ac + rel_shift(bd)) * scaling + softmax, SOLO sulla finestra
-         * chunked_limited — che per riga è contigua: jc in [tc-lc, tc]
-         * => j in [ (tc-lc)*chunk, (tc+1)*chunk ). Niente -inf (UB con -ffast-math),
-         * niente lavoro sui masked (prior-art §A: finestra nei limiti del loop).
-         * left < 0: attention full (att_context [-1,-1], modelli offline). */
+        /* scores = (ac + rel_shift(bd)) * scaling + softmax, ONLY over the
+         * chunked_limited window — which is contiguous per row: jc in [tc-lc, tc]
+         * => j in [ (tc-lc)*chunk, (tc+1)*chunk ). No -inf (UB under -ffast-math),
+         * no work on the masked entries (prior art §A: the window lives in the
+         * loop bounds). left < 0: full attention (att_context [-1,-1], offline
+         * models). */
         for (int t = 0; t < T; t++) {
             float *srow = scores + (size_t)t * (size_t)T;
             const float *brow = bd + (size_t)t * (size_t)P;
@@ -381,7 +382,7 @@ static void attention(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L
 
             float maxv = -3.0e38f;
             for (int j = j0; j < j1; j++) {
-                /* rel_shift in forma chiusa: bd_shifted[t,j] = bd[t, T-1 + j - t] */
+                /* rel_shift in closed form: bd_shifted[t,j] = bd[t, T-1 + j - t] */
                 srow[j] = (srow[j] + brow[T - 1 + j - t]) * scaling;
                 if (srow[j] > maxv) maxv = srow[j];
             }
@@ -396,7 +397,7 @@ static void attention(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L
             for (int j = j1; j < T; j++) srow[j] = 0.0f;
         }
 
-        /* ctx_h = scores @ v_h (v strided per head) */
+        /* ctx_h = scores @ v_h (v is strided per head) */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, dk, T,
                     1.0f, scores, T, v + ho, d, 0.0f, qb, dk);
         for (int t = 0; t < T; t++)
@@ -417,7 +418,7 @@ static void conv_module(const mynah_asr_encoder *enc, const mynah_asr_enc_layer 
     float *c = malloc((size_t)T * (size_t)d * sizeof(float));
     if (!h2 || !g || !c) { free(h2); free(g); free(c); return; }
 
-    /* pointwise_conv1 [2d, d, 1] come linear, poi GLU sui canali */
+    /* pointwise_conv1 [2d, d, 1] as a linear, then GLU over the channels */
     mynah_asr_qmat_mul(&L->pw1_w, x, h2, T);
     add_bias_rows(h2, L->pw1_b, T, 2 * d);
     for (int t = 0; t < T; t++) {
@@ -427,8 +428,8 @@ static void conv_module(const mynah_asr_encoder *enc, const mynah_asr_enc_layer 
         for (int i = 0; i < d; i++) o[i] = a[i] * mynah_asr_sigmoid(b[i]);
     }
 
-    /* depthwise k — dw_w [d, 1, k]: causale (pad left k-1) o 'same' simmetrico
-     * (pad (k-1)/2 per lato); gli out-of-range leggono zero via bounds del loop */
+    /* depthwise k — dw_w [d, 1, k]: causal (left pad k-1) or symmetric 'same'
+     * (pad (k-1)/2 per side); out-of-range reads are zero via the loop bounds */
     const int pc = enc->causal ? k - 1 : (k - 1) / 2;
     for (int t = 0; t < T; t++) {
         float *o = c + (size_t)t * (size_t)d;
@@ -443,7 +444,7 @@ static void conv_module(const mynah_asr_encoder *enc, const mynah_asr_enc_layer 
     }
 
     if (L->cnorm_scale) {
-        /* BatchNorm foldata: affine per-canale */
+        /* folded BatchNorm: per-channel affine */
         for (int t = 0; t < T; t++) {
             const float *src = c + (size_t)t * (size_t)d;
             float *o = g + (size_t)t * (size_t)d;
@@ -458,8 +459,8 @@ static void conv_module(const mynah_asr_encoder *enc, const mynah_asr_enc_layer 
     free(h2); free(g); free(c);
 }
 
-/* ½FFN pre-norm: fusa (qmat_ffn) per i modelli senza bias, unfused con i bias.
- * ln -> linear1 (+b) -> SiLU -> linear2 (+b) in tmp [T,d]; tmp2 scratch [T,ffn]. */
+/* Pre-norm ½FFN: fused (qmat_ffn) for models without bias, unfused with biases.
+ * ln -> linear1 (+b) -> SiLU -> linear2 (+b) into tmp [T,d]; tmp2 scratch [T,ffn]. */
 static void half_ffn(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L,
                      const float *x, float *tmp, float *tmp2, int T, int which2) {
     const mynah_asr_qmat *w1 = which2 ? &L->ff2_w1 : &L->ff1_w1;
@@ -490,7 +491,7 @@ int mynah_asr_encoder_layer(const mynah_asr_encoder *enc, int li, float *x, int 
     float *tmp2 = malloc((size_t)T * (size_t)enc->ffn_dim * sizeof(float));
     if (!tmp || !tmp2) { free(tmp); free(tmp2); return -1; }
 
-    /* ½ FFN1 (fusa se senza bias: su Metal un solo sync) */
+    /* ½ FFN1 (fused when bias-free: a single sync on Metal) */
     half_ffn(enc, L, x, tmp, tmp2, T, 0);
     for (size_t i = 0; i < n; i++) x[i] += 0.5f * tmp[i];
 
@@ -510,21 +511,21 @@ int mynah_asr_encoder_layer(const mynah_asr_encoder *enc, int li, float *x, int 
     half_ffn(enc, L, x, tmp, tmp2, T, 1);
     for (size_t i = 0; i < n; i++) x[i] += 0.5f * tmp[i];
 
-    /* LN out */
+    /* output LN */
     layer_norm_f(x, L->ln_out_w, L->ln_out_b, xn, T, d);
     memcpy(x, xn, n * sizeof(float));
     free(tmp); free(tmp2); free(xn);
     return 0;
 }
 
-/* Stack completo dei layer su x [T,d]. Su Metal (pesi f32, k=9) va tutto in
- * GPU con un solo sync (v4); altrimenti loop per-layer CPU. */
+/* Full layer stack over x [T,d]. On Metal (f32 weights, k=9) everything runs on
+ * GPU with a single sync (v4); otherwise a per-layer CPU loop. */
 static int run_layers(const mynah_asr_encoder *enc, float *x, int T, const float *pe,
                       int left_ctx, int right_ctx) {
 #ifdef MYNAH_ASR_METAL
-    /* Il kernel Metal copre entrambe le semantiche: Nemotron (conv causale, LN,
-     * finestra chunked) e Parakeet (conv 'same', BN foldata, attention full,
-     * bias opzionali). Restano su CPU solo i pesi quantizzati e k != 9. */
+    /* The Metal kernel covers both semantics: Nemotron (causal conv, LN, chunked
+     * window) and Parakeet (conv 'same', folded BN, full attention, optional
+     * biases). Only quantized weights and k != 9 stay on CPU. */
     if (mynah_asr_backend() == MYNAH_ASR_BACKEND_METAL && enc->conv_k == 9 &&
         enc->layers[0].q_w.qtype == MYNAH_ASR_Q_F32) {
         mynah_asr_metal_layer_w *ws = malloc((size_t)enc->n_layers * sizeof(*ws));
@@ -575,12 +576,12 @@ void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T,
     const int dcat = d + np;
 
     if (!enc->encproj_w) {
-        /* CTC puro: niente joint, out = encoder out */
+        /* pure CTC: no joint, out = encoder out */
         memcpy(out, x, (size_t)T * (size_t)d * sizeof(float));
         return;
     }
     if (!enc->prompt_l1_w) {
-        /* modello senza prompt (Parakeet): solo encoder_projector */
+        /* model without prompt (Parakeet): encoder_projector only */
         matmul_wt(x, enc->encproj_w, out, T, enc->d_out, d);
         for (int t = 0; t < T; t++)
             for (int i = 0; i < enc->d_out; i++)
@@ -630,7 +631,7 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
     es->conv_cache = calloc(cv, sizeof(float));
     if (!es->k_cache || !es->v_cache || !es->conv_cache) return -1;
 
-    /* scratch unico del percorso caldo (dimensioni massime, riusato ogni chunk) */
+    /* single scratch for the hot path (max sizes, reused on every chunk) */
     const size_t d = (size_t)enc->d_model, ck = (size_t)enc->conv_k;
     const size_t Qm = (size_t)es->q + 2, Km = (size_t)left_ctx + Qm, Pm = 2 * Km - 1;
     const size_t sz = Qm * d                  /* sx  */
@@ -687,10 +688,10 @@ int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
                                                 : sub * (es->right + 1);
 }
 
-/* Attention streaming: Q righe query, K/V = [cache valida ; chunk], senza mask
- * (la cache contiene esattamente il left context ammesso dalla griglia chunked).
- * pe [2K-1, d] calcolata dal chiamante (una volta per chunk, non per layer);
- * scratch preallocati in es (zero malloc nel percorso caldo). */
+/* Streaming attention: Q query rows, K/V = [valid cache ; chunk], no mask
+ * (the cache holds exactly the left context the chunked grid allows).
+ * pe [2K-1, d] is computed by the caller (once per chunk, not per layer);
+ * scratch preallocated in es (zero mallocs in the hot path). */
 static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L,
                              const float *x, const float *kn, const float *vn,
                              const float *pe, float *out, int Q,
@@ -708,7 +709,7 @@ static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer
         float *kk = es->sa_keys, *vv = es->sa_keys + (size_t)K * (size_t)d;
         mynah_asr_qmat_mul(&L->q_w, x, q, Q);
 
-        /* keys = cache valida ++ nuove (l'update della cache lo fa il chiamante) */
+        /* keys = valid cache ++ new ones (the caller updates the cache) */
         memcpy(kk, k_cache, (size_t)valid * (size_t)d * sizeof(float));
         memcpy(kk + (size_t)valid * (size_t)d, kn, (size_t)Q * (size_t)d * sizeof(float));
         memcpy(vv, v_cache, (size_t)valid * (size_t)d * sizeof(float));
@@ -758,7 +759,7 @@ static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer
     }
 }
 
-/* aggiorna la cache K/V di un layer con le nuove righe k/v del chunk */
+/* update a layer's K/V cache with the new k/v rows of the chunk */
 static void update_kv_cache(float *cache, const float *fresh, int valid, int Q,
                             int left, int d) {
     const int total = valid + Q;
@@ -774,7 +775,7 @@ static void update_kv_cache(float *cache, const float *fresh, int valid, int Q,
            (size_t)fresh_keep * (size_t)d * sizeof(float));
 }
 
-/* Conv module streaming: cache [k-1, d] anteposta, aggiornata con le ultime k-1 righe. */
+/* Streaming conv module: cache [k-1, d] prepended, refreshed with the last k-1 rows. */
 static void stream_conv_module(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L,
                                const float *x, float *out, int Q, float *cache) {
     const mynah_asr_encoder *enc = es->enc;
@@ -789,7 +790,7 @@ static void stream_conv_module(mynah_asr_enc_stream *es, const mynah_asr_enc_lay
         float *o = gp + (size_t)(k - 1 + t) * (size_t)d;
         for (int i = 0; i < d; i++) o[i] = a[i] * mynah_asr_sigmoid(b[i]);
     }
-    /* aggiorna cache = ultime k-1 righe di gp */
+    /* update cache = last k-1 rows of gp */
     memcpy(cache, gp + (size_t)Q * (size_t)d, (size_t)(k - 1) * (size_t)d * sizeof(float));
 
     for (int t = 0; t < Q; t++) {
@@ -817,8 +818,9 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
     const size_t nd = (size_t)Q * (size_t)d;
     float *tmp = es->stmp, *tmp2 = es->stmp2, *xn = es->sxn, *kn = es->skn;
 
-    /* pos emb del passo: dipende solo da K = valid + Q (uguale per tutti i
-     * layer) e a regime K è COSTANTE (cache satura): ricalcolo solo se cambia */
+    /* pos emb for this step: depends only on K = valid + Q (the same for every
+     * layer) and at steady state K is CONSTANT (cache full): recompute only when
+     * it changes */
     const int pe_K = es->cache_valid + Q;
     if (pe_K != es->sa_pe_K) {
         mynah_asr_pos_emb(enc, pe_K, es->sa_pe);
@@ -838,7 +840,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         mynah_asr_qmat_mul(&L->ff1_w2, tmp2, tmp, Q);
         for (size_t i = 0; i < nd; i++) x[i] += 0.5f * tmp[i];
 
-        /* MHSA con cache: servono k/v del chunk per aggiornare la cache DOPO */
+        /* MHSA with cache: the chunk's k/v are needed to update the cache AFTER */
         layer_norm_f(x, L->ln_att_w, L->ln_att_b, xn, Q, d);
         mynah_asr_qmat_mul(&L->k_w, xn, kn, Q);
         mynah_asr_qmat_mul(&L->v_w, xn, kn + nd, Q);
@@ -848,12 +850,12 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         update_kv_cache(vc, kn + nd, es->cache_valid, Q, es->left, d);
         for (size_t i = 0; i < nd; i++) x[i] += tmp[i];
 
-        /* Conv con cache */
+        /* Conv with cache */
         layer_norm_f(x, L->ln_conv_w, L->ln_conv_b, xn, Q, d);
         stream_conv_module(es, L, xn, tmp, Q, cc);
         for (size_t i = 0; i < nd; i++) x[i] += tmp[i];
 
-        /* ½ FFN2 + LN out */
+        /* ½ FFN2 + output LN */
         layer_norm_f(x, L->ln_ff2_w, L->ln_ff2_b, tmp, Q, d);
         mynah_asr_qmat_mul(&L->ff2_w1, tmp, tmp2, Q);
         silu_inplace(tmp2, (size_t)Q * (size_t)enc->ffn_dim);
@@ -869,13 +871,13 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
     return Q;
 }
 
-/* --------------------------------------------------------- forward batched
- * Packing senza padding: x = concat dei frame di tutte le sequenze [ΣT, d].
- * FFN/LN girano sull'intero packed (weight-stationary); attention e conv,
- * che dipendono dalla causalità per-sequenza, iterano sui segmenti —
- * IN PARALLELO (segmenti indipendenti, output disgiunti: bit-identico al
- * loop seriale). È il moltiplicatore del batch su many-core: le GEMM packed
- * le parallelizza il BLAS, i segmenti li parallelizziamo noi. */
+/* --------------------------------------------------------- batched forward
+ * Padding-free packing: x = the frames of every sequence concatenated [ΣT, d].
+ * FFN/LN run over the whole packed buffer (weight-stationary); attention and
+ * conv, which depend on per-sequence causality, iterate over the segments —
+ * IN PARALLEL (independent segments, disjoint outputs: bit-identical to the
+ * serial loop). This is what makes batching pay off on many-core: BLAS
+ * parallelizes the packed GEMMs, we parallelize the segments. */
 typedef struct {
     const mynah_asr_encoder *enc;
     const mynah_asr_enc_layer *L;
@@ -910,7 +912,7 @@ static int encoder_layer_batch(const mynah_asr_encoder *enc, int li, float *x,
     float *xn = malloc(n * sizeof(float));
     if (!tmp || !tmp2 || !xn) { free(tmp); free(tmp2); free(xn); return -1; }
 
-    /* ½ FFN1 — packed (fusa se senza bias) */
+    /* ½ FFN1 — packed (fused when bias-free) */
     half_ffn(enc, L, x, tmp, tmp2, T_total, 0);
     for (size_t i = 0; i < n; i++) x[i] += 0.5f * tmp[i];
 
@@ -920,20 +922,20 @@ static int encoder_layer_batch(const mynah_asr_encoder *enc, int li, float *x,
     seg_par sp = {.enc = enc, .L = L, .xn = xn, .tmp = tmp, .t_enc = t_enc,
                   .offs = offs, .pes = pes, .left = left, .right = right};
 
-    /* MHSA — segmenti in parallelo */
+    /* MHSA — segments in parallel */
     layer_norm_f(x, L->ln_att_w, L->ln_att_b, xn, T_total, d);
     sp.is_conv = 0;
     mynah_asr_parallel_for(batch, seg_worker, &sp);
     for (size_t i = 0; i < n; i++) x[i] += tmp[i];
 
-    /* Conv — segmenti in parallelo (causale per segmento) */
+    /* Conv — segments in parallel (causal per segment) */
     layer_norm_f(x, L->ln_conv_w, L->ln_conv_b, xn, T_total, d);
     sp.is_conv = 1;
     mynah_asr_parallel_for(batch, seg_worker, &sp);
     for (size_t i = 0; i < n; i++) x[i] += tmp[i];
     free(offs);
 
-    /* ½ FFN2 + LN out — packed (fusa se senza bias) */
+    /* ½ FFN2 + output LN — packed (fused when bias-free) */
     half_ffn(enc, L, x, tmp, tmp2, T_total, 1);
     for (size_t i = 0; i < n; i++) x[i] += 0.5f * tmp[i];
     layer_norm_f(x, L->ln_out_w, L->ln_out_b, xn, T_total, d);
@@ -974,9 +976,9 @@ int mynah_asr_encoder_forward_batch(const mynah_asr_encoder *enc, const float *c
     }
 
 #ifdef MYNAH_ASR_METAL
-    /* Su Metal ogni segmento fa l'encoder intero su GPU (pesi residenti =
-     * weight-stationary comunque); il packing paga solo sulle GEMM CPU.
-     * Stesso gate di run_layers. */
+    /* On Metal each segment runs the whole encoder on GPU (resident weights =
+     * weight-stationary anyway); packing only pays off on the CPU GEMMs.
+     * Same gate as run_layers. */
     if (mynah_asr_backend() == MYNAH_ASR_BACKEND_METAL && enc->conv_k == 9 &&
         enc->layers[0].q_w.qtype == MYNAH_ASR_Q_F32) {
         for (int b = 0, off = 0; b < batch; off += t_outs[b], b++)

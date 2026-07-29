@@ -34,13 +34,13 @@ static void pf_run(pf_state *st) {
     }
 }
 
-/* ------------------------------------------------------------ pool persistente
- * I worker vengono creati alla prima parallel_for e dormono su condvar: niente
- * pthread_create/join nel percorso caldo (prima: migliaia di spawn per
- * trascrizione batchata). UN dispatch alla volta (g_pool_mu): se il pool è
- * occupato — chiamate concorrenti dai worker del server — il chiamante gira
- * inline seriale, che è già parallelo TRA le richieste (niente oversubscription).
- * I worker sono detached e vivono fino all'exit del processo (come i pool BLAS). */
+/* ------------------------------------------------------------ persistent pool
+ * Workers are created on the first parallel_for and sleep on a condvar: no
+ * pthread_create/join in the hot path (before: thousands of spawns per batched
+ * transcription). ONE dispatch at a time (g_pool_mu): when the pool is busy —
+ * concurrent calls from the server workers — the caller runs inline and serial,
+ * which is already parallel ACROSS requests (no oversubscription).
+ * The workers are detached and live until process exit (like the BLAS pools). */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER;
@@ -78,13 +78,14 @@ static void pool_init(void) {
     }
 }
 
-/* Dentro una parallel_for i core appartengono ai worker: se ogni worker chiama
- * cblas con l'OpenBLAS multi-thread si va in oversubscription catastrofica
- * (misurato su EPYC 22 core: batch 4×60 s = 257 s invece di ~10 s). BLAS
- * mono-thread per la durata della regione, ripristino all'uscita. Accelerate
- * (macOS) gestisce il nesting via GCD e non ne ha bisogno. Weak symbol come in
- * qwen-tts (qwen_tts_kernels.c): risolto solo se linkato contro OpenBLAS;
- * OPENBLAS_NUM_THREADS esplicito nell'ambiente vince sempre. */
+/* Inside a parallel_for the cores belong to the workers: if every worker calls
+ * cblas with multi-threaded OpenBLAS the result is catastrophic oversubscription
+ * (measured on a 22-core EPYC: batch 4×60 s = 257 s instead of ~10 s). BLAS is
+ * forced single-threaded for the duration of the region and restored on exit.
+ * Accelerate (macOS) handles the nesting through GCD and does not need this.
+ * Weak symbol as in qwen-tts (qwen_tts_kernels.c): resolved only when linked
+ * against OpenBLAS; an explicit OPENBLAS_NUM_THREADS in the environment always
+ * wins. */
 #if defined(__GNUC__) && !defined(__APPLE__)
 extern void openblas_set_num_threads(int) __attribute__((weak));
 #endif
@@ -109,11 +110,11 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
 
     pf_state st = {.fn = fn, .ctx = ctx, .n = n};
     atomic_init(&st.next, 0);
-    /* quota BLAS per worker: con 2 soli job ogni cblas concorrente può usare
-     * metà dei core (misurato su EPYC 22c, batch 2×60 s nemotron: 15.7→33.3×
-     * realtime aggregato); da 3 worker in su le chiamate OpenBLAS concorrenti
-     * si azzuffano sul lock interno e la quota >1 PEGGIORA (B=8: 34→11×) →
-     * mono-thread. */
+    /* BLAS quota per worker: with only 2 jobs each concurrent cblas can use half
+     * the cores (measured on a 22-core EPYC, batch 2×60 s nemotron: 15.7→33.3×
+     * aggregate realtime); from 3 workers up, concurrent OpenBLAS calls fight
+     * over the internal lock and a quota >1 makes it WORSE (B=8: 34→11×) →
+     * single-threaded. */
     const int active = n < nth ? n : nth;
     blas_set_threads(active <= 2 ? nth / active : 1);
     if (g_workers == 0 || pthread_mutex_trylock(&g_pool_mu) != 0) {

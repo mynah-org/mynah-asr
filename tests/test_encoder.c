@@ -1,6 +1,6 @@
-/* Parità encoder: C (f32+BLAS) vs oracolo numpy (f64), per layer.
- * Confronta layer_0, layer_12, layer_23, enc_proj (dump di make golden-dump, it-IT).
- * Uso: test_encoder <model_dir> <file.wav> <golden_dir>
+/* Encoder parity: C (f32+BLAS) vs the numpy oracle (f64), layer by layer.
+ * Compares layer_0, layer_12, layer_23, enc_proj (dumps from make golden-dump, it-IT).
+ * Usage: test_encoder <model_dir> <file.wav> <golden_dir>
  * Exit: 0 ok, 1 mismatch, 77 skip. */
 #include <math.h>
 #include <stdio.h>
@@ -78,8 +78,9 @@ int main(int argc, char **argv) {
            "att [%d,%d]\n", enc.n_layers, enc.d_model, enc.n_heads, enc.ffn_dim, enc.conv_k,
            enc.d_out, enc.causal, left, right);
 
-    /* forward manuale per confrontare i layer intermedi (contesto/prompt dal config:
-     * Nemotron preset default it-IT, Parakeet full [-1,-1] senza prompt) */
+    /* manual forward so the intermediate layers can be compared (context/prompt
+     * from the config: Nemotron default preset it-IT, Parakeet full [-1,-1] with
+     * no prompt) */
     int T;
     float *x = mynah_asr_subsampling_forward(&enc.ss, feats, valid, fcfg.n_mels, &T);
     float *pe = malloc((size_t)(2 * T - 1) * (size_t)enc.d_model * sizeof(float));

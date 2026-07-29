@@ -1,8 +1,8 @@
-/* Decoder AED (Canary): Transformer pre-LN con self-attention causale (KV cache)
- * e cross-attention sull'encoder out proiettato. Greedy autoregressivo col prompt
- * canary2; semantica in docs/canary-arch.md, riferimento oracle/model.py.
- * I grandi linear passano da mynah_asr_qmat: --quant int8/int4 e checkpoint
- * pre-quantizzati coprono anche il decoder. */
+/* AED decoder (Canary): pre-LN Transformer with causal self-attention (KV cache)
+ * and cross-attention over the projected encoder output. Autoregressive greedy
+ * with the canary2 prompt; semantics in docs/canary-arch.md, reference in
+ * oracle/model.py. The large linears go through mynah_asr_qmat: --quant
+ * int8/int4 and pre-quantized checkpoints cover the decoder too. */
 #ifndef MYNAH_ASR_DECODER_AED_H
 #define MYNAH_ASR_DECODER_AED_H
 
@@ -35,14 +35,14 @@ typedef struct {
     mynah_asr_aed_layer *layers;
 } mynah_asr_aed;
 
-/* 0 = ok, -1 = pesi AED assenti (modello non-AED). */
+/* 0 = ok, -1 = AED weights missing (non-AED model). */
 int mynah_asr_aed_init(mynah_asr_aed *a, const mynah_asr_safetensors *st,
                    int n_layers, int n_heads, int max_seq, int max_gen_delta,
                    int quantize);
 void mynah_asr_aed_free(mynah_asr_aed *a);
 
-/* Greedy: enc [T, d_enc] -> token generati (senza prompt né EOS) in tokens[cap].
- * Ritorna il numero di token, -1 su errore. */
+/* Greedy: enc [T, d_enc] -> generated tokens (prompt and EOS excluded) in
+ * tokens[cap]. Returns the token count, -1 on error. */
 int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
                      const int *prompt, int n_prompt, int eos,
                      int *tokens, int cap);

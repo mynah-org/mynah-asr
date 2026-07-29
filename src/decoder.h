@@ -1,10 +1,11 @@
-/* Decoder RNNT/TDT: prediction network LSTM + joint, greedy decode.
- * Semantica NeMo/HF (docs/nemotron-arch.md, docs/parakeet-tdt-arch.md):
- * SOS = blank, lo stato LSTM avanza SOLO su emissione non-blank,
- * max_symbols_per_step limita le emissioni per frame.
- * TDT (n_durations > 0): la head emette [vocab | n_durations] logit; il frame
- * avanza della duration predetta a ogni step (blank con dur 0 -> forzata a 1).
- * Stato liftato e chunk-invariante: decodifica incrementale ≡ intera (prior-art). */
+/* RNNT/TDT decoder: LSTM prediction network + joint, greedy decode.
+ * NeMo/HF semantics (docs/nemotron-arch.md, docs/parakeet-tdt-arch.md):
+ * SOS = blank, the LSTM state advances ONLY on a non-blank emission,
+ * max_symbols_per_step caps the emissions per frame.
+ * TDT (n_durations > 0): the head emits [vocab | n_durations] logits; the frame
+ * advances by the predicted duration at each step (blank with dur 0 -> forced to 1).
+ * Lifted, chunk-invariant state: incremental decoding is equivalent to whole-input
+ * decoding (prior art). */
 #ifndef MYNAH_ASR_DECODER_H
 #define MYNAH_ASR_DECODER_H
 
@@ -22,7 +23,7 @@ typedef struct {
     mynah_asr_qmat head;                        /* joint.head [vocab(+dur), H] (int8 opz.) */
     const float *head_b;
     int vocab, hidden, n_layers, blank, max_symbols;
-    /* TDT: vocab = righe della head; i token sono le prime vocab-n_durations */
+    /* TDT: vocab = rows of the head; the tokens are the first vocab-n_durations */
     int n_durations;
     int durations[MYNAH_ASR_MAX_DURATIONS];
 } mynah_asr_decoder;
@@ -36,18 +37,18 @@ typedef struct {
                                                (per i timestamp nello streaming) */
 } mynah_asr_dec_state;
 
-/* durations: array TDT dal config (NULL/0 = RNNT puro). */
+/* durations: TDT array from the config (NULL/0 = pure RNNT). */
 int mynah_asr_decoder_init(mynah_asr_decoder *dec, const mynah_asr_safetensors *st,
                        int blank, int max_symbols, int quantize,
                        const int *durations, int n_durations);
 
 void mynah_asr_dec_state_reset(const mynah_asr_decoder *dec, mynah_asr_dec_state *s);
 
-/* Greedy RNNT/TDT su enc [T, H]. Appende i token emessi a tokens[] (capienza cap)
- * e, se frames != NULL, il frame encoder ASSOLUTO di emissione di ciascun token
- * (base = somma dei T delle chiamate precedenti sullo stesso stato).
- * Ritorna il numero di token emessi. Lo stato è persistente tra chiamate
- * (streaming-ready): passare lo stesso stato per i chunk successivi. */
+/* Greedy RNNT/TDT over enc [T, H]. Appends the emitted tokens to tokens[]
+ * (capacity cap) and, when frames != NULL, the ABSOLUTE encoder frame each token
+ * was emitted at (base = sum of the T of previous calls on the same state).
+ * Returns the number of emitted tokens. The state persists across calls
+ * (streaming-ready): pass the same state for the following chunks. */
 int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                         const float *enc, int T, int *tokens, int *frames, int cap);
 

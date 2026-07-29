@@ -11,7 +11,7 @@
 #include <cblas.h>
 #endif
 
-/* y = W x + b (T=1 sui qmat: kernel dot diretto per int8/int4) */
+/* y = W x + b (T=1 on the qmats: direct dot kernel for int8/int4) */
 static void mv(const mynah_asr_qmat *w, const float *b, const float *x, float *y) {
     mynah_asr_qmat_mul(w, x, y, 1);
     if (b)
@@ -114,8 +114,8 @@ void mynah_asr_aed_free(mynah_asr_aed *a) {
     a->layers = NULL;
 }
 
-/* attention di UNA query su n_kv chiavi/valori [n_kv, d] (righe contigue),
- * per-head, score scalati 1/sqrt(dk). out [d]. scores: scratch [n_kv]. */
+/* attention of ONE query over n_kv keys/values [n_kv, d] (contiguous rows),
+ * per head, scores scaled by 1/sqrt(dk). out [d]. scores: scratch [n_kv]. */
 static void attend(const float *q, const float *K, const float *V, int n_kv,
                    int H, int dk, float *scores, float *out) {
     const int d = H * dk;
@@ -141,11 +141,11 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
                      int *tokens, int cap) {
     const int d = a->d, H = a->n_heads, dk = d / H, nl = a->n_layers;
     if (n_prompt <= 0 || !prompt) return -1;   /* serve almeno un token di avvio */
-    /* budget di generazione = cap del caller (che sa se i timestamp sono attivi) */
+    /* generation budget = the caller's cap (it knows whether timestamps are on) */
     int max_len = n_prompt + cap;
     if (max_len > a->max_seq) max_len = a->max_seq;
 
-    /* proiezione encoder -> spazio decoder */
+    /* encoder projection -> decoder space */
     float *encp;
     if (a->proj.n) {
         encp = malloc((size_t)T * (size_t)d * sizeof(float));
@@ -156,7 +156,7 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
         encp = (float *)enc;
     }
 
-    /* cross K/V per layer (una volta) + cache self K/V + scratch */
+    /* per-layer cross K/V (computed once) + self K/V cache + scratch */
     const size_t td = (size_t)T * (size_t)d, md = (size_t)max_len * (size_t)d;
     float *ckv = malloc(2u * (size_t)nl * td * sizeof(float));
     float *skv = malloc(2u * (size_t)nl * md * sizeof(float));
@@ -179,7 +179,7 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
 
     int cur = prompt[0];
     for (int p = 0; p < max_len; p++) {
-        /* embedding + pos enc (buffer dal ckpt) + LN */
+        /* embedding + pos enc (buffer from the checkpoint) + LN */
         const float *e = a->emb + (size_t)cur * d, *pe = a->pos + (size_t)p * d;
         for (int i = 0; i < d; i++) x[i] = e[i] + pe[i];
         ln(x, a->embln_w, a->embln_b, x, d);
@@ -187,7 +187,7 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
         for (int li = 0; li < nl; li++) {
             const mynah_asr_aed_layer *L = &a->layers[li];
             float *SK = skv + (size_t)(2 * li) * md, *SV = SK + md;
-            /* self-attention causale: nuova k/v in cache, attention su [0..p] */
+            /* causal self-attention: new k/v into the cache, attention over [0..p] */
             ln(x, L->ln_self_w, L->ln_self_b, xn, d);
             mv(&L->sq, L->sq_b, xn, q);
             mv(&L->sk, L->sk_b, xn, SK + (size_t)p * d);
@@ -195,14 +195,14 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
             attend(q, SK, SV, p + 1, H, dk, scores, att);
             mv(&L->so, L->so_b, att, tmp);
             for (int i = 0; i < d; i++) x[i] += tmp[i];
-            /* cross-attention sull'encoder proiettato */
+            /* cross-attention over the projected encoder output */
             ln(x, L->ln_cross_w, L->ln_cross_b, xn, d);
             mv(&L->cq, L->cq_b, xn, q);
             attend(q, ckv + (size_t)(2 * li) * td, ckv + (size_t)(2 * li) * td + td,
                    T, H, dk, scores, att);
             mv(&L->co, L->co_b, att, tmp);
             for (int i = 0; i < d; i++) x[i] += tmp[i];
-            /* FFN ReLU */
+            /* ReLU FFN */
             ln(x, L->ln_ffn_w, L->ln_ffn_b, xn, d);
             mv(&L->ff1, L->ff1_b, xn, ff);
             for (int i = 0; i < a->ffn; i++) if (ff[i] < 0.0f) ff[i] = 0.0f;

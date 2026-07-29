@@ -67,8 +67,9 @@ int main(int argc, char **argv) {
         if (fabs(golden[i]) > scale) scale = fabs(golden[i]);
         mean += d;
     }
-    /* C è f32+BLAS, l'oracolo f64: tolleranza relativa alla scala dei valori
-     * (qui |max| ~1e3, quindi ~1e-2 assoluto). Prior-art usa 4e-5..6e-3 per stadio. */
+    /* C is f32+BLAS, the oracle is f64: the tolerance is relative to the value
+     * scale (here |max| ~1e3, so ~1e-2 absolute). Prior art uses 4e-5..6e-3 per
+     * stage. */
     double tol = 1e-5 * scale;
     printf("subsampling parity: T=%d d=%d | max|d|=%.3e mean|d|=%.3e scale=%.1f (tol %.1e)\n",
            t_out, ss.d_model, max_diff, mean / (double)n_c, scale, tol);

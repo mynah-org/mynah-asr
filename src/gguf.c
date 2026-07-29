@@ -8,14 +8,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Tipi di valore dei metadata GGUF (KV store nell'header). */
+/* Value types of the GGUF metadata (the KV store in the header). */
 enum {
     GGUF_U8 = 0, GGUF_I8 = 1, GGUF_U16 = 2, GGUF_I16 = 3, GGUF_U32 = 4,
     GGUF_I32 = 5, GGUF_F32 = 6, GGUF_BOOL = 7, GGUF_STRING = 8, GGUF_ARRAY = 9,
     GGUF_U64 = 10, GGUF_I64 = 11, GGUF_F64 = 12
 };
 
-/* Tipi tensore ggml (solo quelli che il runtime accetta; il resto -> errore). */
+/* ggml tensor types (only the ones the runtime accepts; anything else -> error). */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
        GGML_Q4_K = 12, GGML_BF16 = 30 };
 
@@ -32,7 +32,7 @@ struct mynah_asr_gguf {
     size_t count;
 };
 
-/* Aritmetica con controllo overflow: un header ostile non deve mandarci in UB. */
+/* Overflow-checked arithmetic: a hostile header must not drag us into UB. */
 static int add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (b > UINT64_MAX - a) return -1;
     *out = a + b;
@@ -116,8 +116,8 @@ static int skip_value(reader *r, uint32_t type, unsigned depth) {
     return 0;
 }
 
-/* Dei metadata serve solo general.alignment: la config del modello NON viene
- * dal GGUF ma da mynah.json (i KV extra vengono saltati, non sono un errore). */
+/* Of the metadata only general.alignment matters: the model config does NOT come
+ * from the GGUF but from mynah.json (extra KVs are skipped, not an error). */
 static int rd_metadata(mynah_asr_gguf *g, reader *r, uint64_t count) {
     if (count > 100000000u) return -1;
     for (uint64_t i = 0; i < count; i++) {
@@ -176,8 +176,9 @@ static float f16_to_f32(uint16_t v) {
 
 static uint16_t ld_u16(const unsigned char *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
-/* Q4_K: decodifica dei 8 scale/min a 6 bit impacchettati in 12 byte
- * (layout ggml; port da keyra/gguf_quant.c, validato contro file reali di là). */
+/* Q4_K: decoding of the 8 six-bit scales/mins packed into 12 bytes
+ * (ggml layout; ported from keyra/gguf_quant.c, validated there against real
+ * files). */
 static void q4k_scale_min(const unsigned char *scales, int idx,
                           unsigned char *sc, unsigned char *mn) {
     if (idx < 4) {
@@ -189,8 +190,8 @@ static void q4k_scale_min(const unsigned char *scales, int idx,
     }
 }
 
-/* Dequant ggml -> f32. I blocchi sono sequenziali sul tensore row-major
- * (la dim più veloce ne[0] è multiplo di 32: verificato prima). */
+/* ggml -> f32 dequant. The blocks are sequential over the row-major tensor
+ * (the fastest dim ne[0] is a multiple of 32: checked beforehand). */
 static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, float *dst) {
     switch (type) {
     case GGML_F16:
@@ -222,7 +223,7 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
         }
         break;
     case GGML_Q4_K:  /* super-blocco 144B: d,dmin f16 + 12B scale/min + 128B nibble
-                      * x = d*sc*q - dmin*m su 8 sotto-blocchi da 32 */
+                      * x = d*sc*q - dmin*m over 8 sub-blocks of 32 */
         for (size_t b = 0; b < n_elems / 256; b++) {
             const unsigned char *blk = src + b * 144;
             const float d = f16_to_f32(ld_u16(blk));
@@ -248,7 +249,7 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
 }
 
 static uint64_t align_up(uint64_t v, uint64_t a, int *valid) {
-    /* alignment: potenza di 2, ragionevole (spec: default 32) */
+    /* alignment: a power of 2, within reason (spec default: 32) */
     if (a == 0 || a > (1u << 20) || (a & (a - 1)) != 0 || v > UINT64_MAX - a + 1) {
         *valid = 0;
         return 0;
@@ -287,8 +288,8 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
     g->ggml_type = calloc(g->count ? g->count : 1, sizeof(*g->ggml_type));
     if (!g->tensors || !g->names || !g->dequant || !g->ggml_type) goto fail;
 
-    /* tensor info: nome, dims (convenzione ggml: ne[0] = la più veloce ->
-     * invertite rispetto a safetensors row-major), tipo, offset relativo */
+    /* tensor info: name, dims (ggml convention: ne[0] = the fastest one ->
+     * reversed with respect to row-major safetensors), type, relative offset */
     uint64_t *offsets = calloc(g->count ? g->count : 1, sizeof(*offsets));
     if (!offsets) goto fail;
     for (size_t i = 0; i < g->count; i++) {
@@ -328,8 +329,8 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
     for (size_t i = 0; i < g->count; i++) {
         mynah_asr_tensor *t = &g->tensors[i];
         uint64_t be, bb, bytes, abs_off, end;
-        /* tipo ggml ignoto: senza il check si divideva per un `be` mai
-         * scritto (UB) — beccato da GCC 13 sulla prima build Linux */
+        /* unknown ggml type: without this check we divided by a `be` that was
+         * never written (UB) — caught by GCC 13 on the first Linux build */
         if (type_geometry(g->ggml_type[i], &be, &bb) != 0 ||
             mul_u64(t->n_elems / be, bb, &bytes) != 0 ||
             add_u64(g->data_base, offsets[i], &abs_off) != 0 ||

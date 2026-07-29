@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trascrizione offline con l'oracolo numpy (lento, è un riferimento non un runtime).
+"""Offline transcription with the numpy oracle (slow: it is a reference, not a runtime).
 
 Uso:
   uv run python -m oracle.transcribe <model_dir> <file.wav> [--lang it-IT] [--lookahead N]

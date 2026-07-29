@@ -1,17 +1,17 @@
-/* Throughput batch: replica lo stesso wav B volte (B = 1,2,4,...,max-batch) e
- * misura l'aggregato audio-s/s della trascrizione batch weight-stationary
- * (mynah_asr_transcribe_batch). Pensato per stimare quante richieste parallele
- * regge un backend GPU (make cuda / metal), ma gira anche su cpu.
- * Verifica anche che ogni item del batch produca il testo del run B=1.
+/* Batch throughput: replicates the same wav B times (B = 1,2,4,...,max-batch)
+ * and measures the aggregate audio-s/s of the weight-stationary batch
+ * transcription (mynah_asr_transcribe_batch). Meant to estimate how many
+ * parallel requests a GPU backend (make cuda / metal) can sustain, but it runs
+ * on cpu too. It also checks that every batch item produces the B=1 text.
  *
- * Con --threads il bench simula invece N RICHIESTE CONCORRENTI stile server:
- * N pthread sullo stesso modello condiviso, ognuno trascrive il wav R volte
- * (scala N = 1,2,4,...,max). Con CUDA misura il guadagno dei contesti
- * per-thread (stream indipendenti) rispetto al vecchio mutex globale.
+ * With --threads the bench instead simulates N CONCURRENT server-style requests:
+ * N pthreads over the same shared model, each transcribing the wav R times
+ * (sweeping N = 1,2,4,...,max). On CUDA it measures the gain of the per-thread
+ * contexts (independent streams) over the old global mutex.
  *
- * Uso: bench_throughput <model_dir> <wav> [--lang l] [--backend cpu|metal|cuda]
- *                       [--max-batch N] [--runs R] [--threads N]
- * Exit: 0 ok, 1 mismatch testi, 2 uso errato, 77 modello/wav assenti. */
+ * Usage: bench_throughput <model_dir> <wav> [--lang l] [--backend cpu|metal|cuda]
+ *                         [--max-batch N] [--runs R] [--threads N]
+ * Exit: 0 ok, 1 text mismatch, 2 bad usage, 77 model/wav missing. */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +28,7 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* --------------------------- modalità --threads (richieste concorrenti) */
+/* --------------------------- --threads mode (concurrent requests) */
 typedef struct {
     mynah_asr_model *m;
     const float *samples;
@@ -86,12 +86,12 @@ int main(int argc, char **argv) {
     }
     const double dur = (double)ns / 16000.0;
 
-    /* riferimento B=1 (e warm-up: pesi su device, buffer allocati) */
+    /* B=1 reference (and warm-up: weights on device, buffers allocated) */
     char *ref = mynah_asr_transcribe(m, samples, ns, lang, -1, NULL);
     if (!ref) { free(samples); mynah_asr_free(m); return 1; }
 
     if (max_threads > 0) {
-        /* N richieste concorrenti stile server, ognuna `runs` trascrizioni */
+        /* N concurrent server-style requests, each doing `runs` transcriptions */
         printf("# %s | %s %.1fs | lang=%s | reps/thread=%d (concurrent transcribe)\n",
                model_dir, wav, dur, lang, runs);
         printf("%8s %10s %12s %14s\n", "threads", "wall-s", "s-req", "xRT-aggr");

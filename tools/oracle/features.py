@@ -34,11 +34,11 @@ def log_mel(
     # preemphasis: y[0] = x[0], y[n] = x[n] - a*x[n-1]
     y = np.concatenate([x[:1], x[1:] - preemphasis * x[:-1]])
 
-    # center pad (costante, zeri) di n_fft//2 per lato
+    # center pad (constant, zeros) of n_fft//2 per side
     pad = n_fft // 2
     y = np.pad(y, (pad, pad))
 
-    # finestra: Hann win_length center-paddata a n_fft (come torch.stft)
+    # window: Hann of win_length, center-padded to n_fft (like torch.stft)
     win = np.zeros(n_fft, dtype=np.float64)
     off = (n_fft - window.shape[0]) // 2
     win[off:off + window.shape[0]] = window.astype(np.float64)

@@ -42,11 +42,12 @@ struct mynah_asr_model {
     double seg_sec;                 /* limite per segmento offline (default 300 s) */
 };
 
-/* Limite default per segmento offline. I modelli full-attention/AED (Parakeet,
- * Canary) sono addestrati su utterance CORTE: oltre ~30 s la qualità crolla
- * (misurato su FLEURS 305 s: CER 0.68 a segmento unico, 0.29 a 60 s, 0.05 a
- * 30 s; Canary de>en overlap 0.16 -> 0.76). Nemotron ha l'attention finestrata
- * (chunked): non degrada, per lui il limite serve solo per la memoria. */
+/* Default per-segment limit for offline decoding. Full-attention/AED models
+ * (Parakeet, Canary) are trained on SHORT utterances: past ~30 s the quality
+ * collapses (measured on a 305 s FLEURS file: CER 0.68 as a single segment, 0.29
+ * at 60 s, 0.05 at 30 s; Canary de>en overlap 0.16 -> 0.76). Nemotron has
+ * windowed (chunked) attention: it does not degrade, so for it the limit only
+ * bounds memory. */
 #define MYNAH_ASR_SEG_DEFAULT 300.0
 #define MYNAH_ASR_SEG_OFFLINE 30.0
 
@@ -67,8 +68,8 @@ static cJSON *load_json(const char *dir, const char *file) {
     return j;
 }
 
-/* Accessor sicuri sul mynah.json: chiave mancante o tipo sbagliato -> messaggio
- * su stderr + *bad = 1 (il load fallisce pulito invece di dereferenziare NULL). */
+/* Safe accessors over mynah.json: a missing key or the wrong type -> a message
+ * on stderr + *bad = 1 (the load fails cleanly instead of dereferencing NULL). */
 static const cJSON *jneed(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = o ? cJSON_GetObjectItem(o, k) : NULL;
     if (!j) {
@@ -98,10 +99,10 @@ static const char *jstr(const cJSON *o, const char *k, int *bad) {
 
 static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids, int want_ts);
 
-/* --------------------------------------------------------- engine concreti
- * Decodificano l'output encoder di un segmento in token (vedi engine.h).
- * Vivono qui perché consumano gli internals del modello; quando arriverà un
- * engine con stato proprio (Whisper-style) migrerà in un suo modulo. */
+/* -------------------------------------------------------- concrete engines
+ * They decode the encoder output of one segment into tokens (see engine.h).
+ * They live here because they consume the model internals; when an engine with
+ * its own state arrives (Whisper-style) it will move to its own module. */
 
 static int eng_decode_rnnt(struct mynah_asr_model *m, const float *enc, int T,
                            const char *lang, int want_ts, int **tokens, int **frames) {
@@ -132,9 +133,9 @@ static int eng_decode_aed(struct mynah_asr_model *m, const float *enc, int T,
     const int ts = want_ts && m->aed_ts;             /* v2: niente <|timestamp|> */
     const int n_p = aed_build_prompt(m, lang, pids, ts);
     if (n_p <= 0) return -1;
-    /* coi timestamp ogni parola costa 2 token <|N|> in più */
+    /* with timestamps every word costs 2 extra <|N|> tokens */
     const int cap = (ts ? 3 * T : T) + m->aed.max_gen_delta;
-    *frames = NULL;                                  /* tempi nei token <|N|> */
+    *frames = NULL;                                  /* times live in the <|N|> tokens */
     *tokens = malloc((size_t)cap * sizeof(int));
     return *tokens ? mynah_asr_aed_decode(&m->aed, enc, T, pids, n_p, m->aed_eos,
                                       *tokens, cap) : -1;
@@ -155,7 +156,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
     if (!m->cfg) goto fail;
     int bad = 0;
 
-    /* pre-quantizzato su disco? (mynah-asr quantize) -> load istantaneo, niente f32 */
+    /* pre-quantized on disk? (mynah-asr quantize) -> instant load, no f32 */
     const char *wfile = jstr(m->cfg, "weights", &bad);
     if (bad) goto fail;
     m->weights = NULL;
@@ -189,7 +190,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         goto fail;
     }
 
-    /* causalità e xscaling dal config (l'init inferisce dal naming; il config vince) */
+    /* causality and xscaling from the config (init infers from the naming; the config wins) */
     const cJSON *jenc = cJSON_GetObjectItem(m->cfg, "encoder");
     const cJSON *jsub = jenc ? cJSON_GetObjectItem(jenc, "subsampling") : NULL;
     if (jsub && cJSON_IsString(jsub)) {
@@ -217,7 +218,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         m->is_aed = 1;
         m->engine_dflt = &ENG_AED;
     } else if (strcmp(dec_type, "ctc") == 0) {
-        /* CTC puro: niente prednet/joint, la head È il decoder */
+        /* pure CTC: no prednet/joint, the head IS the decoder */
         if (mynah_asr_ctc_init(&m->ctc, m->weights) != 0) {
             fprintf(stderr, "mynah-asr: missing CTC head\n");
             goto fail;
@@ -271,8 +272,8 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
                    / (double)m->feat.sample_rate;
     m->seg_sec = 0.0;   /* risolto DOPO il parse della sezione streaming */
 
-    /* streaming presets [[left, right], ...] — sezione assente per i modelli
-     * offline (Parakeet): attention full [-1,-1], niente stream API */
+    /* streaming presets [[left, right], ...] — the section is absent for offline
+     * models (Parakeet): full attention [-1,-1], no stream API */
     m->left_ctx = -1;
     m->default_right = -1;
     const cJSON *js = cJSON_GetObjectItem(m->cfg, "streaming");
@@ -292,11 +293,11 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         }
         m->n_lookaheads = i;
     }
-    /* default segmentazione model-aware (vedi commento su MYNAH_ASR_SEG_OFFLINE) */
+    /* model-aware segmentation default (see the comment on MYNAH_ASR_SEG_OFFLINE) */
     m->seg_sec = m->n_lookaheads > 0 ? MYNAH_ASR_SEG_DEFAULT : MYNAH_ASR_SEG_OFFLINE;
 
-    /* prompt (Nemotron): assente nei modelli con LID implicita (Parakeet);
-     * per l'AED (Canary) la sezione prompt è quella del DECODER (niente default_id) */
+    /* prompt (Nemotron): absent in models with implicit LID (Parakeet);
+     * for AED (Canary) the prompt section is the DECODER's (no default_id) */
     const cJSON *jprompt = cJSON_GetObjectItem(m->cfg, "prompt");
     const cJSON *jdid = jprompt ? cJSON_GetObjectItem(jprompt, "default_id") : NULL;
     m->default_prompt = jdid ? jdid->valueint : -1;
@@ -304,8 +305,8 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         const cJSON *jeos = cJSON_GetObjectItem(jdec, "eos_token");
         m->aed_eos = jeos ? mynah_asr_tok_find(&m->tok, jeos->valuestring) : -1;
         if (m->aed_eos < 0) { fprintf(stderr, "mynah-asr: AED EOS not found\n"); goto fail; }
-        /* timestamp generativi <|N|>: non tutti gli AED li supportano (v2 usa
-         * un allineatore esterno) — capability dal mynah.json, default sì */
+        /* generative <|N|> timestamps: not every AED supports them (v2 uses an
+         * external aligner) — capability read from mynah.json, default yes */
         const cJSON *jts = cJSON_GetObjectItem(jdec, "timestamp_tokens");
         m->aed_ts = !(jts && cJSON_IsFalse(jts));
     }
@@ -323,7 +324,7 @@ void mynah_asr_free(mynah_asr_model *m) {
     mynah_asr_encoder_free(&m->enc);
     mynah_asr_tokenizer_free(&m->tok);
 #ifdef MYNAH_ASR_METAL
-    /* i pesi GPU cache-ati puntano nel mmap che stiamo per chiudere */
+    /* the cached GPU weights point into the mmap we are about to close */
     mynah_asr_metal_weights_evict();
 #endif
     mynah_asr_st_close(m->weights);
@@ -358,8 +359,8 @@ int mynah_asr_set_decoder(mynah_asr_model *m, const char *name) {
     return strcmp(name, "default") == 0 ? 0 : -1;
 }
 
-/* prompt id per la richiesta: -1 = modello senza prompt (valido, es. Parakeet),
- * -2 = lingua sconosciuta per un modello CON prompt (errore). */
+/* prompt id for the request: -1 = model without prompt (valid, e.g. Parakeet),
+ * -2 = unknown language for a model WITH a prompt (an error). */
 static int resolve_prompt(const mynah_asr_model *m, const char *lang) {
     if (m->default_prompt < 0) return -1;
     if (!lang) return m->default_prompt;
@@ -375,8 +376,8 @@ int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]) {
     return m->n_lookaheads;
 }
 
-/* worker per-item del batch (features e decode sono indipendenti tra item:
- * regioni disgiunte, modello read-only -> parallel_for è sicura) */
+/* per-item batch worker (features and decode are independent across items:
+ * disjoint regions, read-only model -> parallel_for is safe) */
 typedef struct {
     mynah_asr_model *m;
     const float *const *samples;
@@ -401,16 +402,18 @@ static void batch_decode_worker(void *ctx, int b) {
     batch_ctx *c = ctx;
     mynah_asr_model *m = c->m;
     if (!c->encs[b]) return;
-    /* il batch encoder produce l'output POST projector: l'engine CTC (che vuole
-     * il raw) è valido solo quando post == raw (CTC puro, niente projector) */
+    /* the batched encoder produces the POST-projector output: the CTC engine
+     * (which wants the raw one) is valid only when post == raw (pure CTC, no
+     * projector) */
     const mynah_asr_engine *eng = m->engine;
     if (eng->raw_encoder && m->ctc.d_in != m->enc.d_out)
         eng = m->engine_dflt;
-    /* words nel batch SOLO per gli engine frame-based (RNNT/TDT/CTC): i frame
-     * di emissione sono un side-channel che non cambia i token. Per gli AED
-     * want_ts cambia il PROMPT (modalità <|N|>) e quindi il testo: nel batch
-     * — dove convivono richieste json e verbose — resterebbe non deterministico,
-     * quindi niente words AED qui (il percorso non-batch li ha, su richiesta). */
+    /* words in the batch ONLY for frame-based engines (RNNT/TDT/CTC): the
+     * emission frames are a side channel that does not change the tokens. For AED
+     * want_ts changes the PROMPT (<|N|> mode) and therefore the text: inside a
+     * batch — where json and verbose requests coexist — that would stay
+     * non-deterministic, so no AED words here (the non-batch path has them, on
+     * request). */
     const int want_ts = c->words != NULL && !m->is_aed;
     int *tokens = NULL, *frames = NULL;
     const int n_tok = eng->decode(m, c->encs[b], c->t_encs[b],
@@ -535,7 +538,7 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
 
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s) { return s->lang; }
 
-/* Encoda il chunk mel corrente, decodifica, emette il delta di testo. */
+/* Encode the current mel chunk, decode it, emit the text delta. */
 static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
                               mynah_asr_result_cb cb, void *ud) {
     mynah_asr_model *m = s->m;
@@ -608,22 +611,22 @@ int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
         s->mel_have += got;
         if (s->mel_have == 0) break;
         if (s->mel_have < need) {
-            /* coda: chunk corto con right-pad causale (is_last) — identico all'offline */
+            /* tail: short chunk with causal right pad (is_last) — same as offline */
             if (stream_flush_chunk(s, s->mel_have, 1, cb, ud) != 0) return -1;
             break;
         }
-        /* chunk pieno: is_last solo se il mel stream non ha più nulla dopo */
+        /* full chunk: is_last only when the mel stream has nothing left after it */
         if (stream_flush_chunk(s, need, 0, cb, ud) != 0) return -1;
     }
     return 0;
 }
 
-/* Prompt canary2 -> id globali (template dal mynah.json, token come stringhe;
- * slot vuoti = 0 token). lang sorgente ("auto"/NULL -> "en"); la forma
- * "src>tgt" (es. "en>de") chiede la traduzione PER-CHIAMATA (thread-safe, usata
- * dal server); altrimenti target da mynah_asr_set_target_lang ("" = sorgente).
- * want_ts: slot timestamp attivo (il modello bracketa ogni parola con <|N|>).
- * Ritorna n token, -1 = lingua ignota. */
+/* canary2 prompt -> global ids (template from mynah.json, tokens as strings;
+ * empty slots = 0 tokens). lang is the source ("auto"/NULL -> "en"); the
+ * "src>tgt" form (e.g. "en>de") requests translation PER CALL (thread-safe, used
+ * by the server); otherwise the target comes from mynah_asr_set_target_lang
+ * ("" = same as source). want_ts: timestamp slot active (the model brackets every
+ * word with <|N|>). Returns the token count, -1 = unknown language. */
 static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids, int want_ts) {
     char src[8] = "en", tgt_buf[8] = "";
     if (lang && *lang && strncmp(lang, "auto", 4) != 0) {
@@ -700,8 +703,8 @@ int mynah_asr_set_target_lang(mynah_asr_model *m, const char *lang) {
     return -1;
 }
 
-/* Piece "<|N|>" (solo cifre) -> N, altrimenti -1. Clamp anti-overflow: nessun
- * audio reale supera ~10^7 frame (9 giorni), tokens.json ostili sì. */
+/* Piece "<|N|>" (digits only) -> N, otherwise -1. Overflow clamp: no real audio
+ * exceeds ~10^7 frames (9 days), a hostile tokens.json can. */
 static int aed_ts_frame(const char *piece) {
     if (strncmp(piece, "<|", 2) != 0) return -1;
     const char *p = piece + 2;
@@ -714,9 +717,9 @@ static int aed_ts_frame(const char *piece) {
     return strcmp(p, "|>") == 0 ? v : -1;
 }
 
-/* Parole con timestamp dai token AED col formato canary: <|t0|> pezzi <|t1|>
- * per parola (i <|N|> consecutivi chiudono la parola precedente e aprono la
- * successiva). 0 = ok. */
+/* Timestamped words from AED tokens in the canary format: <|t0|> pieces <|t1|>
+ * per word (consecutive <|N|> close the previous word and open the next one).
+ * 0 = ok. */
 static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks, int n,
                                  double frame_sec, mynah_asr_word **out, int *n_out) {
     *out = NULL;
@@ -777,7 +780,7 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
     return 0;
 }
 
-/* Trascrizione di UN segmento (audio intero o fetta tra due silenzi). */
+/* Transcription of ONE segment (the whole audio, or a slice between silences). */
 static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t n_samples,
                                 int prompt, int right, const char *lang, char *lang_out,
                                 mynah_asr_word **words, int *n_words) {
@@ -816,7 +819,7 @@ static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t
     return text;
 }
 
-/* Punto di split: minimo di energia (RMS su finestre da 20 ms) in [lo, hi). */
+/* Split point: energy minimum (RMS over 20 ms windows) in [lo, hi). */
 static size_t find_split_point(const float *s, size_t lo, size_t hi, int sr) {
     const size_t win = (size_t)sr / 50, hop = win / 2;
     double best = 1e300;
@@ -847,14 +850,14 @@ char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n
         return transcribe_segment(m, samples, n_samples, prompt, right, lang, lang_out,
                                   words, n_words);
 
-    /* audio lungo: segmenti indipendenti divisi sul silenzio, risultato concatenato */
+    /* long audio: independent segments split on silence, results concatenated */
     char *text = NULL;
     size_t text_len = 0;
     size_t cur = 0;
     while (cur < n_samples) {
         size_t end = n_samples;
         if (n_samples - cur > seg_max + seg_max / 10) {
-            /* cerca il silenzio negli ultimi 20 s della finestra (min 1 s dentro) */
+            /* look for silence in the last 20 s of the window (at least 1 s in) */
             const size_t hi = cur + seg_max;
             size_t lo = seg_max > 20u * (size_t)sr ? hi - 20u * (size_t)sr : cur + (size_t)sr;
             if (lo <= cur) lo = cur + 1;
@@ -886,7 +889,7 @@ char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n
             mynah_asr_word *nw = realloc(*words, ((size_t)*n_words + (size_t)sn) * sizeof(mynah_asr_word));
             if (!nw) {
                 mynah_asr_words_free(sw, sn); free(text);
-                /* realloc fallita NON libera il vecchio blocco */
+                /* a failed realloc does NOT free the old block */
                 mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0;
                 return NULL;
             }

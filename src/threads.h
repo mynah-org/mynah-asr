@@ -1,16 +1,16 @@
-/* Parallel-for minimale su pthread per i loop CPU indipendenti (frame mel,
- * canali depthwise, segmenti del batch). I task devono scrivere su regioni
- * disgiunte: il risultato è BIT-IDENTICO al loop seriale per costruzione
- * (stesso codice per task, solo su thread diversi).
- * Numero thread: env MYNAH_ASR_THREADS, default = core online. */
+/* Minimal pthread parallel-for for the independent CPU loops (mel frames,
+ * depthwise channels, batch segments). Tasks must write to disjoint regions:
+ * the result is BIT-IDENTICAL to the serial loop by construction (same code
+ * per task, only on different threads).
+ * Thread count: env MYNAH_ASR_THREADS, default = online cores. */
 #ifndef MYNAH_ASR_THREADS_H
 #define MYNAH_ASR_THREADS_H
 
 int mynah_asr_num_threads(void);
 
-/* Esegue fn(ctx, i) per i in [0, n): i task vengono distribuiti su
- * min(n, mynah_asr_num_threads()) thread (il chiamante partecipa).
- * Con n <= 1 o un solo thread gira in-place senza spawn. */
+/* Runs fn(ctx, i) for i in [0, n): the tasks are spread over
+ * min(n, mynah_asr_num_threads()) threads (the caller takes part).
+ * With n <= 1, or a single thread, it runs in place without spawning. */
 void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
 
 #endif

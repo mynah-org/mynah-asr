@@ -1,7 +1,7 @@
-/* Encoder FastConformer cache-aware (path offline-chunked; streaming in M1.3).
- * Blocco pre-norm macaron: ½FFN -> MHSA rel-pos -> Conv -> ½FFN -> LN out.
- * Riferimento numerico: tools/oracle/model.py + docs/nemotron-arch.md.
- * Tutte le dimensioni derivate dalle shape dei tensori (config-driven). */
+/* Cache-aware FastConformer encoder (offline-chunked path; streaming in M1.3).
+ * Pre-norm macaron block: ½FFN -> rel-pos MHSA -> Conv -> ½FFN -> output LN.
+ * Numeric reference: tools/oracle/model.py + docs/nemotron-arch.md.
+ * Every dimension is derived from the tensor shapes (config-driven). */
 #ifndef MYNAH_ASR_ENCODER_H
 #define MYNAH_ASR_ENCODER_H
 
@@ -19,12 +19,12 @@ typedef struct {
     const float *ln_conv_w, *ln_conv_b;
     mynah_asr_qmat pw1_w, pw2_w;
     const float *dw_w, *cnorm_w, *cnorm_b;
-    /* bias dei linear/conv (use_bias true, es. parakeet-110m) — NULL se assenti */
+    /* linear/conv biases (use_bias true, e.g. parakeet-110m) — NULL when absent */
     const float *ff1_b1, *ff1_b2, *ff2_b1, *ff2_b2;
     const float *q_b, *k_b, *v_b, *o_b;
     const float *pw1_b, *dw_b, *pw2_b;
-    /* conv norm = batch_norm (Parakeet): affine per-canale foldata al load
-     * (y = x*scale + shift); NULL => layer_norm con cnorm_w/b (Nemotron) */
+    /* conv norm = batch_norm (Parakeet): per-channel affine folded at load
+     * (y = x*scale + shift); NULL => layer_norm with cnorm_w/b (Nemotron) */
     const float *cnorm_scale, *cnorm_shift;
     const float *ln_ff2_w, *ln_ff2_b;
     mynah_asr_qmat ff2_w1, ff2_w2;
@@ -38,39 +38,39 @@ typedef struct {
     int causal;            /* 1 = depthwise conv causale (Nemotron), 0 = 'same' (Parakeet) */
     float xscale;          /* scala input dei layer (sqrt(d_model) se xscaling, else 1) */
     float *bn_fold;        /* buffer scale+shift della BN foldata (NULL se layer_norm) */
-    /* prompt e projector post-encoder, entrambi opzionali (NULL se assenti:
-     * i modelli CTC puri non hanno joint => d_out = d_model, out = encoder out) */
+    /* prompt and post-encoder projector, both optional (NULL when absent:
+     * pure CTC models have no joint => d_out = d_model, out = encoder out) */
     const float *prompt_l1_w, *prompt_l1_b, *prompt_l2_w, *prompt_l2_b;
     const float *encproj_w, *encproj_b;
     int num_prompts, prompt_inter, d_out;
 } mynah_asr_encoder;
 
-/* quantize != 0: INT8 per-riga sui grandi linear (FFN, attn q/k/v/o, pointwise
- * conv). Costruita al load dal f32; ~2.4x meno memoria residente. */
+/* quantize != 0: per-row INT8 on the large linears (FFN, attn q/k/v/o, pointwise
+ * conv). Built at load time from the f32 weights; ~2.4x less resident memory. */
 int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *st, int quantize);
 void mynah_asr_encoder_free(mynah_asr_encoder *enc);
 
-/* Positional embedding rel [2T-1, d_model] (interleaved sin/cos, pos T-1..-(T-1)).
- * Buffer allocato dal caller: (2T-1)*d_model float. */
+/* Relative positional embedding [2T-1, d_model] (interleaved sin/cos, pos T-1..-(T-1)).
+ * Buffer allocated by the caller: (2T-1)*d_model floats. */
 void mynah_asr_pos_emb(const mynah_asr_encoder *enc, int T, float *pe);
 
-/* Un blocco conformer in-place su x [T, d_model]. left/right = att context;
- * left < 0 = attention full (modelli offline, att_context [-1,-1]). */
+/* One conformer block, in-place on x [T, d_model]. left/right = att context;
+ * left < 0 = full attention (offline models, att_context [-1,-1]). */
 int mynah_asr_encoder_layer(const mynah_asr_encoder *enc, int li, float *x, int T,
                         const float *pe, int left_ctx, int right_ctx);
 
-/* [Prompt one-hot + prompt_projector se presente +] encoder_projector:
- * x [T,d_model] -> out [T,d_out]. prompt_id ignorato se il modello non ha prompt. */
+/* [Prompt one-hot + prompt_projector when present +] encoder_projector:
+ * x [T,d_model] -> out [T,d_out]. prompt_id ignored when the model has no prompt. */
 void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T, int prompt_id,
                         float *out);
 
-/* Forward completo offline: feats [T_mel, n_mels] validi -> out [T_enc, d_out] (malloc). */
+/* Full offline forward: valid feats [T_mel, n_mels] -> out [T_enc, d_out] (malloc'd). */
 float *mynah_asr_encoder_forward(const mynah_asr_encoder *enc, const float *feats, int t_mel,
                              int n_mels, int prompt_id, int left_ctx, int right_ctx,
                              int *t_out);
 
-/* Come sopra ma SENZA prompt/projector: encoder out grezzo [T_enc, d_model]
- * (input della head CTC dei modelli hybrid). */
+/* Same as above but WITHOUT prompt/projector: raw encoder output [T_enc, d_model]
+ * (the input of the CTC head in hybrid models). */
 float *mynah_asr_encoder_forward_raw(const mynah_asr_encoder *enc, const float *feats, int t_mel,
                                  int n_mels, int left_ctx, int right_ctx, int *t_out);
 

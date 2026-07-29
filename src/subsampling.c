@@ -15,7 +15,7 @@ int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safete
     memset(ss, 0, sizeof(*ss));
     ss->conv_in_w = mynah_asr_st_get(st, "encoder.subsampling.conv_in.weight");
     if (ss->conv_in_w) {
-        /* naming Nemotron: conv_in + layers.{i}.{depthwise,pointwise}_conv (causale) */
+        /* Nemotron naming: conv_in + layers.{i}.{depthwise,pointwise}_conv (causal) */
         ss->causal = 1;
         ss->conv_in_b = mynah_asr_st_get(st, "encoder.subsampling.conv_in.bias");
         for (int i = 0; i < 2; i++) {
@@ -31,7 +31,7 @@ int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safete
             if (!ss->dw_w[i] || !ss->dw_b[i] || !ss->pw_w[i] || !ss->pw_b[i]) return -1;
         }
     } else {
-        /* naming Parakeet: Sequential piatto layers.{0,2,3,5,6} (offline, simmetrico) */
+        /* Parakeet naming: flat Sequential layers.{0,2,3,5,6} (offline, symmetric) */
         ss->causal = 0;
         static const int dw_idx[2] = {2, 5}, pw_idx[2] = {3, 6};
         char name[96];
@@ -57,8 +57,8 @@ int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safete
     return 0;
 }
 
-/* Worker depthwise su una fetta di canali (canali indipendenti, output
- * disgiunto -> bit-identico al loop seriale). Pad allocato per fetta. */
+/* Depthwise worker over a slice of channels (independent channels, disjoint
+ * output -> bit-identical to the serial loop). Pad allocated per slice. */
 #include <stdatomic.h>
 typedef struct {
     const float *x, *w, *b;
@@ -100,9 +100,9 @@ static void dw_slice_worker(void *ctx, int wslice) {
     free(pad);
 }
 
-/* conv k3 s2 con pad tempo (pl_t, pr_t) e freq (pl_f, pr_f) parametrici.
- * x [C_in, T, F] -> out [C_out, T', F']. Causale: (2,1); simmetrico: (1,1);
- * streaming: tempo (0,0) (l'input contiene già cache+init a sinistra).
+/* k3 s2 conv with parametric time (pl_t, pr_t) and freq (pl_f, pr_f) padding.
+ * x [C_in, T, F] -> out [C_out, T', F']. Causal: (2,1); symmetric: (1,1);
+ * streaming: time (0,0) (the input already carries cache+init on the left).
  * depthwise: C_in == C_out, weight [C,1,3,3]. full: weight [C_out, C_in, 3, 3]. */
 static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t,
                       int pl_f, int pr_f, const float *w, const float *b, int C_out,
@@ -112,9 +112,9 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
     const int To = (Tp - k) / s + 1, Fo = (Fp - k) / s + 1;
     *To_ = To; *Fo_ = Fo;
 
-    /* conv piena con C_in=1 (stadio 0, ~80% dei MAC del subsampling): im2col
-     * P [9, S] + GEMM W [C_out, 9] @ P -> [C_out, S]. Stessa matematica del
-     * loop diretto (gli out-of-bounds diventano zeri espliciti). */
+    /* full conv with C_in=1 (stage 0, ~80% of the subsampling MACs): im2col
+     * P [9, S] + GEMM W [C_out, 9] @ P -> [C_out, S]. Same math as the direct
+     * loop (out-of-bounds reads become explicit zeros). */
     if (!depthwise && C_in == 1) {
         const size_t S = (size_t)To * (size_t)Fo;
         float *P = malloc(9u * S * sizeof(float));
@@ -149,9 +149,9 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
         /* malloc fallita: prosegue col loop diretto */
     }
 
-    /* depthwise: canale paddato esplicito -> 3x3 srotolato senza branch nel loop
-     * caldo (gli zeri del pad rendono la somma identica al bounds-check).
-     * Canali indipendenti -> fette parallele quando il lavoro è grande
+    /* depthwise: explicitly padded channel -> unrolled 3x3 with no branch in the
+     * hot loop (the pad zeros make the sum identical to the bounds-checked one).
+     * Independent channels -> parallel slices when the work is large
      * (offline); i chunk streaming restano seriali (overhead > lavoro). */
     if (depthwise) {
         dw_par dp = {.x = x, .w = w, .b = b, .out = out, .T = T, .F = F, .Tp = Tp,
@@ -163,14 +163,14 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
             dp.slices = mynah_asr_num_threads() < C_out ? mynah_asr_num_threads() : C_out;
         mynah_asr_parallel_for(dp.slices, dw_slice_worker, &dp);
         if (!atomic_load(&dp.failed)) return;
-        /* malloc fallita in un worker: prosegue col loop diretto */
+        /* a failed malloc in a worker: fall back to the direct loop */
     }
 
     for (int co = 0; co < C_out; co++) {
         float *dst = out + (size_t)co * (size_t)To * (size_t)Fo;
         for (int i = 0; i < To * Fo; i++) dst[i] = b[co];
     }
-    /* loop diretto: (kernel 3x3, stride 2) — chiaro e cache-friendly per queste dimensioni */
+    /* direct loop (3x3 kernel, stride 2) — clear and cache-friendly at these sizes */
     for (int co = 0; co < C_out; co++) {
         const int ci_lo = depthwise ? co : 0;
         const int ci_hi = depthwise ? co + 1 : C_in;
@@ -209,7 +209,7 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
                                  int T, int n_mels, int *t_out) {
     const int C = ss->channels;
 
-    /* buffer di lavoro dimensionati sul primo stadio (il più grande) */
+    /* work buffers sized on the first stage (the largest one) */
     int To = 0, Fo = 0;
     const int To_max = (T + 3 - 3) / 2 + 1, Fo_max = (n_mels + 3 - 3) / 2 + 1;
     float *a = malloc((size_t)C * (size_t)To_max * (size_t)Fo_max * sizeof(float));
@@ -256,7 +256,7 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
                    a + ((size_t)c * (size_t)To + (size_t)t) * (size_t)Fo,
                    (size_t)Fo * sizeof(float));
 
-    /* out = flat @ W^T + b — W [d_model, CF] row-major => GEMM con B trasposta */
+    /* out = flat @ W^T + b — W [d_model, CF] row-major => GEMM with B transposed */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, To, ss->d_model, CF,
                 1.0f, flat, CF, (const float *)ss->lin_w->data, CF, 0.0f, out, ss->d_model);
     const float *lb = (const float *)ss->lin_b->data;
@@ -289,7 +289,7 @@ void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst) {
 }
 
 /* Antepone [init?1:0 zeri][cache 1] al chunk sull'asse tempo, conv valida s2,
- * aggiorna cache = ultimo frame del chunk. x [C, T, F] -> out [C_out, To, Fo]. */
+ * updates cache = last frame of the chunk. x [C, T, F] -> out [C_out, To, Fo]. */
 static void stream_stage(const float *x, int C_in, int T, int F, int first, int last,
                          float *cache, const float *w, const float *b, int C_out,
                          int depthwise, float *out, int *To_, int *Fo_) {
@@ -307,7 +307,7 @@ static void stream_stage(const float *x, int C_in, int T, int F, int first, int 
                (size_t)T * (size_t)F * sizeof(float));
         if (rp) memset(dst + (size_t)(lp + T) * (size_t)F, 0, (size_t)F * sizeof(float));
     }
-    /* aggiorna cache con l'ultimo frame del chunk */
+    /* refresh the cache with the last frame of the chunk */
     for (int c = 0; c < C_in; c++)
         memcpy(cache + (size_t)c * (size_t)F,
                x + ((size_t)c * (size_t)T + (size_t)(T - 1)) * (size_t)F,

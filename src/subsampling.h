@@ -1,15 +1,15 @@
-/* Subsampling FastConformer dw_striding 8x (3 stadi stride-2):
- * conv_in piena + ReLU, poi 2x (depthwise + pointwise + ReLU), flatten
- * channel-major, linear -> d_model. Padding causale (2,1) per Nemotron streaming
- * o simmetrico (1,1) per i modelli offline (Parakeet).
- * Vedi docs/nemotron-arch.md e docs/parakeet-tdt-arch.md. */
+/* FastConformer dw_striding 8x subsampling (3 stride-2 stages):
+ * full conv_in + ReLU, then 2x (depthwise + pointwise + ReLU), channel-major
+ * flatten, linear -> d_model. Causal padding (2,1) for Nemotron streaming or
+ * symmetric (1,1) for the offline models (Parakeet).
+ * See docs/nemotron-arch.md and docs/parakeet-tdt-arch.md. */
 #ifndef MYNAH_ASR_SUBSAMPLING_H
 #define MYNAH_ASR_SUBSAMPLING_H
 
 #include "weights.h"
 
 typedef struct {
-    /* puntatori risolti UNA volta al load (decisione prior-art: niente lookup nel forward) */
+    /* pointers resolved ONCE at load (prior-art decision: no lookups in the forward) */
     const mynah_asr_tensor *conv_in_w, *conv_in_b;         /* [C,1,3,3], [C] */
     const mynah_asr_tensor *dw_w[2], *dw_b[2];             /* [C,1,3,3], [C] */
     const mynah_asr_tensor *pw_w[2], *pw_b[2];             /* [C,C,1,1], [C] */
@@ -19,20 +19,21 @@ typedef struct {
     int causal;                                        /* 1 = pad (2,1), 0 = pad (1,1) */
 } mynah_asr_subsampling;
 
-/* Risolve i tensori dal safetensors. Supporta entrambi i naming HF:
- * Nemotron (conv_in/layers.{i}.depthwise_conv...) e Parakeet (layers.{0,2,3,5,6}).
- * causal di default dal naming (Nemotron 1, Parakeet 0); il config puo' sovrascrivere. */
+/* Resolve the tensors from the safetensors. Supports both HF namings:
+ * Nemotron (conv_in/layers.{i}.depthwise_conv...) and Parakeet (layers.{0,2,3,5,6}).
+ * causal defaults from the naming (Nemotron 1, Parakeet 0); the config can override. */
 int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safetensors *st);
 
-/* feats [T, n_mels] float32 (solo frame validi) -> out [T_out, d_model] (malloc).
- * Scrive *t_out. NULL su errore. Padding tempo/freq secondo ss->causal. */
+/* feats [T, n_mels] float32 (valid frames only) -> out [T_out, d_model] (malloc'd).
+ * Writes *t_out. NULL on error. Time/freq padding according to ss->causal. */
 float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const float *feats,
                                  int T, int n_mels, int *t_out);
 
 /* ------------------------------------------------------- streaming (cache-aware)
- * Cache per stadio: l'ultimo time-frame dell'input (left_pad = k - stride = 1);
- * al primo chunk si antepone 1 zero extra (init_pad) => left effettivo 2, come
- * l'offline. Vedi docs/nemotron-arch.md (reference HF CausalConv2dCacheLayer). */
+ * Per-stage cache: the last time-frame of the input (left_pad = k - stride = 1);
+ * on the first chunk one extra zero is prepended (init_pad) => effective left 2,
+ * like the offline path. See docs/nemotron-arch.md (HF CausalConv2dCacheLayer
+ * reference). */
 typedef struct {
     float *cache[3];        /* [C_in, F] ultimo frame input dello stadio */
     int cin[3], fdim[3];
@@ -42,8 +43,8 @@ typedef struct {
 int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampling *ss, int n_mels);
 void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst);
 
-/* mel chunk [n_mel, n_mels] (size ESATTA: primo = 1+8r, poi 8(r+1)) ->
- * out [q, d_model] con q = r+1 (buffer del caller). Ritorna q, -1 su errore. */
+/* mel chunk [n_mel, n_mels] (EXACT size: first = 1+8r, then 8(r+1)) ->
+ * out [q, d_model] with q = r+1 (caller's buffer). Returns q, -1 on error. */
 int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_stream *sst,
                          const float *mel, int n_mel, int n_mels, int is_last, float *out);
 

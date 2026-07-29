@@ -44,7 +44,7 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
     struct stat sb;
     if (fstat(fd, &sb) != 0 || sb.st_size < 8) { close(fd); return NULL; }
 
-    /* container GGUF? (magic "GGUF"): stessa API, i consumer non cambiano */
+    /* GGUF container? (magic "GGUF"): same API, the consumers do not change */
     char magic[4] = {0};
     if (pread(fd, magic, 4, 0) == 4 && memcmp(magic, "GGUF", 4) == 0) {
         close(fd);

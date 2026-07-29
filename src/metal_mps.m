@@ -1,16 +1,16 @@
-/* Backend Metal v4 — encoder intero su GPU, un sync per forward.
+/* Metal backend v4 — the whole encoder on GPU, one sync per forward.
  *
- * Storia: v1 una GEMM = un sync (~10/layer, perdeva vs AMX). v2 pesi fp16
- * residenti + FFN/QKV fusi (~5/layer). v3 attention e conv module interi
- * su GPU (4/layer). v4: anche lo stream residuo resta su GPU — f32 per
- * fedeltà numerica (i blocchi lavorano in f16 come in v3, ma LN tra i
- * blocchi e residual add accumulano in f32, come la CPU). Le conversioni
- * f32<->f16 avvengono negli shader (LN legge f32 e scrive f16): la CPU fa
- * solo due memcpy (upload x, download x) per l'intero encoder.
- * Un command buffer per layer, commit senza wait: la GPU esegue il layer i
- * mentre la CPU encoda il layer i+1; si aspetta solo l'ultimo.
+ * History: v1 one GEMM = one sync (~10/layer, lost against AMX). v2 resident
+ * fp16 weights + fused FFN/QKV (~5/layer). v3 attention and conv module
+ * entirely on GPU (4/layer). v4: the residual stream stays on GPU too — f32
+ * for numeric fidelity (the blocks work in f16 as in v3, but the LNs between
+ * blocks and the residual adds accumulate in f32, like the CPU). The
+ * f32<->f16 conversions happen inside the shaders (LN reads f32 and writes
+ * f16): the CPU only does two memcpys (upload x, download x) for the whole
+ * encoder. One command buffer per layer, committed without waiting: the GPU
+ * runs layer i while the CPU encodes layer i+1; only the last one is waited on.
  *
- * Sotto MYNAH_ASR_METAL_MIN_T (chunk streaming) si ritorna -1 -> CPU. */
+ * Below MYNAH_ASR_METAL_MIN_T (streaming chunks) it returns -1 -> CPU. */
 #ifdef MYNAH_ASR_METAL
 
 #include "backend.h"
@@ -41,10 +41,10 @@ typedef struct {
 static wc_ent *g_wc;
 static int g_wc_n, g_wc_cap;
 
-/* buffer I/O riusabili (protetti da g_mu) */
+/* reusable I/O buffers (protected by g_mu) */
 static id<MTLBuffer> g_in, g_mid, g_out, g_out2, g_out3;
 static size_t g_in_cap, g_mid_cap, g_out_cap, g_out2_cap, g_out3_cap;
-/* v4: stream residuo f32, staging pe, pe f16, input/output di blocco, scratch attn */
+/* v4: f32 residual stream, pe staging, f16 pe, block input/output, attn scratch */
 static id<MTLBuffer> g_x32, g_pe32, g_pe16, g_xn, g_blk, g_att;
 static size_t g_x32_cap, g_pe32_cap, g_pe16_cap, g_xn_cap, g_blk_cap, g_att_cap;
 
@@ -55,7 +55,7 @@ static const char *SHADER_SRC =
     "    float v = float(x[i]);\n"
     "    x[i] = half(v / (1.0f + exp(-v)));\n"
     "}\n"
-    /* GLU sui canali: x [T,2d] -> g [T,d] */
+    /* GLU over the channels: x [T,2d] -> g [T,d] */
     "kernel void glu(device const half *x [[buffer(0)]], device half *g [[buffer(1)]],\n"
     "                constant uint &d [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
     "    uint t = i / d, c = i % d;\n"
@@ -78,14 +78,14 @@ static const char *SHADER_SRC =
     "    }\n"
     "    c[i] = half(acc);\n"
     "}\n"
-    /* affine per-canale (BatchNorm foldata): x = x * s[ch] + b[ch] */
+    /* per-channel affine (folded BatchNorm): x = x * s[ch] + b[ch] */
     "kernel void caffine(device half *x [[buffer(0)]], device const half *s [[buffer(1)]],\n"
     "                    device const half *b [[buffer(2)]], constant uint &d [[buffer(3)]],\n"
     "                    uint i [[thread_position_in_grid]]) {\n"
     "    uint ch = i % d;\n"
     "    x[i] = half(float(x[i]) * float(s[ch]) + float(b[ch]));\n"
     "}\n"
-    /* Riduzione per-riga condivisa dalle layernorm: un THREADGROUP per riga
+    /* Per-row reduction shared by the layernorms: one THREADGROUP per row
        (letture coalescenti + simd_sum), non un thread per riga (stride d,
        ~128B di traffico per elemento: era il collo di bottiglia della v4). */
     "static float row_moment(float part, threadgroup float *sh, uint tid, uint tpt) {\n"
@@ -98,7 +98,7 @@ static const char *SHADER_SRC =
     "    for (uint i = 0; i < nsg; i++) tot += sh[i];\n"
     "    return tot;\n"
     "}\n"
-    /* layernorm f16 per riga (norm interna del conv module) */
+    /* per-row f16 layernorm (the conv module's internal norm) */
     "kernel void lnorm(device half *x [[buffer(0)]], device const half *gm [[buffer(1)]],\n"
     "                  device const half *bt [[buffer(2)]], constant uint &d [[buffer(3)]],\n"
     "                  uint tg [[threadgroup_position_in_grid]],\n"
@@ -115,13 +115,13 @@ static const char *SHADER_SRC =
     "    for (uint i = tid; i < d; i += tpt)\n"
     "        row[i] = half((float(row[i]) - mu) * inv * float(gm[i]) + float(bt[i]));\n"
     "}\n"
-    /* q + bias per-head (broadcast su T): out[t, h*dk+i] = q[..] + bias[h*dk+i] */
+    /* q + per-head bias (broadcast over T): out[t, h*dk+i] = q[..] + bias[h*dk+i] */
     "kernel void addbias(device const half *q [[buffer(0)]], device const half *b [[buffer(1)]],\n"
     "                    device half *o [[buffer(2)]], constant uint &d [[buffer(3)]],\n"
     "                    uint i [[thread_position_in_grid]]) {\n"
     "    o[i] = half(float(q[i]) + float(b[i % d]));\n"
     "}\n"
-    /* softmax con rel_shift in forma chiusa e finestra chunked_limited
+    /* softmax with rel_shift in closed form and the chunked_limited window
        (chunk == 0 -> attention full, modelli offline).
        scores [H,T,K] (ac), bd [H,T,P]; P = 2L-1, gq = cached + t (qui cached=0). */
     "kernel void smax_shift(device half *sc [[buffer(0)]], device const half *bd [[buffer(1)]],\n"
@@ -152,7 +152,7 @@ static const char *SHADER_SRC =
     "    for (uint j = j0; j < j1; j++) srow[j] = half(float(srow[j]) * inv);\n"
     "    for (uint j = j1; j < K; j++) srow[j] = half(0.0f);\n"
     "}\n"
-    /* --- v4: stream residuo f32 --- */
+    /* --- v4: f32 residual stream --- */
     "kernel void cvt32to16(device const float *x [[buffer(0)]], device half *o [[buffer(1)]],\n"
     "                      uint i [[thread_position_in_grid]]) { o[i] = half(x[i]); }\n"
     /* residual add: x32 += alpha * y16 */
@@ -160,7 +160,7 @@ static const char *SHADER_SRC =
     "                   constant float &alpha [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
     "    x[i] += alpha * float(y[i]);\n"
     "}\n"
-    /* layernorm per riga: stream f32 -> input di blocco f16 */
+    /* per-row layernorm: f32 stream -> f16 block input */
     "kernel void ln32h(device const float *x [[buffer(0)]], device half *o [[buffer(1)]],\n"
     "                  device const half *gm [[buffer(2)]], device const half *bt [[buffer(3)]],\n"
     "                  constant uint &d [[buffer(4)]],\n"
@@ -178,7 +178,7 @@ static const char *SHADER_SRC =
     "    for (uint i = tid; i < d; i += tpt)\n"
     "        o[tg * d + i] = half((row[i] - mu) * inv * float(gm[i]) + float(bt[i]));\n"
     "}\n"
-    /* layernorm f32 in place (norm_out tra i layer) */
+    /* in-place f32 layernorm (norm_out between layers) */
     "kernel void ln32f(device float *x [[buffer(0)]], device const half *gm [[buffer(1)]],\n"
     "                  device const half *bt [[buffer(2)]], constant uint &d [[buffer(3)]],\n"
     "                  uint tg [[threadgroup_position_in_grid]],\n"
@@ -231,7 +231,7 @@ int mynah_asr_metal_available(void) {
            g_caffine != nil;
 }
 
-/* conversioni f32<->f16 bulk via vImage (NEON, ~20 GB/s vs loop scalare) */
+/* bulk f32<->f16 conversions through vImage (NEON, ~20 GB/s vs a scalar loop) */
 static void cvt_f32_to_f16(const float *src, void *dst, size_t n) {
     vImage_Buffer s = {.data = (void *)src, .height = 1, .width = n, .rowBytes = n * 4};
     vImage_Buffer d = {.data = dst, .height = 1, .width = n, .rowBytes = n * 2};
@@ -241,7 +241,7 @@ static void cvt_f32_to_f16(const float *src, void *dst, size_t n) {
     }
 }
 
-/* peso f32 -> MTLBuffer fp16 residente (conversione una tantum, cache per-pointer) */
+/* f32 weight -> resident fp16 MTLBuffer (one-off conversion, per-pointer cache) */
 static id<MTLBuffer> weight_buffer_f16(const float *w, size_t n_elems) {
     for (int i = 0; i < g_wc_n; i++)
         if (g_wc[i].host_ptr == w) return (__bridge id<MTLBuffer>)g_wc[i].buf;
@@ -260,10 +260,10 @@ static id<MTLBuffer> weight_buffer_f16(const float *w, size_t n_elems) {
     return buf;
 }
 
-/* Svuota la cache pesi residenti. Da chiamare quando i puntatori host cessano di
- * essere validi (mynah_asr_free: i safetensors vengono munmap-ati e un load successivo
- * può riusare gli stessi indirizzi virtuali -> la GPU userebbe i pesi VECCHI).
- * I forward successivi ri-caricano i pesi alla prima chiamata. */
+/* Drop the resident weight cache. Call it when the host pointers stop being valid
+ * (mynah_asr_free: the safetensors are munmap'd and a later load may reuse the
+ * same virtual addresses -> the GPU would use the OLD weights).
+ * Subsequent forwards re-upload the weights on the first call. */
 void mynah_asr_metal_weights_evict(void) {
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_wc_n; i++) CFBridgingRelease(g_wc[i].buf);
@@ -304,7 +304,7 @@ static MPSMatrix *mat16(id<MTLBuffer> buf, int rows, int cols) {
     return [[MPSMatrix alloc] initWithBuffer:buf descriptor:d];
 }
 
-/* vista MPS strided (slice per-head o slot in un buffer scratch) */
+/* strided MPS view (a per-head slice, or a slot inside a scratch buffer) */
 static MPSMatrix *mat16_off(id<MTLBuffer> buf, size_t byte_off, int rows, int cols,
                             int row_stride_elems) {
     MPSMatrixDescriptor *d = [MPSMatrixDescriptor
@@ -314,10 +314,10 @@ static MPSMatrix *mat16_off(id<MTLBuffer> buf, size_t byte_off, int rows, int co
     return [[MPSMatrix alloc] initWithBuffer:buf offset:byte_off descriptor:d];
 }
 
-/* cache dei kernel MPSMatrixMultiplication per shape (T,n,k,transB): gli shape
- * ricorrono identici per ogni layer e ogni forward della stessa lunghezza —
- * senza cache si allocava un oggetto MPS per OGNI GEMM encodata (centinaia per
- * forward). Protetta da g_mu (già tenuto durante l'encoding). */
+/* Cache of MPSMatrixMultiplication kernels keyed by shape (T,n,k,transB): the
+ * shapes repeat identically for every layer and every forward of the same length
+ * — without the cache one MPS object was allocated for EVERY encoded GEMM
+ * (hundreds per forward). Protected by g_mu (already held while encoding). */
 typedef struct { int T, n, k, tb; void *mm; } mm_ent;
 static mm_ent g_mmc[512];
 static int g_mmc_n;
@@ -350,7 +350,7 @@ static void encode_silu(id<MTLCommandBuffer> cb, id<MTLBuffer> buf, size_t n) {
     [enc endEncoding];
 }
 
-/* out[T,n] = x[T,k] @ W^T — singola GEMM fp16 */
+/* out[T,n] = x[T,k] @ W^T — a single fp16 GEMM */
 int mynah_asr_metal_gemm_wt(const float *x, const float *w, float *out, int T, int n, int k) {
     if (T < MYNAH_ASR_METAL_MIN_T || !mynah_asr_metal_available()) return -1;
     pthread_mutex_lock(&g_mu);
@@ -375,7 +375,7 @@ int mynah_asr_metal_gemm_wt(const float *x, const float *w, float *out, int T, i
     return rc;
 }
 
-/* FFN fusa: out[T,n2] = SiLU(x[T,k] @ W1^T) @ W2^T — un solo wait */
+/* fused FFN: out[T,n2] = SiLU(x[T,k] @ W1^T) @ W2^T — a single wait */
 int mynah_asr_metal_ffn_wt(const float *x, const float *w1, int n1, const float *w2, int n2,
                        float *out, int T, int k) {
     if (T < MYNAH_ASR_METAL_MIN_T || !mynah_asr_metal_available()) return -1;
@@ -405,7 +405,7 @@ int mynah_asr_metal_ffn_wt(const float *x, const float *w1, int n1, const float 
     return rc;
 }
 
-/* QKV: tre GEMM sullo stesso input, un solo wait */
+/* QKV: three GEMMs over the same input, a single wait */
 int mynah_asr_metal_gemm3_wt(const float *x, const float *wa, const float *wb_,
                          const float *wc_, float *oa, float *ob_, float *oc,
                          int T, int n, int k) {
@@ -443,15 +443,15 @@ int mynah_asr_metal_gemm3_wt(const float *x, const float *wa, const float *wb_,
 
 /* ------------------------------------------------------------ v4: encoder */
 
-/* helper: dispatch 1D di un compute kernel già configurato */
+/* helper: 1D dispatch of an already-configured compute kernel */
 static void run1d(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> ps, size_t n) {
     [enc setComputePipelineState:ps];
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(MIN(n, ps.maxTotalThreadsPerThreadgroup), 1, 1)];
 }
 
-/* LN dal residuo f32: to16 -> scrive f16 in o (input di blocco); altrimenti
- * in place f32 (norm_out). gm/bt f16 residenti. */
+/* LN from the f32 residual: to16 -> writes f16 into o (the block input);
+ * otherwise in-place f32 (norm_out). gm/bt are resident f16. */
 static void encode_ln32(id<MTLCommandBuffer> cb, id<MTLBuffer> x32, id<MTLBuffer> o16,
                         id<MTLBuffer> gm, id<MTLBuffer> bt, int T, int d) {
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -470,7 +470,7 @@ static void encode_ln32(id<MTLCommandBuffer> cb, id<MTLBuffer> x32, id<MTLBuffer
         [enc setBuffer:bt offset:0 atIndex:2];
         [enc setBytes:&du length:4 atIndex:3];
     }
-    /* un threadgroup per riga (letture coalescenti) */
+    /* one threadgroup per row (coalesced reads) */
     [enc dispatchThreadgroups:MTLSizeMake((size_t)T, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];
@@ -489,7 +489,7 @@ static void encode_resadd(id<MTLCommandBuffer> cb, id<MTLBuffer> x32, id<MTLBuff
     [enc endEncoding];
 }
 
-/* bias broadcast per riga, in place: buf[t*d+i] += bias[i] (no-op se bias NULL) */
+/* bias broadcast over rows, in place: buf[t*d+i] += bias[i] (no-op when bias is NULL) */
 static void encode_addbias(id<MTLCommandBuffer> cb, id<MTLBuffer> buf, size_t byte_off,
                            const float *bias, int T, int d) {
     if (!bias) return;
@@ -506,7 +506,7 @@ static void encode_addbias(id<MTLCommandBuffer> cb, id<MTLBuffer> buf, size_t by
     [enc endEncoding];
 }
 
-/* FFN fp16: out16 = SiLU(xn @ W1^T + b1) @ W2^T + b2 (intermedio in g_mid) */
+/* fp16 FFN: out16 = SiLU(xn @ W1^T + b1) @ W2^T + b2 (intermediate in g_mid) */
 static void encode_ffn16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer> out16,
                          id<MTLBuffer> w1, id<MTLBuffer> w2, const float *b1,
                          const float *b2, int T, int k, int ffn) {
@@ -517,8 +517,8 @@ static void encode_ffn16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
     encode_addbias(cb, out16, 0, b2, T, k);
 }
 
-/* Attention fp16 come v3: qkv -> +bias_u/v -> rk = pe@relk^T -> per-head ac/bd
- * (GEMM su viste strided) -> softmax+rel_shift+finestra -> ctx -> o_proj.
+/* fp16 attention as in v3: qkv -> +bias_u/v -> rk = pe@relk^T -> per-head ac/bd
+ * (GEMMs over strided views) -> softmax+rel_shift+window -> ctx -> o_proj.
  * Scratch in g_att: q,k,v,qu,qv [5*td] ++ rk [pd] ++ ctx [td] ++ scores ++ bd. */
 static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer> out16,
                          const mynah_asr_metal_layer_w *L, int T, int d, int H,
@@ -566,7 +566,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
         [enc endEncoding];
     }
 
-    /* per-head: ac[h] = qu_h @ k_h^T ; bd[h] = qv_h @ rk_h^T (viste strided) */
+    /* per head: ac[h] = qu_h @ k_h^T ; bd[h] = qv_h @ rk_h^T (strided views) */
     for (int h = 0; h < H; h++) {
         const size_t ho = (size_t)h * (size_t)dk * sizeof(f16);
         MPSMatrix *quh = mat16_off(sb, 3 * td + ho, T, dk, d);
@@ -582,7 +582,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
     {   /* softmax + rel_shift + finestra */
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         const uint32_t Tu = (uint32_t)T, Ku = (uint32_t)K, Pu = (uint32_t)P;
-        /* left < 0: attention full -> chunk 0 (finestra intera nello shader) */
+        /* left < 0: full attention -> chunk 0 (whole window inside the shader) */
         const uint32_t chunk = left >= 0 ? (uint32_t)(right + 1) : 0u;
         const uint32_t lc = left >= 0 ? (uint32_t)(left / (right + 1)) : 0u;
         const float scale = 1.0f / sqrtf((float)dk);
@@ -600,7 +600,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
         [enc endEncoding];
     }
 
-    /* ctx_h = probs_h @ v_h (output su vista strided [T,dk] dentro [T,d]) */
+    /* ctx_h = probs_h @ v_h (output into a strided [T,dk] view inside [T,d]) */
     for (int h = 0; h < H; h++) {
         const size_t ho = (size_t)h * (size_t)dk * sizeof(f16);
         MPSMatrix *ph = mat16_off(sb, sc_off + (size_t)h * (size_t)T * (size_t)K * sizeof(f16), T, K, K);
@@ -616,7 +616,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
     encode_addbias(cb, out16, 0, L->o_b, T, d);
 }
 
-/* Conv module fp16 come v3: pw1(+b) -> GLU -> dwconv9(+b, pad causale o 'same')
+/* fp16 conv module as in v3: pw1(+b) -> GLU -> dwconv9(+b, causal or 'same' pad)
  * -> LN | BN-affine -> SiLU -> pw2(+b).
  * Scratch in g_mid: h2 [T,2d] @0, g [T,d] @2td, c [T,d] @3td. */
 static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer> out16,
@@ -629,7 +629,7 @@ static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffe
     id<MTLBuffer> bb = L->cnorm_scale ? weight_buffer_f16(L->cnorm_shift, (size_t)d)
                                       : weight_buffer_f16(L->cnorm_b, (size_t)d);
     id<MTLBuffer> b2 = weight_buffer_f16(L->pw2, (size_t)d * (size_t)d);
-    /* bias dwconv opzionale: se assente si binda bw (mai letto, has_b=0) */
+    /* optional dwconv bias: when absent bw is bound instead (never read, has_b=0) */
     id<MTLBuffer> bdw = L->dw_b ? weight_buffer_f16(L->dw_b, (size_t)d) : bw;
     id<MTLBuffer> mb = g_mid;
 
@@ -658,7 +658,7 @@ static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffe
     [enc dispatchThreads:MTLSizeMake((size_t)T * (size_t)d, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (L->cnorm_scale) {
-        /* BatchNorm foldata: affine per-canale in place su c */
+        /* folded BatchNorm: per-channel affine in place on c */
         [enc setComputePipelineState:g_caffine];
         [enc setBuffer:mb offset:3 * td atIndex:0];
         [enc setBuffer:bg offset:0 atIndex:1];
@@ -667,7 +667,7 @@ static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffe
         [enc dispatchThreads:MTLSizeMake((size_t)T * (size_t)d, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        /* LN in place su c (un threadgroup per riga) */
+        /* in-place LN on c (one threadgroup per row) */
         [enc setComputePipelineState:g_lnorm];
         [enc setBuffer:mb offset:3 * td atIndex:0];
         [enc setBuffer:bg offset:0 atIndex:1];
@@ -685,9 +685,9 @@ static void encode_conv16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffe
     encode_addbias(cb, out16, 0, L->pw2_b, T, d);
 }
 
-/* Encoder intero su GPU: x [T,d] f32 aggiornato in place, un solo wait finale.
+/* Whole encoder on GPU: x [T,d] f32 updated in place, a single final wait.
  * Per layer: LN->FFN1(+0.5) -> LN->MHSA(+1) -> LN->conv(+1) -> LN->FFN2(+0.5)
- * -> LN out. Residuo f32 (come CPU), blocchi f16 (come v3). */
+ * -> output LN. f32 residual (like the CPU), f16 blocks (like v3). */
 int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_layers,
                                float *x, const float *pe, int T, int d, int H,
                                int ffn, int left, int right, int conv_pad) {
@@ -715,7 +715,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
         id<MTLBuffer> att = io_buffer(&g_att, &g_att_cap, att_bytes);
         int ok = (x32 && pe32 && pe16 && xn && blk && mid && att);
 
-        /* i pesi vanno in cache PRIMA di encodare (weight_buffer_f16 può fallire) */
+        /* the weights must be cached BEFORE encoding (weight_buffer_f16 can fail) */
         for (int li = 0; ok && li < n_layers; li++) {
             const mynah_asr_metal_layer_w *L = &Ls[li];
             const float *big[] = {L->ff1_w1, L->ff1_w2, L->ff2_w1, L->ff2_w2,
@@ -735,7 +735,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
                                     L->bias_u, L->bias_v};
             for (int i = 0; i < 14 && ok; i++) ok = weight_buffer_f16(small[i], (size_t)d) != nil;
             ok = ok && weight_buffer_f16(L->dw9, (size_t)d * 9u) != nil;
-            /* bias opzionali (use_bias true) */
+            /* optional biases (use_bias true) */
             const float *ob[] = {L->q_b, L->k_b, L->v_b, L->o_b, L->dw_b, L->pw2_b};
             for (int i = 0; i < 6 && ok; i++)
                 if (ob[i]) ok = weight_buffer_f16(ob[i], (size_t)d) != nil;
@@ -777,7 +777,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
                 encode_ln32(cb, x32, xn, LNW(ln_conv_w), LNW(ln_conv_b), T, d);
                 encode_conv16(cb, xn, blk, L, T, d, conv_pad);
                 encode_resadd(cb, x32, blk, 1.0f, nd);
-                /* ½ FFN2 + LN out (in place f32) */
+                /* ½ FFN2 + output LN (in place, f32) */
                 encode_ln32(cb, x32, xn, LNW(ln_ff2_w), LNW(ln_ff2_b), T, d);
                 encode_ffn16(cb, xn, blk, weight_buffer_f16(L->ff2_w1, (size_t)ffn * (size_t)d),
                              weight_buffer_f16(L->ff2_w2, (size_t)d * (size_t)ffn),

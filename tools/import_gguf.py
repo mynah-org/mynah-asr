@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Importa un GGUF di terze parti (ecosistema parakeet.cpp) in una dir modello
+"""Import a third-party GGUF (parakeet.cpp ecosystem) into a model directory
 mynah completa — SENZA torch e senza scaricare il .nemo: dal solo file GGUF
 genera mynah.json (dai metadata stt.*), tokens.json (tokenizer embedded),
 mel_filters.safetensors (calcolate) e model.gguf (tensori RINOMINATI nel
@@ -27,11 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_nemo import melscale_fbanks  # noqa: E402  (clone slaney verificato)
 
 ALIGN = 32
-# geometria dei tipi ggml supportati dal runtime (block_elems, block_bytes)
+# geometry of the ggml types the runtime supports (block_elems, block_bytes)
 GEOM = {0: (1, 4), 1: (1, 2), 30: (1, 2), 8: (32, 34), 2: (32, 18), 12: (256, 144)}
 
-# parakeet.cpp -> naming HF-verbatim (stessa semantica di _NEMO_RENAMES del
-# converter; verificata tensore-per-tensore contro il 110m convertito da .nemo)
+# parakeet.cpp -> HF-verbatim naming (same semantics as the converter's
+# _NEMO_RENAMES; verified tensor by tensor against the 110m converted from .nemo)
 RENAMES = [
     ("enc.pre_encode.conv.", "encoder.subsampling.layers."),
     ("enc.pre_encode.out.", "encoder.subsampling.linear."),
@@ -104,8 +104,8 @@ class Reader:
 import re  # noqa: E402
 
 def rename(name: str) -> str:
-    # LSTM: parakeet.cpp fonde i due bias torch in uno (b_ih + b_hh, che la
-    # LSTM somma comunque): bias -> bias_ih, e bias_hh viene sintetizzato a 0
+    # LSTM: parakeet.cpp fuses the two torch biases into one (b_ih + b_hh, which
+    # the LSTM sums anyway): bias -> bias_ih, and bias_hh is synthesized as 0
     m = re.fullmatch(r"pred\.lstm\.(\d+)\.(Wx|Wh|bias)", name)
     if m:
         part = {"Wx": "weight_ih", "Wh": "weight_hh", "bias": "bias_ih"}[m.group(2)]
@@ -157,11 +157,11 @@ def main() -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
 
-    # ---- mynah.json dai metadata (traduzione una-tantum, config-driven) ----
+    # ---- mynah.json from the metadata (one-off translation, config-driven) ----
     g = lambda k: meta[f"stt.parakeet.{k}"]
     f = lambda k: meta[f"stt.frontend.{k}"]
-    # nome canonico: basename del repo_url upstream (es. parakeet-tdt_ctc-110m)
-    # — è la chiave con cui test/tooling riconoscono il modello
+    # canonical name: basename of the upstream repo_url (e.g. parakeet-tdt_ctc-110m)
+    # — it is the key tests and tooling use to recognize the model
     canon = meta.get("general.repo_url", "").rstrip("/").rsplit("/", 1)[-1] \
         or meta.get("general.name", args.out.name)
     mynah = {
@@ -206,11 +206,11 @@ def main() -> int:
     }
     (args.out / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
 
-    # ---- tokens.json dal tokenizer embedded ----
+    # ---- tokens.json from the embedded tokenizer ----
     (args.out / "tokens.json").write_text(
         json.dumps(meta["tokenizer.ggml.tokens"], ensure_ascii=False))
 
-    # ---- mel filterbank + finestra (stessa costruzione del converter HF) ----
+    # ---- mel filterbank + window (same construction as the HF converter) ----
     fb = melscale_fbanks(f("n_fft") // 2 + 1, f("f_min"), f("f_max"),
                          f("num_mels"), f("sample_rate"))
     save_file({"mel_fb": np.ascontiguousarray(fb.astype(np.float32)),
@@ -239,7 +239,7 @@ def main() -> int:
         payload += data[base + toff: base + toff + nbytes]
         n_out += 1
         if (m := re.fullmatch(r"decoder\.lstm\.bias_ih_l(\d+)", nn)):
-            # bias_hh sintetico a zero (il fuso di parakeet.cpp sta già in bias_ih)
+            # synthetic zero bias_hh (parakeet.cpp's fused one is already in bias_ih)
             while len(payload) % ALIGN != 0:
                 payload += b"\0"
             infos += gguf_string(f"decoder.lstm.bias_hh_l{m.group(1)}")

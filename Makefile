@@ -23,8 +23,9 @@ else
   endif
 endif
 
-# hook per le build varianti ricorsive (cuda): si sommano ai flag calcolati dal
-# Makefile invece di sovrascrivere CFLAGS (che perderebbe il quoting di MYNAH_ASR_BUILD)
+# hook for the recursive variant builds (cuda): these add to the flags the
+# Makefile computed instead of overriding CFLAGS (which would lose the quoting of
+# MYNAH_ASR_BUILD)
 CFLAGS  += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 
@@ -32,7 +33,7 @@ SRC := $(wildcard src/*.c) vendor/cJSON.c
 OBJ := $(SRC:%.c=build/%.o) $(OBJ_EXTRA)
 HDR := $(wildcard src/*.h)
 
-# versione iniettata da git (stringa informativa in `mynah-asr --version`)
+# version injected from git (informational string in `mynah-asr --version`)
 MYNAH_ASR_BUILD := $(shell git describe --always --dirty 2>/dev/null || echo dev)
 CFLAGS += -DMYNAH_ASR_BUILD='"$(MYNAH_ASR_BUILD)"'
 
@@ -48,8 +49,8 @@ mynah-asr: $(OBJ) build/cli/main.o
 mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
-# oggetti in build/ (mai accanto ai sorgenti: le build varianti — ubsan, cuda —
-# non inquinano più quella normale)
+# objects in build/ (never next to the sources: the variant builds — ubsan, cuda
+# — no longer pollute the normal one)
 build/%.o: %.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -63,8 +64,9 @@ TESTS := tests/test_qmat tests/test_gguf tests/test_features tests/test_subsampl
 tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-# Parità C vs oracolo (Nemotron streaming + Parakeet TDT offline).
-# Skip (exit 77) se mancano modello o dump golden. Rigenera con: make golden-dump
+# C vs oracle parity (Nemotron streaming + Parakeet TDT offline).
+# Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
+# with: make golden-dump
 PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tests/test_batch
 test: $(TESTS) mynah-asr examples/minimal
 	@for t in $(TESTS); do \
@@ -103,12 +105,12 @@ golden-dump:
 	  cd tools && uv run python -m oracle.transcribe ../$(PARAKEET110_DIR) \
 	    ../tests/audio/test_en.wav --dump-dir ../tests/golden/parakeet110_en; fi
 
-# libreria statica (senza CLI)
+# static library (without the CLI)
 lib: libmynah_asr.a
 libmynah_asr.a: $(OBJ)
 	ar rcs $@ $^
 
-# libreria condivisa (per i bindings: Python ctypes, Node, ...)
+# shared library (for the bindings: Python ctypes, Node, ...)
 ifeq ($(UNAME_S),Darwin)
   SOEXT := .dylib
 else
@@ -118,13 +120,14 @@ shared: libmynah_asr$(SOEXT)
 libmynah_asr$(SOEXT): $(OBJ)
 	$(CC) $(CFLAGS) -shared -o $@ $^ $(LDFLAGS)
 
-# esempio API (compilato in `make test`: guardia sulla superficie pubblica)
+# API example (built by `make test`: a guard on the public surface)
 example: examples/minimal
 examples/minimal: examples/minimal.c libmynah_asr.a
 	$(CC) $(CFLAGS) -o $@ examples/minimal.c libmynah_asr.a $(LDFLAGS)
 
-# CUDA (Linux, richiede nvcc): GEMM grandi su GPU via cuBLAS. Validato su
-# A100 (2026-07-20): output identico a CPU su tutti i modelli, RTF in docs/benchmarks.md.
+# CUDA (Linux, needs nvcc): the large GEMMs on GPU through cuBLAS. Validated on
+# an A100 (2026-07-20): output identical to CPU on every model, RTF in
+# docs/benchmarks.md.
 NVCC ?= nvcc
 cuda:
 	$(MAKE) clean && $(MAKE) EXTRA_CFLAGS="-DMYNAH_ASR_CUDA" \
@@ -135,13 +138,15 @@ build/src/cuda_gemm.o: src/cuda_gemm.cu
 	@mkdir -p $(@D)
 	$(NVCC) -O3 -DMYNAH_ASR_CUDA -c $< -o $@
 
-# build alternative.
-# Policy memoria/UB su macOS: `make leaks` (nativo, veloce) + `make ubsan` (overhead
-# basso). ASan è LENTISSIMO su Mac e tende a impallarsi col modello grande: solo CI Linux.
+# alternative builds.
+# Memory/UB policy on macOS: `make leaks` (native, fast) + `make ubsan` (low
+# overhead). ASan is VERY SLOW on a Mac and tends to hang with the large model:
+# Linux CI only.
 debug:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF)"
-# NOTA: clean anche in coda — gli oggetti sanitizzati (senza -DMYNAH_ASR_METAL e con
-# riferimenti al runtime ubsan) NON devono restare a inquinare la build normale
+# NOTE: clean at the end too — the sanitized objects (without -DMYNAH_ASR_METAL
+# and referencing the ubsan runtime) must NOT be left behind to pollute the
+# normal build
 ubsan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g -fsanitize=undefined \
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
@@ -151,18 +156,18 @@ asan:
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test && $(MAKE) clean
 
-# bench riproducibile: RTF warm + picco RAM per ogni modello presente
+# reproducible bench: warm RTF + peak RAM for every model present
 bench: mynah-asr
 	@sh tests/bench.sh
 
-# Throughput batch (richieste parallele simulate via mynah_asr_transcribe_batch):
-# quante volte il realtime regge il backend al crescere del batch. Pensato per
-# GPU (make cuda; --backend cuda) ma gira anche su cpu/metal.
+# Batch throughput (parallel requests simulated through mynah_asr_transcribe_batch):
+# how many times realtime the backend sustains as the batch grows. Meant for GPUs
+# (make cuda; --backend cuda) but it runs on cpu/metal too.
 #   tests/bench_throughput models/<m> tests/audio/long_60s.wav --backend cuda --max-batch 64
 bench-throughput: tests/bench_throughput
 	@echo "usage: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
 
-# Test end-to-end del server (REST + concorrenza + WebSocket)
+# End-to-end server test (REST + concurrency + WebSocket)
 test-server: mynah-asr-server
 	@sh tests/test_server.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: model missing"; \
@@ -171,24 +176,24 @@ test-server: mynah-asr-server
 	  if [ $$rc -eq 77 ]; then echo "SKIP serve-repro: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
-# Suite multilingua: sample audio reali (Tatoeba, CC) per ogni lingua supportata,
-# verifica language detection + CER vs testo di riferimento.
-# Prima volta: make fetch-lang-samples (richiede ffmpeg + tools/ uv).
+# Multilingual suite: real audio samples (Tatoeba, CC) for every supported
+# language, checking language detection + CER against the reference text.
+# First time: make fetch-lang-samples (needs ffmpeg + tools/ uv).
 test-nemo-langs: mynah-asr
 	cd tools && uv run python -m eval.test_langs
 
 fetch-lang-samples:
 	cd tools && uv run python fetch_lang_samples.py 3
 
-# Qualità su audio reale (samples/ FLEURS committati): CER ASR + qualità
-# traduzione Canary vs riferimenti paralleli, backend cpu+metal.
+# Quality on real audio (the committed samples/ FLEURS): ASR CER + Canary
+# translation quality against parallel references, cpu+metal backends.
 test-samples: mynah-asr
 	cd tools && uv run python -m eval.test_samples; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP test-samples: samples/ or models missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
-# leak check veloce su macOS (tool nativo `leaks`, nessuna rebuild — su Mac ASan
-# è lentissimo: usarlo solo in CI Linux. Stesso pattern di qwen-tts).
+# fast leak check on macOS (the native `leaks` tool, no rebuild — ASan is very
+# slow on a Mac: use it only in Linux CI. Same pattern as qwen-tts).
 leaks: mynah-asr tests/test_streaming
 	leaks --atExit -- ./mynah-asr transcribe -m $(MODEL_DIR) -i tests/audio/test_it.wav \
 	  --lang it-IT 2>&1 | tail -3
@@ -198,7 +203,7 @@ leaks: mynah-asr tests/test_streaming
 clean:
 	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) examples/minimal dist
 
-# installazione: CLI + server + libreria statica + header
+# install: CLI + server + static library + header
 PREFIX ?= /usr/local
 install: mynah-asr mynah-asr-server libmynah_asr.a
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
@@ -206,9 +211,9 @@ install: mynah-asr mynah-asr-server libmynah_asr.a
 	install -m 644 libmynah_asr.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 src/mynah_asr.h $(DESTDIR)$(PREFIX)/include/
 
-# Tarball di release: CLI + server + libreria statica + header + licenza/readme +
-# script di download modelli. Nome = versione git + os + arch; strip dei binari e
-# checksum SHA-256. Tutto in dist/ (gitignored). Uso: make dist
+# Release tarball: CLI + server + static library + header + licence/readme +
+# model download script. Name = git version + os + arch; binaries stripped and
+# SHA-256 checksummed. Everything in dist/ (gitignored). Usage: make dist
 DIST_OS   := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 DIST_ARCH := $(shell uname -m)
 DIST_NAME := mynah-asr-$(MYNAH_ASR_BUILD)-$(DIST_OS)-$(DIST_ARCH)

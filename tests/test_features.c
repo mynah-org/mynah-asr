@@ -1,6 +1,6 @@
-/* Parità log-mel: C vs oracolo numpy.
- * Uso: test_features <model_dir> <file.wav> <golden_dir>
- * Exit: 0 ok, 1 mismatch, 77 skip (modello o golden assenti). */
+/* log-mel parity: C vs the numpy oracle.
+ * Usage: test_features <model_dir> <file.wav> <golden_dir>
+ * Exit: 0 ok, 1 mismatch, 77 skip (model or goldens missing). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

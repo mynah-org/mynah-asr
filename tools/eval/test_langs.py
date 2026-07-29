@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Suite multilingua: trascrive i sample per-lingua (tests/audio/langs/) con
+"""Multilingual suite: transcribes the per-language samples (tests/audio/langs/) with
 `mynah-asr transcribe --lang auto` e verifica (a) language detection, (b) CER vs testo
 di riferimento (normalizzato: lowercase, senza punteggiatura).
 
@@ -22,12 +22,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Tier "adaptation-ready" della model card: qualità debole BY DESIGN (serve
-# fine-tuning). Segnalate come WEAK, non contano come fallimento della suite.
+# The model card's "adaptation-ready" tier: weak quality BY DESIGN (it needs
+# fine-tuning). Reported as WEAK; they do not count as suite failures.
 ADAPTATION_TIER = {"el-GR", "lt-LT", "lv-LV", "mt-MT", "sl-SI", "he-IL", "th-TH", "nn-NO"}
 
 # Varianti regionali (prompt id diversi, stessa lingua): testate riusando i
-# sample della lingua base con il prompt della variante. 40 locale = 36 lingue.
+# samples of the base language with the variant's prompt. 40 locales = 36 languages.
 VARIANTS = {"en-GB": "en-US", "es-US": "es-ES", "fr-CA": "fr-FR", "pt-PT": "pt-BR"}
 
 
@@ -82,10 +82,10 @@ def main() -> None:
         m = re.search(r"lang=([\w-]+)", proc.stderr)
         return proc.stdout.strip(), (m.group(1) if m else "?")
 
-    # Criterio primario: CER con lingua ESPLICITA (l'ASR funziona per la lingua?).
-    # Secondario/informativo: language detection con "auto" (sui clip corti il
-    # modello può non rilevare la lingua e non emettere nulla: comportamento noto).
-    # varianti regionali: stessi sample della lingua base, prompt della variante
+    # Primary criterion: CER with an EXPLICIT language (does ASR work for it?).
+    # Secondary/informational: language detection with "auto" (on short clips the
+    # model may fail to detect the language and emit nothing: known behaviour).
+    # regional variants: same samples as the base language, the variant's prompt
     jobs = dict(sorted(manifest.items()))
     if has_prompt:   # le varianti differiscono solo per il prompt: senza prompt sono doppioni
         for variant, base in VARIANTS.items():

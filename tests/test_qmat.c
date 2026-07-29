@@ -1,8 +1,8 @@
-/* Self-test dei kernel quantizzati (nessun modello richiesto — gira anche in CI):
- * confronta il path small-T (SDOT/VNNI/AVX2/NEON/scalare) e il path dequant+GEMM
- * contro il riferimento f32, su dati casuali riproducibili.
- * Tolleranze = errore di quantizzazione atteso (q8 ~1%, q4 ~4%): un bug di
- * kernel (segni, ordine lane, saturazione) produce errori di ordini superiori.
+/* Self-test of the quantized kernels (no model required — it runs in CI too):
+ * compares the small-T path (SDOT/VNNI/AVX2/NEON/scalar) and the dequant+GEMM
+ * path against the f32 reference, on reproducible random data.
+ * Tolerances = the expected quantization error (q8 ~1%, q4 ~4%): a kernel bug
+ * (signs, lane order, saturation) produces errors orders of magnitude larger.
  * Exit: 0 ok, 1 fail. */
 #include <math.h>
 #include <stdio.h>

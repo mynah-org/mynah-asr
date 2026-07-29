@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test di QUALITÀ su audio reale (samples/ — FLEURS, CC-BY 4.0).
+"""QUALITY test on real audio (samples/ — FLEURS, CC-BY 4.0).
 
 Per ogni modello presente e ogni sample applicabile:
 - ASR: CER normalizzato vs trascrizione di riferimento (soglia --cer-max)
@@ -29,7 +29,7 @@ from eval.test_langs import cer, normalize
 ROOT = Path(__file__).resolve().parent.parent.parent
 
 # modello -> (lingue ASR coperte dai sample, formato tag lingua)
-# nemotron: 40 locale (qui 11 con sample); v3: 25 lingue EU (niente ja)
+# nemotron: 40 locales (11 with samples here); v3: 25 EU languages (no ja)
 MODELS = {
     "nemotron-3.5-asr-streaming-0.6b": {
         "langs": ["it", "en", "de", "es", "fr", "pt", "nl", "pl", "ru", "uk", "ja"],
@@ -48,7 +48,7 @@ LOCALE = {"it": "it-IT", "en": "en-US", "de": "de-DE", "es": "es-ES", "fr": "fr-
 
 
 def word_overlap(ref: str, hyp: str, min_len: int = 4) -> float:
-    """Recall delle parole di contenuto del riferimento nell'ipotesi, con match
+    """Recall of the reference content words inside the hypothesis, with matching
     per prefisso (5 char): le traduzioni legittime variano la morfologia
     (relative/relatively, inaccessibility/inaccessible) e il match esatto le
     boccerebbe (visto su FLEURS 1534 es>en: parafrasi corretta, overlap 0.18)."""
@@ -142,7 +142,7 @@ def main() -> None:
                         print(f"     ref: {ref['text']}\n     hyp: {hyp}")
                         fails += 1
     # clip lungo: segmentazione su silenzio, timestamp monotoni, streaming reale
-    # (solo cpu: percorsi già provati su metal sopra; qui contano le feature)
+    # (cpu only: the metal paths were exercised above; here the features matter)
     def rtf_of(stderr: str) -> str:
         m = re.search(r"RTF ([0-9.]+)", stderr)
         return m.group(1) if m else "?"
@@ -150,8 +150,8 @@ def main() -> None:
     for s in long_samples:
         wav = str(ROOT / "samples" / s["file"])
         if s["file"].startswith("long/"):
-            # long transcribe / long translate: default di segmentazione
-            # model-aware (misura la qualità out-of-the-box) + RTF
+            # long transcribe / long translate: model-aware segmentation
+            # defaults (measures out-of-the-box quality) + RTF
             if s["lang"] == "en" and "parakeet-tdt-0.6b-v3" in models:
                 p = subprocess.run([args.mynah_asr, "transcribe", "-m",
                                     str(ROOT / "models/parakeet-tdt-0.6b-v3"),

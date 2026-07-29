@@ -27,7 +27,7 @@ int mynah_asr_cuda_gemm_wt(const float *x, const float *w, float *out, int T, in
 
 static int g_backend = MYNAH_ASR_BACKEND_CPU;
 
-/* sotto questa soglia di righe la GEMM resta su CPU: il round-trip GPU non paga */
+/* below this row threshold the GEMM stays on CPU: the GPU round-trip does not pay */
 #define METAL_MIN_T 24
 
 int mynah_asr_set_backend(const char *name) {
@@ -80,10 +80,11 @@ void mynah_asr_gemm_wt(const float *x, const float *w, float *out, int T, int n,
                 1.0f, x, k, w, k, 0.0f, out, n);
 }
 
-/* SiLU in-place. Su Accelerate: vvexpf (vForce) batcha l'exp — dal profilo
- * 2026-07-19 expf scalare pesava ~10% dei sample. Il clamp a 87 evita inf
- * (lezione -ffast-math: inf = UB, vedi mynah_asr_sigmoid); exp(-x) con clamp
- * non overflowa mai in f32. Fallback scalare identico a prima. */
+/* In-place SiLU. On Accelerate: vvexpf (vForce) batches the exp — in the
+ * 2026-07-19 profile scalar expf accounted for ~10% of the samples. The clamp at
+ * 87 avoids inf (the -ffast-math lesson: inf = UB, see mynah_asr_sigmoid);
+ * exp(-x) with the clamp can never overflow in f32. The scalar fallback is
+ * unchanged. */
 void mynah_asr_silu(float *x, size_t n) {
 #ifdef MYNAH_ASR_BLAS_ACCELERATE
     if (n >= 256) {

@@ -63,14 +63,14 @@ class Oracle:
         self.blank = dec.get("blank_id")                       # assente per AED
         self.max_symbols = dec.get("max_symbols_per_step")
         self.durations: list[int] = dec.get("durations", [])   # TDT; [] = RNNT
-        # prompt POST-encoder alla Nemotron (Canary ha "prompt" nel json ma è
-        # il prompt del DECODER: si distingue dai pesi)
+        # Nemotron-style POST-encoder prompt (Canary has "prompt" in the json but
+        # it is the DECODER's prompt: they are told apart by the weights)
         self.has_prompt = "prompt_projector.linear_1.weight" in self.w
-        # inv_freq del rel pos encoding (interleaved sin/cos)
+        # inv_freq of the rel pos encoding (interleaved sin/cos)
         self.inv_freq = 1.0 / (10000.0 ** (np.arange(0, self.d_model, 2, dtype=np.float64) / self.d_model))
 
         # alias nomi subsampling: Nemotron usa conv_in/layers.{i}.{depthwise,pointwise}_conv,
-        # il porting HF di Parakeet un Sequential piatto layers.{0,2,3,5,6}
+        # the HF port of Parakeet a flat Sequential layers.{0,2,3,5,6}
         if "encoder.subsampling.conv_in.weight" in self.w:
             self.ss_names = {
                 "conv_in": "encoder.subsampling.conv_in",
@@ -118,7 +118,7 @@ class Oracle:
         return out + bias[:, None, None]
 
     def subsampling(self, feats: np.ndarray) -> np.ndarray:
-        """feats [T, n_mels] (solo frame validi) -> [T', d_model]."""
+        """feats [T, n_mels] (valid frames only) -> [T', d_model]."""
         w = self.w
         nm = self.ss_names
         x = feats.astype(np.float64)[None, :, :]                      # [1, T, F]
@@ -202,7 +202,7 @@ class Oracle:
             h = h + pb
         a, b = h[:, :self.d_model], h[:, self.d_model:]
         h = a * sigmoid(b)
-        # depthwise k: causale (pad left k-1) o 'same' simmetrico (pad (k-1)/2 per lato)
+        # depthwise k: causal (left pad k-1) or symmetric 'same' (pad (k-1)/2 per side)
         k = self.conv_k
         pad = (k - 1, 0) if self.causal else ((k - 1) // 2, (k - 1) // 2)
         hp = np.pad(h, (pad, (0, 0)))
@@ -212,7 +212,7 @@ class Oracle:
         if db is not None:
             h = h + db
         if self.conv_norm == "batch_norm":
-            # BatchNorm1d in inference: affine per-canale con le running stats (eps 1e-5)
+            # BatchNorm1d at inference: per-channel affine with the running stats (eps 1e-5)
             inv = 1.0 / np.sqrt(w[p + "norm.running_var"].astype(np.float64) + 1e-5)
             h = (h - w[p + "norm.running_mean"]) * inv * w[p + "norm.weight"] + w[p + "norm.bias"]
         else:
@@ -312,7 +312,7 @@ class Oracle:
         return g, new_state
 
     def greedy_decode(self, enc: np.ndarray) -> list[int]:
-        """Greedy RNNT su enc [T, 640]. SOS = blank; stato LSTM avanza solo su non-blank."""
+        """Greedy RNNT over enc [T, 640]. SOS = blank; the LSTM state advances only on non-blank."""
         if self.cfg["decoder"]["type"] == "aed_transformer":
             return self.greedy_decode_aed(enc)
         if self.cfg["decoder"]["type"] == "ctc":
@@ -341,7 +341,7 @@ class Oracle:
     def greedy_decode_ctc(self, enc_out: np.ndarray) -> list[int]:
         """Greedy CTC sulla head ausiliaria (modelli hybrid, es. tdt_ctc-110m):
         logits per frame dall'ENCODER OUT (pre-projector), argmax, collapse dei
-        ripetuti, rimozione dei blank (= ultimo indice)."""
+        repeats, blanks removed (= last index)."""
         w = self.w["ctc_head.weight"][:, :, 0].astype(np.float64)   # [V+1, d, 1]
         b = self.w["ctc_head.bias"].astype(np.float64)
         ids = np.argmax(enc_out @ w.T + b, axis=-1)
@@ -354,11 +354,11 @@ class Oracle:
         return tokens
 
     def greedy_decode_tdt(self, enc: np.ndarray) -> list[int]:
-        """Greedy TDT su enc [T, 640] (ParakeetTDTGenerationMixin): ogni step il joint
+        """Greedy TDT over enc [T, 640] (ParakeetTDTGenerationMixin): at each step the joint
         predice token (argmax sui primi V logit, blank incluso) E duration (argmax sugli
         ultimi len(durations)); il puntatore frame avanza della duration a OGNI step
         (blank con duration 0 -> forzata a 1); lo stato LSTM avanza solo su non-blank.
-        Guardia max_symbols per-frame come NeMo (forza avanzamento su loop dur=0)."""
+        Per-frame max_symbols guard as in NeMo (forces progress on a dur=0 loop)."""
         H = self.cfg["decoder"]["pred_hidden"]
         V = self.cfg["decoder"]["vocab_size"]              # 8193, blank incluso
         zeros = lambda: [(np.zeros(H), np.zeros(H)) for _ in range(self.cfg["decoder"]["pred_layers"])]
@@ -387,7 +387,7 @@ class Oracle:
 
     # ------------------------------------------------------- decoder AED (Canary)
     def aed_prompt_ids(self, source_lang: str, target_lang: str) -> list[int]:
-        """Prompt canary2 come id globali; slot vuoti (decodercontext) = 0 token."""
+        """canary2 prompt as global ids; empty slots (decodercontext) = 0 tokens."""
         pr = self.cfg["prompt"]
         piece_id = {p: i for i, p in reversed(list(enumerate(self.pieces)))}  # prima occorrenza vince
         slots = dict(pr["defaults"])

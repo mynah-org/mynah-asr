@@ -1,12 +1,12 @@
-/* Interfaccia engine: un tipo di decoder = un engine dietro la vtable.
+/* Engine interface: one decoder type = one engine behind the vtable.
  *
- * L'encoder resta un percorso UNICO condiviso (regola repo #2: niente percorsi
- * divergenti); l'engine decodifica l'output encoder di UN segmento in token.
- * Lo streaming cache-aware sta fuori dalla vtable: è incrementale per natura
- * (stato per-chunk) e oggi esiste solo per Nemotron.
+ * The encoder stays a SINGLE shared path (repo rule #2: no divergent paths);
+ * the engine decodes the encoder output of ONE segment into tokens.
+ * Cache-aware streaming lives outside the vtable: it is incremental by nature
+ * (per-chunk state) and today exists only for Nemotron.
  *
- * Per aggiungere un engine (es. Whisper-style, Moonshine): una mynah_asr_engine
- * statica + il suo decode, selezionata al load dal decoder.type del mynah.json.
+ * To add an engine (e.g. Whisper-style, Moonshine): one static mynah_asr_engine
+ * plus its decode, selected at load time from decoder.type in mynah.json.
  */
 #ifndef MYNAH_ASR_ENGINE_H
 #define MYNAH_ASR_ENGINE_H
@@ -15,16 +15,18 @@ struct mynah_asr_model;
 
 typedef struct {
     const char *name;
-    /* 1: l'engine consuma l'encoder out PRE-projector (mynah_asr_encoder_forward_raw,
-     * es. head CTC); 0: output post prompt/projector (mynah_asr_encoder_forward). */
+    /* 1: the engine consumes the PRE-projector encoder output
+     * (mynah_asr_encoder_forward_raw, e.g. the CTC head); 0: the post
+     * prompt/projector output (mynah_asr_encoder_forward). */
     int raw_encoder;
-    /* Decodifica enc [T, d] -> *tokens (malloc del chiamato, caller free).
-     * Ritorna n token >= 0, -1 su errore.
-     * lang: tag della richiesta (usato dal prompt AED, "src>tgt" = traduzione).
-     * want_ts: il chiamante vuole i timestamp — l'engine scrive in *frames un
-     * array malloc parallelo ai token (frame encoder di emissione) oppure lo
-     * lascia NULL se produce i tempi in altro modo (AED: token <|N|> dentro
-     * la sequenza, estratti a valle da aed_words_from_tokens). */
+    /* Decode enc [T, d] -> *tokens (malloc'd by the callee, freed by the caller).
+     * Returns the token count >= 0, or -1 on error.
+     * lang: the request tag (used by the AED prompt, "src>tgt" = translation).
+     * want_ts: the caller wants timestamps — the engine either writes into
+     * *frames a malloc'd array parallel to the tokens (the encoder frame each
+     * token was emitted at) or leaves it NULL when it produces times some other
+     * way (AED: <|N|> tokens inside the sequence, extracted downstream by
+     * aed_words_from_tokens). */
     int (*decode)(struct mynah_asr_model *m, const float *enc, int T,
                   const char *lang, int want_ts, int **tokens, int **frames);
 } mynah_asr_engine;

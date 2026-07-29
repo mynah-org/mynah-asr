@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Costruisce samples/ dal dataset FLEURS (google/fleurs, CC-BY 4.0).
+"""Build samples/ from the FLEURS dataset (google/fleurs, CC-BY 4.0).
 
 Frasi PARALLELE tra le lingue (stesso id FLEURS = stessa frase tradotta):
 l'inglese fa da riferimento per valutare la speech translation di Canary.
@@ -23,22 +23,22 @@ BASE = "https://huggingface.co/datasets/google/fleurs/resolve/main/data"
 CACHE = Path("/tmp/fleurs")
 
 # lingua mynah -> config FLEURS. Le prime 5 coprono Canary (traduzione) e i
-# fixture storici; le altre esercitano i 40 locale di Nemotron e le 25 lingue
-# EU di v3 (alfabeti inclusi: cirillico, giapponese).
+# historical fixtures; the others exercise Nemotron's 40 locales and v3's 25 EU
+# languages (alphabets included: Cyrillic, Japanese).
 LANGS = {"it": "it_it", "en": "en_us", "de": "de_de", "es": "es_419", "fr": "fr_fr",
          "pt": "pt_br", "nl": "nl_nl", "pl": "pl_pl", "ru": "ru_ru", "uk": "uk_ua",
          "ja": "ja_jp"}
-# id FLEURS delle frasi scelte (parallele in tutte le lingue, 7-13 s,
+# FLEURS ids of the chosen sentences (parallel across all languages, 7-13 s,
 # contenuti distintivi: 1521 satellite, 1534 Timbuctù)
 IDS = ["1521", "1534"]
-# clip lungo EN (~90 s): frasi dev concatenate con pause da 0.6 s — riferimento
-# esatto per segmentazione su silenzio, timestamp lunghi e streaming
+# long EN clip (~90 s): dev sentences concatenated with 0.6 s pauses — an exact
+# reference for silence segmentation, long timestamps and streaming
 LONG_N = 8
 LONG_PAUSE = 0.6
-# clip LUNGHI (WAV PCM16, committati: ~5 min EN + ~2 min DE ≈ 14 MB) per i test
-# di long transcribe / long translate — lossless dalle sorgenti FLEURS, nessuna
-# dipendenza ffmpeg nei test. de: solo frasi PARALLELE (id anche in en) così il
-# riferimento della traduzione è la concatenazione degli en.
+# LONG clips (WAV PCM16, committed: ~5 min EN + ~2 min DE ≈ 14 MB) for the long
+# transcribe / long translate tests — lossless from the FLEURS sources, no ffmpeg
+# dependency in the tests. de: only PARALLEL sentences (ids present in en too) so
+# the translation reference is the concatenation of the en ones.
 LONG_TARGETS = {"en": 300.0, "de": 120.0}
 
 
@@ -90,7 +90,7 @@ def main() -> None:
             src = CACHE / cfg / "dev" / rows[i]["file"]
             dst = samples_dir / lang / f"fleurs_{i}.wav"
             # FLEURS distribuisce float32: riscrittura in PCM16 (metà peso,
-            # supporto universale — il runtime legge WAV PCM16)
+            # universal support — the runtime reads WAV PCM16)
             import soundfile as sf
             audio, sr = sf.read(src, dtype="float32")
             sf.write(dst, audio, sr, subtype="PCM_16")
@@ -102,7 +102,7 @@ def main() -> None:
                 "text": rows[i]["raw"],
                 "en_ref": texts["en"][i]["raw"],
             })
-    # clip lungo EN: le prime LONG_N frasi del dev (durata 8-14 s) concatenate
+    # long EN clip: the first LONG_N dev sentences (8-14 s each) concatenated
     import numpy as np
     import soundfile as sf
     en = texts["en"]

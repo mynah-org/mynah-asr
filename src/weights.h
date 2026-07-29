@@ -1,5 +1,5 @@
-/* Loader safetensors: mmap del file + indice nome -> tensore.
- * I nomi dei tensori sono quelli HF verbatim (decisione da docs/prior-art.md). */
+/* safetensors loader: file mmap + name -> tensor index.
+ * Tensor names are the HF ones verbatim (decision from docs/prior-art.md). */
 #ifndef MYNAH_ASR_WEIGHTS_H
 #define MYNAH_ASR_WEIGHTS_H
 
@@ -23,7 +23,7 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path);
 mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path); /* niente errore se assente */
 void mynah_asr_st_close(mynah_asr_safetensors *st);
 
-/* Lookup per nome esatto. NULL se assente. */
+/* Exact-name lookup. NULL when absent. */
 const mynah_asr_tensor *mynah_asr_st_get(const mynah_asr_safetensors *st, const char *name);
 size_t mynah_asr_st_count(const mynah_asr_safetensors *st);
 const mynah_asr_tensor *mynah_asr_st_at(const mynah_asr_safetensors *st, size_t i);

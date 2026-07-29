@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confronto tra due directory di dump .npy con tolleranze per stadio (M0.4).
+"""Compare two directories of .npy dumps with per-stage tolerances (M0.4).
 
 Casi d'uso: diffare i golden dell'oracolo tra versioni del converter/oracolo
 (rigenera in una dir nuova e confronta con la vecchia), o qualunque coppia di
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Tolleranze di default per stadio (pattern fnmatch sul nome file senza .npy),
+# Default per-stage tolerances (fnmatch pattern on the file name without .npy),
 # allineate ai test C: mel bit-esatto, stadi profondi via accumulo f32.
 DEFAULT_TOLS: list[tuple[str, float]] = [
     ("mel", 0.0),

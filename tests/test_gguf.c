@@ -1,11 +1,11 @@
-/* Self-test del loader GGUF (nessun modello richiesto — gira anche in CI):
- * costruisce in /tmp dei GGUF sintetici e verifica
- *   1. parse del file valido: dims invertite (ggml ne[0] = la più veloce),
+/* Self-test of the GGUF loader (no model required — it runs in CI too):
+ * builds synthetic GGUFs in /tmp and checks
+ *   1. parsing of the valid file: reversed dims (ggml ne[0] = the fastest one),
  *      F32 zero-copy bit-esatto, dequant F16/BF16/Q8_0/Q4_0 entro tolleranza;
- *   2. che i file malformati (magic, v1, troncato, offset oltre EOF, stringa
- *      abnorme, alignment non potenza di 2, tipo ggml ignoto) siano rifiutati
- *      puliti (NULL, niente crash) — stessa classe di harness usata per
- *      validare il parser d'origine (keyra).
+ *   2. that malformed files (magic, v1, truncated, offset past EOF, absurd
+ *      string, alignment not a power of 2, unknown ggml type) are rejected
+ *      cleanly (NULL, no crash) — the same class of harness used to validate
+ *      the original parser (keyra).
  * Exit: 0 ok, 1 fail. */
 #include <math.h>
 #include <stdio.h>
@@ -63,7 +63,7 @@ static const char *write_tmp(const buf *b, char *path_out) {
     return w == (ssize_t)b->len ? path_out : NULL;
 }
 
-/* header v3 con 1 voce di metadata (general.alignment=32) */
+/* v3 header with 1 metadata entry (general.alignment=32) */
 static void hdr(buf *b, uint32_t version, uint64_t n_tensors) {
     put_u32(b, 0x46554747u);
     put_u32(b, version);
@@ -144,9 +144,9 @@ int main(void) {
         }
     }
 
-    /* q4_k a offset 544: 1 super-blocco con sc/min/q noti; l'atteso si calcola
-     * dalla formula di spec x = d*sc*q - dmin*m (valida il layout: pack dei
-     * 6-bit e ordine nibble i|i+32 per gruppo da 64) */
+    /* q4_k at offset 544: 1 super-block with known sc/min/q; the expectation is
+     * computed from the spec formula x = d*sc*q - dmin*m (it validates the
+     * layout: the 6-bit packing and the i|i+32 nibble order per group of 64) */
     static const float KD = 0.5f, KDMIN = 0.25f;
     unsigned char ksc[8], kmn[8], kq[NK];
     float expect_k[NK];

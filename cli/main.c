@@ -1,9 +1,9 @@
-/* mynah — CLI. Sottocomandi: transcribe (offline). stream arriva con M1.3. */
+/* mynah-asr — CLI. Subcommands: transcribe (offline). stream lands with M1.3. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/resource.h>   /* getrusage: picco RAM in `bench` */
+#include <sys/resource.h>   /* getrusage: peak RAM in `bench` */
 
 #include "mynah_asr.h"
 #include "audio.h"
@@ -160,7 +160,7 @@ static int cmd_stream(int argc, char **argv) {
 #include "stwrite.h"
 #include "weights.h"
 
-/* allowlist: gli stessi linear che il runtime consuma via qmat (2D o [n,k,1]) */
+/* allowlist: the same linears the runtime consumes through qmat (2D or [n,k,1]) */
 static int quantizable(const char *name, const mynah_asr_tensor *t) {
     if (strstr(name, "relative_k_proj")) return 0;
     const int is_2dish = t->n_dims == 2 || (t->n_dims == 3 && t->shape[2] == 1);
@@ -169,7 +169,7 @@ static int quantizable(const char *name, const mynah_asr_tensor *t) {
     if (strstr(name, "self_attn.") && strstr(name, "_proj.weight")) return 1;
     if (strstr(name, "conv.pointwise_conv") && !strstr(name, "subsampling")) return 1;
     if (strcmp(name, "joint.head.weight") == 0) return 1;
-    /* decoder AED (Canary): attention self/cross, FFN, head, proiezione encoder */
+    /* AED decoder (Canary): self/cross attention, FFN, head, encoder projection */
     if (strstr(name, "cross_attn.") && strstr(name, "_proj.weight")) return 1;
     if (strstr(name, "aed.") && strstr(name, "ffn.linear")) return 1;
     if (strcmp(name, "aed.head.weight") == 0) return 1;
@@ -264,7 +264,7 @@ static int cmd_quantize(int argc, char **argv) {
     return 0;
 }
 
-/* Picco RSS del processo in GB (getrusage: byte su macOS, KB su Linux). */
+/* Peak process RSS in GB (getrusage: bytes on macOS, KB on Linux). */
 static double peak_ram_gb(void) {
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
@@ -280,9 +280,9 @@ static int cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* bench: RTF warm (min/mediana su N run cronometrati, dopo W warm-up) + picco RAM.
- * Stessa metrica di `make bench` (tests/bench.sh) ma in-process, un modello alla
- * volta e con parametri A/B espliciti (regola repo 6). */
+/* bench: warm RTF (min/median over N timed runs, after W warm-ups) + peak RAM.
+ * Same metric as `make bench` (tests/bench.sh) but in-process, one model at a
+ * time and with explicit A/B parameters (repo rule 6). */
 static int cmd_bench(int argc, char **argv) {
     const char *model_dir = NULL, *wav = "tests/audio/test_it.wav", *lang = "auto";
     int lookahead = -1, quant = MYNAH_ASR_QUANT_F32, runs = 5, warmup = 2;

@@ -43,12 +43,12 @@ void mynah_asr_words_free(mynah_asr_word *words, int n_words) {
     free(words);
 }
 
-/* piece "speciale" <...>: tag lingua o marcatore di controllo -> non è testo */
+/* "special" piece <...>: a language tag or a control marker -> not text */
 static int piece_is_special(const char *p, size_t pl) {
     return pl >= 2 && p[0] == '<' && p[pl - 1] == '>';
 }
 
-/* il piece inizia con ▁ (U+2581, e2 96 81)? */
+/* does the piece start with ▁ (U+2581, e2 96 81)? */
 static int piece_starts_word(const char *p) {
     return (unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 &&
            (unsigned char)p[2] == 0x81;
@@ -75,7 +75,7 @@ int mynah_asr_detokenize_words(const mynah_asr_tokenizer *tk, const int *tokens,
             special = piece_is_special(p, pl);
             starts = pl >= 3 && piece_starts_word(p);
         }
-        /* chiudi la parola corrente a fine sequenza o all'inizio della prossima */
+        /* close the current word at end of sequence, or when the next one starts */
         if (wlen > 0 && (i == n || (!special && starts))) {
             char *w = malloc(wlen + 1);
             if (!w) { mynah_asr_words_free(words, nw); free(wbuf); return -1; }
@@ -97,7 +97,7 @@ int mynah_asr_detokenize_words(const mynah_asr_tokenizer *tk, const int *tokens,
             if (!nb) { mynah_asr_words_free(words, nw); free(wbuf); return -1; }
             wbuf = nb;
         }
-        /* copia saltando il ▁ iniziale (e ogni ▁ interno -> niente: è un confine) */
+        /* copy, skipping the leading ▁ (and any inner ▁ -> dropped: it is a boundary) */
         for (size_t j = starts ? 3 : 0; j < pl; j++) wbuf[wlen++] = p[j];
     }
     free(wbuf);
@@ -118,7 +118,7 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
         const char *p = tk->pieces[tokens[i]];
         const size_t pl = strlen(p);
 
-        /* token speciale <...>: tag lingua (contiene '-') o marcatore -> strip */
+        /* special token <...>: language tag (contains '-') or marker -> stripped */
         if (pl >= 2 && p[0] == '<' && p[pl - 1] == '>') {
             if (lang_out && memchr(p, '-', pl) && pl - 2 < 16) {
                 memcpy(lang_out, p + 1, pl - 2);
@@ -132,7 +132,7 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
             if (!nb) { free(out); return NULL; }
             out = nb;
         }
-        /* copia sostituendo ▁ (U+2581, e2 96 81) con spazio */
+        /* copy, replacing ▁ (U+2581, e2 96 81) with a space */
         for (size_t j = 0; j < pl; ) {
             if (j + 2 < pl && (unsigned char)p[j] == 0xE2 && (unsigned char)p[j + 1] == 0x96 &&
                 (unsigned char)p[j + 2] == 0x81) {
@@ -145,9 +145,10 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
     }
     out[len] = '\0';
 
-    /* Il tag lingua può arrivare anche "spelled-out" in pezzi BPE normali quando
-     * il token singolo non esiste nel vocab (es. <sl-SI> vs token <sl-SL>):
-     * rimuovi i pattern <xx-XX> inline e usali come lang se non già rilevata. */
+    /* The language tag can also arrive "spelled out" as ordinary BPE pieces when
+     * the single token does not exist in the vocab (e.g. <sl-SI> vs the <sl-SL>
+     * token): strip inline <xx-XX> patterns and use them as lang when it has not
+     * been detected yet. */
     for (char *p = out; (p = strchr(p, '<')) != NULL;) {
         char *close = strchr(p, '>');
         if (!close || (size_t)(close - p) > 12 || !memchr(p, '-', (size_t)(close - p))) {
@@ -165,7 +166,7 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
     }
     len = strlen(out);
 
-    /* strip degli spazi iniziali (come l'oracolo: lstrip) */
+    /* strip the leading spaces (like the oracle: lstrip) */
     size_t skip = 0;
     while (out[skip] == ' ') skip++;
     if (skip) memmove(out, out + skip, len - skip + 1);

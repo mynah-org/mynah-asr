@@ -1,6 +1,6 @@
-/* Helper condiviso dei test di parità: legge da mynah.json i parametri che
- * variano tra i modelli (normalize, att context di default, prompt it-IT).
- * Modelli senza streaming/prompt (Parakeet): left/right/prompt = -1. */
+/* Shared helper for the parity tests: reads from mynah.json the parameters that
+ * vary across models (normalize, default att context, it-IT prompt).
+ * Models without streaming/prompt (Parakeet): left/right/prompt = -1. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -42,9 +42,9 @@ int mynah_asr_stw_add(mynah_asr_stw *w, const char *name, const char *dtype,
 }
 
 /* Append printf-style in *buf a partire da *len, facendo crescere *cap quando
- * serve. Il valore di ritorno di vsnprintf viene SEMPRE confrontato con lo spazio
- * residuo PRIMA di avanzare *len: niente troncamento silenzioso e niente
- * aritmetica (cap - len) che possa andare in underflow. Ritorna 0, -1 su OOM. */
+ * needed. The return value of vsnprintf is ALWAYS compared against the remaining
+ * space BEFORE advancing *len: no silent truncation and no (cap - len) arithmetic
+ * that could underflow. Returns 0, or -1 on OOM. */
 static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ...) {
     for (;;) {
         va_list ap;
@@ -65,8 +65,8 @@ static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ..
 
 int mynah_asr_stw_write(mynah_asr_stw *w, const char *path) {
     /* header JSON costruito a mano: nomi controllati (tensori HF), niente escaping
-     * esotico da gestire. Il buffer cresce da solo via stw_appendf, quindi la
-     * capacità iniziale è solo una stima. */
+     * exotic to handle. The buffer grows on its own through stw_appendf, so the
+     * initial capacity is only an estimate. */
     size_t hcap = 256 + w->n * 256;
     char *hdr = malloc(hcap);
     if (!hdr) return -1;
@@ -85,7 +85,7 @@ int mynah_asr_stw_write(mynah_asr_stw *w, const char *path) {
                               e->offset, e->offset + e->bytes);
     }
     if (!err) err = stw_appendf(&hdr, &hcap, &hl, "}");
-    /* pad a multipli di 8 con spazi (convenzione safetensors) */
+    /* pad to a multiple of 8 with spaces (safetensors convention) */
     while (!err && hl % 8 != 0) err = stw_appendf(&hdr, &hcap, &hl, " ");
     if (err) { free(hdr); return -1; }
 

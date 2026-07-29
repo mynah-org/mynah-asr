@@ -15,7 +15,7 @@
 #include <cblas.h>
 #endif
 
-/* ------------------------------------------------------------ quantizzatori */
+/* ------------------------------------------------------------- quantizers */
 void mynah_asr_quantize_int8(const float *w, int n, int k, int8_t *out_q, float *out_scales) {
     for (int i = 0; i < n; i++) {
         const float *row = w + (size_t)i * (size_t)k;
@@ -68,9 +68,9 @@ void mynah_asr_quantize_int4(const float *w, int n, int k, uint8_t *out_q, float
 
 /* --------------------------------------------------------------------- init */
 static void release_f32_pages(const float *w, size_t bytes) {
-    /* pagine mmap del f32 quantizzato: clean e rileggibili — su Linux il
-     * DONTNEED le rilascia subito, su macOS restano riappropriabili sotto
-     * pressione (l'accounting RSS non cala: limite noto, vedi TODO M5) */
+    /* mmap pages of the quantized f32: clean and re-readable — on Linux DONTNEED
+     * releases them immediately, on macOS they stay reclaimable under pressure
+     * (RSS accounting does not drop: known limitation, see TODO M5) */
     const long pg = sysconf(_SC_PAGESIZE);
     uintptr_t lo = ((uintptr_t)w + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
     uintptr_t hi = ((uintptr_t)w + bytes) & ~((uintptr_t)pg - 1);
@@ -176,13 +176,13 @@ void mynah_asr_qmat_dequant(const mynah_asr_qmat *m, float *wd) {
     for (int i = 0; i < m->n; i++) dequant_row(m, i, wd + (size_t)i * (size_t)m->k);
 }
 
-/* soglia righe: sotto -> dot diretto (bandwidth-bound), sopra -> dequant+GEMM */
+/* row threshold: below -> direct dot (bandwidth-bound), above -> dequant+GEMM */
 #define QMAT_SMALL_T 16
 #define QMAT_K_MAX 8192
 
-/* ------------------------------------------------- quantizzazione attivazioni
- * Per-riga absmax -> int8 (ricetta qwen-tts, qualità verificata in produzione):
- * abilita il dot int8xint8 nativo (SDOT/VNNI) senza dequant per-peso. */
+/* -------------------------------------------------- activation quantization
+ * Per-row absmax -> int8 (qwen-tts recipe, quality verified in production):
+ * enables the native int8xint8 dot (SDOT/VNNI) without a per-weight dequant. */
 static float quantize_act_int8(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -201,11 +201,11 @@ static float quantize_act_int8(int8_t *qx, const float *x, int n) {
     return amax / 127.0f;
 }
 
-/* ---------------------------------------------------- kernel SDOT (ARMv8.2+)
- * int8xint8 nativo: 4 MAC per lane per istruzione, zero conversioni f32.
- * Pattern da qwen-tts (int8_matvec_sdot), esteso al q4 con vld2q_s8 per il
- * deinterleave pari/dispari dei nibble (l'ordine nel dot non conta, ma i lane
- * di SDOT devono allinearsi elemento per elemento). */
+/* ---------------------------------------------------- SDOT kernel (ARMv8.2+)
+ * Native int8xint8: 4 MACs per lane per instruction, zero f32 conversions.
+ * Pattern from qwen-tts (int8_matvec_sdot), extended to q4 with vld2q_s8 for the
+ * even/odd deinterleave of the nibbles (order inside the dot does not matter, but
+ * the SDOT lanes must line up element by element). */
 #if defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
 
@@ -237,13 +237,13 @@ static float dot_q4_sdot(const int8_t *qx, float sx, const uint8_t *q,
 #define MYNAH_ASR_HAVE_SDOT 1
 #endif
 
-/* --------------------------------------------- kernel x86 (q8 VNNI/AVX2, q4 AVX2)
- * DISPATCH A RUNTIME (pattern --caps di qwen-tts): i kernel sono compilati
- * sempre con target-attribute (nessun -march richiesto: binari release
- * multi-target), la selezione avviene via cpuid+xgetbv alla prima chiamata.
- * Override con mynah_asr_set_caps("scalar"|"avx2"|"vnni") o env MYNAH_ASR_CAPS.
- * dpbusd/maddubs moltiplicano u8 x s8: ua = qx+128 e correzione -128*Σw
- * (pattern qwen-tts int8_matvec_vnni). Validati da tests/test_qmat in CI. */
+/* --------------------------------------------- x86 kernels (q8 VNNI/AVX2, q4 AVX2)
+ * RUNTIME DISPATCH (qwen-tts --caps pattern): the kernels are always compiled
+ * with a target attribute (no -march needed: multi-target release binaries), and
+ * the selection happens through cpuid+xgetbv on the first call.
+ * Override with mynah_asr_set_caps("scalar"|"avx2"|"vnni") or env MYNAH_ASR_CAPS.
+ * dpbusd/maddubs multiply u8 x s8: ua = qx+128 with a -128*Σw correction
+ * (qwen-tts int8_matvec_vnni pattern). Validated by tests/test_qmat in CI. */
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <cpuid.h>
@@ -299,8 +299,8 @@ static float dot_q8_vnni(const int8_t *qx, float sx, const int8_t *w, float ws, 
     return (float)s * ws * sx;
 }
 
-/* trick sign/abs (llama.cpp): maddubs(|w|, qx*sign(w)) — coppie <= 32258,
- * niente saturazione int16 e niente termine di correzione */
+/* sign/abs trick (llama.cpp): maddubs(|w|, qx*sign(w)) — pairs <= 32258, so no
+ * int16 saturation and no correction term */
 __attribute__((target("avx2")))
 static float dot_q8_avx2(const int8_t *qx, float sx, const int8_t *w, float ws, int k) {
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -321,12 +321,12 @@ static float dot_q8_avx2(const int8_t *qx, float sx, const int8_t *w, float ws, 
     return (float)s * ws * sx;
 }
 
-/* q4 x86 (AVX2 base, usato anche sulle macchine VNNI). Le ATTIVAZIONI vengono
- * pre-permutate per gruppo ([pari(16) | dispari(16)]) una volta per riga, così
- * l'unpack dei nibble [lo(16) | hi(16)] si allinea senza shuffle nel loop
- * interno. |w| <= 8 => maddubs non satura mai (8*127*2 = 2032). */
+/* q4 on x86 (plain AVX2, used on VNNI machines too). The ACTIVATIONS are
+ * pre-permuted per group ([even(16) | odd(16)]) once per row, so the nibble
+ * unpack [lo(16) | hi(16)] lines up without a shuffle in the inner loop.
+ * |w| <= 8 => maddubs can never saturate (8*127*2 = 2032). */
 
-/* xq -> xq_perm: per ogni gruppo di 32, prima i pari poi i dispari */
+/* xq -> xq_perm: for each group of 32, the even elements first, then the odd */
 static void q4_permute_act(const int8_t *qx, int8_t *xp, int k) {
     for (int g = 0; g < k / MYNAH_ASR_Q4_GROUP; g++) {
         const int8_t *src = qx + g * 32;
@@ -386,11 +386,11 @@ int mynah_asr_set_caps(const char *name) {
 #endif
 }
 
-/* ------------------------------------------------------------- kernel NEON */
+/* ------------------------------------------------------------- NEON kernels */
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 
-/* dot f32 x int8 (riga intera, scala unica) */
+/* f32 x int8 dot (whole row, single scale) */
 static float dot_q8_neon(const float *x, const int8_t *q, int k) {
     float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
     float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
@@ -406,8 +406,8 @@ static float dot_q8_neon(const float *x, const int8_t *q, int k) {
     return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 }
 
-/* dot f32 x int4 (gruppi da 32 nibble packed: byte j = elementi 2j | 2j+1<<4).
- * vld2q_f32 deinterleava x in lane pari/dispari, allineate ai nibble lo/hi. */
+/* f32 x int4 dot (groups of 32 packed nibbles: byte j = elements 2j | 2j+1<<4).
+ * vld2q_f32 deinterleaves x into even/odd lanes, aligned with the lo/hi nibbles. */
 static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
                          int k) {
     const int8x16_t off = vdupq_n_s8(8);
@@ -444,10 +444,10 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
 #define MYNAH_ASR_HAVE_NEON 1
 #endif
 
-/* --------------------------------------------- GEMM int8xint8 per T grande
- * Blocco di QGEMM_ROWS righe peso per task: ogni riga peso viene caricata una
- * volta e dottata contro tutte le T attivazioni (già quantizzate, calde in
- * cache). I task scrivono colonne disgiunte di out -> bit-identico al seriale. */
+/* --------------------------------------------- int8xint8 GEMM for large T
+ * A block of QGEMM_ROWS weight rows per task: each weight row is loaded once and
+ * dotted against all T activations (already quantized, hot in cache). Tasks write
+ * disjoint columns of out -> bit-identical to the serial version. */
 #define QGEMM_ROWS 32
 
 #if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
@@ -506,9 +506,9 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
         return;
     }
     if (T <= QMAT_SMALL_T) {
-        /* dot int8xint8 nativo (SDOT compile-time su ARM; VNNI/AVX2 a RUNTIME
-         * su x86): quantizza le attivazioni una volta per riga (per-riga
-         * absmax, ricetta qwen-tts) */
+        /* native int8xint8 dot (SDOT at compile time on ARM; VNNI/AVX2 at
+         * RUNTIME on x86): quantize the activations once per row (per-row
+         * absmax, qwen-tts recipe) */
 #if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
 #ifdef MYNAH_ASR_HAVE_X86
         const int caps = x86_caps();
@@ -595,14 +595,14 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
         }
         return;
     }
-    /* T grande, OPT-IN via env MYNAH_ASR_QGEMM=1: GEMM int8xint8 threaded —
-     * attivazioni quantizzate UNA volta (T righe int8 + scale), parallel-for a
-     * blocchi sulle righe peso (peso letto una volta in int8 = 4x meno banda
-     * del dequant f32, attivazioni calde in cache).
-     * MISURATO 2026-07-18 su M-series: PERDE vs dequant+sgemm (l'AMX di
-     * Accelerate domina) e l'act-quant cambia la numerica -> default OFF.
-     * Il margine atteso è su x86 VNNI (niente AMX): validare lì prima di
-     * considerare un default per piattaforma. */
+    /* Large T, OPT-IN through env MYNAH_ASR_QGEMM=1: threaded int8xint8 GEMM —
+     * activations quantized ONCE (T int8 rows + scales), parallel-for in blocks
+     * over the weight rows (the weight is read once as int8 = 4x less bandwidth
+     * than the f32 dequant, activations hot in cache).
+     * MEASURED 2026-07-18 on M-series: it LOSES against dequant+sgemm (the AMX
+     * inside Accelerate dominates) and the activation quant changes the numerics
+     * -> default OFF. The expected upside is on x86 VNNI (no AMX): validate
+     * there before considering a per-platform default. */
 #if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
     static int g_qgemm = -1;
     if (g_qgemm < 0) {
@@ -623,7 +623,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
                                           x + (size_t)t * (size_t)m->k, m->k);
 #if defined(MYNAH_ASR_HAVE_X86) && !defined(MYNAH_ASR_HAVE_SDOT)
             if (m->qtype == MYNAH_ASR_Q_INT4) {
-                /* il kernel q4 AVX2 vuole le attivazioni pre-permutate */
+                /* the q4 AVX2 kernel wants the activations pre-permuted */
                 for (int t = 0; t < T; t++) {
                     int8_t xp[QMAT_K_MAX];
                     q4_permute_act(qx + (size_t)t * (size_t)m->k, xp, m->k);
@@ -641,7 +641,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
         free(sx);
     }
 #endif
-    /* dequant per-chiamata + GEMM: fallback (kernel nativi assenti) */
+    /* per-call dequant + GEMM: fallback (no native kernels available) */
     float *wd = malloc((size_t)m->n * (size_t)m->k * sizeof(float));
     if (!wd) return;
     for (int i = 0; i < m->n; i++) dequant_row(m, i, wd + (size_t)i * (size_t)m->k);
@@ -650,7 +650,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
     free(wd);
 }
 
-/* ------------------------------------------------------------ helper fusi */
+/* ---------------------------------------------------------- fused helpers */
 void mynah_asr_qmat_ffn(const mynah_asr_qmat *w1, const mynah_asr_qmat *w2, const float *x,
                     float *out, int T, float *scratch) {
     if (w1->qtype == MYNAH_ASR_Q_F32 && w2->qtype == MYNAH_ASR_Q_F32) {

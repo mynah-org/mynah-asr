@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-/* SHA-1 (RFC 3174) — compatta, solo per l'handshake WebSocket. */
+/* SHA-1 (RFC 3174) — compact, only for the WebSocket handshake. */
 void mynah_asr_sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
     uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
     const uint64_t total_bits = (uint64_t)len * 8;

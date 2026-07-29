@@ -1,9 +1,9 @@
-/* Log-mel config-driven — replica dei feature extractor HF NeMo
- * (vedi docs/nemotron-arch.md, docs/parakeet-tdt-arch.md, tools/oracle/features.py):
- * preemph -> center pad costante -> Hann simmetrica paddata a n_fft -> |rfft|^2
- * -> filterbank mel -> log(x + guard) -> normalizzazione opzionale.
- * normalize "NA" (Nemotron) o "per_feature" (Parakeet: media/std per bin sui
- * frame validi, ddof=1, x = (x-mu)/(std+1e-5)). */
+/* Config-driven log-mel — a replica of the HF NeMo feature extractors
+ * (see docs/nemotron-arch.md, docs/parakeet-tdt-arch.md, tools/oracle/features.py):
+ * preemph -> constant center pad -> symmetric Hann padded to n_fft -> |rfft|^2
+ * -> mel filterbank -> log(x + guard) -> optional normalization.
+ * normalize "NA" (Nemotron) or "per_feature" (Parakeet: per-bin mean/std over the
+ * valid frames, ddof=1, x = (x-mu)/(std+1e-5)). */
 #ifndef MYNAH_ASR_FEATURES_H
 #define MYNAH_ASR_FEATURES_H
 
@@ -22,18 +22,18 @@ typedef struct {
     const float *window;   /* [win_length] */
 } mynah_asr_feat_cfg;
 
-/* Calcola il log-mel offline. Ritorna feats [T, n_mels] float32 (malloc, caller
- * free), scrive *n_frames (= 1 + S/hop) e *valid_frames (= S/hop; i frame oltre
- * il valid sono azzerati, come nel feature extractor HF). NULL su errore. */
+/* Compute the offline log-mel. Returns feats [T, n_mels] float32 (malloc'd, freed
+ * by the caller), writes *n_frames (= 1 + S/hop) and *valid_frames (= S/hop;
+ * frames past valid are zeroed, as in the HF feature extractor). NULL on error. */
 float *mynah_asr_log_mel(const mynah_asr_feat_cfg *cfg, const float *audio, size_t n_samples,
                      int *n_frames, int *valid_frames);
 
-/* ------------------------------------------------------------- mel streaming
- * Incrementale, identico bit-a-bit all'offline sui frame validi (possibile solo
- * perché Nemotron non normalizza — vedi docs/prior-art.md §A.7).
- * Il frame t copre i campioni [t*hop-256, t*hop+256): è pronto quando il segnale
- * arriva a t*hop+256; a finish() si emettono i frame residui (< S/hop) leggendo
- * gli zeri del pad destro. */
+/* ------------------------------------------------------------- streaming mel
+ * Incremental, bit-identical to the offline path on the valid frames (only
+ * possible because Nemotron does not normalize — see docs/prior-art.md §A.7).
+ * Frame t covers samples [t*hop-256, t*hop+256): it is ready once the signal
+ * reaches t*hop+256; finish() emits the leftover frames (< S/hop) by reading
+ * the zeros of the right pad. */
 typedef struct {
     const mynah_asr_feat_cfg *cfg;
     double *buf;            /* finestra scorrevole di segnale preemfatizzato   */
@@ -50,12 +50,12 @@ typedef struct {
 int mynah_asr_mel_stream_init(mynah_asr_mel_stream *ms, const mynah_asr_feat_cfg *cfg);
 void mynah_asr_mel_stream_free(mynah_asr_mel_stream *ms);
 
-/* Aggiunge campioni; scrive in *out (capienza cap_frames righe da n_mels) i frame
- * mel diventati pronti. Ritorna il numero di frame scritti. */
+/* Push samples; writes into *out (capacity cap_frames rows of n_mels) the mel
+ * frames that became ready. Returns the number of frames written. */
 int mynah_asr_mel_stream_feed(mynah_asr_mel_stream *ms, const float *audio, size_t n,
                           float *out, int cap_frames);
 
-/* Fine stream: emette i frame residui fino a S/hop (esclusi). */
+/* End of stream: emits the leftover frames up to S/hop (exclusive). */
 int mynah_asr_mel_stream_finish(mynah_asr_mel_stream *ms, float *out, int cap_frames);
 
 #endif

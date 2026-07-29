@@ -1,12 +1,14 @@
-/* Loader GGUF: container ALTERNATIVO a safetensors per i pesi (stessa struct
- * mynah_asr_tensor, quindi encoder/decoder non sanno da che file arrivano — un
- * solo code path dopo il load). Il GGUF trasporta solo pesi: la config resta
- * mynah.json (regola config-driven), mel filters e tokenizer restano invariati.
+/* GGUF loader: an ALTERNATIVE weight container to safetensors (same
+ * mynah_asr_tensor struct, so encoder/decoder never know which file the weights
+ * came from — a single code path after load). GGUF carries weights only: the
+ * config stays in mynah.json (config-driven rule), mel filters and tokenizer are
+ * unchanged.
  *
- * Tipi ggml supportati: F32 (zero-copy dal mmap), F16/BF16/Q8_0/Q4_0
- * (dequantizzati a f32 in buffer al load). Q4_K/Q6_K: rimandati al milestone
- * interop parakeet.cpp. Solo GGUF v2/v3 (la v1 ha un layout diverso, u32).
- * Origine: parser di keyra (../keyra), verificato con harness su file malformati. */
+ * Supported ggml types: F32 (zero-copy from the mmap), F16/BF16/Q8_0/Q4_0
+ * (dequantized to f32 into buffers at load). Q4_K/Q6_K: deferred to the
+ * parakeet.cpp interop milestone. GGUF v2/v3 only (v1 has a different, u32
+ * layout). Origin: the keyra parser (../keyra), exercised with a harness of
+ * malformed files. */
 #ifndef MYNAH_ASR_GGUF_H
 #define MYNAH_ASR_GGUF_H
 
@@ -19,7 +21,7 @@ typedef struct mynah_asr_gguf mynah_asr_gguf;
 mynah_asr_gguf *mynah_asr_gguf_open(const char *path);   /* NULL su errore (stderr) */
 void mynah_asr_gguf_close(mynah_asr_gguf *g);
 
-/* Array interno dei tensori (vive quanto il handle). */
+/* Internal tensor array (lives as long as the handle). */
 const mynah_asr_tensor *mynah_asr_gguf_tensors(const mynah_asr_gguf *g, size_t *count);
 
 #endif

@@ -62,7 +62,7 @@ def quantize_q4_0(x: np.ndarray) -> bytes:
 def quantize_q4_k(x: np.ndarray) -> bytes:
     """Super-blocchi da 256 (8 sotto-blocchi da 32): x = d*sc*q - dmin*m.
     Quantizzatore semplice non-iterativo (ggml usa una ricerca più fine): basta
-    per validare il layout del dequant C con la regola oracle."""
+    to validate the C dequant layout against the oracle rule."""
     blocks = x.reshape(-1, 8, 32).astype(np.float64)
     lo = np.minimum(blocks.min(axis=2), 0.0)              # m_j >= 0
     hi = np.maximum(blocks.max(axis=2), 0.0)
@@ -99,8 +99,8 @@ def quantize_q4_k(x: np.ndarray) -> bytes:
 def encode_tensor(x: np.ndarray, dtype: str) -> tuple[int, bytes]:
     x = np.ascontiguousarray(x, dtype=np.float32)
     if dtype != "f32" and (x.ndim < 2 or x.shape[-1] % 32 != 0):
-        # solo le matrici si quantizzano: bias/norm/running-stats 1-D restano f32
-        # (stile llama.cpp; quantizzare running_var rompe 1/sqrt(var) del BatchNorm)
+        # only matrices get quantized: 1-D bias/norm/running-stats stay f32
+        # (llama.cpp style; quantizing running_var breaks BatchNorm's 1/sqrt(var))
         dtype = "f32"
     if dtype == "q4_k" and x.shape[-1] % 256 != 0:
         dtype = "q8_0"                      # fallback K-quant (come llama.cpp)

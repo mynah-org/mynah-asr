@@ -1,7 +1,7 @@
 /* Mynah — a lightweight native C runtime for streaming and offline ASR.
  *
- * API pubblica di libmynah_asr. Fase attuale: trascrizione offline-chunked (M1.2).
- * Streaming API (mynah_asr_stream_*) in arrivo con M1.3.
+ * Public API of libmynah_asr. Current phase: offline-chunked transcription (M1.2).
+ * The streaming API (mynah_asr_stream_*) lands with M1.3.
  */
 #ifndef MYNAH_ASR_H
 #define MYNAH_ASR_H
@@ -18,8 +18,8 @@
 extern "C" {
 #endif
 
-/* Risultato incrementale di trascrizione (streaming e offline).
- * text è UTF-8, valido solo per la durata della callback. */
+/* Incremental transcription result (streaming and offline).
+ * text is UTF-8 and only valid for the duration of the callback. */
 typedef struct {
     const char *text;      /* testo del segmento/parziale                   */
     double      t0, t1;    /* finestra temporale in secondi (se disponibile) */
@@ -31,77 +31,78 @@ typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata)
 
 const char *mynah_asr_version(void);
 
-/* ----------------------------------------------------------------- modello */
+/* ------------------------------------------------------------------- model */
 typedef struct mynah_asr_model mynah_asr_model;
 
-/* Carica un modello convertito (directory con mynah.json + model.safetensors
- * + tokens.json + mel_filters.safetensors). NULL su errore. */
+/* Load a converted model (a directory with mynah.json + model.safetensors
+ * + tokens.json + mel_filters.safetensors). NULL on error. */
 mynah_asr_model *mynah_asr_load(const char *model_dir);
 
-/* Come mynah_asr_load con quantizzazione: MYNAH_ASR_QUANT_INT8 costruisce al load l'INT8
- * per-riga sui grandi linear (~2.4x meno RAM, qualita' quasi identica). */
+/* Like mynah_asr_load but quantized: MYNAH_ASR_QUANT_INT8 builds per-row INT8 for
+ * the large linears at load time (~2.4x less RAM, near-identical quality). */
 enum { MYNAH_ASR_QUANT_F32 = 0, MYNAH_ASR_QUANT_INT8 = 1, MYNAH_ASR_QUANT_INT4 = 2 };
 mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant);
 void mynah_asr_free(mynah_asr_model *m);
 
-/* Risolve un tag lingua ("it-IT", "auto", ...) nel prompt id. -1 se ignoto. */
+/* Resolve a language tag ("it-IT", "auto", ...) into a prompt id. -1 if unknown. */
 int mynah_asr_lang_id(const mynah_asr_model *m, const char *lang);
 
-/* Seleziona il decoder per le trascrizioni successive: "default" (RNNT/TDT del
- * modello) o "ctc" (head ausiliaria dei modelli hybrid, più veloce, solo offline).
- * -1 se il modello non supporta il decoder richiesto. */
+/* Select the decoder for subsequent transcriptions: "default" (the model's
+ * RNNT/TDT) or "ctc" (the auxiliary head of hybrid models, faster, offline only).
+ * -1 when the model does not support the requested decoder. */
 int mynah_asr_set_decoder(mynah_asr_model *m, const char *name);
 
-/* Solo modelli AED (Canary): lingua di USCITA delle trascrizioni successive
- * ("en", "de", ...). Diversa dalla sorgente = speech translation. NULL o "" =
- * uguale alla sorgente (ASR). -1 se non supportata dal modello.
- * Alternativa PER-CHIAMATA (thread-safe, per server/batch): lang "src>tgt"
- * in mynah_asr_transcribe* (es. "en>de"); vince su mynah_asr_set_target_lang. */
+/* AED models only (Canary): OUTPUT language of subsequent transcriptions
+ * ("en", "de", ...). Different from the source = speech translation. NULL or "" =
+ * same as the source (ASR). -1 when unsupported by the model.
+ * PER-CALL alternative (thread-safe, for server/batch): lang "src>tgt" in
+ * mynah_asr_transcribe* (e.g. "en>de"); it wins over mynah_asr_set_target_lang. */
 int mynah_asr_set_target_lang(mynah_asr_model *m, const char *lang);
 
-/* 1 se il modello supporta la speech translation (engine AED). */
+/* 1 when the model supports speech translation (AED engine). */
 int mynah_asr_can_translate(const mynah_asr_model *m);
 
-/* Limite di durata per segmento nella trascrizione offline: gli audio più lunghi
- * vengono divisi sul minimo di energia (silenzio) vicino al confine e trascritti
- * a segmenti indipendenti (testo e timestamp concatenati). Default MODEL-AWARE:
- * 30 s per i modelli full-attention/AED (Parakeet, Canary — addestrati su
- * utterance corte: segmenti lunghi degradano la qualità), 300 s per i modelli
- * ad attention finestrata (Nemotron). sec >= 5; 0 = ripristina il default. */
+/* Per-segment duration limit for offline transcription: longer audio is split at
+ * the energy minimum (silence) near the boundary and transcribed as independent
+ * segments (text and timestamps concatenated). MODEL-AWARE default: 30 s for
+ * full-attention/AED models (Parakeet, Canary — trained on short utterances: long
+ * segments degrade quality), 300 s for windowed-attention models (Nemotron).
+ * sec >= 5; 0 = restore the default. */
 void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec);
 
-/* Lookahead (right context) validi per il modello, es. {3,0,6,13}. */
+/* Lookaheads (right context) valid for the model, e.g. {3,0,6,13}. */
 int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]);
 
-/* Trascrizione offline: samples float32 [-1,1] 16 kHz mono.
- * lang: tag ("auto" per detection). lookahead: -1 = default del modello.
- * Ritorna testo UTF-8 (malloc, caller free); se lang_out != NULL (>= 16 byte)
- * vi scrive la lingua rilevata. NULL su errore. */
+/* Offline transcription: float32 [-1,1] 16 kHz mono samples.
+ * lang: tag ("auto" for detection). lookahead: -1 = the model's default.
+ * Returns UTF-8 text (malloc'd, freed by the caller); when lang_out != NULL
+ * (>= 16 bytes) the detected language is written there. NULL on error. */
 char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_samples,
                        const char *lang, int lookahead, char *lang_out);
 
-/* Parola con finestra temporale (dai frame encoder di emissione greedy:
- * risoluzione = 1 frame encoder, tipicamente 80 ms). */
+/* A word with its time window (from the greedy emission encoder frames:
+ * resolution = 1 encoder frame, typically 80 ms). */
 typedef struct {
     char  *word;           /* UTF-8, senza marcatori (malloc) */
     double t0, t1;         /* secondi dall'inizio dell'audio   */
 } mynah_asr_word;
 
-/* Come mynah_asr_transcribe, in piu' scrive in *words un array malloc di *n_words
- * parole con timestamp (liberare con mynah_asr_words_free). words == NULL = solo testo. */
+/* Like mynah_asr_transcribe, and additionally writes into *words a malloc'd array
+ * of *n_words timestamped words (free with mynah_asr_words_free).
+ * words == NULL = text only. */
 char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n_samples,
                           const char *lang, int lookahead, char *lang_out,
                           mynah_asr_word **words, int *n_words);
 
 void mynah_asr_words_free(mynah_asr_word *words, int n_words);
 
-/* Trascrizione BATCH weight-stationary: N richieste processate insieme — i pesi
- * (2.5 GB) vengono letti una volta per layer invece di N. Lunghezze variabili,
- * nessun padding. texts[i] riceve il testo (malloc, caller free; NULL su errore
- * del singolo item); langs_out[i] (>= 16 byte l'uno) opzionale. 0 = ok. */
-/* Come mynah_asr_transcribe_batch, in piu' words[b]/n_words[b] per item (array di
- * `batch` slot forniti dal chiamante; ogni words[b] va liberato con
- * mynah_asr_words_free). words == NULL = solo testo. */
+/* Weight-stationary BATCH transcription: N requests processed together — the
+ * weights (2.5 GB) are read once per layer instead of N times. Variable lengths,
+ * no padding. texts[i] receives the text (malloc'd, freed by the caller; NULL when
+ * that single item failed); langs_out[i] (>= 16 bytes each) is optional. 0 = ok. */
+/* Like mynah_asr_transcribe_batch, plus words[b]/n_words[b] per item (arrays of
+ * `batch` slots provided by the caller; each words[b] must be freed with
+ * mynah_asr_words_free). words == NULL = text only. */
 int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *samples,
                               const size_t *n_samples, int batch, const char *const *langs,
                               int lookahead, char **texts, char (*langs_out)[16],
@@ -111,20 +112,20 @@ int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                            int lookahead, char **texts, char (*langs_out)[16]);
 
 /* --------------------------------------------------------------- streaming
- * Cache-aware, latenza = (lookahead+1) * 80 ms. Il testo emesso via callback è
- * SEMPRE definitivo (greedy monotono, mai ritrattato): is_final = true. */
+ * Cache-aware, latency = (lookahead+1) * 80 ms. Text emitted through the callback
+ * is ALWAYS final (monotonic greedy, never retracted): is_final = true. */
 typedef struct mynah_asr_stream mynah_asr_stream;
 
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead);
 
-/* Alimenta campioni float32 16 kHz mono; la callback riceve i delta di testo. */
+/* Feed float32 16 kHz mono samples; the callback receives the text deltas. */
 int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                       mynah_asr_result_cb cb, void *userdata);
 
-/* Fine stream: processa la coda (ultimo chunk paddato) ed emette il resto. */
+/* End of stream: processes the tail (last chunk padded) and emits the rest. */
 int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *userdata);
 
-/* Lingua rilevata finora ("" se non ancora emessa). */
+/* Language detected so far ("" when not emitted yet). */
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
 
 void mynah_asr_stream_close(mynah_asr_stream *s);

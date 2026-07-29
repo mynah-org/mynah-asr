@@ -1,5 +1,5 @@
-/* Loader .npy minimale condiviso dai test: v1.0, C-order, dtype <f4 o <f8.
- * Ritorna sempre double (upcast di f4). */
+/* Minimal .npy loader shared by the tests: v1.0, C-order, dtype <f4 or <f8.
+ * Always returns double (f4 is upcast). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

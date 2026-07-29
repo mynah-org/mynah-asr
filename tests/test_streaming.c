@@ -1,6 +1,6 @@
-/* Streaming ≡ offline: alimenta il WAV in pezzi da ~37 ms e confronta il testo
- * finale con la trascrizione offline (stessa matematica: devono coincidere).
- * Uso: test_streaming <model_dir> <wav> <golden_dir(ignorata)>
+/* Streaming ≡ offline: feeds the WAV in ~37 ms pieces and compares the final
+ * text with the offline transcription (same math: they must match).
+ * Usage: test_streaming <model_dir> <wav> <golden_dir(ignored)>
  * Exit: 0 ok, 1 mismatch, 77 skip. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,11 +32,11 @@ int main(int argc, char **argv) {
     float *audio = mynah_asr_wav_load(argv[2], &n_samples, &sr);
     if (!audio || sr != 16000) return 2;
 
-    /* offline (lookahead default) */
+    /* offline (default lookahead) */
     char *offline = mynah_asr_transcribe(m, audio, n_samples, "it-IT", -1, NULL);
     if (!offline) return 2;
 
-    /* streaming a pezzi di 600 campioni (37.5 ms, non allineati a nulla) */
+    /* streaming in 600-sample pieces (37.5 ms, deliberately unaligned) */
     mynah_asr_stream *s = mynah_asr_stream_open(m, "it-IT", -1);
     if (!s) return 2;
     for (size_t off = 0; off < n_samples; off += 600) {

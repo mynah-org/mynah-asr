@@ -41,7 +41,7 @@ int mynah_asr_decoder_init(mynah_asr_decoder *dec, const mynah_asr_safetensors *
         const mynah_asr_tensor *w = mynah_asr_st_get(st, name);
         if (!w) break;
         dec->w_ih[n] = (const float *)w->data;
-        /* layer parziale (checkpoint corrotto): errore pulito, non null-deref */
+        /* partial layer (corrupt checkpoint): clean error instead of a null deref */
         const mynah_asr_tensor *whh, *bih, *bhh;
         snprintf(name, sizeof(name), "decoder.lstm.weight_hh_l%d", n);
         whh = mynah_asr_st_get(st, name);
@@ -69,7 +69,7 @@ void mynah_asr_dec_state_reset(const mynah_asr_decoder *dec, mynah_asr_dec_state
 
 static inline float sigmoid_f(float x) { return mynah_asr_sigmoid(x); }
 
-/* Un passo LSTM stacked + projector: input = embedding[token]. Aggiorna h/c e s->g. */
+/* One stacked-LSTM step + projector: input = embedding[token]. Updates h/c and s->g. */
 static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int token) {
     const int H = dec->hidden;
     const float *x = dec->embedding + (size_t)token * (size_t)H;
@@ -98,18 +98,18 @@ static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int 
     s->last_token = token;
 }
 
-/* Greedy a BLOCCHI: g cambia solo su emissione non-blank, quindi i frame di una
- * run di blank condividono la stessa g e il joint head (il costo dominante:
- * matvec V x H per frame) si batcha in UNA GEMM [B, V] — stessa matrice pesi
- * letta una volta per blocco invece che per frame. Il blocco è adattivo
- * (raddoppia sulle run di blank, riparte corto dopo un'emissione) per non
- * sprecare righe oltre il primo frame che emette. Semantica identica al loop
- * per-frame (l'inner loop su un frame che emette resta scalare). */
+/* BLOCKED greedy: g changes only on a non-blank emission, so the frames of a
+ * blank run share the same g and the joint head (the dominant cost: a V x H
+ * matvec per frame) batches into ONE GEMM [B, V] — the same weight matrix read
+ * once per block instead of once per frame. The block is adaptive (it doubles
+ * over blank runs and restarts short after an emission) so it does not waste
+ * rows past the first emitting frame. Semantics identical to the per-frame loop
+ * (the inner loop over an emitting frame stays scalar). */
 #define DEC_BMAX 32
 
-/* argmax di (logits + bias) al volo: stessa aritmetica float del sommare in un
- * buffer e poi cercare il massimo (v calcolato una volta per k), senza le
- * scritture/riletture di V float per riga. */
+/* argmax of (logits + bias) on the fly: same float arithmetic as summing into a
+ * buffer and then searching for the maximum (v computed once per k), without the
+ * V float writes/re-reads per row. */
 static int argmax_bias(const float *lg, const float *bias, int V) {
     int best = 0;
     float bv = lg[0] + bias[0];
@@ -120,12 +120,12 @@ static int argmax_bias(const float *lg, const float *bias, int V) {
     return best;
 }
 
-/* Greedy TDT (ParakeetTDTGenerationMixin / NeMo GreedyTDTInfer): la head emette
- * [vocab | n_durations] logit; a OGNI step il frame avanza della duration
- * predetta (argmax sugli ultimi ND logit) — blank con duration 0 avanza di 1,
- * non-blank con duration 0 riemette sullo stesso frame (guardia max_symbols).
- * Niente blocking sulle run di blank: il TDT salta già i frame (dur>1) e la
- * griglia visitata non è contigua. */
+/* TDT greedy (ParakeetTDTGenerationMixin / NeMo GreedyTDTInfer): the head emits
+ * [vocab | n_durations] logits; at EVERY step the frame advances by the predicted
+ * duration (argmax over the last ND logits) — a blank with duration 0 advances by
+ * 1, a non-blank with duration 0 re-emits on the same frame (guarded by
+ * max_symbols). No blocking over blank runs: TDT already skips frames (dur>1) and
+ * the visited grid is not contiguous. */
 static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                              const float *enc, int T, int *tokens, int *frames, int cap) {
     const int H = dec->hidden, V = dec->vocab, ND = dec->n_durations;
@@ -134,8 +134,8 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
     float *logits = malloc((size_t)VL * sizeof(float));
     if (!logits) return 0;
 
-    /* head f32 per la GEMM BLAS (deterministica tra backend); se quantizzata e
-     * T grande si dequantizza una volta per chiamata, come il percorso RNNT */
+    /* f32 head for the BLAS GEMM (deterministic across backends); when quantized
+     * and T is large it is dequantized once per call, like the RNNT path */
     const float *W = dec->head.qtype == MYNAH_ASR_Q_F32 ? dec->head.f32 : NULL;
     float *wd = NULL;
     if (!W && T > 16) {
@@ -191,11 +191,11 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
     if (!jin || !logits) { free(jin); free(logits); return 0; }
     int n_out = 0;
 
-    /* Head come matrice f32 per la GEMM BLAS diretta (CPU: deterministica tra
-     * backend — il decode non passa MAI dalla GPU). Se quantizzata e T grande
-     * (offline) si dequantizza UNA volta per chiamata: 33 MB letti/scritti una
-     * volta contro la matrice int8 riletta per ogni frame. Per T piccolo
-     * (chunk streaming) resta il dot quantizzato per-frame di qmat. */
+    /* The head as an f32 matrix for a direct BLAS GEMM (CPU: deterministic across
+     * backends — decoding NEVER goes through the GPU). When quantized and T is
+     * large (offline) it is dequantized ONCE per call: 33 MB read/written once
+     * against the int8 matrix re-read for every frame. For small T (streaming
+     * chunks) qmat's per-frame quantized dot stays. */
     const float *W = dec->head.qtype == MYNAH_ASR_Q_F32 ? dec->head.f32 : NULL;
     float *wd = NULL;
     if (!W && T > 16) {
@@ -233,7 +233,7 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
             continue;
         }
 
-        /* frame t+first emette: inner loop scalare (la prima emissione è già nota) */
+        /* frame t+first emits: scalar inner loop (the first emission is already known) */
         t += first;
         const float *e = enc + (size_t)t * (size_t)H;
         for (int emitted = 0; emitted < dec->max_symbols; emitted++) {

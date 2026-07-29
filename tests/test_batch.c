@@ -1,7 +1,7 @@
-/* Batch ≡ singolo: trascrive 3 fixture in batch weight-stationary e confronta
- * col percorso B=1 (devono coincidere: le GEMM packed producono le stesse righe).
- * Misura anche il rapporto di tempo batch vs sequenziale.
- * Uso: test_batch <model_dir> <wav_ignorato> <golden_ignorato>
+/* Batch ≡ single: transcribes 3 fixtures in a weight-stationary batch and
+ * compares against the B=1 path (they must match: the packed GEMMs produce the
+ * same rows). Also measures the batch vs sequential time ratio.
+ * Usage: test_batch <model_dir> <ignored_wav> <ignored_golden>
  * Exit: 0 ok, 1 mismatch, 77 skip. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
         if (!samples[b] || sr != 16000) { fprintf(stderr, "missing fixture %s\n", wavs[b]); return 2; }
     }
 
-    /* riferimento: B=1 sequenziale */
+    /* reference: sequential B=1 */
     char *ref[4];
     double t0 = now_sec();
     for (int b = 0; b < B; b++)
