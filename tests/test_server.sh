@@ -1,6 +1,6 @@
 #!/bin/sh
-# Test end-to-end di mynah-asr-server: REST + concorrenza + WebSocket streaming.
-# Exit: 0 ok, 1 fail, 77 skip (modello assente).
+# End-to-end test of mynah-asr-server: REST + concurrency + WebSocket streaming.
+# Exit: 0 ok, 1 fail, 77 skip (model missing).
 MODEL_DIR="${1:-models/nemotron-3.5-asr-streaming-0.6b}"
 PORT="${2:-8199}"
 [ -f "$MODEL_DIR/mynah.json" ] || exit 77
@@ -9,14 +9,14 @@ PORT="${2:-8199}"
 SRV_PID=$!
 trap 'kill $SRV_PID 2>/dev/null' EXIT
 
-# attesa readiness
+# wait for readiness
 for i in $(seq 1 50); do
     curl -sf "http://localhost:$PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.2
 done
 
 fail=0
-check() { # descrizione, comando, substring attesa
+check() { # description, command, expected substring
     out=$(eval "$2" 2>/dev/null)
     case "$out" in
         *"$3"*) echo "server $1 OK" ;;
@@ -43,9 +43,9 @@ check error-400 \
     '"error"'
 check translations-no-aed \
     "curl -s -F file=@tests/audio/test_en.wav http://localhost:$PORT/v1/audio/translations" \
-    'non supporta la traduzione'
+    'does not support translation'
 
-# /v1/audio/translations con un modello AED (Canary), se presente
+# /v1/audio/translations with an AED model (Canary), when present
 if [ -f models/canary-180m-flash/mynah.json ]; then
     PORT2=$((PORT + 1))
     ./mynah-asr-server -m models/canary-180m-flash -p "$PORT2" --threads 2 --batch 2 2>/dev/null &

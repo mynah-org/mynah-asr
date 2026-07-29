@@ -1,9 +1,9 @@
 #!/bin/sh
-# Parità container GGUF vs safetensors sul modello CI (110m):
-#   1. esporta model.gguf (f32) e q8_0 con tools/export_gguf.py
-#   2. dir di soli symlink SENZA model.safetensors -> il runtime carica il GGUF
-#   3. f32: trascrizione IDENTICA al load safetensors; q8_0: testo atteso
-# Exit: 0 ok, 1 mismatch, 77 skip (modello convertito o uv assenti).
+# GGUF vs safetensors container parity on the CI model (110m):
+#   1. export model.gguf (f32) and q8_0 with tools/export_gguf.py
+#   2. a symlink-only dir WITHOUT model.safetensors -> the runtime loads the GGUF
+#   3. f32: transcription IDENTICAL to the safetensors load; q8_0: expected text
+# Exit: 0 ok, 1 mismatch, 77 skip (converted model or uv missing).
 MODEL_DIR="${1:-models/parakeet-tdt_ctc-110m}"
 WAV=tests/audio/test_en.wav
 [ -f "$MODEL_DIR/model.safetensors" ] || exit 77
@@ -21,7 +21,7 @@ mkdir "$TMP/model"
 for f in "$ABS_MODEL"/*; do
     case "$(basename "$f")" in
         mel_filters.safetensors) ln -s "$f" "$TMP/model/" ;;
-        *.safetensors|*.gguf) ;;                 # niente pesi primari: forza il GGUF
+        *.safetensors|*.gguf) ;;                 # no primary weights: forces the GGUF
         *) ln -s "$f" "$TMP/model/" ;;
     esac
 done
@@ -48,8 +48,8 @@ for q in q8:q8_0 q4k:q4_k; do
     esac
 done
 
-# mynah-asr quantize a partire dai pesi GGUF (stessa API f32 -> deve funzionare):
-# scrive model.int8.safetensors nella dir tmp e ritrascrive col checkpoint
+# mynah-asr quantize starting from GGUF weights (same f32 API -> must work):
+# writes model.int8.safetensors in the tmp dir and re-transcribes with it
 rm "$TMP/model/model.gguf"
 ln -s "$TMP/f32.gguf" "$TMP/model/model.gguf"
 if ./mynah-asr quantize -m "$TMP/model" --quant int8 >/dev/null 2>&1; then
@@ -59,7 +59,7 @@ if ./mynah-asr quantize -m "$TMP/model" --quant int8 >/dev/null 2>&1; then
         *) echo "gguf quantize-int8 FAIL: $got"; fail=1 ;;
     esac
 else
-    echo "gguf quantize-int8 FAIL: mynah-asr quantize fallito"; fail=1
+    echo "gguf quantize-int8 FAIL: mynah-asr quantize failed"; fail=1
 fi
 
 exit $fail

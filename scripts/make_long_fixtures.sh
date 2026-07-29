@@ -1,8 +1,8 @@
 #!/bin/sh
-# Rigenera i fixture audio lunghi dei bench (tests/audio/long_{60s,300s}.wav)
-# da LibriSpeech dev-clean (CC-BY 4.0): primi 40 flac dello speaker 1272,
-# concatenati e riconvertiti a 16 kHz mono s16. Stessi file usati per i numeri
-# in docs/benchmarks.md (M1 e A100). Richiede ffmpeg + curl (o aria2c).
+# Regenerate the long bench audio fixtures (tests/audio/long_{60s,300s}.wav)
+# from LibriSpeech dev-clean (CC-BY 4.0): the first 40 flac files of speaker
+# 1272, concatenated and reconverted to 16 kHz mono s16. Same files behind the
+# numbers in docs/benchmarks.md (M1 and A100). Needs ffmpeg + curl (or aria2c).
 set -eu
 cd "$(dirname "$0")/.."
 TMP=${TMPDIR:-/tmp}/mynah-librispeech

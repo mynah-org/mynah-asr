@@ -1,8 +1,8 @@
 #!/bin/sh
-# End-to-end: mynah-asr transcribe sui WAV fixture, confronto col testo atteso.
-# Testi attesi per engine (mynah.json): nemotron-streaming o parakeet-tdt
-# (Parakeet: niente --lang, ITN attiva -> numeri in cifre).
-# Exit: 0 ok, 1 mismatch, 77 skip (modello assente).
+# End-to-end: mynah-asr transcribe on the fixture WAVs, compared to the expected text.
+# Expected texts per engine (mynah.json): nemotron-streaming or parakeet-tdt
+# (Parakeet: no --lang, ITN on -> numbers in digits).
+# Exit: 0 ok, 1 mismatch, 77 skip (model missing).
 MODEL_DIR="${1:-models/nemotron-3.5-asr-streaming-0.6b}"
 [ -f "$MODEL_DIR/mynah.json" ] || exit 77
 ENGINE=$(sed -n 's/.*"engine": "\([^"]*\)".*/\1/p' "$MODEL_DIR/mynah.json")
@@ -14,23 +14,23 @@ check() { # wav, lang, expected substring
     out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$1" --lang "$2" 2>/dev/null)
     case "$out" in
         *"$3"*) printf 'e2e %-16s OK: %s\n' "$(basename "$1")/$2" "$out" ;;
-        *) printf 'e2e %-16s FAIL:\n  atteso  ~ %s\n  ottenuto: %s\n' "$(basename "$1")/$2" "$3" "$out"; fail=1 ;;
+        *) printf 'e2e %-16s FAIL:\n  expected ~ %s\n  got:       %s\n' "$(basename "$1")/$2" "$3" "$out"; fail=1 ;;
     esac
 }
 
-# wav e substring per i check comuni (quant, timestamps, metal, segmentazione)
+# wav and substring for the shared checks (quant, timestamps, metal, segmentation)
 Q_WAV=tests/audio/test_it.wav
 Q_SUB="riconoscimento vocale in italiano"
 SEG_TAIL="divano"
 
 if [ "$ENGINE" = "parakeet-rnnt" ] || [ "$ENGINE" = "parakeet-ctc" ]; then
-    # RNNT/CTC puri EN: lowercase, senza punteggiatura
+    # pure EN RNNT/CTC: lowercase, no punctuation
     Q_WAV=tests/audio/test_en.wav
     Q_SUB="speech recognition test"
     SEG_TAIL="today"
     check tests/audio/test_en.wav auto "hello this is a speech recognition test the weather is nice today"
 elif [ "$NAME" = "parakeet-tdt_ctc-110m" ]; then
-    # 110M: solo inglese (candidato CI); hybrid -> anche la head CTC
+    # 110M: English only (the CI model); hybrid -> the CTC head too
     Q_WAV=tests/audio/test_en.wav
     Q_SUB="speech recognition test"
     SEG_TAIL="today"
@@ -48,8 +48,8 @@ elif [ "$ENGINE" = "parakeet-tdt" ]; then
     check tests/audio/test_fr.wav auto "la réunion commence à 9h dans la grande salle"
     check tests/audio/test_es.wav auto "la reunión empieza a las 9 en la sala grande"
 elif [ "$ENGINE" = "canary-aed" ]; then
-    # Canary: ASR + matrice di traduzione src>tgt. v2 (25 lingue EU) applica
-    # l'ITN di default (numeri in CIFRE) -> attesi diversi dai flash
+    # Canary: ASR + src>tgt translation matrix. v2 (25 EU languages) applies
+    # ITN by default (numbers in DIGITS) -> expectations differ from the flash models
     Q_WAV=tests/audio/test_en.wav
     Q_SUB="speech recognition test"
     SEG_TAIL="today"
@@ -71,9 +71,9 @@ it:en:cat"
         check tests/audio/test_de.wav de "Die Besprechung beginnt um neun Uhr"
         check tests/audio/test_fr.wav fr "la réunion commence à neuf heures"
         check tests/audio/test_es.wav es "la reunión empieza a las nueve"
-        # coppie input > output atteso (substring; raccolte dagli output reali —
-        # greedy deterministico). fr>en: il 180m emette EOS subito (limite del
-        # modello, verificato anche con l'oracolo) -> solo sui modelli più grandi
+        # input > expected output pairs (substring; collected from real outputs —
+        # greedy is deterministic). fr>en: the 180m emits EOS immediately (a model
+        # limitation, confirmed against the oracle too) -> larger models only
         TRX="en:de:Spracherkennungstest
 en:fr:reconnaissance
 en:es:reconocimiento de voz
@@ -89,7 +89,7 @@ fr:en:nine o'clock"
               --lang "$src" --target-lang "$tgt" 2>/dev/null)
         case "$out" in
             *"$want"*) printf 'e2e translate %s>%s OK: %s\n' "$src" "$tgt" "$out" ;;
-            *) printf 'e2e translate %s>%s FAIL:\n  atteso ~ %s\n  ottenuto: %s\n' \
+            *) printf 'e2e translate %s>%s FAIL:\n  expected ~ %s\n  got:       %s\n' \
                    "$src" "$tgt" "$want" "$out"; echo FAIL > /tmp/mynah_asr_trx_fail ;;
         esac
     done
@@ -103,7 +103,7 @@ else
     check tests/audio/test_es.wav auto  "la reunión empieza"
 fi
 
-# checkpoint pre-quantizzati (se generati con: mynah-asr quantize)
+# pre-quantized checkpoints (when generated with: mynah-asr quantize)
 checkq() { # quant, expected substring
     out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --quant "$1" 2>/dev/null)
     case "$out" in
@@ -114,33 +114,33 @@ checkq() { # quant, expected substring
 [ -f "$MODEL_DIR/model.int8.safetensors" ] && checkq int8 "$Q_SUB"
 [ -f "$MODEL_DIR/model.int4.safetensors" ] && checkq int4 "$Q_SUB"
 
-# timestamp per parola: righe "t0 t1 parola", t0 monotono non-decrescente,
-# t1 entro la durata dell'audio (fixture <= 5.2s + margine di un frame).
-# AED (Canary flash): prompt <|timestamp|> -> parole bracketate con <|N|>.
-# Skip se il modello non li supporta (v2: allineatore esterno, non implementato)
+# per-word timestamps: "t0 t1 word" lines, t0 monotonically non-decreasing,
+# t1 within the audio duration (fixture <= 5.2s + one frame of margin).
+# AED (Canary flash): <|timestamp|> prompt -> words bracketed with <|N|>.
+# Skipped when the model has no support (v2: external aligner, not implemented)
 if grep -q '"timestamp_tokens": false' "$MODEL_DIR/mynah.json"; then
-    echo "e2e timestamps SKIP: il modello non ha i token <|timestamp|> generativi"
+    echo "e2e timestamps SKIP: this model has no generative <|timestamp|> tokens"
 else
 ts=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --timestamps 2>/dev/null)
 ts_ok=$(printf '%s\n' "$ts" | awk 'NF<3 {bad=1} $1+0>$2+0 {bad=1} $1+0<prev {bad=1}
     {prev=$1+0; n++} END {print (bad || n<5 || prev>5.3) ? "FAIL" : "OK"}')
 if [ "$ts_ok" = "OK" ]; then
-    echo "e2e timestamps OK: $(printf '%s\n' "$ts" | wc -l | tr -d ' ') parole"
+    echo "e2e timestamps OK: $(printf '%s\n' "$ts" | wc -l | tr -d ' ') words"
 else
     echo "e2e timestamps FAIL:"; printf '%s\n' "$ts"; fail=1
 fi
 fi
 
-# segmentazione file lunghi: limite forzato a 4 s sul fixture -> 2 segmenti
-# divisi sul silenzio, il testo concatenato deve restare completo
+# long-file segmentation: limit forced to 4 s on the fixture -> 2 segments
+# split on silence; the concatenated text must stay complete
 seg=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --segment-sec 4 2>/dev/null)
 case "$seg" in
     *"$Q_SUB"*"$SEG_TAIL"*) echo "e2e segment OK: $seg" ;;
     *) echo "e2e segment FAIL: $seg"; fail=1 ;;
 esac
 
-# backend Metal (solo macOS; per i modelli non-causali il kernel Metal non si
-# applica e il gate ricade su CPU: il check verifica comunque il testo)
+# Metal backend (macOS only; for non-causal models the Metal kernel does not
+# apply and the gate falls back to CPU: the check validates the text anyway)
 out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --backend metal 2>/dev/null)
 case "$out" in
     *"$Q_SUB"*) echo "e2e backend-metal OK: $out" ;;
