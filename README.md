@@ -68,7 +68,7 @@ first-class citizen.
 
 ## Supported models
 
-**v0.4-dev, feature-complete toward v1** — 10 working models
+**v0.5.0, feature-complete toward v1** — 10 working models
 (full catalog with verified configs: [docs/models.md](docs/models.md)):
 
 | Model | What it does | Status |
@@ -116,6 +116,60 @@ streaming). Nemotron streaming: ~26 ms of compute per 80 ms chunk (9 ms int4).
 Every numeric stage is validated against a numpy reference oracle
 (`make test`: bit-exact mel, f32-tolerance encoder, streaming ≡ offline).
 
+## Quickstart
+
+**1 — Get the binary.** Either grab a
+[prebuilt tarball](https://github.com/mynah-org/mynah-asr/releases/latest)
+(linux-x86_64, linux-aarch64, darwin-arm64 — CLI + server + `libmynah.a` +
+header, with `SHA256SUMS`), or build in a few seconds:
+
+```sh
+git clone https://github.com/mynah-org/mynah-asr.git && cd mynah-asr
+make          # macOS: Accelerate + Metal, zero deps
+              # Linux: sudo apt install libopenblas-dev  (Fedora: openblas-devel)
+```
+
+**2 — Get a model.** `scripts/download_model.sh` fetches any supported
+checkpoint straight from HuggingFace — the 10 models above plus 2 community
+GGUF ports, no account and no token needed — and prints the exact convert
+command for the one you picked:
+
+```sh
+scripts/download_model.sh --list            # alias, size and capabilities of each
+scripts/download_model.sh                   # interactive menu
+scripts/download_model.sh --model nemotron  # ...or by alias, for scripts and CI
+
+# convert to mynah's format (offline tooling, run once per model)
+cd tools && uv sync && uv run python convert_nemo.py ../models/nemotron-3.5-asr-streaming-0.6b && cd ..
+```
+
+| if you want… | alias | download |
+|---|---|---|
+| the lightest possible first run — community GGUF, no torch | `110m-gguf` | 90 MB |
+| the fastest English model | `110m` | 0.5 GB |
+| streaming + 40 languages with language detection | `nemotron` | 2.6 GB |
+| offline, 25 EU languages, punctuation + ITN | `tdt-v3` | 2.4 GB |
+| speech **translation**, en ↔ 24 languages | `canary-v2` | 3.9 GB |
+
+**3 — Transcribe, or stream.**
+
+```sh
+# offline file (any sample rate: WAV is resampled automatically)
+./mynah transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --lang auto
+
+# optional: int8 checkpoint — 0.79 GB instead of 2.55, instant load
+./mynah quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8
+./mynah transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --quant int8
+
+# live stream from mic or pipe (raw s16le 16 kHz mono on stdin)
+ffmpeg -v quiet -i anything.mp3 -f s16le -ar 16000 -ac 1 - | \
+  ./mynah stream -m models/nemotron-3.5-asr-streaming-0.6b --lookahead 3
+```
+
+For mp3/m4a: `ffmpeg -i file.mp3 -ar 16000 -ac 1 out.wav`. Languages and latency
+presets: [docs/nemotron-languages.md](docs/nemotron-languages.md) ·
+[docs/streaming.md](docs/streaming.md).
+
 ## Hear it — 11 languages, one sentence
 
 The quality suite runs on **real committed audio** ([samples/](samples/README.md)):
@@ -154,38 +208,6 @@ Longer clips (~2–5 min) exercise segmentation, timestamps and streaming.
 
 Full locale tables with quality tiers and prompt ids:
 [docs/nemotron-languages.md](docs/nemotron-languages.md).
-
-## Quickstart
-
-```sh
-# 1. build (macOS: Accelerate, zero deps; Linux: needs OpenBLAS first)
-#    Linux: sudo apt install libopenblas-dev   (Fedora: sudo dnf install openblas-devel)
-git clone https://github.com/mynah-org/mynah-asr.git && cd mynah-asr
-make
-
-# 2. pick a model from the interactive menu (or --model <alias> to script it)
-scripts/download_model.sh
-cd tools && uv sync && uv run python convert_nemo.py ../models/nemotron-3.5-asr-streaming-0.6b && cd ..
-
-# 3. (optional) quantized checkpoint: 0.79 GB instead of 2.55, instant load
-./mynah quantize -m models/nemotron-3.5-asr-streaming-0.6b --quant int8
-
-# 4. transcribe
-./mynah transcribe -m models/nemotron-3.5-asr-streaming-0.6b -i file.wav --lang auto  # --quant int8
-
-# 5. stream from mic/pipe (raw s16le 16 kHz mono on stdin)
-ffmpeg -v quiet -i anything.mp3 -f s16le -ar 16000 -ac 1 - | \
-  ./mynah stream -m models/nemotron-3.5-asr-streaming-0.6b --lookahead 3
-```
-
-Prefer not to build? Every tagged release ships stripped tarballs (CLI + server +
-`libmynah.a` + header) for linux-x86_64, linux-aarch64 and darwin-arm64, with
-`SHA256SUMS`: [github.com/mynah-org/mynah-asr/releases/latest](https://github.com/mynah-org/mynah-asr/releases/latest).
-
-WAV files at other sample rates are resampled automatically
-(for mp3/m4a: `ffmpeg -i file.mp3 -ar 16000 -ac 1 out.wav`).
-Supported languages and latency presets: [docs/nemotron-languages.md](docs/nemotron-languages.md)
-· [docs/streaming.md](docs/streaming.md).
 
 ## CLI
 
