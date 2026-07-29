@@ -1,18 +1,18 @@
 'use strict';
-// Esempio d'uso dei bindings Node (koffi). Gemello di bindings/python/example.py.
+// Node bindings example (koffi). Twin of bindings/python/example.py.
 //
-//   make shared          # nella root del repo -> libmynah.dylib/.so
+//   make shared          # in the repo root -> libmynah.dylib/.so
 //   npm i koffi
 //   node bindings/node/example.js models/parakeet-tdt-0.6b-v3 audio.wav
 //
-// Con un modello AED/Canary si può tradurre: passare lang "src>tgt", es. "de>en".
+// With an AED/Canary model you can translate: pass lang "src>tgt", e.g. "de>en".
 
 const { Mynah, version } = require('./mynah');
 
 function main() {
   const [modelDir, wav, lang = 'auto'] = process.argv.slice(2);
   if (!modelDir || !wav) {
-    console.error('uso: node example.js <model_dir> <file.wav> [lang|src>tgt]');
+    console.error('usage: node example.js <model_dir> <file.wav> [lang|src>tgt]');
     process.exit(2);
   }
 

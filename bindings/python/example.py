@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Esempio bindings Python: ASR + timestamp (+ traduzione se il modello è AED).
+"""Python bindings example: ASR + timestamps (+ translation on AED models).
 
 Uso: make shared && python3 bindings/python/example.py <model_dir> <file.wav> [lang]
 """

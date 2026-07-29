@@ -259,7 +259,7 @@ static uint64_t align_up(uint64_t v, uint64_t a, int *valid) {
 
 mynah_gguf *mynah_gguf_open(const char *path) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "gguf: impossibile aprire %s\n", path); return NULL; }
+    if (fd < 0) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
     struct stat sb;
     if (fstat(fd, &sb) != 0 || sb.st_size < 24) { close(fd); return NULL; }
 
@@ -276,7 +276,7 @@ mynah_gguf *mynah_gguf_open(const char *path) {
         rd_u32(&r, &version) != 0 || version < 2 || version > 3 ||  /* v1: layout u32, non supportato */
         rd_u64(&r, &n_tensors) != 0 || rd_u64(&r, &n_meta) != 0 ||
         n_tensors > 1000000u || rd_metadata(g, &r, n_meta) != 0) {
-        fprintf(stderr, "gguf: header non valido in %s\n", path);
+        fprintf(stderr, "gguf: invalid header in %s\n", path);
         goto fail;
     }
 
@@ -305,7 +305,7 @@ mynah_gguf *mynah_gguf_open(const char *path) {
             if (ne[d] == 0 || mul_u64(elems, ne[d], &elems) != 0) goto fail_off;
         if (type_geometry(type, &be, &bb) != 0 || elems % be != 0 ||
             (be > 1 && rank > 0 && ne[0] % be != 0)) { /* i blocchi non attraversano le righe */
-            fprintf(stderr, "gguf: tensore '%s' con tipo ggml %u non supportato\n",
+            fprintf(stderr, "gguf: tensor '%s' has unsupported ggml type %u\n",
                     g->names[i], type);
             goto fail_off;
         }
@@ -335,7 +335,7 @@ mynah_gguf *mynah_gguf_open(const char *path) {
             add_u64(g->data_base, offsets[i], &abs_off) != 0 ||
             add_u64(abs_off, bytes, &end) != 0 || end > g->size ||
             offsets[i] % g->alignment != 0) {
-            fprintf(stderr, "gguf: payload del tensore '%s' fuori dal file\n", t->name);
+            fprintf(stderr, "gguf: payload of tensor '%s' lies outside the file\n", t->name);
             goto fail_off;
         }
         const unsigned char *src = g->map + abs_off;
@@ -355,7 +355,7 @@ mynah_gguf *mynah_gguf_open(const char *path) {
 fail_off:
     free(offsets);
 fail:
-    fprintf(stderr, "gguf: load di %s fallito\n", path);
+    fprintf(stderr, "gguf: failed to load %s\n", path);
     mynah_gguf_close(g);
     return NULL;
 }

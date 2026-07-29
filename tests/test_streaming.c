@@ -17,7 +17,7 @@ static void collect(const mynah_result *res, void *ud) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "uso: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
+    if (argc != 4) { fprintf(stderr, "usage: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/mynah.json", argv[1]);

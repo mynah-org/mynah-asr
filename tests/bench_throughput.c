@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "argomento ignoto: %s\n", argv[i]); return 2; }
     }
     if (!model_dir || !wav) {
-        fprintf(stderr, "uso: %s <model_dir> <wav> [--lang l] [--backend b] "
+        fprintf(stderr, "usage: %s <model_dir> <wav> [--lang l] [--backend b] "
                         "[--max-batch N] [--runs R]\n", argv[0]);
         return 2;
     }

@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Converte un checkpoint HF-native NeMo ASR nel layout Mynah (in-place).
+"""Convert an HF-native NeMo ASR checkpoint into the Mynah layout (in-place).
 
-Input: directory con il porting HuggingFace del modello
+Input: directory holding the HuggingFace port of the model
   (config.json, processor_config.json, tokenizer.json, model.safetensors).
-Output (scritto NELLA stessa directory, i pesi non vengono toccati):
-  - mynah.json              config unificata che guida il runtime C
-  - tokens.json             array id -> piece (incluso il blank in coda)
-  - mel_filters.safetensors filterbank mel (slaney) + finestra Hann precomputate
+Output (written INTO the same directory; the weights are left untouched):
+  - mynah.json              unified config that drives the C runtime
+  - tokens.json             id -> piece array (blank included, last)
+  - mel_filters.safetensors precomputed mel filterbank (slaney) + Hann window
 
-Modelli supportati (dispatch su config.json model_type):
-  - nemotron3_5_asr  (streaming cache-aware, RNNT, language prompt)
-  - parakeet_tdt     (offline, TDT, niente prompt — docs/parakeet-tdt-arch.md)
+Supported models (dispatched on config.json model_type):
+  - nemotron3_5_asr  (cache-aware streaming, RNNT, language prompt)
+  - parakeet_tdt     (offline, TDT, no prompt — docs/parakeet-tdt-arch.md)
 
-Ingresso alternativo: directory con SOLO l'archivio `.nemo` (modelli senza porting
-HF-native, es. parakeet-tdt_ctc-110m). Richiede torch (`uv sync --extra oracle`):
-estrae model_config.yaml + tokenizer, rinomina i tensori NeMo nel naming canonico
-(quello HF che il runtime legge) e scrive model.safetensors f32.
+Alternative input: a directory holding ONLY the `.nemo` archive (models without
+an HF-native port, e.g. parakeet-tdt_ctc-110m). Requires torch
+(`uv sync --extra oracle`): it extracts model_config.yaml + tokenizer, renames
+the NeMo tensors to the canonical (HF) naming the runtime reads, and writes
+model.safetensors in f32.
 
-Uso: uv run python convert_nemo.py ../models/<model_dir>
+Usage: uv run python convert_nemo.py ../models/<model_dir>
 """
 
 from __future__ import annotations
@@ -513,7 +514,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
     assert len(pieces) == mynah["decoder"]["vocab_size"]
     (model_dir / "tokens.json").write_text(json.dumps(pieces, ensure_ascii=False))
     (model_dir / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
-    print(f"OK {model_dir.name} [{mynah['engine']}] da .nemo: {len(tensors)} tensori "
+    print(f"OK {model_dir.name} [{mynah['engine']}] from .nemo: {len(tensors)} tensors "
           f"f32, {len(pieces)} pieces, mel fb {fb.shape} dal checkpoint")
 
 
@@ -550,7 +551,7 @@ def convert(model_dir: Path) -> None:
     print(f"OK {model_dir.name} [{mynah['engine']}]: mynah.json, tokens.json ({len(pieces)} pieces), "
           f"mel_filters.safetensors (fb {fb.shape}, window {window.shape})")
     if "streaming" in mynah:
-        print(f"   presets latenza: {mynah['streaming']['att_context_presets']} "
+        print(f"   latency presets: {mynah['streaming']['att_context_presets']} "
               f"(default idx {mynah['streaming']['default_preset_index']})")
 
 

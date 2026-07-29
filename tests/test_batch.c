@@ -18,7 +18,7 @@ static double now_sec(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "uso: %s <model_dir> ...\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s <model_dir> ...\n", argv[0]); return 2; }
     char path[1024];
     snprintf(path, sizeof(path), "%s/mynah.json", argv[1]);
     FILE *probe = fopen(path, "rb");
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     for (int b = 0; b < B; b++) {
         int sr;
         samples[b] = mynah_wav_load(wavs[b], &ns[b], &sr);
-        if (!samples[b] || sr != 16000) { fprintf(stderr, "fixture %s mancante\n", wavs[b]); return 2; }
+        if (!samples[b] || sr != 16000) { fprintf(stderr, "missing fixture %s\n", wavs[b]); return 2; }
     }
 
     /* riferimento: B=1 sequenziale */
@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     if (mynah_transcribe_batch(m, (const float *const *)samples, ns, B, langs, -1,
                                out, NULL) != 0) {
-        fprintf(stderr, "FAIL: transcribe_batch errore\n");
+        fprintf(stderr, "FAIL: transcribe_batch error\n");
         return 1;
     }
     const double t_batch = now_sec() - t0;

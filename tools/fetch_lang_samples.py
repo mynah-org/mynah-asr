@@ -57,7 +57,7 @@ def fetch_fleurs(locale: str, cfg: str, n: int, lang_dir: Path) -> list[dict]:
             break
         except Exception as e:
             if attempt == 3:
-                print(f"{locale}: FLEURS API errore ({e})")
+                print(f"{locale}: FLEURS API error ({e})")
                 return entries
             time.sleep(3.0 * (attempt + 1))
     for r in rows:

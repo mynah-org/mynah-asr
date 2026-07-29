@@ -40,7 +40,7 @@ mynah_safetensors *mynah_st_open_quiet(const char *path) {
 
 mynah_safetensors *mynah_st_open(const char *path) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "weights: impossibile aprire %s\n", path); return NULL; }
+    if (fd < 0) { fprintf(stderr, "weights: cannot open %s\n", path); return NULL; }
     struct stat sb;
     if (fstat(fd, &sb) != 0 || sb.st_size < 8) { close(fd); return NULL; }
 
@@ -59,7 +59,7 @@ mynah_safetensors *mynah_st_open(const char *path) {
 
     void *map = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (map == MAP_FAILED) { fprintf(stderr, "weights: mmap fallita per %s\n", path); return NULL; }
+    if (map == MAP_FAILED) { fprintf(stderr, "weights: mmap failed for %s\n", path); return NULL; }
 
     uint64_t hlen;
     memcpy(&hlen, map, 8); /* little-endian; assumiamo host LE (arm64/x86_64) */

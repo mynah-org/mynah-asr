@@ -12,24 +12,24 @@
 
 static void usage(void) {
     printf("mynah %s — native ASR runtime for NeMo speech models\n\n", mynah_version());
-    printf("Uso: mynah <comando> [opzioni]\n\n");
-    printf("Comandi:\n");
+    printf("Usage: mynah <command> [options]\n\n");
+    printf("Commands:\n");
     printf("  transcribe -m <model_dir> -i <file.wav> [--lang auto] [--lookahead N] [--quant int8]\n");
-    printf("             [--target-lang xx]   (AED/Canary: traduzione, es. --lang en --target-lang de)\n");
+    printf("             [--target-lang xx]   (AED/Canary: translation, e.g. --lang en --target-lang de)\n");
     printf("             [--timestamps] [--decoder default|ctc]\n");
-    printf("             trascrizione offline (WAV PCM16 16 kHz);\n");
-    printf("             --timestamps stampa una parola per riga: t0 t1 parola\n");
-    printf("             --decoder ctc usa la head CTC dei modelli hybrid (tdt_ctc)\n");
+    printf("             offline transcription (WAV PCM16 16 kHz);\n");
+    printf("             --timestamps prints one word per line: t0 t1 word\n");
+    printf("             --decoder ctc uses the CTC head of hybrid models (tdt_ctc)\n");
     printf("  stream     -m <model_dir> [--lang auto] [--quant int8|int4]\n");
-    printf("             streaming live da stdin (raw s16le 16 kHz mono)\n");
+    printf("             live streaming from stdin (raw s16le 16 kHz mono)\n");
     printf("  quantize   -m <model_dir> --quant int8|int4\n");
-    printf("             salva il checkpoint pre-quantizzato (load istantaneo)\n");
+    printf("             writes the pre-quantized checkpoint (instant load)\n");
     printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8]\n");
-    printf("             RTF warm (min/mediana su N run) + picco RAM, un modello alla volta\n");
-    printf("  --version                                 stampa la versione\n\n");
-    printf("Opzioni comuni (transcribe/stream):\n");
-    printf("  --backend cpu|metal|cuda    backend GEMM (fallback CPU se assente)\n");
-    printf("  --caps auto|scalar|avx2|vnni  livello SIMD x86 (default: cpuid; env MYNAH_CAPS)\n");
+    printf("             warm RTF (min/median over N runs) + peak RAM, one model at a time\n");
+    printf("  --version                                 prints the version\n\n");
+    printf("Common options (transcribe/stream):\n");
+    printf("  --backend cpu|metal|cuda    GEMM backend (falls back to CPU if unavailable)\n");
+    printf("  --caps auto|scalar|avx2|vnni  x86 SIMD level (default: cpuid; env MYNAH_CAPS)\n");
 }
 
 static double now_sec(void) {
@@ -59,7 +59,7 @@ static int cmd_transcribe(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_set_caps(argv[++i]);
-        else { fprintf(stderr, "opzione ignota: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
     if (!model_dir || !wav) { usage(); return 2; }
 
@@ -95,7 +95,7 @@ static int cmd_transcribe(int argc, char **argv) {
     if (!text) { free(samples); mynah_free(m); return 1; }
 
     const double dur = (double)n_samples / 16000.0;
-    fprintf(stderr, "[%.1fs audio | load %.2fs | inferenza %.2fs | RTF %.3f | lang=%s]\n",
+    fprintf(stderr, "[%.1fs audio | load %.2fs | inference %.2fs | RTF %.3f | lang=%s]\n",
             dur, t_load, t_run, t_run / dur, lang_out[0] ? lang_out : lang);
     if (timestamps) {
         for (int i = 0; i < n_words; i++)
@@ -129,7 +129,7 @@ static int cmd_stream(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_set_caps(argv[++i]);
-        else { fprintf(stderr, "opzione ignota: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
     if (!model_dir) { usage(); return 2; }
 
@@ -137,7 +137,7 @@ static int cmd_stream(int argc, char **argv) {
     if (!m) return 1;
     mynah_stream *s = mynah_stream_open(m, lang, lookahead);
     if (!s) { mynah_free(m); return 1; }
-    fprintf(stderr, "[stream: raw s16le 16 kHz mono da stdin, lang=%s]\n", lang);
+    fprintf(stderr, "[stream: raw s16le 16 kHz mono from stdin, lang=%s]\n", lang);
 
     short pcm[1600]; /* 100 ms per read */
     float buf[1600];
@@ -182,12 +182,12 @@ static int cmd_quantize(int argc, char **argv) {
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) qs = argv[++i];
-        else { fprintf(stderr, "opzione ignota: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
     const int qtype = strcmp(qs, "int4") == 0 ? MYNAH_Q_INT4
                     : strcmp(qs, "int8") == 0 ? MYNAH_Q_INT8 : MYNAH_Q_F32;
     if (!model_dir || qtype == MYNAH_Q_F32) {
-        fprintf(stderr, "uso: mynah quantize -m <model_dir> --quant int8|int4\n");
+        fprintf(stderr, "usage: mynah quantize -m <model_dir> --quant int8|int4\n");
         return 2;
     }
 
@@ -199,7 +199,7 @@ static int cmd_quantize(int argc, char **argv) {
         st = mynah_st_open_quiet(path);
     }
     if (!st) {
-        fprintf(stderr, "quantize: ne' model.safetensors ne' model.gguf in %s\n", model_dir);
+        fprintf(stderr, "quantize: neither model.safetensors nor model.gguf in %s\n", model_dir);
         return 1;
     }
 
@@ -254,13 +254,13 @@ static int cmd_quantize(int argc, char **argv) {
     mynah_stw_free(w);
     mynah_st_close(st);
 
-    if (rc != 0) { fprintf(stderr, "quantize: scrittura fallita\n"); return 1; }
+    if (rc != 0) { fprintf(stderr, "quantize: write failed\n"); return 1; }
     FILE *f = fopen(path, "rb");
     fseek(f, 0, SEEK_END);
     const double gb = (double)ftell(f) / 1e9;
     fclose(f);
-    printf("OK %s: %zu tensori quantizzati %s, %.2f GB (%.1fs)\n", path, n_quant, qs, gb, dt);
-    printf("Uso: mynah transcribe|stream --quant %s (o mynah-server --quant %s)\n", qs, qs);
+    printf("OK %s: %zu tensors quantized to %s, %.2f GB (%.1fs)\n", path, n_quant, qs, gb, dt);
+    printf("Usage: mynah transcribe|stream --quant %s (or mynah-server --quant %s)\n", qs, qs);
     return 0;
 }
 
@@ -300,7 +300,7 @@ static int cmd_bench(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_set_caps(argv[++i]);
-        else { fprintf(stderr, "opzione ignota: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
     if (!model_dir) { usage(); return 2; }
     if (runs < 1) runs = 1;

@@ -9,7 +9,7 @@
 int mynah_tokenizer_load(mynah_tokenizer *tk, const char *path) {
     memset(tk, 0, sizeof(*tk));
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "tokenizer: impossibile aprire %s\n", path); return -1; }
+    if (!f) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return -1; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);

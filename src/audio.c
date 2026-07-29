@@ -37,7 +37,7 @@ float *mynah_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
             sr = (int)rd_u32(body + 4);
             bits = rd_u16(body + 14);
             if (audio_format != 1 /* PCM */) {
-                fprintf(stderr, "audio: formato WAV %u non supportato (solo PCM)\n", audio_format);
+                fprintf(stderr, "audio: unsupported WAV format %u (PCM only)\n", audio_format);
                 return NULL;
             }
         } else if (memcmp(chdr, "data", 4) == 0) {
@@ -48,7 +48,7 @@ float *mynah_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
     }
 
     if (!pcm || channels <= 0 || bits != 16) {
-        fprintf(stderr, "audio: atteso WAV PCM16 con chunk fmt+data (ch=%d bits=%d)\n",
+        fprintf(stderr, "audio: expected WAV PCM16 with fmt+data chunks (ch=%d bits=%d)\n",
                 channels, bits);
         return NULL;
     }
@@ -75,14 +75,14 @@ float *mynah_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
 
 float *mynah_wav_load(const char *path, size_t *n_samples, int *sample_rate) {
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "audio: impossibile aprire %s\n", path); return NULL; }
+    if (!f) { fprintf(stderr, "audio: cannot open %s\n", path); return NULL; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (len <= 0) { fclose(f); return NULL; }
     unsigned char *buf = malloc((size_t)len);
     if (!buf || fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        fprintf(stderr, "audio: lettura fallita per %s\n", path);
+        fprintf(stderr, "audio: read failed for %s\n", path);
         free(buf);
         fclose(f);
         return NULL;

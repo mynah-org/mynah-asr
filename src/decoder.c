@@ -50,7 +50,7 @@ int mynah_decoder_init(mynah_decoder *dec, const mynah_safetensors *st,
         snprintf(name, sizeof(name), "decoder.lstm.bias_hh_l%d", n);
         bhh = mynah_st_get(st, name);
         if (!whh || !bih || !bhh) {
-            fprintf(stderr, "mynah: LSTM layer %d incompleto nel checkpoint\n", n);
+            fprintf(stderr, "mynah: LSTM layer %d is incomplete in the checkpoint\n", n);
             return -1;
         }
         dec->w_hh[n] = (const float *)whh->data;

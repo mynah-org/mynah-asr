@@ -293,13 +293,13 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         f.file = body;           /* body raw: audio/wav diretto */
         f.file_len = body_len;
     }
-    if (!f.file || f.file_len < 44) { send_error(fd, 400, "manca il file audio (multipart 'file' o body WAV)"); return; }
+    if (!f.file || f.file_len < 44) { send_error(fd, 400, "missing audio file (multipart 'file' or raw WAV body)"); return; }
 
     char src_lang[24];
     snprintf(src_lang, sizeof(src_lang), "%s", f.language);
     if (translate || f.target_language[0]) {
         if (!mynah_can_translate(g_model)) {
-            send_error(fd, 400, "il modello non supporta la traduzione (serve un engine AED, es. Canary)");
+            send_error(fd, 400, "this model does not support translation (an AED engine is required, e.g. Canary)");
             return;
         }
         const char *tgt = f.target_language[0] ? f.target_language : "en";
@@ -314,7 +314,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         size_t n2;
         float *rs = mynah_resample(samples, n_samples, sr, 16000, &n2);
         free(samples);
-        if (!rs) { send_error(fd, 500, "resampling fallito"); return; }
+        if (!rs) { send_error(fd, 500, "resampling failed"); return; }
         samples = rs;
         n_samples = n2;
     }
@@ -346,7 +346,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     }
     const double duration = (double)n_samples / 16000.0;
     free(samples);
-    if (!text) { send_error(fd, 400, "trascrizione fallita (lingua non supportata?)"); return; }
+    if (!text) { send_error(fd, 400, "transcription failed (unsupported language?)"); return; }
 
     if (strcmp(f.response_format, "text") == 0) {
         send_response(fd, 200, "OK", "text/plain; charset=utf-8", text, strlen(text));
@@ -559,7 +559,7 @@ static void handle_conn(int fd) {
         if (!cl) cl = strstr(hdr, "content-length:");
         if (cl) content_len = strtoull(cl + 15, NULL, 10);
         if (content_len == 0 || content_len > MAX_BODY) {
-            send_error(fd, 400, "Content-Length mancante o troppo grande");
+            send_error(fd, 400, "missing or oversized Content-Length");
             close(fd);
             return;
         }
@@ -604,13 +604,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_set_caps(argv[++i]);
         else {
-            fprintf(stderr, "uso: mynah-server -m <model_dir> [-p 8090] [--threads 4] "
+            fprintf(stderr, "usage: mynah-server -m <model_dir> [-p 8090] [--threads 4] "
                             "[--batch 8] [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n");
             return 2;
         }
     }
     if (!model_dir) {
-        fprintf(stderr, "uso: mynah-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8]\n");
+        fprintf(stderr, "usage: mynah-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8]\n");
         return 2;
     }
     if (g_max_batch < 1) g_max_batch = 1;
@@ -626,7 +626,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
                                .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 64) != 0) {
-        fprintf(stderr, "mynah-server: bind/listen su porta %d fallita\n", port);
+        fprintf(stderr, "mynah-server: bind/listen failed on port %d\n", port);
         return 1;
     }
 
@@ -640,7 +640,7 @@ int main(int argc, char **argv) {
         pthread_create(&t, NULL, batch_worker, NULL);
         pthread_detach(t);
     }
-    fprintf(stderr, "mynah-server %s: in ascolto su :%d (%d worker, batch %d)\n"
+    fprintf(stderr, "mynah-server %s: listening on :%d (%d workers, batch %d)\n"
                     "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
             mynah_version(), port, n_threads, g_max_batch);
 

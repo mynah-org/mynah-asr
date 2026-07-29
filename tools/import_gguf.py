@@ -125,7 +125,7 @@ def main() -> int:
     r = Reader(data)
     magic, ver = r.u32(), r.u32()
     if magic != 0x46554747 or ver < 2:
-        print("errore: non è un GGUF v2/v3", file=sys.stderr)
+        print("error: not a GGUF v2/v3 file", file=sys.stderr)
         return 1
     n_t, n_kv = r.u64(), r.u64()
     meta = {}
@@ -134,11 +134,11 @@ def main() -> int:
         meta[key] = r.value(r.u32())
 
     if meta.get("general.architecture") != "parakeet":
-        print(f"errore: architettura '{meta.get('general.architecture')}' non supportata "
+        print(f"error: unsupported architecture '{meta.get('general.architecture')}' "
               "(v1: parakeet)", file=sys.stderr)
         return 1
     if meta.get("stt.parakeet.head_kind", "tdt") != "tdt":
-        print("errore: solo head TDT in v1", file=sys.stderr)
+        print("error: TDT head only in v1", file=sys.stderr)
         return 1
 
     tensors = []
@@ -148,7 +148,7 @@ def main() -> int:
         ne = [r.u64() for _ in range(rank)]
         typ, toff = r.u32(), r.u64()
         if typ not in GEOM:
-            print(f"errore: tensore '{name}' tipo ggml {typ} non supportato dal runtime",
+            print(f"error: tensor '{name}' has ggml type {typ}, unsupported by the runtime",
                   file=sys.stderr)
             return 1
         tensors.append((name, ne, typ, toff))
@@ -224,7 +224,7 @@ def main() -> int:
     for name, ne, typ, toff in tensors:
         nn = rename(name)
         if nn in renamed:
-            print(f"errore: rename duplicato '{name}' -> '{nn}'", file=sys.stderr)
+            print(f"error: duplicate rename '{name}' -> '{nn}'", file=sys.stderr)
             return 1
         renamed.add(nn)
         be, bb = GEOM[typ]
@@ -255,8 +255,8 @@ def main() -> int:
     (args.out / "model.gguf").write_bytes(body + b"\0" * pad + bytes(payload))
 
     size_mb = (args.out / "model.gguf").stat().st_size / 1e6
-    print(f"OK {args.out}: {len(tensors)} tensori rinominati, model.gguf {size_mb:.1f} MB")
-    print(f"   prova: ./mynah transcribe -m {args.out} -i file.wav")
+    print(f"OK {args.out}: {len(tensors)} tensors renamed, model.gguf {size_mb:.1f} MB")
+    print(f"   try it: ./mynah transcribe -m {args.out} -i file.wav")
     return 0
 
 

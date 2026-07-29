@@ -83,7 +83,7 @@ def main() -> None:
         rows = texts[lang]
         missing = [i for i in IDS if i not in rows]
         if missing:
-            sys.exit(f"{cfg}: id mancanti nel dev set: {missing}")
+            sys.exit(f"{cfg}: ids missing from the dev set: {missing}")
         extract(cfg, [rows[i]["file"] for i in IDS])
         (samples_dir / lang).mkdir(parents=True, exist_ok=True)
         for i in IDS:

@@ -78,7 +78,7 @@ jobs:
           # the version string must carry the tag, not a stale git describe
           "$D/bin/mynah" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
           # mynah-server exits 2 on --help by design: check the usage line instead
-          "$D/bin/mynah-server" --help 2>&1 | grep -q 'uso: mynah-server'
+          "$D/bin/mynah-server" --help 2>&1 | grep -q 'usage: mynah-server'
 
       - name: Kernel self-test (no model needed)
         env:

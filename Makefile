@@ -70,14 +70,14 @@ test: $(TESTS) mynah examples/minimal
 	@for t in $(TESTS); do \
 	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: modello o golden assenti (make golden-dump)"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
 	@for spec in "$(PARAKEET_DIR) tests/audio/test_it.wav tests/golden/parakeet_it" \
 	             "$(PARAKEET110_DIR) tests/audio/test_en.wav tests/golden/parakeet110_en"; do \
 	  for t in $(PARITY_BOTH); do \
 	    $$t $$spec; rc=$$?; \
-	    if [ $$rc -eq 77 ]; then echo "SKIP $$t ($$spec): modello o golden assenti"; \
+	    if [ $$rc -eq 77 ]; then echo "SKIP $$t ($$spec): model or golden dumps missing"; \
 	    elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	  done; \
 	done
@@ -86,11 +86,11 @@ test: $(TESTS) mynah examples/minimal
 	          models/parakeet-rnnt-1.1b models/parakeet-ctc-1.1b \
 	          models/canary-180m-flash models/canary-1b-flash models/canary-1b-v2; do \
 	  sh tests/test_e2e.sh $$m; rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP e2e $$m: non scaricato (HF-native: scripts/download_model.sh + convert_nemo.py; .nemo: curl dal repo HF + convert_nemo.py — vedi docs/models.md)"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP e2e $$m: not downloaded (HF-native: scripts/download_model.sh + convert_nemo.py; .nemo: curl from the HF repo + convert_nemo.py — see docs/models.md)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
 	@sh tests/test_gguf.sh $(PARAKEET110_DIR); rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP gguf parity: 110m convertito o uv assenti"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP gguf parity: converted 110m or uv missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
@@ -160,15 +160,15 @@ bench: mynah
 # GPU (make cuda; --backend cuda) ma gira anche su cpu/metal.
 #   tests/bench_throughput models/<m> tests/audio/long_60s.wav --backend cuda --max-batch 64
 bench-throughput: tests/bench_throughput
-	@echo "uso: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
+	@echo "usage: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
 
 # Test end-to-end del server (REST + concorrenza + WebSocket)
 test-server: mynah-server
 	@sh tests/test_server.sh $(MODEL_DIR); rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: modello assente"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_serve_repro.sh $(MODEL_DIR); rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP serve-repro: modello assente"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP serve-repro: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 # Suite multilingua: sample audio reali (Tatoeba, CC) per ogni lingua supportata,
@@ -184,7 +184,7 @@ fetch-lang-samples:
 # traduzione Canary vs riferimenti paralleli, backend cpu+metal.
 test-samples: mynah
 	cd tools && uv run python -m eval.test_samples; rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP test-samples: samples/ o modelli assenti"; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-samples: samples/ or models missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 # leak check veloce su macOS (tool nativo `leaks`, nessuna rebuild — su Mac ASan

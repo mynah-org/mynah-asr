@@ -15,7 +15,7 @@ int test_model_cfg(const char *model_dir, int *normalize_pf, int *left, int *rig
                    int *prompt_it); /* tests/testcfg.c */
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "uso: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
+    if (argc != 4) { fprintf(stderr, "usage: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/mel_filters.safetensors", argv[1]);

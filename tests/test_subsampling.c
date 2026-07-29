@@ -16,7 +16,7 @@ int test_model_cfg(const char *model_dir, int *normalize_pf, int *left, int *rig
                    int *prompt_it); /* tests/testcfg.c */
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "uso: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
+    if (argc != 4) { fprintf(stderr, "usage: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
     char path[1024];
 
     snprintf(path, sizeof(path), "%s/subsampling.npy", argv[3]);
@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
     float *feats = mynah_log_mel(&cfg, audio, n_samples, &T, &valid);
 
     mynah_subsampling ss;
-    if (mynah_subsampling_init(&ss, st) != 0) { fprintf(stderr, "init subsampling fallita\n"); return 2; }
+    if (mynah_subsampling_init(&ss, st) != 0) { fprintf(stderr, "subsampling init failed\n"); return 2; }
 
     int t_out;
     float *out = mynah_subsampling_forward(&ss, feats, valid, cfg.n_mels, &t_out);

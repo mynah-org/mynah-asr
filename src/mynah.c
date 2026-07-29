@@ -54,7 +54,7 @@ static cJSON *load_json(const char *dir, const char *file) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s", dir, file);
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "mynah: manca %s\n", path); return NULL; }
+    if (!f) { fprintf(stderr, "mynah: missing %s\n", path); return NULL; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -72,7 +72,7 @@ static cJSON *load_json(const char *dir, const char *file) {
 static const cJSON *jneed(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = o ? cJSON_GetObjectItem(o, k) : NULL;
     if (!j) {
-        fprintf(stderr, "mynah: mynah.json: manca \"%s\"\n", k);
+        fprintf(stderr, "mynah: mynah.json: missing \"%s\"\n", k);
         if (bad) *bad = 1;
     }
     return j;
@@ -185,7 +185,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     if (!m->weights || !m->mel_filters) goto fail;
 
     if (mynah_encoder_init(&m->enc, m->weights, quant) != 0) {
-        fprintf(stderr, "mynah: encoder init fallita\n");
+        fprintf(stderr, "mynah: encoder init failed\n");
         goto fail;
     }
 
@@ -211,7 +211,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
         if (bad) goto fail;
         if (mynah_aed_init(&m->aed, m->weights, a_layers, a_heads, a_maxseq,
                            a_delta, quant) != 0) {
-            fprintf(stderr, "mynah: decoder AED init fallita\n");
+            fprintf(stderr, "mynah: AED decoder init failed\n");
             goto fail;
         }
         m->is_aed = 1;
@@ -219,7 +219,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     } else if (strcmp(dec_type, "ctc") == 0) {
         /* CTC puro: niente prednet/joint, la head È il decoder */
         if (mynah_ctc_init(&m->ctc, m->weights) != 0) {
-            fprintf(stderr, "mynah: head CTC mancante\n");
+            fprintf(stderr, "mynah: missing CTC head\n");
             goto fail;
         }
         m->engine_dflt = &ENG_CTC;
@@ -234,7 +234,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
         if (bad) goto fail;
         if (mynah_decoder_init(&m->dec, m->weights, blank_id, max_sym,
                                quant, durations, n_durations) != 0) {
-            fprintf(stderr, "mynah: decoder init fallita\n");
+            fprintf(stderr, "mynah: decoder init failed\n");
             goto fail;
         }
         mynah_ctc_init(&m->ctc, m->weights);   /* head ausiliaria hybrid, opzionale */
@@ -303,7 +303,7 @@ mynah_model *mynah_load_quant(const char *model_dir, int quant) {
     if (m->is_aed) {
         const cJSON *jeos = cJSON_GetObjectItem(jdec, "eos_token");
         m->aed_eos = jeos ? mynah_tok_find(&m->tok, jeos->valuestring) : -1;
-        if (m->aed_eos < 0) { fprintf(stderr, "mynah: EOS AED non trovato\n"); goto fail; }
+        if (m->aed_eos < 0) { fprintf(stderr, "mynah: AED EOS not found\n"); goto fail; }
         /* timestamp generativi <|N|>: non tutti gli AED li supportano (v2 usa
          * un allineatore esterno) — capability dal mynah.json, default sì */
         const cJSON *jts = cJSON_GetObjectItem(jdec, "timestamp_tokens");
@@ -348,7 +348,7 @@ void mynah_set_segment_limit(mynah_model *m, double sec) {
 int mynah_set_decoder(mynah_model *m, const char *name) {
     if (strcmp(name, "ctc") == 0) {
         if (!m->ctc.w) {
-            fprintf(stderr, "mynah: il modello non ha una head CTC\n");
+            fprintf(stderr, "mynah: this model has no CTC head\n");
             return -1;
         }
         m->engine = &ENG_CTC;
@@ -499,11 +499,11 @@ struct mynah_stream {
 
 mynah_stream *mynah_stream_open(mynah_model *m, const char *lang, int lookahead) {
     if (m->n_lookaheads == 0) {
-        fprintf(stderr, "mynah: il modello è offline-only (niente streaming cache-aware)\n");
+        fprintf(stderr, "mynah: this model is offline-only (no cache-aware streaming)\n");
         return NULL;
     }
     const int prompt = resolve_prompt(m, lang);
-    if (prompt == -2) { fprintf(stderr, "mynah: lingua '%s' non supportata\n", lang); return NULL; }
+    if (prompt == -2) { fprintf(stderr, "mynah: language '%s' is not supported\n", lang); return NULL; }
     const int right = lookahead >= 0 ? lookahead : m->default_right;
 
     mynah_stream *s = calloc(1, sizeof(*s));
@@ -648,13 +648,13 @@ static int aed_build_prompt(const mynah_model *m, const char *lang, int *ids, in
         ok_tgt |= strcmp(e->valuestring, tgt) == 0;
     }
     if (!ok_src || !ok_tgt) {
-        fprintf(stderr, "mynah: lingua '%s' non supportata dal modello\n",
+        fprintf(stderr, "mynah: language '%s' is not supported by the model\n",
                 ok_src ? tgt : src);
         return -1;
     }
     const cJSON *jd = cJSON_GetObjectItem(jp, "defaults");
     const cJSON *jt = jp ? cJSON_GetObjectItem(jp, "template") : NULL;
-    if (!jt) { fprintf(stderr, "mynah: prompt.template mancante\n"); return -1; }
+    if (!jt) { fprintf(stderr, "mynah: missing prompt.template\n"); return -1; }
     int n = 0;
     for (const cJSON *e = jt->child; e && n < MYNAH_AED_PROMPT_MAX; e = e->next) {
         if (!cJSON_IsString(e)) continue;
@@ -687,7 +687,7 @@ int mynah_can_translate(const mynah_model *m) { return m->is_aed; }
 int mynah_set_target_lang(mynah_model *m, const char *lang) {
     if (!lang || !*lang) { m->aed_target[0] = '\0'; return 0; }
     if (!m->is_aed) {
-        fprintf(stderr, "mynah: il modello non supporta la traduzione (solo AED)\n");
+        fprintf(stderr, "mynah: this model does not support translation (AED only)\n");
         return -1;
     }
     const cJSON *jl = cJSON_GetObjectItem(cJSON_GetObjectItem(m->cfg, "prompt"), "languages");
@@ -696,7 +696,7 @@ int mynah_set_target_lang(mynah_model *m, const char *lang) {
             snprintf(m->aed_target, sizeof(m->aed_target), "%s", lang);
             return 0;
         }
-    fprintf(stderr, "mynah: lingua target '%s' non supportata\n", lang);
+    fprintf(stderr, "mynah: target language '%s' is not supported\n", lang);
     return -1;
 }
 
@@ -838,7 +838,7 @@ char *mynah_transcribe_ts(mynah_model *m, const float *samples, size_t n_samples
     if (words) { *words = NULL; *n_words = 0; }
     if (lang_out) lang_out[0] = '\0';
     const int prompt = resolve_prompt(m, lang);
-    if (prompt == -2) { fprintf(stderr, "mynah: lingua '%s' non supportata\n", lang); return NULL; }
+    if (prompt == -2) { fprintf(stderr, "mynah: language '%s' is not supported\n", lang); return NULL; }
     const int right = lookahead >= 0 ? lookahead : m->default_right;
 
     const int sr = m->feat.sample_rate;

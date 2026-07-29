@@ -39,9 +39,9 @@ int mynah_set_backend(const char *name) {
                     METAL_MIN_T);
             return g_backend;
         }
-        fprintf(stderr, "mynah: CUDA richiesto ma device non disponibile -> CPU\n");
+        fprintf(stderr, "mynah: CUDA requested but no device available -> CPU\n");
 #else
-        fprintf(stderr, "mynah: CUDA richiesto ma non compilato (make cuda) -> CPU\n");
+        fprintf(stderr, "mynah: CUDA requested but not compiled in (make cuda) -> CPU\n");
 #endif
         g_backend = MYNAH_BACKEND_CPU;
         return g_backend;
@@ -54,9 +54,9 @@ int mynah_set_backend(const char *name) {
                     METAL_MIN_T);
             return g_backend;
         }
-        fprintf(stderr, "mynah: Metal richiesto ma device non disponibile -> CPU\n");
+        fprintf(stderr, "mynah: Metal requested but no device available -> CPU\n");
 #else
-        fprintf(stderr, "mynah: Metal richiesto ma non compilato in questa build -> CPU\n");
+        fprintf(stderr, "mynah: Metal requested but not compiled into this build -> CPU\n");
 #endif
     }
     g_backend = MYNAH_BACKEND_CPU;

@@ -374,7 +374,7 @@ int mynah_set_caps(const char *name) {
     else if (name && strcmp(name, "auto") != 0)
         fprintf(stderr, "mynah: caps ignoti '%s' (scalar|avx2|vnni|auto) -> auto\n", name);
     if (want > detected) {
-        fprintf(stderr, "mynah: caps '%s' non supportati dalla CPU -> livello %d\n",
+        fprintf(stderr, "mynah: caps '%s' not supported by this CPU -> level %d\n",
                 name, detected);
         want = detected;
     }

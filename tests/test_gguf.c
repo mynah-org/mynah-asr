@@ -258,7 +258,7 @@ int main(void) {
 
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
         CHECK(write_tmp(&bad[k].f, junk) != NULL, "fixture malformato scritto");
-        fprintf(stderr, "--- atteso errore (%s):\n", bad[k].what);
+        fprintf(stderr, "--- expected error (%s):\n", bad[k].what);
         mynah_safetensors *s = mynah_st_open(junk);
         CHECK(s == NULL, bad[k].what);
         if (s) mynah_st_close(s);

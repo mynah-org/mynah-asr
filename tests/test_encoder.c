@@ -22,7 +22,7 @@ static int check(const char *name, const float *c, const char *golden_dir, size_
     snprintf(path, sizeof(path), "%s/%s.npy", golden_dir, name);
     size_t n_g;
     double *g = npy_load_f(path, &n_g);
-    if (!g) { printf("skip %s (dump assente)\n", name); return 0; }
+    if (!g) { printf("skip %s (dump missing)\n", name); return 0; }
     if (n_g != n_expect) { fprintf(stderr, "FAIL %s: size %zu vs %zu\n", name, n_expect, n_g); return 1; }
     double max_d = 0.0, scale = 0.0, mean = 0.0;
     for (size_t i = 0; i < n_g; i++) {
@@ -39,7 +39,7 @@ static int check(const char *name, const float *c, const char *golden_dir, size_
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "uso: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
+    if (argc != 4) { fprintf(stderr, "usage: %s <model_dir> <wav> <golden_dir>\n", argv[0]); return 2; }
     char path[1024];
 
     snprintf(path, sizeof(path), "%s/enc_proj.npy", argv[3]);
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     float *feats = mynah_log_mel(&fcfg, audio, n_samples, &T_mel, &valid);
 
     mynah_encoder enc;
-    if (mynah_encoder_init(&enc, st, 0) != 0) { fprintf(stderr, "encoder init fallita\n"); return 2; }
+    if (mynah_encoder_init(&enc, st, 0) != 0) { fprintf(stderr, "encoder init failed\n"); return 2; }
     printf("encoder: %d layer, d=%d, heads=%d, ffn=%d, conv_k=%d, d_out=%d, causal=%d, "
            "att [%d,%d]\n", enc.n_layers, enc.d_model, enc.n_heads, enc.ffn_dim, enc.conv_k,
            enc.d_out, enc.causal, left, right);

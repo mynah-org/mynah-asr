@@ -1,12 +1,12 @@
-"""Bindings Python per libmynah (ctypes, zero dipendenze).
+"""Python bindings for libmynah (ctypes, zero dependencies).
 
-Prerequisito: `make shared` nella root del repo (produce libmynah.dylib/.so).
+Prerequisite: `make shared` in the repo root (produces libmynah.dylib/.so).
 
     from mynah import Mynah
     m = Mynah("models/parakeet-tdt-0.6b-v3")
     print(m.transcribe("audio.wav"))
     text, words = m.transcribe("audio.wav", timestamps=True)
-    # traduzione (modelli AED/Canary):
+    # translation (AED/Canary models):
     print(Mynah("models/canary-180m-flash").transcribe("de.wav", lang="de>en"))
 """
 
@@ -29,7 +29,7 @@ def _find_lib() -> ctypes.CDLL:
     for c in candidates:
         if c.exists():
             return ctypes.CDLL(str(c))
-    raise OSError("libmynah non trovata: compila con `make shared` nella root del repo")
+    raise OSError("libmynah not found: build it with `make shared` in the repo root")
 
 
 class _Word(ctypes.Structure):
@@ -46,7 +46,7 @@ def _api() -> ctypes.CDLL:
         _lib.mynah_load_quant.restype = ctypes.c_void_p
         _lib.mynah_load_quant.argtypes = [ctypes.c_char_p, ctypes.c_int]
         _lib.mynah_free.argtypes = [ctypes.c_void_p]
-        _lib.mynah_transcribe_ts.restype = ctypes.c_void_p   # char* (da liberare noi)
+        _lib.mynah_transcribe_ts.restype = ctypes.c_void_p   # char* (we own it and must free it)
         _lib.mynah_transcribe_ts.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
             ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
@@ -64,10 +64,10 @@ def _api() -> ctypes.CDLL:
 
 
 def _load_wav(path: str) -> tuple[array.array, int]:
-    """WAV PCM16 -> float32 [-1,1] mono (media dei canali) + sample rate."""
+    """WAV PCM16 -> float32 [-1,1] mono (channels averaged) + sample rate."""
     with wave.open(path, "rb") as w:
         if w.getsampwidth() != 2:
-            raise ValueError("serve WAV PCM16 (per mp3/altro: ffmpeg -ar 16000 -ac 1)")
+            raise ValueError("WAV PCM16 required (for mp3 and friends: ffmpeg -ar 16000 -ac 1)")
         nch, sr, n = w.getnchannels(), w.getframerate(), w.getnframes()
         pcm = array.array("h")
         pcm.frombytes(w.readframes(n))
@@ -81,13 +81,13 @@ def _load_wav(path: str) -> tuple[array.array, int]:
 
 
 class Mynah:
-    """Un modello caricato. Thread-safety: usare da un thread alla volta."""
+    """A loaded model. Thread-safety: use from one thread at a time."""
 
     def __init__(self, model_dir: str, quant: str = "f32"):
         self._lib = _api()
         self._m = self._lib.mynah_load_quant(str(model_dir).encode(), QUANT[quant])
         if not self._m:
-            raise RuntimeError(f"load fallita: {model_dir}")
+            raise RuntimeError(f"load failed: {model_dir}")
 
     def close(self) -> None:
         if self._m:
@@ -104,18 +104,18 @@ class Mynah:
         self.close()
 
     def set_target_lang(self, lang: str) -> None:
-        """AED/Canary: lingua di uscita (≠ sorgente = traduzione). '' = ASR."""
+        """AED/Canary: output language (different from source = translation). '' = ASR."""
         if self._lib.mynah_set_target_lang(self._m, lang.encode()) != 0:
-            raise ValueError(f"target lang non supportata: {lang}")
+            raise ValueError(f"unsupported target lang: {lang}")
 
     def set_segment_limit(self, sec: float) -> None:
         self._lib.mynah_set_segment_limit(self._m, sec)
 
     def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
                    timestamps: bool = False):
-        """Trascrive un WAV (resample automatico). lang accetta anche "src>tgt"
+        """Transcribe a WAV (resampled automatically). lang also accepts "src>tgt"
         per la traduzione AED. Ritorna str, o (str, [(word, t0, t1), ...])
-        con timestamps=True."""
+        with timestamps=True."""
         samples, sr = _load_wav(wav)
         buf = (ctypes.c_float * len(samples)).from_buffer(samples)
         n = ctypes.c_size_t(len(samples))
@@ -124,7 +124,7 @@ class Mynah:
             p = self._lib.mynah_resample(buf, len(samples), sr, 16000,
                                          ctypes.byref(n_out))
             if not p:
-                raise RuntimeError("resampling fallito")
+                raise RuntimeError("resampling failed")
             buf, n = p, n_out
         lang_out = ctypes.create_string_buffer(16)
         words_p = ctypes.POINTER(_Word)()
@@ -134,7 +134,7 @@ class Mynah:
             ctypes.byref(words_p) if timestamps else None,
             ctypes.byref(n_words) if timestamps else None)
         if not raw:
-            raise RuntimeError("trascrizione fallita (lingua non supportata?)")
+            raise RuntimeError("transcription failed (unsupported language?)")
         text = ctypes.cast(raw, ctypes.c_char_p).value.decode()
         libc = ctypes.CDLL(None)
         libc.free(ctypes.c_void_p(raw))

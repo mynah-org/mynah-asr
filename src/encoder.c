@@ -116,7 +116,7 @@ int mynah_encoder_init(mynah_encoder *enc, const mynah_safetensors *st, int quan
         L->dw_b = T_(st, F, li, "conv.depthwise_conv.bias");
         L->pw2_b = T_(st, F, li, "conv.pointwise_conv2.bias");
         if (!L->ln_ff1_w || !L->relk_w || !L->cnorm_w || !L->ln_out_w) {
-            fprintf(stderr, "encoder: tensori mancanti al layer %d\n", li);
+            fprintf(stderr, "encoder: missing tensors at layer %d\n", li);
             return -1;
         }
         /* grandi linear: qmat — cerca prima la forma pre-quantizzata (.q8/.q4) */
@@ -137,7 +137,7 @@ int mynah_encoder_init(mynah_encoder *enc, const mynah_safetensors *st, int quan
         rc |= QM(pw2_w, "conv.pointwise_conv2.weight");
         #undef QM
         if (rc != 0) {
-            fprintf(stderr, "encoder: init qmat fallita al layer %d\n", li);
+            fprintf(stderr, "encoder: qmat init failed at layer %d\n", li);
             return -1;
         }
     }
@@ -155,7 +155,7 @@ int mynah_encoder_init(mynah_encoder *enc, const mynah_safetensors *st, int quan
             const float *mu = T_(st, F, li, "conv.norm.running_mean");
             const float *var = T_(st, F, li, "conv.norm.running_var");
             if (!mu || !var) {
-                fprintf(stderr, "encoder: running stats BN mancanti al layer %d\n", li);
+                fprintf(stderr, "encoder: missing BN running stats at layer %d\n", li);
                 return -1;
             }
             float *scale = enc->bn_fold + (size_t)li * 2u * (size_t)d;

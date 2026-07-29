@@ -124,7 +124,7 @@ def main() -> int:
 
     st_path = args.model_dir / "model.safetensors"
     if not st_path.exists():
-        print(f"errore: {st_path} assente (serve il modello convertito)", file=sys.stderr)
+        print(f"error: {st_path} is missing (a converted model is required)", file=sys.stderr)
         return 1
     name = args.model_dir.name
     cfg = args.model_dir / "mynah.json"
@@ -157,7 +157,7 @@ def main() -> int:
     pad = (ALIGN - len(body) % ALIGN) % ALIGN
     out_path.write_bytes(body + b"\0" * pad + bytes(payload))
     size_mb = out_path.stat().st_size / 1e6
-    print(f"OK {out_path} [{args.dtype}] {len(tensors)} tensori, {size_mb:.1f} MB")
+    print(f"OK {out_path} [{args.dtype}] {len(tensors)} tensors, {size_mb:.1f} MB")
     return 0
 
 

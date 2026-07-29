@@ -74,11 +74,11 @@ int mynah_aed_init(mynah_aed *a, const mynah_safetensors *st,
 #define GF(field, suffix) \
         snprintf(n, sizeof(n), "aed.layers.%d." suffix, li); \
         L->field = T_(st, n); \
-        if (!L->field) { fprintf(stderr, "mynah: aed manca %s\n", n); return -1; }
+        if (!L->field) { fprintf(stderr, "mynah: aed is missing %s\n", n); return -1; }
 #define GQ(field, suffix) \
         snprintf(n, sizeof(n), "aed.layers.%d." suffix, li); \
         if (mynah_qmat_init_st(&L->field, st, n, quantize) != 0) { \
-            fprintf(stderr, "mynah: aed manca %s\n", n); return -1; }
+            fprintf(stderr, "mynah: aed is missing %s\n", n); return -1; }
         GF(ln_self_w, "ln_self.weight")   GF(ln_self_b, "ln_self.bias")
         GQ(sq, "self_attn.q_proj.weight") GF(sq_b, "self_attn.q_proj.bias")
         GQ(sk, "self_attn.k_proj.weight") GF(sk_b, "self_attn.k_proj.bias")

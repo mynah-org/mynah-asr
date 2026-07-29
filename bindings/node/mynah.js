@@ -1,19 +1,19 @@
 'use strict';
-// Bindings Node per libmynah (koffi, FFI puro — NESSUNO step di build nel repo).
+// Node bindings for libmynah (koffi, pure FFI — NO build step in the repo).
 //
-// Prerequisiti:
-//   1) `make shared` nella root del repo  -> libmynah.dylib / libmynah.so
-//   2) `npm i koffi`                        (l'utente, dove vuole: nessuna build nativa)
+// Prerequisites:
+//   1) `make shared` in the repo root      -> libmynah.dylib / libmynah.so
+//   2) `npm i koffi`                        (wherever you like: no native build)
 //
 //   const { Mynah } = require('./mynah');
 //   const m = new Mynah('models/parakeet-tdt-0.6b-v3');
 //   console.log(m.transcribe('audio.wav'));
 //   const { text, words } = m.transcribe('audio.wav', { timestamps: true });
-//   // traduzione (modelli AED/Canary): lang "src>tgt"
+//   // translation (AED/Canary models): lang "src>tgt"
 //   console.log(new Mynah('models/canary-180m-flash').transcribe('de.wav', { lang: 'de>en' }));
 //   m.close();
 //
-// Gemello di bindings/python/mynah.py: stessa superficie, stessi 7 simboli.
+// Twin of bindings/python/mynah.py: same surface, same 7 symbols.
 
 const fs = require('fs');
 const path = require('path');
@@ -22,7 +22,7 @@ let koffi;
 try {
   koffi = require('koffi');
 } catch {
-  throw new Error("koffi non installato: `npm i koffi` (solo FFI, nessuna build nativa)");
+  throw new Error("koffi not installed: `npm i koffi` (FFI only, no native build)");
 }
 
 const QUANT = { f32: 0, int8: 1, int4: 2 };
@@ -38,13 +38,13 @@ function findLib() {
       if (fs.existsSync(p)) return p;
     }
   }
-  throw new Error('libmynah non trovata: compila con `make shared` nella root del repo');
+  throw new Error('libmynah not found: build it with `make shared` in the repo root');
 }
 
 const lib = koffi.load(findLib());
 
-// libc.free: il testo restituito da mynah_transcribe_ts è malloc'd dal runtime e
-// va liberato con la stessa free (come il ctypes.CDLL(None) del binding Python).
+// libc.free: the text returned by mynah_transcribe_ts is malloc'd by the runtime and
+// must be released with the same free (like ctypes.CDLL(None) in the Python binding).
 const libc = koffi.load(
   process.platform === 'darwin' ? 'libSystem.B.dylib'
   : process.platform === 'win32' ? 'msvcrt.dll'
@@ -63,9 +63,9 @@ const fn = {
   words_free: lib.func('void mynah_words_free(mynah_word *w, int n)'),
   resample: lib.func(
     'float *mynah_resample(float *in, size_t n, int sr_in, int sr_out, _Out_ size_t *n_out)'),
-  // stesso simbolo, due prototipi: solo-testo (words = NULL) e con timestamp.
-  // lang_out e' un buffer di uscita: uint8_t* (puntatore vero) e non char* — che
-  // koffi tratterebbe come stringa d'ingresso senza ricopiare la scrittura del C.
+  // same symbol, two prototypes: text-only (words = NULL) and with timestamps.
+  // lang_out is an output buffer: uint8_t* (a real pointer) and not char*, which
+  // koffi would treat as an input string, dropping what C writes back.
   transcribe_text: lib.func(
     'void *mynah_transcribe_ts(void *m, float *s, size_t n, const char *lang, int la, ' +
     'uint8_t *lang_out, void *words, void *n_words)'),
@@ -74,11 +74,11 @@ const fn = {
     'uint8_t *lang_out, _Out_ mynah_word **words, _Out_ int *n_words)'),
 };
 
-// ---- WAV PCM16 -> Float32Array mono [-1,1] + sample rate (parser minimale) ----
+// ---- WAV PCM16 -> Float32Array mono [-1,1] + sample rate (minimal parser) ----
 function loadWav(file) {
   const b = fs.readFileSync(file);
   if (b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WAVE') {
-    throw new Error('non è un WAV RIFF/WAVE');
+    throw new Error('not a RIFF/WAVE file');
   }
   let off = 12, fmt = null, data = null;
   while (off + 8 <= b.length) {
@@ -95,10 +95,10 @@ function loadWav(file) {
     } else if (id === 'data') {
       data = b.subarray(body, body + size);
     }
-    off = body + size + (size & 1); // i chunk sono word-aligned
+    off = body + size + (size & 1); // chunks are word-aligned
   }
-  if (!fmt || !data) throw new Error('WAV senza chunk fmt/data');
-  if (fmt.bits !== 16) throw new Error('serve WAV PCM16 (per mp3/altro: ffmpeg -ar 16000 -ac 1)');
+  if (!fmt || !data) throw new Error('WAV without fmt/data chunks');
+  if (fmt.bits !== 16) throw new Error('WAV PCM16 required (for mp3 and friends: ffmpeg -ar 16000 -ac 1)');
   const nch = fmt.channels;
   const nSamp = Math.floor(data.length / 2 / nch);
   const out = new Float32Array(nSamp);
@@ -111,11 +111,11 @@ function loadWav(file) {
 }
 
 class Mynah {
-  // Un modello caricato. Thread-safety: usare da un thread alla volta.
+  // A loaded model. Thread-safety: use from one thread at a time.
   constructor(modelDir, quant = 'f32') {
-    if (!(quant in QUANT)) throw new Error(`quant sconosciuto: ${quant}`);
+    if (!(quant in QUANT)) throw new Error(`unknown quant: ${quant}`);
     this._m = fn.load_quant(String(modelDir), QUANT[quant]);
-    if (!this._m) throw new Error(`load fallita: ${modelDir}`);
+    if (!this._m) throw new Error(`load failed: ${modelDir}`);
   }
 
   close() {
@@ -123,17 +123,17 @@ class Mynah {
   }
 
   setTargetLang(lang) {
-    // AED/Canary: lingua di uscita (≠ sorgente = traduzione). '' = ASR.
-    if (fn.set_target_lang(this._m, lang) !== 0) throw new Error(`target lang non supportata: ${lang}`);
+    // AED/Canary: output language (different from source = translation). '' = ASR.
+    if (fn.set_target_lang(this._m, lang) !== 0) throw new Error(`unsupported target lang: ${lang}`);
   }
 
   canTranslate() { return fn.can_translate(this._m) === 1; }
 
   setSegmentLimit(sec) { fn.set_segment_limit(this._m, sec); }
 
-  // Trascrive un WAV (resample automatico a 16 kHz). opts: { lang, lookahead, timestamps }.
-  // lang accetta "src>tgt" per la traduzione AED. Ritorna string, oppure
-  // { text, words: [{ word, t0, t1 }, ...] } con timestamps: true.
+  // Transcribe a WAV (resampled to 16 kHz automatically). opts: { lang, lookahead, timestamps }.
+  // lang accepts "src>tgt" for AED translation. Returns a string, or
+  // { text, words: [{ word, t0, t1 }, ...] } with timestamps: true.
   transcribe(wav, opts = {}) {
     const { lang = 'auto', lookahead = -1, timestamps = false } = opts;
     let { samples, sampleRate } = loadWav(wav);
@@ -142,7 +142,7 @@ class Mynah {
     if (sampleRate !== 16000) {
       const nOut = [0n];
       const p = fn.resample(samples, n, sampleRate, 16000, nOut);
-      if (!p) throw new Error('resampling fallito');
+      if (!p) throw new Error('resampling failed');
       const count = Number(nOut[0]);
       samples = Float32Array.from(koffi.decode(p, 'float', count));
       cfree(p);
@@ -156,7 +156,7 @@ class Mynah {
       const wp = [null];
       const nw = [0];
       raw = fn.transcribe_ts(this._m, samples, n, lang, lookahead, langOut, wp, nw);
-      if (!raw) throw new Error('trascrizione fallita (lingua non supportata?)');
+      if (!raw) throw new Error('transcription failed (unsupported language?)');
       if (wp[0] && nw[0] > 0) {
         const arr = koffi.decode(wp[0], 'mynah_word', nw[0]);
         words = arr.map((w) => ({ word: w.word, t0: w.t0, t1: w.t1 }));
@@ -166,11 +166,11 @@ class Mynah {
       }
     } else {
       raw = fn.transcribe_text(this._m, samples, n, lang, lookahead, langOut, null, null);
-      if (!raw) throw new Error('trascrizione fallita (lingua non supportata?)');
+      if (!raw) throw new Error('transcription failed (unsupported language?)');
     }
 
-    const text = koffi.decode(raw, 'char', -1); // stringa C NUL-terminata dal puntatore
-    cfree(raw);                                 // liberata con la free del runtime (malloc)
+    const text = koffi.decode(raw, 'char', -1); // NUL-terminated C string from the pointer
+    cfree(raw);                                 // released with the runtime's free (malloc)
     return timestamps ? { text, words, lang: cstr(langOut) } : text;
   }
 }
