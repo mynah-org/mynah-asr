@@ -75,6 +75,22 @@ jobs:
       - name: Tests (parity vs oracle + e2e; big models skip)
         run: make test
 
+      # The bindings are public surface that `make test` never touches: they load
+      # the shared library by name and call the exported symbols by name, so a
+      # rename that misses one breaks them silently (it did: the Node export
+      # still said `Mynah` after the mynah-asr rename). This transcribes for
+      # real through both FFI layers.
+      - name: Shared library for the bindings
+        run: make shared
+
+      - name: Bindings end-to-end (Python ctypes + Node koffi)
+        run: |
+          python3 bindings/python/example.py models/${{ env.MODEL }} \
+            tests/audio/test_en.wav | tee /dev/stderr | grep -qi 'speech recognition test'
+          npm install --no-save --no-package-lock koffi
+          node bindings/node/example.js models/${{ env.MODEL }} \
+            tests/audio/test_en.wav | tee /dev/stderr | grep -qi 'speech recognition test'
+
       - name: Quality on real audio (samples/ FLEURS, CER with the 110m)
         run: make test-samples
 

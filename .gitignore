@@ -54,3 +54,5 @@ examples/minimal
 libmynah_asr.dylib
 *.dylib
 *.so
+node_modules/
+package-lock.json

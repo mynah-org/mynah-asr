@@ -29,7 +29,7 @@ const QUANT = { f32: 0, int8: 1, int4: 2 };
 
 function findLib() {
   const names = process.platform === 'darwin' ? ['libmynah_asr.dylib']
-              : process.platform === 'win32' ? ['mynah.dll', 'libmynah_asr.dll']
+              : process.platform === 'win32' ? ['mynah_asr.dll', 'libmynah_asr.dll']
               : ['libmynah_asr.so'];
   const bases = [__dirname, path.resolve(__dirname, '..', '..'), process.cwd()];
   for (const b of bases) {
@@ -184,4 +184,4 @@ function version() {
   return fn.version();
 }
 
-module.exports = { Mynah, version, loadWav };
+module.exports = { MynahASR, version, loadWav };

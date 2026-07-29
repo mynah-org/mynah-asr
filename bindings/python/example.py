@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Python bindings example: ASR + timestamps (+ translation on AED models).
 
-Uso: make shared && python3 bindings/python/example.py <model_dir> <file.wav> [lang]
+Usage: make shared && python3 bindings/python/example.py <model_dir> <file.wav> [lang]
 """
 
 import sys
 
 from mynah_asr import MynahASR, version
 
+if len(sys.argv) < 3:
+    sys.exit("usage: python3 example.py <model_dir> <file.wav> [lang|src>tgt]")
 model_dir, wav = sys.argv[1], sys.argv[2]
 lang = sys.argv[3] if len(sys.argv) > 3 else "auto"
 
