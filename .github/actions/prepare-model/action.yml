@@ -27,7 +27,7 @@ runs:
 
     - name: Setup uv
       if: steps.model-cache.outputs.cache-hit != 'true'
-      uses: astral-sh/setup-uv@v9
+      uses: astral-sh/setup-uv@v9.0.0   # no floating v9 tag: pin the exact release (node24)
 
     - name: Download and convert the model (.nemo -> mynah), golden dump
       if: steps.model-cache.outputs.cache-hit != 'true'

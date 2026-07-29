@@ -67,7 +67,7 @@ jobs:
           model-url: ${{ env.MODEL_URL }}
 
       - name: Setup uv                # needed by test-samples (Python eval)
-        uses: astral-sh/setup-uv@v9
+        uses: astral-sh/setup-uv@v9.0.0   # no floating v9 tag: pin the exact release (node24)
 
       - name: Int8 checkpoint (exercises the quantize path)
         run: ./mynah quantize -m models/${{ env.MODEL }} --quant int8
