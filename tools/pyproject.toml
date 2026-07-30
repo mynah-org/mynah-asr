@@ -17,6 +17,12 @@ dependencies = [
 oracle = [
     "torch>=2.4",
 ]
+# Silero VAD conversion + oracle: onnx to read the graph, onnxruntime to run the
+# reference implementation itself (uv sync --extra vad). No torch needed.
+vad = [
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
 
 [tool.uv]
 package = false
