@@ -139,6 +139,68 @@ int main(int argc, char **argv) {
            fails ? "FAIL" : "OK", dur, limit, (int)(dur / limit) + 1);
     mynah_asr_set_segment_limit(m, saved_limit);
 
+    /* ---- phase 3: an EMPTY item in the middle -----------------------------
+     * A 0-sample item is not a failure, it is an empty transcription, and it must
+     * not take the rest of the batch down with it (the batch is all-or-nothing on
+     * real failures, which is a different thing). Checked in every position,
+     * because the empty one being first or last exercises different edges. */
+    float *s3 = mynah_asr_wav_load("tests/audio/test_en.wav", &n2[1], &sr2);
+    if (!s3) { fprintf(stderr, "FAIL: fixture for phase 3\n"); return 1; }
+    const size_t full = n2[1];
+    const size_t positions[3][3] = {{full, 0, full}, {0, full, full}, {full, full, 0}};
+    const char *where[3] = {"middle", "first", "last"};
+    for (int k = 0; k < 3; k++) {
+        const float *s3v[3] = {s3, s3, s3};
+        char *out3[3] = {0};
+        const int rc3 = mynah_asr_transcribe_batch(m, s3v, positions[k], 3, NULL, -1, out3, NULL);
+        int ok = rc3 == 0;
+        for (int b = 0; b < 3 && ok; b++) {
+            if (!out3[b]) ok = 0;                                  /* every slot filled */
+            else if (positions[k][b] == 0 && out3[b][0] != '\0') ok = 0;  /* empty in, empty out */
+            else if (positions[k][b] != 0 && out3[b][0] == '\0') ok = 0;  /* the others survive */
+        }
+        printf("batch empty item (%s): %s\n", where[k], ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+        for (int b = 0; b < 3; b++) free(out3[b]);
+    }
+    {   /* all three empty: still a success, three empty strings */
+        const float *s3v[3] = {s3, s3, s3};
+        const size_t none[3] = {0, 0, 0};
+        char *out3[3] = {0};
+        const int rc3 = mynah_asr_transcribe_batch(m, s3v, none, 3, NULL, -1, out3, NULL);
+        const int ok = rc3 == 0 && out3[0] && out3[1] && out3[2] &&
+                       !out3[0][0] && !out3[1][0] && !out3[2][0];
+        printf("batch all items empty: %s\n", ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+        for (int b = 0; b < 3; b++) free(out3[b]);
+    }
+
+    /* ---- phase 4: the decoder selection must survive batching -------------
+     * A hybrid switched to "ctc" used to come back with the DEFAULT engine's text
+     * in a batch (the batched encoder produces post-projector output, which that
+     * engine cannot consume, and the fallback was silent). Same call, different
+     * text, which breaks the documented contract. Now such configurations run one
+     * item at a time instead. Only meaningful on a model that HAS both heads. */
+    if (mynah_asr_set_decoder(m, "ctc") == 0) {
+        const float *s4[2] = {s3, s3};
+        const size_t n4[2] = {full, full};
+        char *ref4 = mynah_asr_transcribe(m, s3, full, "auto", -1, NULL);
+        char *out4[2] = {0};
+        const int rc4 = mynah_asr_transcribe_batch(m, s4, n4, 2, NULL, -1, out4, NULL);
+        const int ok = rc4 == 0 && ref4 && out4[0] && strcmp(ref4, out4[0]) == 0;
+        printf("batch --decoder ctc parity: %s\n", ok ? "OK" : "FAIL");
+        if (!ok) {
+            fprintf(stderr, "  single: %s\n  batch:  %s\n", ref4 ? ref4 : "(null)",
+                    out4[0] ? out4[0] : "(null)");
+            fails++;
+        }
+        free(ref4); free(out4[0]); free(out4[1]);
+        mynah_asr_set_decoder(m, "default");
+    } else {
+        printf("batch --decoder ctc parity: SKIP (this model has no CTC head)\n");
+    }
+    free(s3);
+
     mynah_asr_free(m);
     return fails ? 1 : 0;
 }

@@ -102,7 +102,12 @@ int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                            int lookahead, char **texts, char (*langs_out)[16]);
 ```
 N requests processed weight-stationary (weights read once per layer, variable-length
-packing without padding). Output identical to N `mynah_asr_transcribe` calls.
+packing without padding). Output identical to N `mynah_asr_transcribe` calls — which
+is a contract, not an aspiration: a 0-sample item transcribes to `""` without
+affecting the others, and the two configurations the batched encoder cannot serve
+identically (a hybrid switched to `"ctc"`, and `words` on an AED model) fall back to
+one item at a time rather than returning a different text. Failure is
+all-or-nothing.
 
 ## Streaming
 

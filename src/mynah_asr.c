@@ -508,6 +508,24 @@ int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                                      texts, langs_out, NULL, NULL);
 }
 
+/* Configurations the BATCHED encoder cannot serve identically to the single path:
+ *
+ *  - a hybrid model switched to "ctc": that engine consumes the RAW encoder output
+ *    and the batched forward produces the post-projector one, so the batch used to
+ *    quietly fall back to the model's default engine — same call, different text.
+ *  - words on an AED model: on the flash models asking for timestamps changes the
+ *    PROMPT and therefore the text, and on canary-1b-v2 the times come from a
+ *    second model (the aligner) run over the same audio.
+ *
+ * For these, doing the items one at a time makes the documented contract ("the same
+ * text as N mynah_asr_transcribe calls") true by construction. What is lost is only
+ * the weight-stationary speedup, in configurations that are the exception. */
+static int batch_needs_single_path(const mynah_asr_model *m, int want_words) {
+    if (m->engine->raw_encoder && m->ctc.d_in != m->enc.d_out) return 1;
+    if (want_words && m->is_aed) return 1;
+    return 0;
+}
+
 int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *samples,
                               const size_t *n_samples, int batch, const char *const *langs,
                               int lookahead, char **texts, char (*langs_out)[16],
@@ -523,6 +541,26 @@ int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *sample
         texts[b] = NULL;
         if (words) { words[b] = NULL; n_words[b] = 0; }
         if (langs_out) langs_out[b][0] = '\0';
+    }
+
+    if (batch_needs_single_path(m, words != NULL)) {
+        for (int b = 0; b < batch; b++) {
+            texts[b] = mynah_asr_transcribe_ts(m, samples[b], n_samples[b],
+                                           langs ? langs[b] : NULL, lookahead,
+                                           langs_out ? langs_out[b] : NULL,
+                                           words ? &words[b] : NULL,
+                                           words ? &n_words[b] : NULL);
+            if (!texts[b]) {            /* all-or-nothing, like the batched path */
+                for (int i = 0; i < batch; i++) {
+                    free(texts[i]);
+                    texts[i] = NULL;
+                    if (words) { mynah_asr_words_free(words[i], n_words[i]);
+                                 words[i] = NULL; n_words[i] = 0; }
+                }
+                return -1;
+            }
+        }
+        return 0;
     }
 
     /* Batching happens over SEGMENTS, not over items: an item longer than the

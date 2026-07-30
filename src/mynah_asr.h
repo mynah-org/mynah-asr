@@ -127,6 +127,17 @@ void mynah_asr_words_free(mynah_asr_word *words, int n_words);
  * splits them, so both entry points return the same text (they did not before:
  * the batch path encoded each item whole and long audio came out worse).
  *
+ * An item with 0 samples is NOT a failure: it transcribes to "" and leaves the
+ * rest of the batch alone (verified in every position by tests/test_batch.c).
+ *
+ * Two configurations cannot be batched without changing the answer, and are run one
+ * item at a time instead of quietly returning something else: a hybrid model
+ * switched to "ctc" (that engine needs the raw encoder output, the batched forward
+ * produces the projected one) and `words` on an AED model (asking for timestamps
+ * changes the prompt on the flash models, and canary-1b-v2 needs its aligner). The
+ * text is then identical to the single path by construction; only the
+ * weight-stationary speedup is lost.
+ *
  * Returns 0 on success, -1 on failure — and failure is ALL-OR-NOTHING: every
  * texts[]/words[] slot comes back NULL/0, not just the item that failed. On
  * success every texts[i] is non-NULL (possibly ""). Every output slot is
