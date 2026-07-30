@@ -60,7 +60,7 @@ class Oracle:
         self.causal = "causal" in enc["subsampling"]
         self.conv_norm = enc.get("conv_norm", "layer_norm")
         self.xscale = np.sqrt(self.d_model) if enc.get("xscaling") else 1.0
-        self.blank = dec.get("blank_id")                       # assente per AED
+        self.blank = dec.get("blank_id")                       # absent for AED
         self.max_symbols = dec.get("max_symbols_per_step")
         self.durations: list[int] = dec.get("durations", [])   # TDT; [] = RNNT
         # Nemotron-style POST-encoder prompt (Canary has "prompt" in the json but
@@ -69,7 +69,7 @@ class Oracle:
         # inv_freq of the rel pos encoding (interleaved sin/cos)
         self.inv_freq = 1.0 / (10000.0 ** (np.arange(0, self.d_model, 2, dtype=np.float64) / self.d_model))
 
-        # alias nomi subsampling: Nemotron usa conv_in/layers.{i}.{depthwise,pointwise}_conv,
+        # subsampling name aliases: Nemotron uses conv_in/layers.{i}.{depthwise,pointwise}_conv,
         # the HF port of Parakeet a flat Sequential layers.{0,2,3,5,6}
         if "encoder.subsampling.conv_in.weight" in self.w:
             self.ss_names = {
@@ -98,7 +98,7 @@ class Oracle:
         C_out = weight.shape[0]
         To = (T - k) // stride + 1
         Fo = (F - k) // stride + 1
-        # im2col semplice (oracolo: chiarezza > velocità)
+        # simple im2col (oracle: clarity > speed)
         out = np.zeros((C_out, To, Fo), dtype=np.float64)
         if groups == 1:
             cols = np.zeros((C_in * k * k, To * Fo))
@@ -137,7 +137,7 @@ class Oracle:
 
     # ---------------------------------------------------------------- encoder
     def rel_pos_emb(self, L: int) -> np.ndarray:
-        """[2L-1, d_model], posizioni L-1 .. -(L-1), interleaved [sin, cos, ...]."""
+        """[2L-1, d_model], positions L-1 .. -(L-1), interleaved [sin, cos, ...]."""
         pos = np.arange(L - 1, -L, -1, dtype=np.float64)
         freqs = pos[:, None] * self.inv_freq[None, :]                  # [2L-1, d/2]
         emb = np.stack([np.sin(freqs), np.cos(freqs)], axis=-1).reshape(2 * L - 1, self.d_model)
@@ -152,7 +152,7 @@ class Oracle:
         return bd
 
     def _attn_mask(self, T: int, left: int, right: int) -> np.ndarray:
-        """Mask booleana chunked_limited [T, T] (True = visibile)."""
+        """Boolean chunked_limited mask [T, T] (True = visible)."""
         chunk = right + 1
         lc = left // chunk
         q = np.arange(T)[:, None] // chunk
@@ -246,7 +246,7 @@ class Oracle:
 
     def encode(self, feats: np.ndarray, prompt_id: int | None, lookahead: int | None = None,
                dumps: dict | None = None) -> np.ndarray:
-        """feats [T_mel, n_mels] validi -> enc [T_enc, 640] (dopo prompt + projector)."""
+        """Valid feats [T_mel, n_mels] -> enc [T_enc, 640] (after prompt + projector)."""
         w = self.w
         x = self.subsampling(feats)
         if dumps is not None:
@@ -316,7 +316,7 @@ class Oracle:
         if self.cfg["decoder"]["type"] == "aed_transformer":
             return self.greedy_decode_aed(enc)
         if self.cfg["decoder"]["type"] == "ctc":
-            return self.greedy_decode_ctc(enc)   # CTC puro: enc = encoder out
+            return self.greedy_decode_ctc(enc)   # pure CTC: enc = encoder out
         if self.durations:
             return self.greedy_decode_tdt(enc)
         H = self.cfg["decoder"]["pred_hidden"]
@@ -324,7 +324,7 @@ class Oracle:
         head_w = self.w["joint.head.weight"].astype(np.float64)
         head_b = self.w["joint.head.bias"].astype(np.float64)
 
-        g, state = self._pred_step(self.blank, zeros())   # primo step: input blank, stato zero
+        g, state = self._pred_step(self.blank, zeros())   # first step: blank input, zero state
         tokens: list[int] = []
         for t in range(enc.shape[0]):
             emitted = 0
@@ -355,12 +355,12 @@ class Oracle:
 
     def greedy_decode_tdt(self, enc: np.ndarray) -> list[int]:
         """Greedy TDT over enc [T, 640] (ParakeetTDTGenerationMixin): at each step the joint
-        predice token (argmax sui primi V logit, blank incluso) E duration (argmax sugli
-        last len(durations)); the frame pointer advances by the duration at EVERY step
-        (blank con duration 0 -> forzata a 1); lo stato LSTM avanza solo su non-blank.
+        predicts a token (argmax over the first V logits, blank included) AND a duration
+        (argmax over the last len(durations)); the frame pointer advances by the duration at
+        EVERY step (blank with duration 0 -> forced to 1); the LSTM state advances on non-blank only.
         Per-frame max_symbols guard as in NeMo (forces progress on a dur=0 loop)."""
         H = self.cfg["decoder"]["pred_hidden"]
-        V = self.cfg["decoder"]["vocab_size"]              # 8193, blank incluso
+        V = self.cfg["decoder"]["vocab_size"]              # 8193, blank included
         zeros = lambda: [(np.zeros(H), np.zeros(H)) for _ in range(self.cfg["decoder"]["pred_layers"])]
         head_w = self.w["joint.head.weight"].astype(np.float64)
         head_b = self.w["joint.head.bias"].astype(np.float64)
@@ -377,9 +377,9 @@ class Oracle:
                 g, state = self._pred_step(k, state)
                 emitted_here += 1
                 if dur == 0 and emitted_here >= self.max_symbols:
-                    dur = 1                                # sblocca il frame (NeMo)
+                    dur = 1                                # unblocks the frame (NeMo)
             elif dur == 0:
-                dur = 1                                    # blank: avanzamento minimo 1
+                dur = 1                                    # blank: advance at least 1
             if dur > 0:
                 emitted_here = 0
             t += dur
@@ -389,7 +389,7 @@ class Oracle:
     def aed_prompt_ids(self, source_lang: str, target_lang: str) -> list[int]:
         """canary2 prompt as global ids; empty slots (decodercontext) = 0 tokens."""
         pr = self.cfg["prompt"]
-        piece_id = {p: i for i, p in reversed(list(enumerate(self.pieces)))}  # prima occorrenza vince
+        piece_id = {p: i for i, p in reversed(list(enumerate(self.pieces)))}  # first occurrence wins
         slots = dict(pr["defaults"])
         slots["source_lang"] = f"<|{source_lang}|>"
         slots["target_lang"] = f"<|{target_lang}|>"
@@ -401,8 +401,8 @@ class Oracle:
         return ids
 
     def _aed_mha(self, x_q, x_kv, prefix: str, causal: bool):
-        """MultiHeadAttention NeMo (transformer_modules): q e k divisi per dk^(1/4)
-        ciascuno (= scaling 1/sqrt(dk) sugli score), proiezioni con bias."""
+        """NeMo MultiHeadAttention (transformer_modules): q and k each divided by
+        dk^(1/4) (= 1/sqrt(dk) scaling on the scores), projections with bias."""
         w = self.w
         dec = self.cfg["decoder"]
         H, d = dec["n_heads"], dec["d_model"]
@@ -424,7 +424,7 @@ class Oracle:
         return out @ w[prefix + "o_proj.weight"].T.astype(np.float64) + w[prefix + "o_proj.bias"]
 
     def _aed_forward(self, ids: list[int], enc: np.ndarray) -> np.ndarray:
-        """Decoder Transformer pre-LN sull'intera sequenza (oracolo: chiarezza).
+        """Pre-LN Transformer decoder over the whole sequence (oracle: clarity).
         Returns the logits of the LAST position."""
         w = self.w
         dec = self.cfg["decoder"]
@@ -445,7 +445,7 @@ class Oracle:
 
     def greedy_decode_aed(self, enc_out: np.ndarray, source_lang: str = "en",
                           target_lang: str | None = None) -> list[int]:
-        """Greedy AED: enc_out [T, d_enc] -> proiezione -> loop autoregressivo
+        """Greedy AED: enc_out [T, d_enc] -> projection -> autoregressive loop
         with the canary2 prompt; stops at <|endoftext|> or on the length guard."""
         w = self.w
         dec = self.cfg["decoder"]
@@ -465,7 +465,7 @@ class Oracle:
             ids.append(k)
         return ids[len(prompt):]
 
-    # ------------------------------------------------------------------ testo
+    # ------------------------------------------------------------------- text
     def detokenize(self, tokens: list[int]) -> tuple[str, str | None]:
         """Text + language tag (None when the model does not emit them, e.g. Parakeet)."""
         lang = None

@@ -11,7 +11,7 @@
 #include "../src/qmat.h"
 
 static unsigned long rng_state = 42;
-static float frand(void) { /* xorshift, riproducibile ovunque */
+static float frand(void) { /* xorshift, reproducible everywhere */
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
@@ -57,12 +57,12 @@ static int check(const char *name, int qtype, int n, int k, int T, double tol) {
 
 int main(void) {
     int fails = 0;
-    /* small-T: percorso dot diretto (SDOT/VNNI/AVX2/NEON) */
+    /* small-T: direct dot path (SDOT/VNNI/AVX2/NEON) */
     fails += check("q8 small-T", MYNAH_ASR_Q_INT8, 96, 1024, 1, 0.03);
     fails += check("q8 small-T multi", MYNAH_ASR_Q_INT8, 64, 4096, 4, 0.03);
     fails += check("q4 small-T", MYNAH_ASR_Q_INT4, 96, 1024, 1, 0.08);
     fails += check("q4 small-T multi", MYNAH_ASR_Q_INT4, 64, 4096, 4, 0.08);
-    /* T grande: percorso dequant+GEMM */
+    /* large T: dequant+GEMM path */
     fails += check("q8 large-T", MYNAH_ASR_Q_INT8, 96, 1024, 48, 0.02);
     fails += check("q4 large-T", MYNAH_ASR_Q_INT4, 96, 1024, 48, 0.08);
     /* f32 passthrough */

@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
     const int same = strcmp(offline, stream_text) == 0;
     printf("streaming  offline : %s\n", offline);
     printf("streaming  chunked : %s\n", stream_text);
-    printf("streaming parity: %s\n", same ? "IDENTICI OK" : "DIVERSI FAIL");
+    printf("streaming parity: %s\n", same ? "IDENTICAL OK" : "DIFFERENT FAIL");
 
     free(offline); free(audio); mynah_asr_free(m);
     return same ? 0 : 1;

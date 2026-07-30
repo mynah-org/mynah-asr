@@ -18,7 +18,7 @@
 
 typedef struct mynah_asr_gguf mynah_asr_gguf;
 
-mynah_asr_gguf *mynah_asr_gguf_open(const char *path);   /* NULL su errore (stderr) */
+mynah_asr_gguf *mynah_asr_gguf_open(const char *path);   /* NULL on error (stderr) */
 void mynah_asr_gguf_close(mynah_asr_gguf *g);
 
 /* Internal tensor array (lives as long as the handle). */

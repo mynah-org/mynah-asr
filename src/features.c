@@ -3,7 +3,7 @@
 
 #include <math.h>
 
-#ifndef M_PI                       /* non-ISO: glibc lo nasconde con -std=c11 */
+#ifndef M_PI                       /* non-ISO: glibc hides it with -std=c11 */
 #define M_PI 3.14159265358979323846
 #endif
 #include <stdio.h>
@@ -56,7 +56,7 @@ static void mel_ranges(const mynah_asr_feat_cfg *cfg, int *lo, int *hi) {
                 if (b < a) a = b;
                 z = b + 1;
             }
-        lo[m] = a; hi[m] = z;   /* [lo, hi); filtro tutto-zero: lo >= hi */
+        lo[m] = a; hi[m] = z;   /* [lo, hi); all-zero filter: lo >= hi */
     }
 }
 
@@ -218,7 +218,7 @@ static void mel_stream_compact(mynah_asr_mel_stream *ms) {
     if (drop >= ms->buf_len) {
         ms->base += ms->buf_len;
         ms->buf_len = 0;
-        ms->base = (size_t)min_keep; /* buffer vuoto: riallinea */
+        ms->base = (size_t)min_keep; /* empty buffer: realign */
         return;
     }
     memmove(ms->buf, ms->buf + drop, (ms->buf_len - drop) * sizeof(double));

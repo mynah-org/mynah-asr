@@ -123,7 +123,7 @@ static const char *SHADER_SRC =
     "}\n"
     /* softmax with rel_shift in closed form and the chunked_limited window
        (chunk == 0 -> full attention, offline models).
-       scores [H,T,K] (ac), bd [H,T,P]; P = 2L-1, gq = cached + t (qui cached=0). */
+       scores [H,T,K] (ac), bd [H,T,P]; P = 2L-1, gq = cached + t (here cached=0). */
     "kernel void smax_shift(device half *sc [[buffer(0)]], device const half *bd [[buffer(1)]],\n"
     "                       constant uint &T [[buffer(2)]], constant uint &K [[buffer(3)]],\n"
     "                       constant uint &P [[buffer(4)]], constant float &scale [[buffer(5)]],\n"
@@ -579,7 +579,7 @@ static void encode_att16(id<MTLCommandBuffer> cb, id<MTLBuffer> xn, id<MTLBuffer
         encode_gemm(cb, qvh, rkh, bdh, T, P, dk);
     }
 
-    {   /* softmax + rel_shift + finestra */
+    {   /* softmax + rel_shift + windowing */
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         const uint32_t Tu = (uint32_t)T, Ku = (uint32_t)K, Pu = (uint32_t)P;
         /* left < 0: full attention -> chunk 0 (whole window inside the shader) */
@@ -802,7 +802,7 @@ int mynah_asr_metal_encoder_layers(const mynah_asr_metal_layer_w *Ls, int n_laye
     }
     pthread_mutex_unlock(&g_mu);
     if (getenv("MYNAH_ASR_METAL_PROF"))
-        fprintf(stderr, "metal v4: funzione intera %.3fs\n",
+        fprintf(stderr, "metal v4: whole function %.3fs\n",
                 CFAbsoluteTimeGetCurrent() - tf0);
     return rc;
 }

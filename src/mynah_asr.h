@@ -22,8 +22,8 @@ extern "C" {
  * text is UTF-8 and only valid for the duration of the callback. */
 typedef struct {
     const char *text;      /* text of the segment/partial                   */
-    double      t0, t1;    /* finestra temporale in secondi (se disponibile) */
-    bool        is_final;  /* false = partial (può cambiare), true = commit  */
+    double      t0, t1;    /* time window in seconds (when available) */
+    bool        is_final;  /* false = partial (may still change), true = commit */
     const char *lang;      /* detected language tag, NULL when unavailable   */
 } mynah_asr_result;
 
@@ -84,7 +84,7 @@ char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_sa
  * resolution = 1 encoder frame, typically 80 ms). */
 typedef struct {
     char  *word;           /* UTF-8, markers stripped (malloc'd) */
-    double t0, t1;         /* secondi dall'inizio dell'audio   */
+    double t0, t1;         /* seconds from the start of audio  */
 } mynah_asr_word;
 
 /* Like mynah_asr_transcribe, and additionally writes into *words a malloc'd array

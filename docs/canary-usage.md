@@ -16,7 +16,7 @@ Output language ≠ source language = translation:
 
 ```sh
 ./mynah-asr transcribe -m models/canary-1b-v2 -i italian.wav --lang it --target-lang en
-# API: mynah_asr_set_target_lang(m, "en")  o  lang "it>en" per-chiamata (thread-safe)
+# API: mynah_asr_set_target_lang(m, "en")  or  lang "it>en" per-call (thread-safe)
 # server: POST /v1/audio/translations  (target_language, default en)
 ```
 

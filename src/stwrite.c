@@ -41,7 +41,7 @@ int mynah_asr_stw_add(mynah_asr_stw *w, const char *name, const char *dtype,
     return 0;
 }
 
-/* Append printf-style in *buf a partire da *len, facendo crescere *cap quando
+/* Printf-style append into *buf starting at *len, growing *cap when
  * needed. The return value of vsnprintf is ALWAYS compared against the remaining
  * space BEFORE advancing *len: no silent truncation and no (cap - len) arithmetic
  * that could underflow. Returns 0, or -1 on OOM. */
@@ -53,7 +53,7 @@ static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ..
         va_end(ap);
         if (need < 0) return -1;
         if ((size_t)need < *cap - *len) { *len += (size_t)need; return 0; }
-        /* troncato: raddoppia finché entra (need + NUL) e riprova */
+        /* truncated: double until it fits (need + NUL) and retry */
         size_t ncap = *cap ? *cap : 256;
         while (ncap <= *len + (size_t)need) ncap *= 2;
         char *nb = realloc(*buf, ncap);
@@ -64,9 +64,9 @@ static int stw_appendf(char **buf, size_t *cap, size_t *len, const char *fmt, ..
 }
 
 int mynah_asr_stw_write(mynah_asr_stw *w, const char *path) {
-    /* hand-built JSON header: the names are controlled (HF tensors), so no escaping
-     * exotic to handle. The buffer grows on its own through stw_appendf, so the
-     * initial capacity is only an estimate. */
+    /* hand-built JSON header: the names are controlled (HF tensors), so there is
+     * no exotic escaping to handle. The buffer grows on its own through
+     * stw_appendf, so the initial capacity is only an estimate. */
     size_t hcap = 256 + w->n * 256;
     char *hdr = malloc(hcap);
     if (!hdr) return -1;

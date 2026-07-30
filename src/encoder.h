@@ -78,7 +78,7 @@ float *mynah_asr_encoder_forward_raw(const mynah_asr_encoder *enc, const float *
  * the per-frame GEMMs (FFN, projections — >95% of the FLOPs) run over [ΣT, d]
  * reading the weights ONCE; attention and conv (per-sequence) iterate over the
  * segments.
- * outs[b] riceve un buffer malloc [t_outs[b], d_out] (caller free). 0 = ok. */
+ * outs[b] receives a malloc'd buffer [t_outs[b], d_out] (caller frees). 0 = ok. */
 int mynah_asr_encoder_forward_batch(const mynah_asr_encoder *enc, const float *const *feats,
                                 const int *t_mel, int batch, int n_mels,
                                 const int *prompt_ids, int left_ctx, int right_ctx,
@@ -95,10 +95,10 @@ typedef struct {
     mynah_asr_ss_stream ss;
     float *k_cache, *v_cache;   /* [n_layers, left, d_model] */
     float *conv_cache;          /* [n_layers, conv_k-1, d_model] */
-    int left, right, q;         /* q = right+1 frame encoder per chunk */
+    int left, right, q;         /* q = right+1 encoder frames per chunk */
     int cache_valid;            /* valid frames in the K/V cache (0..left) */
     /* hot-path scratch, ONE malloc at init (zero mallocs per chunk):
-     * puntatori ritagliati da scr. Dimensionati su Qmax = q+2, Kmax = left+Qmax. */
+     * pointers carved out of scr. Sized for Qmax = q+2, Kmax = left+Qmax. */
     float *scr;
     float *sx, *stmp, *stmp2, *sxn, *skn;                    /* step */
     int sa_pe_K;                /* K of the last computed pos-emb (0 = never) */
@@ -111,10 +111,10 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
                           int left_ctx, int right_ctx, int n_mels);
 void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es);
 
-/* Frame mel richiesti dal prossimo chunk (primo: 1+8r, poi 8(r+1)). */
+/* Mel frames required by the next chunk (first: 1+8r, then 8(r+1)). */
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es);
 
-/* mel chunk [n_mel, n_mels] esatto -> out [q, d_out] (buffer caller >= q*d_out).
+/* Exact mel chunk [n_mel, n_mels] -> out [q, d_out] (caller buffer >= q*d_out).
  * Returns the number of encoder frames produced, -1 on error. */
 int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_mel,
                           int n_mels, int prompt_id, int is_last, float *out);

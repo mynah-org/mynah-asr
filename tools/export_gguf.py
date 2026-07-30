@@ -30,7 +30,7 @@ def gguf_string(s: str) -> bytes:
 
 
 def quantize_q8_0(x: np.ndarray) -> bytes:
-    """Blocchi da 32: d f16 + 32 int8 (q = round(x/d), d = amax/127)."""
+    """Blocks of 32: d f16 + 32 int8 (q = round(x/d), d = amax/127)."""
     blocks = x.reshape(-1, 32).astype(np.float32)
     amax = np.abs(blocks).max(axis=1)
     d = amax / 127.0
@@ -44,10 +44,10 @@ def quantize_q8_0(x: np.ndarray) -> bytes:
 
 
 def quantize_q4_0(x: np.ndarray) -> bytes:
-    """Blocchi da 32: d f16 + 16 byte nibble (ggml: d = max_signed/-8)."""
+    """Blocks of 32: d f16 + 16 nibble bytes (ggml: d = max_signed/-8)."""
     blocks = x.reshape(-1, 32).astype(np.float32)
     idx = np.abs(blocks).argmax(axis=1)
-    maxs = blocks[np.arange(blocks.shape[0]), idx]          # col segno, come ggml
+    maxs = blocks[np.arange(blocks.shape[0]), idx]          # signed, like ggml
     d = maxs / -8.0
     inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1), 0)
     q = np.clip(np.round(blocks * inv[:, None]) + 8, 0, 15).astype(np.uint8)
@@ -60,23 +60,23 @@ def quantize_q4_0(x: np.ndarray) -> bytes:
 
 
 def quantize_q4_k(x: np.ndarray) -> bytes:
-    """Super-blocchi da 256 (8 sotto-blocchi da 32): x = d*sc*q - dmin*m.
+    """Super-blocks of 256 (8 sub-blocks of 32): x = d*sc*q - dmin*m.
     A simple non-iterative quantizer (ggml uses a finer search): enough
     to validate the C dequant layout against the oracle rule."""
     blocks = x.reshape(-1, 8, 32).astype(np.float64)
     lo = np.minimum(blocks.min(axis=2), 0.0)              # m_j >= 0
     hi = np.maximum(blocks.max(axis=2), 0.0)
-    scale = (hi - lo) / 15.0                              # per sotto-blocco
+    scale = (hi - lo) / 15.0                              # per sub-block
     mins = -lo
     d = scale.max(axis=1) / 63.0                          # super-block globals
     dmin = mins.max(axis=1) / 63.0
-    d16 = d.astype(np.float16).astype(np.float64)         # arrotonda come su file
+    d16 = d.astype(np.float16).astype(np.float64)         # round as stored on file
     dmin16 = dmin.astype(np.float16).astype(np.float64)
     sc6 = np.where(d16[:, None] > 0, np.round(scale / np.where(d16[:, None] > 0, d16[:, None], 1)), 0)
     mn6 = np.where(dmin16[:, None] > 0, np.round(mins / np.where(dmin16[:, None] > 0, dmin16[:, None], 1)), 0)
     sc6 = np.clip(sc6, 0, 63).astype(np.uint8)
     mn6 = np.clip(mn6, 0, 63).astype(np.uint8)
-    eff_d = d16[:, None] * sc6                            # scala/min effettivi
+    eff_d = d16[:, None] * sc6                            # effective scale/min
     eff_m = dmin16[:, None] * mn6
     q = np.where(eff_d[:, :, None] > 0,
                  np.round((blocks + eff_m[:, :, None]) / np.where(eff_d[:, :, None] > 0, eff_d[:, :, None], 1)), 0)
@@ -89,7 +89,7 @@ def quantize_q4_k(x: np.ndarray) -> bytes:
             scales[j + 4] = mn6[b, j] | ((mn6[b, j + 4] >> 4) << 6)
             scales[j + 8] = (sc6[b, j + 4] & 0x0F) | ((mn6[b, j + 4] & 0x0F) << 4)
         qs = bytearray()
-        for grp in range(4):                              # 4 gruppi da 64: i | i+32
+        for grp in range(4):                              # 4 groups of 64: i | i+32
             g = q[b, 2 * grp : 2 * grp + 2].reshape(64)
             qs += (g[:32] | (g[32:] << 4)).astype(np.uint8).tobytes()
         out += np.float16(d16[b]).tobytes() + np.float16(dmin16[b]).tobytes() + scales + qs
@@ -103,7 +103,7 @@ def encode_tensor(x: np.ndarray, dtype: str) -> tuple[int, bytes]:
         # (llama.cpp style; quantizing running_var breaks BatchNorm's 1/sqrt(var))
         dtype = "f32"
     if dtype == "q4_k" and x.shape[-1] % 256 != 0:
-        dtype = "q8_0"                      # fallback K-quant (come llama.cpp)
+        dtype = "q8_0"                      # K-quant fallback (like llama.cpp)
     if dtype == "f32":
         return GGML["f32"], x.tobytes()
     if dtype == "f16":
@@ -146,7 +146,7 @@ def main() -> int:
         ggml_type, blob = encode_tensor(x, args.dtype)
         while len(payload) % ALIGN != 0:
             payload += b"\0"
-        dims = list(x.shape)[::-1] or [1]   # convenzione ggml: ne[0] = la più veloce
+        dims = list(x.shape)[::-1] or [1]   # ggml convention: ne[0] = the fastest-moving
         infos += gguf_string(tname) + struct.pack("<I", len(dims))
         for d in dims:
             infos += struct.pack("<Q", d)

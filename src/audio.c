@@ -2,7 +2,7 @@
 
 #include <math.h>
 
-#ifndef M_PI                       /* non-ISO: glibc lo nasconde con -std=c11 */
+#ifndef M_PI                       /* non-ISO: glibc hides it with -std=c11 */
 #define M_PI 3.14159265358979323846
 #endif
 #include <stdio.h>
@@ -18,7 +18,7 @@ static uint16_t rd_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8))
 float *mynah_asr_wav_parse(const unsigned char *data, size_t len, size_t *n_samples,
                        int *sample_rate) {
     if (len < 44 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
-        fprintf(stderr, "audio: non è un WAV RIFF\n");
+        fprintf(stderr, "audio: not a RIFF WAV file\n");
         return NULL;
     }
     int channels = 0, bits = 0, sr = 0;
@@ -44,7 +44,7 @@ float *mynah_asr_wav_parse(const unsigned char *data, size_t len, size_t *n_samp
             pcm = body;
             pcm_len = sz;
         }
-        off += 8 + sz + (sz & 1); /* chunk dispari: pad byte */
+        off += 8 + sz + (sz & 1); /* odd-sized chunk: pad byte */
     }
 
     if (!pcm || channels <= 0 || bits != 16) {
@@ -57,8 +57,8 @@ float *mynah_asr_wav_parse(const unsigned char *data, size_t len, size_t *n_samp
     float *out = malloc(frames * sizeof(float));
     if (!out) return NULL;
 
-    /* lettura per byte (LE): un chunk data a offset dispari renderebbe il cast
-     * a int16_t* disallineato (UB tecnico, ultima voce dell'audit 2026-07-18) */
+    /* byte-wise read (LE): a data chunk at an odd offset would make the cast
+     * to int16_t* misaligned (technical UB, last item of the 2026-07-18 audit) */
     const uint8_t *s = pcm;
     for (size_t i = 0; i < frames; i++) {
         int32_t acc = 0;
@@ -110,7 +110,7 @@ float *mynah_asr_resample(const float *in, size_t n_in, int sr_in, int sr_out, s
     if (!out) return NULL;
 
     for (size_t i = 0; i < N; i++) {
-        const double center = (double)i / ratio;   /* posizione nel segnale sorgente */
+        const double center = (double)i / ratio;   /* position in the source signal */
         const long i0 = (long)floor(center) - taps + 1;
         double acc = 0.0, wsum = 0.0;
         for (long j = i0; j < i0 + 2 * taps; j++) {

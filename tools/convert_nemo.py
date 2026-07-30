@@ -34,7 +34,7 @@ from safetensors.numpy import save_file
 
 # ---------------------------------------------------------------- mel filters
 def hz_to_mel_slaney(f: np.ndarray) -> np.ndarray:
-    """Scala mel 'slaney' (librosa/torchaudio htk=False): lineare sotto 1 kHz."""
+    """'slaney' mel scale (librosa/torchaudio htk=False): linear below 1 kHz."""
     f = np.asarray(f, dtype=np.float64)
     mel = 3.0 * f / 200.0
     log_region = f >= 1000.0
@@ -54,7 +54,7 @@ def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sampl
     """Clone of torchaudio.functional.melscale_fbanks(norm='slaney', mel_scale='slaney').
 
     Identical to the NeMo construction (librosa htk=False, norm slaney); see
-    docs/prior-art.md §B.2 (onnx-asr la valida vs NeMo con atol 5e-7).
+    docs/prior-art.md §B.2 (onnx-asr validates it vs NeMo with atol 5e-7).
     Returns [n_freqs, n_mels] float64.
     """
     all_freqs = np.linspace(0.0, sample_rate // 2, n_freqs, dtype=np.float64)
@@ -72,9 +72,9 @@ def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sampl
 def load_pieces(model_dir: Path, vocab_size: int, blank_id: int, blank_token: str) -> list[str]:
     """Extract the id -> piece array from tokenizer.json (HF tokenizers format).
 
-    Nota (verificato sul checkpoint): il tokenizer.json elenca <pad>=13087 e <blank>=13088,
+    Note (verified on the checkpoint): tokenizer.json lists <pad>=13087 and <blank>=13088,
     but in the model's output space (joint = vocab_size=13088 logits, blank_as_pad)
-    l'id 13087 È il blank/pad e 13088 non esiste. Normalizziamo: pieces[blank_id]=blank_token,
+    id 13087 IS the blank/pad and 13088 does not exist. We normalize: pieces[blank_id]=blank_token,
     added tokens beyond vocab_size are ignored.
     """
     tok = json.loads((model_dir / "tokenizer.json").read_text())
@@ -183,7 +183,7 @@ def build_parakeet_tdt(model_dir: Path, cfg: dict, proc: dict) -> dict:
             "n_heads": enc["num_attention_heads"],
             "ffn_dim": enc["intermediate_size"],
             "conv_kernel": enc["conv_kernel_size"],
-            "conv_norm": "batch_norm",                # foldata in scale+shift al load
+            "conv_norm": "batch_norm",                # folded into scale+shift at load
             "subsampling": "dw_striding",             # NOT causal: symmetric padding
             "subsampling_factor": enc["subsampling_factor"],
             "subsampling_conv_channels": enc["subsampling_conv_channels"],
@@ -215,7 +215,7 @@ BUILDERS = {
 }
 
 
-# ------------------------------------------------------------- ingresso .nemo
+# ---------------------------------------------------------------- .nemo input
 # NeMo -> canonical rename (the HF port naming, the one the runtime reads).
 # Verified on parakeet-tdt_ctc-110m (docs/parakeet-tdt-arch.md for the v3 map).
 _NEMO_RENAMES = [
@@ -260,7 +260,7 @@ _AED_RENAMES = [
 
 
 def rename_nemo_key(k: str) -> str | None:
-    """None = tensore da saltare (preprocessor, stats inutili, head CTC ausiliaria)."""
+    """None = tensor to skip (preprocessor, useless stats, auxiliary CTC head)."""
     if k.startswith("preprocessor.") or k.endswith("num_batches_tracked"):
         return None
     if k.startswith(("transf_decoder.", "log_softmax.", "encoder_decoder_proj.")):
@@ -288,7 +288,7 @@ def yaml_features_section(fe: dict) -> dict:
         "n_fft": fe["n_fft"],
         "win_length": round(fe["window_size"] * sr),
         "hop_length": round(fe["window_stride"] * sr),
-        "preemphasis": 0.97,                 # default NeMo (assente nello yaml)
+        "preemphasis": 0.97,                 # NeMo default (absent from the yaml)
         "log_zero_guard": 2.0 ** -24,
         "normalize": fe["normalize"],
         "dither": 0.0,
@@ -299,7 +299,7 @@ def yaml_features_section(fe: dict) -> dict:
 def yaml_encoder_section(enc: dict) -> dict:
     assert enc.get("att_context_style", "regular") == "regular" \
         and not enc.get("causal_downsampling", False), \
-        "solo encoder offline non-causali da .nemo (per ora)"
+        "only non-causal offline encoders from .nemo (for now)"
     return {
         "n_layers": enc["n_layers"],
         "d_model": enc["d_model"],
@@ -310,7 +310,7 @@ def yaml_encoder_section(enc: dict) -> dict:
         "subsampling": enc["subsampling"],            # dw_striding (non-causal)
         "subsampling_factor": enc["subsampling_factor"],
         "subsampling_conv_channels": enc["subsampling_conv_channels"],
-        "use_bias": enc.get("use_bias", True),        # default NeMo: bias presenti
+        "use_bias": enc.get("use_bias", True),        # NeMo default: biases present
         "activation": "silu",
         "att_context_style": enc.get("att_context_style", "regular"),
         "pos_emb_max_len": enc["pos_emb_max_len"],
@@ -358,9 +358,9 @@ def build_parakeet_ctc_from_yaml(model_dir: Path, y: dict) -> dict:
         "encoder": yaml_encoder_section(y["encoder"]),
         "decoder": {
             "type": "ctc",
-            "vocab_size": y["decoder"]["num_classes"] + 1,  # + blank (ultimo indice)
+            "vocab_size": y["decoder"]["num_classes"] + 1,  # + blank (last index)
             "blank_id": y["decoder"]["num_classes"],
-            "max_symbols_per_step": 1,                      # n/a per CTC
+            "max_symbols_per_step": 1,                      # n/a for CTC
         },
         "tokenizer": {"type": "spe_bpe", "pieces": "tokens.json"},
     }
@@ -382,7 +382,7 @@ def build_canary_from_yaml(model_dir: Path, y: dict) -> dict:
     langs = ([l for l in y["tokenizer"]["langs"] if l != "spl_tokens"]
              if y["tokenizer"].get("type") == "agg" else CANARY_V2_LANGS)
     slots = y["prompt_defaults"][0]["slots"]
-    assert y["prompt_format"] == "canary2", f"prompt_format non supportato: {y['prompt_format']}"
+    assert y["prompt_format"] == "canary2", f"unsupported prompt_format: {y['prompt_format']}"
     assert dcfg["pre_ln"] and dcfg["hidden_act"] == "relu"
     return {
         "mynah_asr_format": 1,
@@ -457,7 +457,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
 
     def member(suffix: str) -> str:
         hits = [n for n in names if n.endswith(suffix)]
-        if len(hits) > 1:   # es. v2: model_config.yaml + timestamps_asr_model_config.yaml
+        if len(hits) > 1:   # e.g. v2: model_config.yaml + timestamps_asr_model_config.yaml
             exact = [n for n in hits if n.rsplit("/", 1)[-1] == suffix]
             if exact:
                 hits = exact
@@ -485,7 +485,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
         nk = rename_nemo_key(k)
         if nk is None:
             continue
-        assert nk not in tensors, f"rename duplicato: {k} -> {nk}"
+        assert nk not in tensors, f"duplicate rename: {k} -> {nk}"
         tensors[nk] = v.float().numpy()
     save_file(tensors, model_dir / "model.safetensors")
 
@@ -506,7 +506,7 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
         need += [f"<|{l}|>" for l in mynah["prompt"]["languages"]]
         need += [v for v in mynah["prompt"]["defaults"].values() if v]
         missing = [t for t in need if t not in pset]
-        assert not missing, f"token assenti dal vocab: {missing}"
+        assert not missing, f"tokens missing from the vocab: {missing}"
     else:
         # pieces from the yaml (in id order) + blank appended last
         vocab = ycfg.get("joint", {}).get("vocabulary") or ycfg["decoder"]["vocabulary"]
@@ -515,13 +515,13 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
     (model_dir / "tokens.json").write_text(json.dumps(pieces, ensure_ascii=False))
     (model_dir / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
     print(f"OK {model_dir.name} [{mynah['engine']}] from .nemo: {len(tensors)} tensors "
-          f"f32, {len(pieces)} pieces, mel fb {fb.shape} dal checkpoint")
+          f"f32, {len(pieces)} pieces, mel fb {fb.shape} from the checkpoint")
 
 
 def convert(model_dir: Path) -> None:
     if not (model_dir / "config.json").exists():
         nemos = sorted(model_dir.glob("*.nemo"))
-        assert nemos, f"{model_dir}: ne' config.json (porting HF) ne' archivio .nemo"
+        assert nemos, f"{model_dir}: neither config.json (HF port) nor a .nemo archive"
         convert_from_nemo(model_dir, nemos[0])
         return
     cfg = json.loads((model_dir / "config.json").read_text())
@@ -530,7 +530,7 @@ def convert(model_dir: Path) -> None:
     fe = proc["feature_extractor"]
 
     builder = BUILDERS.get(cfg["model_type"])
-    assert builder, f"model_type non supportato: {cfg['model_type']} (noti: {list(BUILDERS)})"
+    assert builder, f"unsupported model_type: {cfg['model_type']} (known: {list(BUILDERS)})"
     assert fe["feature_size"] == cfg["encoder_config"]["num_mel_bins"]
 
     mynah = builder(model_dir, cfg, proc)
@@ -540,7 +540,7 @@ def convert(model_dir: Path) -> None:
     pieces = load_pieces(model_dir, vocab_size, blank_id, tok_cfg.get("blank_token", "<blank>"))
 
     fb = melscale_fbanks(fe["n_fft"] // 2 + 1, 0.0, fe["sampling_rate"] / 2, fe["feature_size"], fe["sampling_rate"])
-    window = np.hanning(fe["win_length"])  # simmetrica, come torch.hann_window(periodic=False)
+    window = np.hanning(fe["win_length"])  # symmetric, like torch.hann_window(periodic=False)
 
     (model_dir / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
     (model_dir / "tokens.json").write_text(json.dumps(pieces, ensure_ascii=False))

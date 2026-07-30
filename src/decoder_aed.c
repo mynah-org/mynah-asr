@@ -140,7 +140,7 @@ int mynah_asr_aed_decode(const mynah_asr_aed *a, const float *enc, int T,
                      const int *prompt, int n_prompt, int eos,
                      int *tokens, int cap) {
     const int d = a->d, H = a->n_heads, dk = d / H, nl = a->n_layers;
-    if (n_prompt <= 0 || !prompt) return -1;   /* serve almeno un token di avvio */
+    if (n_prompt <= 0 || !prompt) return -1;   /* at least one start token needed */
     /* generation budget = the caller's cap (it knows whether timestamps are on) */
     int max_len = n_prompt + cap;
     if (max_len > a->max_seq) max_len = a->max_seq;

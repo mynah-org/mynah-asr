@@ -22,24 +22,24 @@ const char *mynah_asr_version(void) { return MYNAH_ASR_VERSION; }
 #define MYNAH_ASR_AED_PROMPT_MAX 16
 
 struct mynah_asr_model {
-    cJSON *cfg;                     /* mynah.json (vivo per il prompt dictionary) */
+    cJSON *cfg;                     /* mynah.json (kept alive for the prompt dictionary) */
     mynah_asr_safetensors *weights;
     mynah_asr_safetensors *mel_filters;
     mynah_asr_encoder enc;
     mynah_asr_decoder dec;
-    mynah_asr_ctc ctc;                  /* head CTC (hybrid o CTC puro); w NULL se assente */
-    const mynah_asr_engine *engine;     /* decoder attivo (vtable, vedi engine.h)  */
+    mynah_asr_ctc ctc;                  /* CTC head (hybrid or pure CTC); w NULL if absent */
+    const mynah_asr_engine *engine;     /* active decoder (vtable, see engine.h)   */
     const mynah_asr_engine *engine_dflt;/* the model's default engine              */
-    mynah_asr_aed aed;                  /* decoder AED (Canary); layers NULL se assente */
-    int is_aed, aed_eos, aed_ts;    /* aed_ts: supporta i token <|timestamp|> */
+    mynah_asr_aed aed;                  /* AED decoder (Canary); layers NULL if absent */
+    int is_aed, aed_eos, aed_ts;    /* aed_ts: supports <|timestamp|> tokens  */
     char aed_target[8];             /* output language ("" = same as source)   */
     mynah_asr_tokenizer tok;
     mynah_asr_feat_cfg feat;
-    int left_ctx, default_right;    /* att context dal preset di default */
+    int left_ctx, default_right;    /* att context from the default preset */
     int lookaheads[8], n_lookaheads;
     int default_prompt;
-    double frame_sec;               /* durata di un frame encoder (hop*sub/sr) */
-    double seg_sec;                 /* limite per segmento offline (default 300 s) */
+    double frame_sec;               /* duration of one encoder frame (hop*sub/sr) */
+    double seg_sec;                 /* offline per-segment limit (default 300 s) */
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -81,19 +81,19 @@ static const cJSON *jneed(const cJSON *o, const char *k, int *bad) {
 
 static int jint(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" is not a number\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsNumber(j) ? j->valueint : 0;
 }
 
 static double jnum(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" non numerico\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsNumber(j)) { fprintf(stderr, "mynah-asr: \"%s\" is not a number\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsNumber(j) ? j->valuedouble : 0.0;
 }
 
 static const char *jstr(const cJSON *o, const char *k, int *bad) {
     const cJSON *j = jneed(o, k, bad);
-    if (j && !cJSON_IsString(j)) { fprintf(stderr, "mynah-asr: \"%s\" non stringa\n", k); if (bad) *bad = 1; }
+    if (j && !cJSON_IsString(j)) { fprintf(stderr, "mynah-asr: \"%s\" is not a string\n", k); if (bad) *bad = 1; }
     return j && cJSON_IsString(j) ? j->valuestring : "";
 }
 
@@ -165,18 +165,18 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
                  quant == MYNAH_ASR_QUANT_INT8 ? "int8" : "int4");
         m->weights = mynah_asr_st_open_quiet(path);
         if (m->weights)
-            fprintf(stderr, "mynah-asr: checkpoint pre-quantizzato %s\n", path);
+            fprintf(stderr, "mynah-asr: pre-quantized checkpoint %s\n", path);
     }
     if (!m->weights) {
         snprintf(path, sizeof(path), "%s/%s", model_dir, wfile);
         m->weights = mynah_asr_st_open_quiet(path);
-        if (!m->weights) {   /* container alternativo GGUF (tools/export_gguf.py) */
+        if (!m->weights) {   /* alternative GGUF container (tools/export_gguf.py) */
             snprintf(path, sizeof(path), "%s/model.gguf", model_dir);
             m->weights = mynah_asr_st_open_quiet(path);
             if (m->weights)
                 fprintf(stderr, "mynah-asr: weights from the GGUF container %s\n", path);
         }
-        if (!m->weights) {   /* riapre il path primario per il messaggio d'errore */
+        if (!m->weights) {   /* reopen the primary path for the error message */
             snprintf(path, sizeof(path), "%s/%s", model_dir, wfile);
             m->weights = mynah_asr_st_open(path);
         }
@@ -238,7 +238,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
             fprintf(stderr, "mynah-asr: decoder init failed\n");
             goto fail;
         }
-        mynah_asr_ctc_init(&m->ctc, m->weights);   /* head ausiliaria hybrid, opzionale */
+        mynah_asr_ctc_init(&m->ctc, m->weights);   /* auxiliary hybrid head, optional */
         m->engine_dflt = &ENG_RNNT;
     }
     m->engine = m->engine_dflt;
@@ -284,7 +284,7 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         int i = 0;
         for (cJSON *p = presets->child; p && i < 8; p = p->next, i++) {
             const cJSON *pl = cJSON_GetArrayItem(p, 0), *pr = cJSON_GetArrayItem(p, 1);
-            if (!pl || !pr) { fprintf(stderr, "mynah-asr: preset streaming malformato\n"); goto fail; }
+            if (!pl || !pr) { fprintf(stderr, "mynah-asr: malformed streaming preset\n"); goto fail; }
             m->lookaheads[i] = pr->valueint;
             if (i == def) {
                 m->left_ctx = pl->valueint;
@@ -492,7 +492,7 @@ struct mynah_asr_stream {
     int prompt;
     float *mel_buf;             /* buffer of the current mel chunk */
     int mel_have;
-    float *enc_buf;             /* [q, d_out] output encoder per chunk */
+    float *enc_buf;             /* [q, d_out] encoder output per chunk */
     int *tokens;
     int n_tokens, cap_tokens;
     size_t chars_emitted;       /* bytes of text already handed to the callback */
@@ -679,7 +679,7 @@ static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids
             snprintf(tok, sizeof(tok), "%s", item);
         }
         const int id = mynah_asr_tok_find(&m->tok, tok);
-        if (id < 0) { fprintf(stderr, "mynah-asr: token prompt '%s' ignoto\n", tok); return -1; }
+        if (id < 0) { fprintf(stderr, "mynah-asr: unknown prompt token '%s'\n", tok); return -1; }
         ids[n++] = id;
     }
     return n;
@@ -744,11 +744,11 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
                 blen = 0;
                 word_open = 0;
             } else {
-                open_ts = ts;                     /* apre la prossima */
+                open_ts = ts;                     /* opens the next one */
             }
             continue;
         }
-        if (piece[0] == '<') continue;            /* altri speciali */
+        if (piece[0] == '<') continue;            /* other specials */
         if (strncmp(piece, "\xe2\x96\x81", 3) == 0) {   /* ▁: new word */
             if (word_open && blen > 0) {          /* no closing ts: close it */
                 buf[blen] = '\0';
@@ -810,7 +810,7 @@ static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t
         if (frames)
             mynah_asr_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
                                    words, n_words);
-        else if (m->is_aed && m->aed_ts)   /* AED: tempi nei token <|N|> */
+        else if (m->is_aed && m->aed_ts)   /* AED: times in the <|N|> tokens */
             aed_words_from_tokens(&m->tok, tokens, n_tok, m->frame_sec,
                                   words, n_words);
     }
@@ -846,7 +846,7 @@ char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n
 
     const int sr = m->feat.sample_rate;
     const size_t seg_max = (size_t)(m->seg_sec * sr);
-    if (n_samples <= seg_max + seg_max / 10)   /* +10%: non spezzare per poco */
+    if (n_samples <= seg_max + seg_max / 10)   /* +10%: don't split for a small overrun */
         return transcribe_segment(m, samples, n_samples, prompt, right, lang, lang_out,
                                   words, n_words);
 

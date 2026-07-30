@@ -3,11 +3,11 @@
 
 PARALLEL sentences across languages (same FLEURS id = same sentence, translated):
 the English one is the reference for scoring Canary's speech translation.
-I wav (16 kHz mono PCM16) vengono COMMITTATI nel repo: pochi e leggeri.
+The wavs (16 kHz mono PCM16) are COMMITTED to the repo: few and small.
 
 Usage: uv run python fetch_fleurs_samples.py          # from the tools/ dir
-Riscarica i tsv, estrae in streaming SOLO i wav scelti dai dev.tar.gz
-(--fast-read), scrive samples/<lang>/fleurs_<id>.wav + manifest.json.
+Re-downloads the tsv files, streams ONLY the chosen wavs out of dev.tar.gz
+(--fast-read), writes samples/<lang>/fleurs_<id>.wav + manifest.json.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ LANGS = {"it": "it_it", "en": "en_us", "de": "de_de", "es": "es_419", "fr": "fr_
          "pt": "pt_br", "nl": "nl_nl", "pl": "pl_pl", "ru": "ru_ru", "uk": "uk_ua",
          "ja": "ja_jp"}
 # FLEURS ids of the chosen sentences (parallel across all languages, 7-13 s,
-# contenuti distintivi: 1521 satellite, 1534 Timbuctù)
+# distinctive content: 1521 satellite, 1534 Timbuktu)
 IDS = ["1521", "1534"]
 # long EN clip (~90 s): dev sentences concatenated with 0.6 s pauses — an exact
 # reference for silence segmentation, long timestamps and streaming
@@ -123,7 +123,7 @@ def main() -> None:
         "text": " ".join(refs),
     })
 
-    # clip lunghi WAV
+    # long WAV clips
     (samples_dir / "long").mkdir(exist_ok=True)
     for lang, target in LONG_TARGETS.items():
         rows = texts[lang]
@@ -155,7 +155,7 @@ def main() -> None:
     (samples_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=1, ensure_ascii=False) + "\n")
     total = sum(s["duration_sec"] for s in manifest["samples"])
-    print(f"OK samples/: {len(manifest['samples'])} clip, {total:.0f}s totali")
+    print(f"OK samples/: {len(manifest['samples'])} clips, {total:.0f}s total")
 
 
 if __name__ == "__main__":

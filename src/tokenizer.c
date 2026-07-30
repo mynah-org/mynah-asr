@@ -160,7 +160,7 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
             lang_out[close - p - 1] = '\0';
         }
         memmove(p, close + 1, strlen(close + 1) + 1);
-        /* comprimi l'eventuale doppio spazio risultante */
+        /* collapse any resulting double space */
         if (p > out && p[-1] == ' ' && p[0] == ' ')
             memmove(p, p + 1, strlen(p + 1) + 1);
     }

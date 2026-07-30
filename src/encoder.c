@@ -61,8 +61,8 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
      * pre-quantized file the f32 of linear1 does not exist) */
     const mynah_asr_tensor *bu = mynah_asr_st_get(st, "encoder.layers.0.self_attn.bias_u");
     const mynah_asr_tensor *dw = mynah_asr_st_get(st, "encoder.layers.0.conv.depthwise_conv.weight");
-    const mynah_asr_tensor *ep = mynah_asr_st_get(st, "encoder_projector.weight");  /* opzionale (CTC puro) */
-    const mynah_asr_tensor *p1 = mynah_asr_st_get(st, "prompt_projector.linear_1.weight"); /* opzionale */
+    const mynah_asr_tensor *ep = mynah_asr_st_get(st, "encoder_projector.weight");  /* optional (pure CTC) */
+    const mynah_asr_tensor *p1 = mynah_asr_st_get(st, "prompt_projector.linear_1.weight"); /* optional */
     if (!bu || !dw) return -1;
 
     enc->d_model = enc->ss.d_model;
@@ -70,8 +70,8 @@ int mynah_asr_encoder_init(mynah_asr_encoder *enc, const mynah_asr_safetensors *
     enc->d_head = (int)bu->shape[1];
     enc->conv_k = (int)dw->shape[2];
     enc->d_out = ep ? (int)ep->shape[0] : enc->d_model;
-    enc->causal = enc->ss.causal;  /* default dal naming; il config puo' sovrascrivere */
-    enc->xscale = 1.0f;            /* xscaling dal config (mynah.c) */
+    enc->causal = enc->ss.causal;  /* default from the naming; the config can override */
+    enc->xscale = 1.0f;            /* xscaling from the config (mynah_asr.c) */
     if (p1) {
         enc->prompt_inter = (int)p1->shape[0];
         enc->num_prompts = (int)p1->shape[1] - enc->d_model;
@@ -223,7 +223,7 @@ static void attention_banded(const mynah_asr_encoder *enc, const mynah_asr_enc_l
     const int d = enc->d_model, H = enc->n_heads, dk = enc->d_head, P = 2 * T - 1;
     const float scaling = 1.0f / sqrtf((float)dk);
     const int chunk = right + 1, lc = left / chunk;
-    const int B = 128 / chunk > 0 ? 128 / chunk : 1;   /* chunk di query per blocco */
+    const int B = 128 / chunk > 0 ? 128 / chunk : 1;   /* query chunks per block */
     const int Rb_max = B * chunk;
     const int Wb_max = (lc + B) * chunk;
     const int pW_max = Wb_max + Rb_max - 1;
@@ -683,7 +683,7 @@ void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es) {
 }
 
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
-    const int sub = 8; /* subsampling_factor: 3 stadi stride-2 */
+    const int sub = 8; /* subsampling_factor: 3 stride-2 stages */
     return es->cache_valid == 0 && es->ss.first ? 1 + sub * es->right
                                                 : sub * (es->right + 1);
 }
@@ -1029,7 +1029,7 @@ static float *forward_core(const mynah_asr_encoder *enc, const float *feats, int
     }
     free(pe);
     *t_out = T;
-    if (!do_post) return x;                /* encoder out grezzo [T, d_model] (CTC) */
+    if (!do_post) return x;                /* raw encoder out [T, d_model] (CTC) */
 
     float *out = malloc((size_t)T * (size_t)enc->d_out * sizeof(float));
     if (!out) { free(x); return NULL; }

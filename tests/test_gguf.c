@@ -1,7 +1,7 @@
 /* Self-test of the GGUF loader (no model required — it runs in CI too):
  * builds synthetic GGUFs in /tmp and checks
  *   1. parsing of the valid file: reversed dims (ggml ne[0] = the fastest one),
- *      F32 zero-copy bit-esatto, dequant F16/BF16/Q8_0/Q4_0 entro tolleranza;
+ *      F32 zero-copy bit-exact, dequant F16/BF16/Q8_0/Q4_0 within tolerance;
  *   2. that malformed files (magic, v1, truncated, offset past EOF, absurd
  *      string, alignment not a power of 2, unknown ggml type) are rejected
  *      cleanly (NULL, no crash) — the same class of harness used to validate
@@ -20,7 +20,7 @@ static int failures;
     if (!(cond)) { printf("gguf FAIL: %s\n", msg); failures = 1; } \
     else printf("gguf ok:   %s\n", msg); } while (0)
 
-/* --------------------------------------------------- costruzione file */
+/* --------------------------------------------------- file construction */
 typedef struct { unsigned char *p; size_t len, cap; } buf;
 
 static void put(buf *b, const void *src, size_t n) {
@@ -43,7 +43,7 @@ static void pad_to(buf *b, size_t align) {
     while (b->len % align != 0) put(b, z, 1);
 }
 
-static uint16_t f32_to_f16(float f) { /* solo per i fixture (valori normali) */
+static uint16_t f32_to_f16(float f) { /* fixtures only (normal values) */
     uint32_t bits;
     memcpy(&bits, &f, 4);
     uint32_t sign = (bits >> 16) & 0x8000u;
@@ -89,14 +89,14 @@ static float src_val(int i) { return (float)(i - 32) * 0.03125f; } /* [-1, 1] */
 int main(void) {
     char path[64], junk[64];
 
-    /* ---- file valido: f32 4x8 + f16/bf16/q8_0/q4_0 da 64 elementi + q4_k 256 ---- */
+    /* ---- valid file: f32 4x8 + f16/bf16/q8_0/q4_0 with 64 elements + q4_k 256 ---- */
     enum { N = 64, NK = 256 };
     float vals[N];
     for (int i = 0; i < N; i++) vals[i] = src_val(i);
 
     buf b = {0};
     hdr(&b, 3, 6);
-    const uint64_t ne_f32[2] = {8, 4};    /* ggml: ne[0]=8 veloce -> mynah [4][8] */
+    const uint64_t ne_f32[2] = {8, 4};    /* ggml: ne[0]=8 fastest -> mynah [4][8] */
     const uint64_t ne_v[1] = {N};
     const uint64_t ne_k[1] = {NK};
     /* payload: f32 (128B) | f16 (128B) | bf16 (128B) | q8_0 (68B, pad) | q4_0 | q4_k */
@@ -104,8 +104,8 @@ int main(void) {
     tinfo(&b, "t.f16", 1, ne_v, 1, 128);
     tinfo(&b, "t.bf16", 1, ne_v, 30, 256);
     tinfo(&b, "t.q8", 1, ne_v, 8, 384);
-    tinfo(&b, "t.q4", 1, ne_v, 2, 480);   /* 384+68 -> pad a 480 */
-    tinfo(&b, "t.q4k", 1, ne_k, 12, 544); /* 480+36 -> pad a 544, 1 super-blocco */
+    tinfo(&b, "t.q4", 1, ne_v, 2, 480);   /* 384+68 -> pad to 480 */
+    tinfo(&b, "t.q4k", 1, ne_k, 12, 544); /* 480+36 -> pad to 544, 1 super-block */
     pad_to(&b, 32);
 
     for (int i = 0; i < 32; i++) put(&b, &vals[i], 4);          /* t.f32: 4x8 = 32 elem */
@@ -113,7 +113,7 @@ int main(void) {
     for (int i = 0; i < N; i++) {
         uint32_t bits;
         memcpy(&bits, &vals[i], 4);
-        uint16_t h = (uint16_t)(bits >> 16);                     /* bf16 = troncamento */
+        uint16_t h = (uint16_t)(bits >> 16);                     /* bf16 = truncation */
         put(&b, &h, 2);
     }
     for (int blk = 0; blk < 2; blk++) {                          /* q8_0: d=1/127 * amax */
@@ -127,7 +127,7 @@ int main(void) {
             put(&b, &q, 1);
         }
     }
-    pad_to(&b, 32);                                              /* q4_0 a offset 480 */
+    pad_to(&b, 32);                                              /* q4_0 at offset 480 */
     for (int blk = 0; blk < 2; blk++) {
         float maxs = 0;
         for (int i = 0; i < 32; i++) if (fabsf(vals[blk * 32 + i]) > fabsf(maxs)) maxs = vals[blk * 32 + i];
@@ -177,14 +177,14 @@ int main(void) {
 
     CHECK(write_tmp(&b, path) != NULL, "fixture written");
     mynah_asr_safetensors *st = mynah_asr_st_open(path);
-    CHECK(st != NULL, "GGUF valido aperto (via mynah_asr_st_open)");
+    CHECK(st != NULL, "valid GGUF opened (via mynah_asr_st_open)");
     if (st) {
         CHECK(mynah_asr_st_count(st) == 6, "count == 6");
         const mynah_asr_tensor *f32 = mynah_asr_st_get(st, "t.f32");
         CHECK(f32 && f32->n_dims == 2 && f32->shape[0] == 4 && f32->shape[1] == 8,
-              "dims ggml invertite -> [4][8]");
+              "ggml dims reversed -> [4][8]");
         CHECK(f32 && f32->n_elems == 32 && memcmp(f32->data, vals, 32 * 4) == 0,
-              "f32 zero-copy bit-esatto");
+              "f32 zero-copy bit-exact");
         struct { const char *name; double tol; } deq[] = {
             {"t.f16", 1e-3}, {"t.bf16", 8e-3}, {"t.q8", 1.5e-2}, {"t.q4", 1e-1},
         };
@@ -214,7 +214,7 @@ int main(void) {
         }
         char kmsg[128];
         snprintf(kmsg, sizeof(kmsg), "dequant t.q4k vs formula spec (max err %.2e)", worst_k);
-        CHECK(worst_k <= 1e-6, kmsg);   /* d/dmin esatti in f16: atteso 0 */
+        CHECK(worst_k <= 1e-6, kmsg);   /* d/dmin exact in f16: expect 0 */
         mynah_asr_st_close(st);
     }
     unlink(path);

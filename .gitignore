@@ -5,7 +5,7 @@ mynah-asr
 mynah-asr-server
 dist/
 
-# Models & audio di lavoro
+# Models & working audio
 models
 *.wav
 *.npy
@@ -24,21 +24,21 @@ CLAUDE.md
 .DS_Store
 tools/.venv/
 
-# PDF di riferimento: restano locali
+# Reference PDFs: stay local
 *.pdf
 
-# fixture audio dei test: tracciate
+# test audio fixtures: tracked
 !tests/audio/*.wav
 !samples/**/*.wav
 
-# fixture lunghi dei bench (10 MB, LibriSpeech): rigenerabili con
-# scripts/make_long_fixtures.sh — non committare
+# long bench fixtures (10 MB, LibriSpeech): regenerable with
+# scripts/make_long_fixtures.sh — do not commit
 tests/audio/long_*.wav
 
-# golden dumps: derivati da modello+wav, rigenerabili con make golden-dump
+# golden dumps: derived from model+wav, regenerable with make golden-dump
 tests/golden/
 
-# sample per-lingua scaricati (Tatoeba, licenze varie): non committare
+# per-language samples (Tatoeba, mixed licenses): do not commit
 tests/audio/langs/
 libmynah_asr.a
 tests/test_qmat

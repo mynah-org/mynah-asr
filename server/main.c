@@ -35,7 +35,7 @@
 
 static mynah_asr_model *g_model;
 static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
-static int g_max_batch = 8;          /* --batch N; 1 = disabilitato */
+static int g_max_batch = 8;          /* --batch N; 1 = disabled */
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
 /* --------------------------------------------------- micro-batching scheduler
@@ -48,7 +48,7 @@ typedef struct trx_job {
     size_t n_samples;
     char lang[24];
     int lookahead;
-    char *text;                 /* risultato (malloc) */
+    char *text;                 /* result (malloc'd) */
     char lang_out[16];
     mynah_asr_word *words;          /* per-word timestamps (malloc'd, may be NULL) */
     int n_words;
@@ -100,8 +100,8 @@ static void *batch_worker(void *arg) {
         if (!bq_head) bq_tail = NULL;
         bq_len -= B;
         pthread_mutex_unlock(&bq_mu);
-        if (B == 0) continue;   /* mai col wait su bq_head, ma rende il bound
-                                   provabile (GCC 13 maybe-uninitialized) */
+        if (B == 0) continue;   /* never happens with the wait on bq_head, but makes
+                                   the bound provable (GCC 13 maybe-uninitialized) */
 
         const float *samples[64];
         size_t ns[64];
@@ -110,7 +110,7 @@ static void *batch_worker(void *arg) {
         char louts[64][16];
         mynah_asr_word *wordsv[64];
         int nwordsv[64];
-        int lookahead = jobs[0]->lookahead;   /* batch omogeneo sul primo */
+        int lookahead = jobs[0]->lookahead;   /* batch homogeneous on the first */
         for (int b = 0; b < B; b++) {
             samples[b] = jobs[b]->samples;
             ns[b] = jobs[b]->n_samples;
@@ -136,7 +136,7 @@ static void *batch_worker(void *arg) {
     return NULL;
 }
 
-/* ------------------------------------------------------------ coda connessioni */
+/* ------------------------------------------------------------ connection queue */
 static int q_fds[QUEUE_CAP];
 static int q_head, q_tail, q_len;
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -144,10 +144,10 @@ static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 
 static void q_push(int fd) {
     pthread_mutex_lock(&q_mu);
-    if (q_len == QUEUE_CAP) {   /* pieno: rifiuta subito */
+    if (q_len == QUEUE_CAP) {   /* full: reject right away */
         pthread_mutex_unlock(&q_mu);
         const char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-        if (write(fd, msg, strlen(msg)) < 0) { /* best-effort: chiudiamo comunque */ }
+        if (write(fd, msg, strlen(msg)) < 0) { /* best-effort: we close anyway */ }
         close(fd);
         return;
     }
@@ -230,7 +230,7 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
         if (!part) break;
         part += sep_len;
         remain = len - (size_t)(part - body);
-        if (remain < 4 || part[0] == '-') break;   /* --boundary-- finale */
+        if (remain < 4 || part[0] == '-') break;   /* final --boundary-- */
 
         const uint8_t *hdr_end = mynah_asr_memmem(part, remain, (const uint8_t *)"\r\n\r\n", 4);
         if (!hdr_end) break;
@@ -291,7 +291,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     if (boundary[0]) {
         parse_multipart(body, body_len, boundary, &f);
     } else {
-        f.file = body;           /* body raw: audio/wav diretto */
+        f.file = body;           /* raw body: direct audio/wav */
         f.file_len = body_len;
     }
     if (!f.file || f.file_len < 44) { send_error(fd, 400, "missing audio file (multipart 'file' or raw WAV body)"); return; }
@@ -425,7 +425,7 @@ static void ws_on_text(const mynah_asr_result *res, void *ud) {
 
 static void handle_ws_stream(int fd, const char *headers, const char *query) {
     const char *k = strstr(headers, "Sec-WebSocket-Key:");
-    if (!k) { send_error(fd, 400, "handshake WebSocket non valido"); return; }
+    if (!k) { send_error(fd, 400, "invalid WebSocket handshake"); return; }
     char key[64] = {0};
     sscanf(k + 18, " %63[^\r\n]", key);
 
@@ -475,7 +475,7 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
         }
         uint8_t mask[4] = {0};
         if (masked && read_exact(fd, mask, 4) != 0) break;
-        if (plen > sizeof(fbuf) * 2) break;   /* frame irragionevole */
+        if (plen > sizeof(fbuf) * 2) break;   /* unreasonable frame */
 
         uint8_t *payload = malloc(plen ? plen : 1);
         if (!payload || read_exact(fd, payload, plen) != 0) { free(payload); break; }
@@ -575,7 +575,7 @@ static void handle_conn(int fd) {
             have += (size_t)r;
         }
         if (have == content_len) handle_transcribe(fd, hdr, body, content_len, translate);
-        else send_error(fd, 400, "body incompleto");
+        else send_error(fd, 400, "incomplete body");
         free(body);
     } else {
         send_error(fd, 404, "not found");

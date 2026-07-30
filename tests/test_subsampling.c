@@ -1,4 +1,4 @@
-/* Parità subsampling: C (f32+BLAS) vs oracolo numpy (f64).
+/* Subsampling parity: C (f32+BLAS) vs the numpy oracle (f64).
  * Usage: test_subsampling <model_dir> <file.wav> <golden_dir>
  * Exit: 0 ok, 1 mismatch, 77 skip. */
 #include <math.h>
@@ -11,7 +11,7 @@
 #include "../src/subsampling.h"
 #include "../src/weights.h"
 
-double *npy_load_f(const char *path, size_t *n_elems); /* condiviso da npy.c */
+double *npy_load_f(const char *path, size_t *n_elems); /* shared from npy.c */
 int test_model_cfg(const char *model_dir, int *normalize_pf, int *left, int *right,
                    int *prompt_it); /* tests/testcfg.c */
 

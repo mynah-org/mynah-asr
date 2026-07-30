@@ -29,11 +29,11 @@ int main(int argc, char **argv) {
 
     size_t n_samples; int sr;
     float *audio = mynah_asr_wav_load(argv[2], &n_samples, &sr);
-    if (!audio || sr != 16000) { fprintf(stderr, "wav non valido o non 16 kHz\n"); return 2; }
+    if (!audio || sr != 16000) { fprintf(stderr, "invalid wav or not 16 kHz\n"); return 2; }
 
     const mynah_asr_tensor *fb = mynah_asr_st_get(mf, "mel_fb");
     const mynah_asr_tensor *win = mynah_asr_st_get(mf, "window");
-    if (!fb || !win) { fprintf(stderr, "mel_filters.safetensors incompleto\n"); return 2; }
+    if (!fb || !win) { fprintf(stderr, "mel_filters.safetensors incomplete\n"); return 2; }
 
     int norm_pf = 0, left, right, prompt;
     if (test_model_cfg(argv[1], &norm_pf, &left, &right, &prompt) != 0) return 77;

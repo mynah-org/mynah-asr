@@ -1,9 +1,9 @@
 """NeMo log-mel in pure numpy — an exact replica of the HF extractors
-(reference/transformers-nemotron_asr_streaming/ e reference/transformers-parakeet/)
-con torch.stft(center=True, pad_mode="constant") e finestra Hann simmetrica.
+(reference/transformers-nemotron_asr_streaming/ and reference/transformers-parakeet/)
+with torch.stft(center=True, pad_mode="constant") and a symmetric Hann window.
 
-normalize: "NA" (Nemotron, nessuna normalizzazione) o "per_feature" (Parakeet:
-media/std per bin sui frame validi, ddof=1, x = (x-mu)/(std+1e-5), come
+normalize: "NA" (Nemotron, no normalization) or "per_feature" (Parakeet:
+per-bin mean/std over the valid frames, ddof=1, x = (x-mu)/(std+1e-5), like
 ParakeetFeatureExtractor).
 """
 
@@ -16,8 +16,8 @@ LOG_ZERO_GUARD = 2.0 ** -24
 
 def log_mel(
     audio: np.ndarray,          # [S] float32 in [-1, 1], 16 kHz mono
-    mel_fb: np.ndarray,         # [n_fft//2+1, n_mels] dal convertitore
-    window: np.ndarray,         # [win_length] Hann simmetrica dal convertitore
+    mel_fb: np.ndarray,         # [n_fft//2+1, n_mels] from the converter
+    window: np.ndarray,         # [win_length] symmetric Hann from the converter
     n_fft: int = 512,
     hop: int = 160,
     preemphasis: float = 0.97,
@@ -26,7 +26,7 @@ def log_mel(
     """Returns (features [T, n_mels] float32, valid_len).
 
     T = 1 + S//hop (center=True); frames >= valid_len (= S//hop) are zeroed,
-    come fa il feature extractor HF.
+    like the HF feature extractor does.
     """
     x = audio.astype(np.float64)
     S = x.shape[0]

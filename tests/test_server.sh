@@ -64,7 +64,7 @@ if [ -f models/canary-180m-flash/mynah.json ]; then
     kill $SRV2_PID 2>/dev/null
     wait $SRV2_PID 2>/dev/null
 else
-    echo "server translate SKIP (canary-180m-flash assente)"
+    echo "server translate SKIP (canary-180m-flash missing)"
 fi
 
 # 4 concurrent requests (wait ONLY on the curls: a bare wait would also wait on the server)
@@ -81,7 +81,7 @@ for i in 1 2 3 4; do
 done
 [ $conc_ok -eq 1 ] && echo "server concurrent-4 OK" || { echo "server concurrent-4 FAIL"; fail=1; }
 
-# WebSocket streaming (richiede tools/ con uv)
+# WebSocket streaming (requires tools/ with uv)
 if command -v uv >/dev/null 2>&1; then
     ws_out=$(cd tools && uv run python -m eval.ws_client ../tests/audio/test_it.wav localhost "$PORT" auto 3 2>/dev/null)
     case "$ws_out" in
@@ -89,7 +89,7 @@ if command -v uv >/dev/null 2>&1; then
         *) echo "server ws-stream FAIL: $ws_out"; fail=1 ;;
     esac
 else
-    echo "server ws-stream SKIP (uv assente)"
+    echo "server ws-stream SKIP (uv missing)"
 fi
 
 exit $fail

@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) max_threads = atoi(argv[++i]);
         else if (!model_dir) model_dir = argv[i];
         else if (!wav) wav = argv[i];
-        else { fprintf(stderr, "argomento ignoto: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
     if (!model_dir || !wav) {
         fprintf(stderr, "usage: %s <model_dir> <wav> [--lang l] [--backend b] "

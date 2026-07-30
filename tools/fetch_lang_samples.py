@@ -2,9 +2,9 @@
 """Download real per-language audio samples from Tatoeba (short CC-audio sentences).
 
 For every language Nemotron 3.5 supports it takes up to N sentences with audio,
-le converte a WAV 16 kHz mono (ffmpeg) e scrive un manifest con testo di
-reference and attribution. The samples must NOT be committed (local fixtures only,
-licenze audio Tatoeba variabili): tests/audio/langs/ è in .gitignore.
+converts them to 16 kHz mono WAV (ffmpeg) and writes a manifest with reference
+text and attribution. The samples must NOT be committed (local fixtures only,
+Tatoeba audio licenses vary): tests/audio/langs/ is in .gitignore.
 
 Usage: uv run python fetch_lang_samples.py [n_per_language=3]
 """
@@ -51,7 +51,7 @@ FLEURS_API = ("https://datasets-server.huggingface.co/rows?dataset=google/fleurs
 def fetch_fleurs(locale: str, cfg: str, n: int, lang_dir: Path) -> list[dict]:
     entries = []
     rows = []
-    for attempt in range(4):                # il datasets-server dà 5xx transitori
+    for attempt in range(4):                # the datasets-server throws transient 5xx
         try:
             rows = fetch_json(FLEURS_API.format(cfg=cfg, n=n * 2)).get("rows", [])
             break
@@ -108,7 +108,7 @@ def main() -> None:
         try:
             data = fetch_json(API.format(code=code)).get("data", [])
         except Exception:
-            data = []   # nessun continue: lascia lavorare il fallback FLEURS
+            data = []   # no continue: let the FLEURS fallback do its job
 
         # CJK/Thai: short in characters but dense — lowered threshold
         min_len = 4 if code in {"jpn", "cmn", "kor", "tha"} else 12
@@ -152,7 +152,7 @@ def main() -> None:
             got = len(entries)
         if entries:
             manifest[locale] = entries
-        report.append(f"{locale}: {got} sample")
+        report.append(f"{locale}: {got} samples")
 
     (OUT_DIR / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1))

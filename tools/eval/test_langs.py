@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Multilingual suite: transcribes the per-language samples (tests/audio/langs/) with
-`mynah-asr transcribe --lang auto` e verifica (a) language detection, (b) CER vs testo
+`mynah-asr transcribe --lang auto` and checks (a) language detection, (b) CER vs the
 reference text (normalized: lowercase, no punctuation).
 
 Usage: uv run python -m eval.test_langs [--cer-max 0.3] [--mynah-asr ../mynah-asr] [--model DIR]
                                       [--quant int8|int4]
 --quant: quantization regression — the same suite over the pre-quantized
-pre-quantizzato (richiede model.int8/int4.safetensors da `mynah-asr quantize`).
+checkpoint (requires model.int8/int4.safetensors from `mynah-asr quantize`).
 Exit: 0 every language ok, 1 failures, 77 skip (samples or model missing).
 """
 
@@ -67,7 +67,7 @@ def main() -> None:
         print("SKIP: samples (tools/fetch_lang_samples.py) or model missing")
         sys.exit(77)
     if args.quant and not Path(args.model, f"model.{args.quant}.safetensors").exists():
-        print(f"SKIP: checkpoint {args.quant} assente (mynah-asr quantize --quant {args.quant})")
+        print(f"SKIP: {args.quant} checkpoint missing (mynah-asr quantize --quant {args.quant})")
         sys.exit(77)
     manifest = json.loads(manifest_path.read_text())
     model_cfg = json.loads(Path(args.model, "mynah.json").read_text())
@@ -107,7 +107,7 @@ def main() -> None:
             hyp, _ = transcribe(wav, locale if has_prompt else "auto")
             c = cer(e["text"], hyp)
             cers.append(c)
-            if has_prompt:   # detection separata solo se il prompt esiste
+            if has_prompt:   # separate detection only when a prompt exists
                 _, detected = transcribe(wav, "auto")
                 if detected.split("-")[0] == locale.split("-")[0]:
                     auto_hits += 1

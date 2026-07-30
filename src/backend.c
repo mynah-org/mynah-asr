@@ -35,7 +35,7 @@ int mynah_asr_set_backend(const char *name) {
 #ifdef MYNAH_ASR_CUDA
         if (mynah_asr_cuda_available()) {
             g_backend = MYNAH_ASR_BACKEND_CUDA;
-            fprintf(stderr, "mynah-asr: backend CUDA attivo (GEMM grandi su GPU, T>=%d)\n",
+            fprintf(stderr, "mynah-asr: CUDA backend active (large GEMMs on GPU, T>=%d)\n",
                     METAL_MIN_T);
             return g_backend;
         }
@@ -50,7 +50,7 @@ int mynah_asr_set_backend(const char *name) {
 #ifdef MYNAH_ASR_METAL
         if (mynah_asr_metal_available()) {
             g_backend = MYNAH_ASR_BACKEND_METAL;
-            fprintf(stderr, "mynah-asr: backend Metal attivo (GEMM grandi su GPU, T>=%d)\n",
+            fprintf(stderr, "mynah-asr: Metal backend active (large GEMMs on GPU, T>=%d)\n",
                     METAL_MIN_T);
             return g_backend;
         }

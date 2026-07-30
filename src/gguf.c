@@ -26,7 +26,7 @@ struct mynah_asr_gguf {
     uint64_t alignment;
     unsigned char *map;
     mynah_asr_tensor *tensors;
-    char **names;          /* proprietà nostra (in safetensors puntano nel JSON) */
+    char **names;          /* owned by us (in safetensors they point into the JSON) */
     float **dequant;       /* f32 buffers of the non-F32 tensors (NULL when zero-copy) */
     uint32_t *ggml_type;
     size_t count;
@@ -61,7 +61,7 @@ static int rd_bytes(reader *r, void *dst, uint64_t n) {
     return 0;
 }
 
-/* letture little-endian esplicite: indipendenti dall'endianness dell'host */
+/* explicit little-endian reads: independent of host endianness */
 static int rd_u32(reader *r, uint32_t *v) {
     unsigned char b[4];
     if (rd_bytes(r, b, 4) != 0) return -1;
@@ -126,8 +126,8 @@ static int rd_metadata(mynah_asr_gguf *g, reader *r, uint64_t count) {
         if (rd_string(r, &key) != 0 || rd_u32(r, &type) != 0) { free(key); return -1; }
         int rc = 0;
         if (strcmp(key, "general.alignment") == 0 && type == GGUF_U32) {
-            uint32_t a = 0;   /* su errore di lettura rc abortisce, ma non
-                                 copiamo comunque spazzatura nell'alignment */
+            uint32_t a = 0;   /* on a read error rc aborts, but don't copy
+                                 garbage into the alignment either way */
             rc = rd_u32(r, &a);
             g->alignment = a;
         } else if (strcmp(key, "general.alignment") == 0 && type == GGUF_U64) {
@@ -159,7 +159,7 @@ static float f16_to_f32(uint16_t v) {
     uint32_t bits;
     if (e == 0) {
         if (frac == 0) bits = sign;
-        else { /* subnormale: normalizza */
+        else { /* subnormal: normalize */
             e = 1;
             while ((frac & 0x0400u) == 0) { frac <<= 1; e--; }
             bits = sign | ((uint32_t)(e + 112) << 23) | ((frac & 0x03ffu) << 13);
@@ -203,7 +203,7 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
             memcpy(&dst[i], &bits, 4);
         }
         break;
-    case GGML_Q8_0:  /* blocco 34B: d f16 + 32 int8 */
+    case GGML_Q8_0:  /* 34B block: d f16 + 32 int8 */
         for (size_t b = 0; b < n_elems / 32; b++) {
             const unsigned char *blk = src + b * 34;
             const float d = f16_to_f32(ld_u16(blk));
@@ -211,7 +211,7 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
             for (int i = 0; i < 32; i++) dst[b * 32 + i] = d * (float)q[i];
         }
         break;
-    case GGML_Q4_0:  /* blocco 18B: d f16 + 16B nibble (j e j+16 impacchettati) */
+    case GGML_Q4_0:  /* 18B block: d f16 + 16B nibbles (j and j+16 packed) */
         for (size_t b = 0; b < n_elems / 32; b++) {
             const unsigned char *blk = src + b * 18;
             const float d = f16_to_f32(ld_u16(blk));
@@ -222,7 +222,7 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
             }
         }
         break;
-    case GGML_Q4_K:  /* super-blocco 144B: d,dmin f16 + 12B scale/min + 128B nibble
+    case GGML_Q4_K:  /* 144B super-block: d,dmin f16 + 12B scales/mins + 128B nibbles
                       * x = d*sc*q - dmin*m over 8 sub-blocks of 32 */
         for (size_t b = 0; b < n_elems / 256; b++) {
             const unsigned char *blk = src + b * 144;
@@ -274,7 +274,7 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
     uint32_t magic, version;
     uint64_t n_tensors, n_meta;
     if (rd_u32(&r, &magic) != 0 || magic != 0x46554747u /* "GGUF" LE */ ||
-        rd_u32(&r, &version) != 0 || version < 2 || version > 3 ||  /* v1: layout u32, non supportato */
+        rd_u32(&r, &version) != 0 || version < 2 || version > 3 ||  /* v1: u32 layout, unsupported */
         rd_u64(&r, &n_tensors) != 0 || rd_u64(&r, &n_meta) != 0 ||
         n_tensors > 1000000u || rd_metadata(g, &r, n_meta) != 0) {
         fprintf(stderr, "gguf: invalid header in %s\n", path);
@@ -341,8 +341,8 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
         }
         const unsigned char *src = g->map + abs_off;
         if (g->ggml_type[i] == GGML_F32) {
-            t->data = src;                       /* zero-copy dal mmap */
-        } else {                                 /* dequant a f32 al load */
+            t->data = src;                       /* zero-copy from the mmap */
+        } else {                                 /* dequant to f32 at load */
             if (t->n_elems > SIZE_MAX / sizeof(float)) goto fail_off;
             g->dequant[i] = malloc(t->n_elems * sizeof(float));
             if (!g->dequant[i]) goto fail_off;

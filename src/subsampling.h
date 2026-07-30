@@ -35,7 +35,7 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
  * like the offline path. See docs/nemotron-arch.md (HF CausalConv2dCacheLayer
  * reference). */
 typedef struct {
-    float *cache[3];        /* [C_in, F] ultimo frame input dello stadio */
+    float *cache[3];        /* [C_in, F] last input frame of the stage */
     int cin[3], fdim[3];
     int first;
 } mynah_asr_ss_stream;

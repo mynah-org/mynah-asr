@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
         }
         free(ref[b]); free(out[b]); free(samples[b]);
     }
-    printf("batch parity: %d/%d identici | seq %.2fs vs batch %.2fs (%.2fx)\n",
+    printf("batch parity: %d/%d identical | seq %.2fs vs batch %.2fs (%.2fx)\n",
            B - fails, B, t_seq, t_batch, t_seq / t_batch);
     mynah_asr_free(m);
     return fails ? 1 : 0;

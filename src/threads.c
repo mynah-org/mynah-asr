@@ -64,7 +64,7 @@ static void *pool_worker(void *arg) {
         pthread_mutex_lock(&g_job_mu);
         if (--g_pending == 0) pthread_cond_signal(&g_done_cv);
     }
-    return NULL;   /* mai raggiunto */
+    return NULL;   /* never reached */
 }
 
 static void pool_init(void) {
@@ -118,7 +118,7 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     const int active = n < nth ? n : nth;
     blas_set_threads(active <= 2 ? nth / active : 1);
     if (g_workers == 0 || pthread_mutex_trylock(&g_pool_mu) != 0) {
-        pf_run(&st);              /* pool assente o occupato: inline */
+        pf_run(&st);              /* no pool or busy: run inline */
         blas_set_threads(nth);
         return;
     }

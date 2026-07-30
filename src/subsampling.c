@@ -146,13 +146,13 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
             free(P);
             return;
         }
-        /* malloc fallita: prosegue col loop diretto */
+        /* malloc failed: fall back to the direct loop */
     }
 
     /* depthwise: explicitly padded channel -> unrolled 3x3 with no branch in the
      * hot loop (the pad zeros make the sum identical to the bounds-checked one).
      * Independent channels -> parallel slices when the work is large
-     * (offline); i chunk streaming restano seriali (overhead > lavoro). */
+     * (offline); streaming chunks stay serial (overhead > work). */
     if (depthwise) {
         dw_par dp = {.x = x, .w = w, .b = b, .out = out, .T = T, .F = F, .Tp = Tp,
                      .Fp2 = F + pl_f + pr_f, .To = To, .Fo = Fo, .pl = pl, .pf = pl_f,
@@ -219,13 +219,13 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
     /* time/freq padding: causal (2,1) or symmetric 'same' (1,1) */
     const int pl = ss->causal ? 2 : 1, pr = 1;
 
-    /* stadio 0: conv piena 1 -> C su [1, T, n_mels] */
+    /* stage 0: full conv 1 -> C over [1, T, n_mels] */
     conv2d_s2(feats, 1, T, n_mels, pl, pr, pl, pr,
               (const float *)ss->conv_in_w->data, (const float *)ss->conv_in_b->data,
               C, 0, a, &To, &Fo);
     relu_inplace(a, (size_t)C * (size_t)To * (size_t)Fo);
 
-    /* stadi 1..2: depthwise + pointwise + ReLU */
+    /* stages 1..2: depthwise + pointwise + ReLU */
     for (int i = 0; i < 2; i++) {
         int To2, Fo2;
         conv2d_s2(a, C, To, Fo, pl, pr, pl, pr,
@@ -288,12 +288,12 @@ void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst) {
     for (int s = 0; s < 3; s++) { free(sst->cache[s]); sst->cache[s] = NULL; }
 }
 
-/* Antepone [init?1:0 zeri][cache 1] al chunk sull'asse tempo, conv valida s2,
+/* Prepends [init?1:0 zeros][cache 1] to the chunk on the time axis, valid conv s2,
  * updates cache = last frame of the chunk. x [C, T, F] -> out [C_out, To, Fo]. */
 static void stream_stage(const float *x, int C_in, int T, int F, int first, int last,
                          float *cache, const float *w, const float *b, int C_out,
                          int depthwise, float *out, int *To_, int *Fo_) {
-    const int lp = first ? 2 : 1; /* cache(1) + init_pad(1) al primo chunk */
+    const int lp = first ? 2 : 1; /* cache(1) + init_pad(1) on the first chunk */
     const int rp = last ? 1 : 0;  /* last chunk: causal right-pad, as offline */
     const int Tp = T + lp + rp;
     float *xp = malloc((size_t)C_in * (size_t)Tp * (size_t)F * sizeof(float));

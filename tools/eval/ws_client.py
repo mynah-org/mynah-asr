@@ -3,7 +3,7 @@
 
 Usage: uv run python -m eval.ws_client <file.wav> [host=localhost] [port=8090]
                                      [lang=auto] [lookahead=3]
-Invia il PCM in chunk da 100 ms come frame binari e stampa i delta JSON ricevuti.
+Sends the PCM in 100 ms chunks as binary frames and prints the received JSON deltas.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def ws_recv(sock: socket.socket) -> tuple[int, bytes]:
         while len(buf) < n:
             part = sock.recv(n - len(buf))
             if not part:
-                raise ConnectionError("connessione chiusa")
+                raise ConnectionError("connection closed")
             buf += part
         return buf
 
@@ -59,7 +59,7 @@ def main() -> None:
     lookahead = sys.argv[5] if len(sys.argv) > 5 else "3"
 
     w = wave.open(wav_path)
-    assert w.getframerate() == 16000 and w.getnchannels() == 1, "serve WAV 16 kHz mono"
+    assert w.getframerate() == 16000 and w.getnchannels() == 1, "16 kHz mono WAV required"
     pcm = w.readframes(w.getnframes())
 
     sock = socket.create_connection((host, port), timeout=60)
@@ -71,10 +71,10 @@ def main() -> None:
     resp = b""
     while b"\r\n\r\n" not in resp:
         resp += sock.recv(4096)
-    assert b"101" in resp.split(b"\r\n")[0], f"handshake fallito: {resp[:100]!r}"
+    assert b"101" in resp.split(b"\r\n")[0], f"handshake failed: {resp[:100]!r}"
 
     sock.settimeout(0.05)
-    chunk_bytes = 3200  # 100 ms di s16le a 16 kHz
+    chunk_bytes = 3200  # 100 ms of s16le at 16 kHz
 
     def drain() -> bool:
         try:
@@ -95,7 +95,7 @@ def main() -> None:
         ws_send(sock, 0x2, pcm[off:off + chunk_bytes])
         drain()
 
-    ws_send(sock, 0x8, b"")  # close: il server processa la coda e risponde
+    ws_send(sock, 0x8, b"")  # close: the server drains the queue and replies
     sock.settimeout(30)
     while drain():
         pass

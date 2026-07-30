@@ -23,11 +23,11 @@ typedef struct {
 
 typedef struct {
     int n_layers, d, n_heads, ffn, vocab, max_seq, max_gen_delta;
-    int d_enc;                       /* input di enc_dec_proj (= d se identity) */
+    int d_enc;                       /* input of enc_dec_proj (= d if identity) */
     mynah_asr_qmat proj;                 /* enc_dec_proj (n == 0 = identity)        */
     const float *proj_b;
     const float *emb;                /* [vocab, d]                              */
-    const float *pos;                /* [max_seq, d] buffer dal ckpt (già /√d)  */
+    const float *pos;                /* [max_seq, d] buffer from the ckpt (already /√d) */
     const float *embln_w, *embln_b;
     const float *fin_w, *fin_b;      /* final_layer_norm                        */
     mynah_asr_qmat head;                 /* [vocab, d]                              */

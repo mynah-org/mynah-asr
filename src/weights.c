@@ -17,7 +17,7 @@ struct mynah_asr_safetensors {
     cJSON *header;         /* keeps the name strings alive */
     mynah_asr_tensor *tensors;
     size_t n_tensors;
-    mynah_asr_gguf *gguf;      /* container alternativo: se set, tensors punta lì */
+    mynah_asr_gguf *gguf;      /* alternative container: if set, tensors point there */
 };
 
 static int dtype_of(const char *s, mynah_asr_dtype *out) {
@@ -62,9 +62,9 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
     if (map == MAP_FAILED) { fprintf(stderr, "weights: mmap failed for %s\n", path); return NULL; }
 
     uint64_t hlen;
-    memcpy(&hlen, map, 8); /* little-endian; assumiamo host LE (arm64/x86_64) */
+    memcpy(&hlen, map, 8); /* little-endian; we assume an LE host (arm64/x86_64) */
     if (8 + hlen > (uint64_t)sb.st_size) {
-        fprintf(stderr, "weights: header safetensors corrotto in %s\n", path);
+        fprintf(stderr, "weights: corrupt safetensors header in %s\n", path);
         munmap(map, (size_t)sb.st_size);
         return NULL;
     }
@@ -75,7 +75,7 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
     cJSON *header = cJSON_Parse(hjson);
     free(hjson);
     if (!header) {
-        fprintf(stderr, "weights: header JSON non valido in %s\n", path);
+        fprintf(stderr, "weights: invalid JSON header in %s\n", path);
         munmap(map, (size_t)sb.st_size);
         return NULL;
     }
@@ -102,7 +102,7 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
         const cJSON *jo = cJSON_GetObjectItemCaseSensitive(it, "data_offsets");
         if (!cJSON_IsString(jd) || !cJSON_IsArray(js) || !cJSON_IsArray(jo) ||
             dtype_of(jd->valuestring, &t->dtype) != 0) {
-            fprintf(stderr, "weights: voce '%s' non valida (dtype %s)\n", it->string,
+            fprintf(stderr, "weights: invalid entry '%s' (dtype %s)\n", it->string,
                     cJSON_IsString(jd) ? jd->valuestring : "?");
             mynah_asr_st_close(st);
             return NULL;
@@ -123,7 +123,7 @@ mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
 
 void mynah_asr_st_close(mynah_asr_safetensors *st) {
     if (!st) return;
-    if (st->gguf) {           /* i tensori appartengono al handle GGUF */
+    if (st->gguf) {           /* the tensors belong to the GGUF handle */
         mynah_asr_gguf_close(st->gguf);
         free(st);
         return;

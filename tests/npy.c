@@ -17,7 +17,7 @@ double *npy_load_f(const char *path, size_t *n_elems) {
 
     int is_f8 = strstr(hdr, "<f8") != NULL;
     if (!is_f8 && !strstr(hdr, "<f4")) {
-        fprintf(stderr, "npy: dtype non supportato: %s\n", hdr);
+        fprintf(stderr, "npy: unsupported dtype: %s\n", hdr);
         free(hdr); fclose(f);
         return NULL;
     }

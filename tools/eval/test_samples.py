@@ -5,10 +5,10 @@ For every model present and every applicable sample:
 - ASR: normalized CER against the reference transcription (--cer-max threshold)
 - Speech translation (AED/Canary models): X->en against the English reference
   PARALLEL to it (same FLEURS sentence) + en->de against the German reference, with
-  word overlap over the content words (--overlap-min threshold: the
-  traduzioni legittime variano, il CER sarebbe ingiusto)
-- Backend: cpu e, su macOS, metal (--backend per restringere; "cuda" per
-  la validazione Linux futura)
+  word overlap over the content words (--overlap-min threshold: legitimate
+  translations vary, CER would be unfair)
+- Backend: cpu and, on macOS, metal (--backend to narrow down; "cuda" for
+  the future Linux validation)
 
 Exit: 0 ok, 1 fail, 77 skip (samples or models missing).
 Usage: uv run python -m eval.test_samples [--models a,b] [--backend cpu]
@@ -48,10 +48,10 @@ LOCALE = {"it": "it-IT", "en": "en-US", "de": "de-DE", "es": "es-ES", "fr": "fr-
 
 
 def word_overlap(ref: str, hyp: str, min_len: int = 4) -> float:
-    """Recall of the reference content words inside the hypothesis, with matching
-    per prefisso (5 char): le traduzioni legittime variano la morfologia
-    (relative/relatively, inaccessibility/inaccessible) e il match esatto le
-    boccerebbe (visto su FLEURS 1534 es>en: parafrasi corretta, overlap 0.18)."""
+    """Recall of the reference content words inside the hypothesis, with prefix
+    matching (5 chars): legitimate translations vary the morphology
+    (relative/relatively, inaccessibility/inaccessible) and exact matching would
+    reject them (seen on FLEURS 1534 es>en: correct paraphrase, overlap 0.18)."""
     rw = {w for w in normalize(ref).split() if len(w) >= min_len}
     hw = {w for w in normalize(hyp).split() if len(w) >= min_len}
     if not rw:
@@ -66,13 +66,13 @@ def main() -> None:
     ap.add_argument("--cer-max", type=float, default=0.20)
     ap.add_argument("--overlap-min", type=float, default=0.35)
     ap.add_argument("--models", default=",".join(MODELS))
-    ap.add_argument("--backend", default=None, help="cpu|metal|cuda (default: cpu+metal su macOS)")
+    ap.add_argument("--backend", default=None, help="cpu|metal|cuda (default: cpu+metal on macOS)")
     ap.add_argument("--mynah-asr", dest="mynah_asr", default=str(ROOT / "mynah-asr"))
     args = ap.parse_args()
 
     manifest_path = ROOT / "samples/manifest.json"
     if not manifest_path.exists():
-        print("SKIP: samples/ assente (tools/fetch_fleurs_samples.py)")
+        print("SKIP: samples/ missing (tools/fetch_fleurs_samples.py)")
         sys.exit(77)
     samples = json.loads(manifest_path.read_text())["samples"]
     by_lang: dict[str, list[dict]] = {}
@@ -141,7 +141,7 @@ def main() -> None:
                     if not ok:
                         print(f"     ref: {ref['text']}\n     hyp: {hyp}")
                         fails += 1
-    # clip lungo: segmentazione su silenzio, timestamp monotoni, streaming reale
+    # long clip: silence-based segmentation, monotonic timestamps, real streaming
     # (cpu only: the metal paths were exercised above; here the features matter)
     def rtf_of(stderr: str) -> str:
         m = re.search(r"RTF ([0-9.]+)", stderr)
@@ -186,7 +186,7 @@ def main() -> None:
             c = cer(s["text"], p.stdout.strip())
             ok = c <= args.cer_max
             print(f"{'OK ' if ok else 'FAIL'} seg  parakeet-tdt-0.6b-v3 "
-                  f"{s['file']} ({s['duration_sec']}s, segmenti da 30s) CER {c:.3f}")
+                  f"{s['file']} ({s['duration_sec']}s, 30s segments) CER {c:.3f}")
             fails += 0 if ok else 1
 
             p = subprocess.run([args.mynah_asr, "transcribe", "-m",

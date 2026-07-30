@@ -41,7 +41,7 @@ typedef struct {
     const int8_t *q8;       /* INT8 [n, k] */
     const uint8_t *q4;      /* INT4 packed [n, k/2] */
     const float *scales;    /* INT8: [n]; INT4: [n, k/32] */
-    void *owned_q, *owned_s;/* buffer nostri (quantizzazione al load), da liberare */
+    void *owned_q, *owned_s;/* our buffers (quantized at load), to free */
     int qtype;
     int n, k;
 } mynah_asr_qmat;

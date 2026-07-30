@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
 
     mynah_asr_encoder enc;
     if (mynah_asr_encoder_init(&enc, st, 0) != 0) { fprintf(stderr, "encoder init failed\n"); return 2; }
-    printf("encoder: %d layer, d=%d, heads=%d, ffn=%d, conv_k=%d, d_out=%d, causal=%d, "
+    printf("encoder: %d layers, d=%d, heads=%d, ffn=%d, conv_k=%d, d_out=%d, causal=%d, "
            "att [%d,%d]\n", enc.n_layers, enc.d_model, enc.n_heads, enc.ffn_dim, enc.conv_k,
            enc.d_out, enc.causal, left, right);
 
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
 
     free(audio); free(feats); free(x); free(out);
     mynah_asr_encoder_free(&enc); mynah_asr_st_close(mf); mynah_asr_st_close(st);
-    if (fails) { fprintf(stderr, "FAIL (%d stadi)\n", fails); return 1; }
+    if (fails) { fprintf(stderr, "FAIL (%d stages)\n", fails); return 1; }
     printf("OK\n");
     return 0;
 }

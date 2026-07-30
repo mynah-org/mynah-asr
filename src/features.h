@@ -18,7 +18,7 @@ typedef struct {
     double preemphasis;    /* 0.97 */
     double log_zero_guard; /* 2^-24 */
     int normalize_per_feature; /* 0 = NA, 1 = per_feature (offline only) */
-    const float *mel_fb;   /* [n_fft/2+1, n_mels] da mel_filters.safetensors */
+    const float *mel_fb;   /* [n_fft/2+1, n_mels] from mel_filters.safetensors */
     const float *window;   /* [win_length] */
 } mynah_asr_feat_cfg;
 
@@ -36,14 +36,14 @@ float *mynah_asr_log_mel(const mynah_asr_feat_cfg *cfg, const float *audio, size
  * the zeros of the right pad. */
 typedef struct {
     const mynah_asr_feat_cfg *cfg;
-    double *buf;            /* finestra scorrevole di segnale preemfatizzato   */
+    double *buf;            /* sliding window of preemphasized signal          */
     size_t buf_len, buf_cap;
     size_t base;            /* absolute index of sample buf[0]                 */
     size_t total;           /* total samples seen                              */
-    double *win;            /* finestra Hann center-paddata a n_fft (precomp.) */
-    int *mel_lo, *mel_hi;   /* range bin non-zero per filtro (precomputati)    */
-    float last_raw;         /* carry per la preemphasis tra feed               */
-    long next_frame;        /* prossimo frame mel da emettere                  */
+    double *win;            /* Hann window center-padded to n_fft (precomp.)   */
+    int *mel_lo, *mel_hi;   /* non-zero bin range per filter (precomputed)     */
+    float last_raw;         /* preemphasis carry across feeds                  */
+    long next_frame;        /* next mel frame to emit                          */
     int finished;
 } mynah_asr_mel_stream;
 

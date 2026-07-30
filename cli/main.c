@@ -210,9 +210,9 @@ static int cmd_quantize(int argc, char **argv) {
 
     for (size_t idx = 0; idx < mynah_asr_st_count(st); idx++) {
         const mynah_asr_tensor *t = mynah_asr_st_at(st, idx);
-        if (t->dtype == MYNAH_ASR_DT_I64) continue; /* BN num_batches_tracked: inutile a runtime */
+        if (t->dtype == MYNAH_ASR_DT_I64) continue; /* BN num_batches_tracked: useless at runtime */
         if (!quantizable(t->name, t)) {
-            const size_t bytes = t->n_elems * 4u; /* solo F32 nel file sorgente */
+            const size_t bytes = t->n_elems * 4u; /* source file holds F32 only */
             mynah_asr_stw_add(w, t->name, "F32", t->shape, t->n_dims, t->data, bytes);
             continue;
         }

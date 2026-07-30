@@ -37,7 +37,7 @@ def main() -> None:
     audio, sr = sf.read(args.wav, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    assert sr == 16000, f"servono 16 kHz, ricevuti {sr} (resampla con ffmpeg/sox)"
+    assert sr == 16000, f"16 kHz required, got {sr} (resample with ffmpeg/sox)"
 
     oracle = Oracle(model_dir)
     prompt_id = oracle.cfg["prompt"]["dictionary"][args.lang] if oracle.has_prompt else None
@@ -67,10 +67,10 @@ def main() -> None:
         out.mkdir(parents=True, exist_ok=True)
         for name, arr in dumps.items():
             np.save(out / f"{name}.npy", arr)
-        print(f"[dump] {len(dumps)} stadi in {out}")
+        print(f"[dump] {len(dumps)} stages in {out}")
 
     dur = len(audio) / sr
-    print(f"[{dur:.1f}s audio | {dt:.1f}s oracolo | lang={lang or args.lang} | {len(tokens)} token]")
+    print(f"[{dur:.1f}s audio | {dt:.1f}s oracle | lang={lang or args.lang} | {len(tokens)} tokens]")
     print(text)
 
 

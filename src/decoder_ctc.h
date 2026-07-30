@@ -10,7 +10,7 @@
 
 typedef struct {
     const float *w, *b;    /* ctc_head [V, d, 1] + [V]; NULL when the model has no CTC */
-    int vocab, d_in;       /* V include il blank (ultimo indice) */
+    int vocab, d_in;       /* V includes the blank (last index) */
 } mynah_asr_ctc;
 
 /* 0 = head found, -1 = absent (not an error: a model without CTC). */

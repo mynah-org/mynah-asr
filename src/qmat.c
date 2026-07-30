@@ -96,7 +96,7 @@ int mynah_asr_qmat_init(mynah_asr_qmat *m, const float *w, int n, int k, int qty
         m->owned_s = s;
         m->qtype = MYNAH_ASR_Q_INT8;
     } else {
-        if (k % MYNAH_ASR_Q4_GROUP != 0) return 0;   /* resta f32 */
+        if (k % MYNAH_ASR_Q4_GROUP != 0) return 0;   /* stays f32 */
         uint8_t *q = malloc((size_t)n * (size_t)k / 2);
         float *s = malloc((size_t)n * (size_t)(k / MYNAH_ASR_Q4_GROUP) * sizeof(float));
         if (!q || !s) { free(q); free(s); return -1; }
@@ -121,7 +121,7 @@ int mynah_asr_qmat_init_st(mynah_asr_qmat *m, const mynah_asr_safetensors *st, c
         const mynah_asr_tensor *tq = mynah_asr_st_get(st, qname);
         snprintf(qname, sizeof(qname), "%s.scales", name);
         const mynah_asr_tensor *ts = mynah_asr_st_get(st, qname);
-        if (tq && ts) {                       /* pre-quantizzato: zero-copy dal mmap */
+        if (tq && ts) {                       /* pre-quantized: zero-copy from the mmap */
             m->n = (int)tq->shape[0];
             m->scales = (const float *)ts->data;
             if (qtype == MYNAH_ASR_Q_INT8) {
@@ -228,7 +228,7 @@ static float dot_q4_sdot(const int8_t *qx, float sx, const uint8_t *q,
         const uint8x16_t b = vld1q_u8(q + g * 16);
         const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, maskv)), off);
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
-        const int8x16x2_t xg = vld2q_s8(qx + g * 32);  /* val[0]=pari, val[1]=dispari */
+        const int8x16x2_t xg = vld2q_s8(qx + g * 32);  /* val[0]=even, val[1]=odd */
         int32x4_t ig = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, xg.val[0]), hi, xg.val[1]);
         acc += (float)vaddvq_s32(ig) * scales[g];
     }
@@ -262,7 +262,7 @@ static int x86_detect_caps(void) {
     if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27))) /* OSXSAVE */
         return MYNAH_ASR_CAPS_SCALAR;
     const unsigned long long xcr0 = xgetbv0();
-    if ((xcr0 & 0x6) != 0x6) return MYNAH_ASR_CAPS_SCALAR;        /* xmm+ymm dall'OS */
+    if ((xcr0 & 0x6) != 0x6) return MYNAH_ASR_CAPS_SCALAR;        /* xmm+ymm from the OS */
     if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !((b >> 5) & 1)) /* AVX2 */
         return MYNAH_ASR_CAPS_SCALAR;
     const int avx512f = (b >> 16) & 1, avx512bw = (b >> 30) & 1, vnni = (c >> 11) & 1;
@@ -309,7 +309,7 @@ static float dot_q8_avx2(const int8_t *qx, float sx, const int8_t *w, float ws, 
     for (; j + 32 <= k; j += 32) {
         const __m256i xv = _mm256_loadu_si256((const __m256i *)(qx + j));
         const __m256i wv = _mm256_loadu_si256((const __m256i *)(w + j));
-        const __m256i aw = _mm256_sign_epi8(wv, wv);   /* |w| come u8 */
+        const __m256i aw = _mm256_sign_epi8(wv, wv);   /* |w| as u8 */
         const __m256i sxv = _mm256_sign_epi8(xv, wv);  /* qx * sign(w) */
         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sxv), ones16));
     }
@@ -339,7 +339,7 @@ static void q4_permute_act(const int8_t *qx, int8_t *xp, int k) {
 }
 
 __attribute__((target("avx2")))
-static float dot_q4_x86(const int8_t *xp /* permutate */, float sx, const uint8_t *q,
+static float dot_q4_x86(const int8_t *xp /* permuted */, float sx, const uint8_t *q,
                         const float *scales, int k) {
     const __m128i mask4 = _mm_set1_epi8(0x0F);
     const __m128i off8 = _mm_set1_epi8(8);
@@ -372,7 +372,7 @@ int mynah_asr_set_caps(const char *name) {
     else if (name && strcmp(name, "avx2") == 0) want = MYNAH_ASR_CAPS_AVX2;
     else if (name && strcmp(name, "vnni") == 0) want = MYNAH_ASR_CAPS_VNNI;
     else if (name && strcmp(name, "auto") != 0)
-        fprintf(stderr, "mynah-asr: caps ignoti '%s' (scalar|avx2|vnni|auto) -> auto\n", name);
+        fprintf(stderr, "mynah-asr: unknown caps '%s' (scalar|avx2|vnni|auto) -> auto\n", name);
     if (want > detected) {
         fprintf(stderr, "mynah-asr: caps '%s' not supported by this CPU -> level %d\n",
                 name, detected);
@@ -418,7 +418,7 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
         const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, maskv)), off);
         const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), off);
 
-        const float32x4x2_t x0 = vld2q_f32(x + g * 32);       /* pari/dispari 0..7  */
+        const float32x4x2_t x0 = vld2q_f32(x + g * 32);       /* even/odd 0..7  */
         const float32x4x2_t x1 = vld2q_f32(x + g * 32 + 8);   /* 8..15  */
         const float32x4x2_t x2 = vld2q_f32(x + g * 32 + 16);  /* 16..23 */
         const float32x4x2_t x3 = vld2q_f32(x + g * 32 + 24);  /* 24..31 */
@@ -455,8 +455,8 @@ static float dot_q4_neon(const float *x, const uint8_t *q, const float *scales,
 
 typedef struct {
     const mynah_asr_qmat *m;
-    const int8_t *qx;      /* [T, k] attivazioni int8 (x86-q4: pre-permutate) */
-    const float *sx;       /* [T] scale attivazioni */
+    const int8_t *qx;      /* [T, k] int8 activations (x86-q4: pre-permuted) */
+    const float *sx;       /* [T] activation scales */
     float *out;            /* [T, n] */
     int T;
 } qgemm_ctx;

@@ -32,7 +32,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; /* init + weight cache 
 
 typedef struct {
     const void *host_ptr;
-    void *dev;   /* f32, o bf16 se g_bf16 */
+    void *dev;   /* f32, or bf16 if g_bf16 */
 } wc_ent;
 static wc_ent *g_wc;
 static int g_wc_n, g_wc_cap;
@@ -53,9 +53,9 @@ typedef struct {
     cudaStream_t stream;
     float *in, *out;
     size_t in_cap, out_cap;
-    unsigned short *stage;  /* staging host per la conversione x -> bf16 */
+    unsigned short *stage;  /* host staging for the x -> bf16 conversion */
     size_t stage_cap;
-    int state; /* 0 = da inizializzare, 1 = ok, -1 = fallito (resta su CPU) */
+    int state; /* 0 = to initialize, 1 = ok, -1 = failed (stays on CPU) */
 } cu_tls;
 static __thread cu_tls t_cu;
 
@@ -81,8 +81,8 @@ static cu_tls *tls_ctx(void) {
                      cudaStreamCreate(&t_cu.stream) == cudaSuccess ? 1 : -1;
         if (t_cu.state == 1) {
             cublasSetStream(t_cu.blas, t_cu.stream);
-            /* TF32: tensor core con I/O f32 (mantissa 10 bit nel prodotto).
-             * Validato sui fixture e2e; MYNAH_ASR_CUDA_TF32=0 per il f32 stretto. */
+            /* TF32: tensor cores with f32 I/O (10-bit mantissa in the product).
+             * Validated on the e2e fixtures; MYNAH_ASR_CUDA_TF32=0 for strict f32. */
             if (g_tf32) cublasSetMathMode(t_cu.blas, CUBLAS_TF32_TENSOR_OP_MATH);
         }
     }
@@ -154,7 +154,7 @@ extern "C" int mynah_asr_cuda_gemm_wt(const float *x, const float *w, float *out
     if (!dw || !dx || !dy) return -1;
 
     if (g_bf16) {
-        /* x -> bf16 su host: metà byte sul PCIe, tensor core in GemmEx */
+        /* x -> bf16 on the host: half the bytes over PCIe, tensor cores in GemmEx */
         if (!c->stage || c->stage_cap < xe) {
             size_t want = c->stage_cap ? c->stage_cap : (1u << 19);
             while (want < xe) want *= 2;
@@ -171,7 +171,7 @@ extern "C" int mynah_asr_cuda_gemm_wt(const float *x, const float *w, float *out
                             cudaMemcpyHostToDevice, c->stream) != cudaSuccess) return -1;
     }
 
-    /* cuBLAS è column-major: out_rm[T,n] = x_rm[T,k] @ W_rm[n,k]^T equivale a
+    /* cuBLAS is column-major: out_rm[T,n] = x_rm[T,k] @ W_rm[n,k]^T is equivalent to
      * out_cm[n,T] = W_cm[k,n]^T @ x_cm[k,T] -> gemm(op=T, op=N, m=n, n=T, k=k) */
     const float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t st;

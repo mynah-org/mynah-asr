@@ -1,7 +1,7 @@
 {
  "source": "FLEURS (google/fleurs) — Conneau et al., CC-BY 4.0",
  "url": "https://huggingface.co/datasets/google/fleurs",
- "note": "frasi parallele tra lingue: stesso id = stessa frase; l'inglese è il riferimento per la speech translation",
+ "note": "parallel sentences across languages: same id = same sentence; the English one is the reference for speech translation",
  "samples": [
   {
    "file": "it/fleurs_1521.wav",

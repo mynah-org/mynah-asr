@@ -24,7 +24,7 @@ import numpy as np
 from safetensors.numpy import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from convert_nemo import melscale_fbanks  # noqa: E402  (clone slaney verificato)
+from convert_nemo import melscale_fbanks  # noqa: E402  (verified slaney clone)
 
 ALIGN = 32
 # geometry of the ggml types the runtime supports (block_elems, block_bytes)
@@ -176,7 +176,7 @@ def main() -> int:
             "n_fft": f("n_fft"), "win_length": f("win_length"),
             "hop_length": f("hop_length"), "preemphasis": round(f("pre_emphasis"), 4),
             "log_zero_guard": 2.0 ** -24, "normalize": f("normalize"),
-            "dither": 0.0,                      # inference: mai dither (trappole §6)
+            "dither": 0.0,                      # inference: never dither (traps §6)
             "mel_filters": "mel_filters.safetensors",
         },
         "encoder": {
@@ -217,7 +217,7 @@ def main() -> int:
                "window": np.hanning(f("win_length")).astype(np.float32)},
               args.out / "mel_filters.safetensors")
 
-    # ---- model.gguf: tensori rinominati, payload verbatim ----
+    # ---- model.gguf: renamed tensors, verbatim payload ----
     infos, payload = bytearray(), bytearray()
     renamed = set()
     n_out = 0

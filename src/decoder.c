@@ -143,7 +143,7 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
         if (wd) { mynah_asr_qmat_dequant(&dec->head, wd); W = wd; }
     }
 
-    if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, stato zero */
+    if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, zero state */
 
     int n_out = 0, t = 0, emitted_here = 0;
     while (t < T) {
@@ -165,12 +165,12 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
                 if (frames) frames[n_out] = (int)(s->t_abs + t);
                 tokens[n_out++] = k;
             }
-            pred_step(dec, s, k);                          /* stato avanza solo su emit */
+            pred_step(dec, s, k);                          /* state advances only on emit */
             emitted_here++;
             if (dur == 0 && emitted_here >= dec->max_symbols)
-                dur = 1;                                   /* sblocca il frame (NeMo) */
+                dur = 1;                                   /* unblocks the frame (NeMo) */
         } else if (dur == 0) {
-            dur = 1;                                       /* blank: avanzamento minimo */
+            dur = 1;                                       /* blank: minimal advance */
         }
         if (dur > 0) emitted_here = 0;
         t += dur;
@@ -203,7 +203,7 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
         if (wd) { mynah_asr_qmat_dequant(&dec->head, wd); W = wd; }
     }
 
-    if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, stato zero */
+    if (s->last_token < 0) pred_step(dec, s, dec->blank); /* SOS = blank, zero state */
 
     int t = 0, B = 4;
     while (t < T) {
@@ -227,7 +227,7 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
             const int am = argmax_bias(logits + (size_t)b * (size_t)V, dec->head_b, V);
             if (am != dec->blank) { first = b; best = am; break; }
         }
-        if (first < 0) {                                   /* run di soli blank */
+        if (first < 0) {                                   /* all-blank run */
             t += Bc;
             if (B < DEC_BMAX) B *= 2;
             continue;
@@ -237,7 +237,7 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
         t += first;
         const float *e = enc + (size_t)t * (size_t)H;
         for (int emitted = 0; emitted < dec->max_symbols; emitted++) {
-            if (emitted > 0) {                             /* iterazione 0: dal batch */
+            if (emitted > 0) {                             /* iteration 0: from the batch */
                 for (int i = 0; i < H; i++) {
                     const float v = e[i] + s->g[i];
                     joint[i] = v > 0.0f ? v : 0.0f;
@@ -254,10 +254,10 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
                 if (frames) frames[n_out] = (int)(s->t_abs + t);
                 tokens[n_out++] = best;
             }
-            pred_step(dec, s, best);                       /* stato avanza solo su emit */
+            pred_step(dec, s, best);                       /* state advances only on emit */
         }
         t++;
-        B = 4;                                             /* riparte corto dopo un emit */
+        B = 4;                                             /* restart short after an emit */
     }
     s->t_abs += T;
     free(jin); free(logits); free(wd);
