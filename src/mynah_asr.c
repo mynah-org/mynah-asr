@@ -346,6 +346,8 @@ void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec) {
     m->seg_sec = sec <= 0.0 ? def : (sec < 5.0 ? 5.0 : sec);
 }
 
+double mynah_asr_segment_limit(const mynah_asr_model *m) { return m->seg_sec; }
+
 int mynah_asr_set_decoder(mynah_asr_model *m, const char *name) {
     if (strcmp(name, "ctc") == 0) {
         if (!m->ctc.w) {
@@ -375,6 +377,26 @@ int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]) {
     memcpy(out, m->lookaheads, sizeof(m->lookaheads));
     return m->n_lookaheads;
 }
+
+/* One planner for BOTH offline paths. Long audio is decoded as independent
+ * segments split on silence, because full-attention models (Parakeet/Canary)
+ * collapse past ~30 s — see MYNAH_ASR_SEG_OFFLINE. The batch path used to skip
+ * this and encode each item whole, so a long file came out WORSE through
+ * transcribe_batch than through transcribe: same input, two answers.
+ *
+ * With the same segmentation, transcribe_batch now gives the same TEXT as
+ * transcribe. The `_ts` variants still differ in ways that predate this and live
+ * in batch_decode_worker: no word timestamps for AED in a batch (and for AED
+ * asking for them changes the prompt, hence the text), and a hybrid model set to
+ * "ctc" decodes with the default engine in a batch. Both are commented there.
+ *
+ * Defined next to find_split_point, declared here for the batch path above it. */
+typedef struct { size_t off, len; } seg_range;
+static int plan_segments(const mynah_asr_model *m, const float *samples,
+                         size_t n_samples, seg_range **out);
+static int append_segment(char **text, size_t *text_len, mynah_asr_word **words,
+                          int *n_words, char *seg, mynah_asr_word *sw, int sn,
+                          double off_sec);
 
 /* per-item batch worker (features and decode are independent across items:
  * disjoint regions, read-only model -> parallel_for is safe) */
@@ -441,44 +463,153 @@ int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *sample
                               int lookahead, char **texts, char (*langs_out)[16],
                               mynah_asr_word **words, int *n_words) {
     const int right = lookahead >= 0 ? lookahead : m->default_right;
+    const int sr = m->feat.sample_rate;
     int rc = -1;
 
-    float **feats = calloc((size_t)batch, sizeof(float *));
-    float **encs = calloc((size_t)batch, sizeof(float *));
-    int *valids = calloc((size_t)batch, sizeof(int));
-    int *prompts = calloc((size_t)batch, sizeof(int));
-    int *t_encs = calloc((size_t)batch, sizeof(int));
-    if (!feats || !encs || !valids || !prompts || !t_encs) goto done;
-
-    batch_ctx c = {.m = m, .samples = samples, .n_samples = n_samples, .langs = langs,
-                   .feats = feats, .encs = encs, .valids = valids, .t_encs = t_encs,
-                   .texts = texts, .langs_out = langs_out,
-                   .words = words, .n_words = n_words};
-
+    /* Zero EVERY caller slot FIRST, before any allocation that could fail: the
+     * cleanup path frees texts[]/words[], so no bail-out may ever reach it with
+     * uninitialized entries (that would free garbage pointers). */
     for (int b = 0; b < batch; b++) {
         texts[b] = NULL;
         if (words) { words[b] = NULL; n_words[b] = 0; }
-        prompts[b] = resolve_prompt(m, langs ? langs[b] : NULL);
-        if (prompts[b] == -2) goto done;
+        if (langs_out) langs_out[b][0] = '\0';
     }
-    mynah_asr_parallel_for(batch, batch_feat_worker, &c);
-    for (int b = 0; b < batch; b++)
-        if (!feats[b]) goto done;
 
-    if (mynah_asr_encoder_forward_batch(&m->enc, (const float *const *)feats, valids, batch,
-                                    m->feat.n_mels, prompts, m->left_ctx, right,
-                                    encs, t_encs) != 0)
+    /* Batching happens over SEGMENTS, not over items: an item longer than the
+     * offline limit is split exactly as the single path splits it, so both paths
+     * answer the same thing (they did not before). Short items — the common case
+     * — give one segment each, i.e. the previous behaviour unchanged.
+     * Segments are processed in waves of `batch`, which also bounds the memory to
+     * what a batch of items used to take. */
+    float **feats = calloc((size_t)batch, sizeof(float *));
+    float **encs = calloc((size_t)batch, sizeof(float *));
+    int *valids = calloc((size_t)batch, sizeof(int));
+    int *t_encs = calloc((size_t)batch, sizeof(int));
+    int *prompts = calloc((size_t)batch, sizeof(int));        /* per item */
+    size_t *acc_len = calloc((size_t)batch, sizeof(size_t));  /* per item */
+    int *seen = calloc((size_t)batch, sizeof(int));            /* per item */
+    seg_range **plans = calloc((size_t)batch, sizeof(seg_range *));
+    int *n_plan = calloc((size_t)batch, sizeof(int));
+    /* wave-local slots (indexed 0..W-1) */
+    const float **wsamp = calloc((size_t)batch, sizeof(const float *));
+    size_t *wns = calloc((size_t)batch, sizeof(size_t));
+    const char **wlangs = calloc((size_t)batch, sizeof(const char *));
+    int *wprompts = calloc((size_t)batch, sizeof(int));
+    char **wtexts = calloc((size_t)batch, sizeof(char *));
+    char (*wlangs_out)[16] = calloc((size_t)batch, sizeof(*wlangs_out));
+    mynah_asr_word **wwords = words ? calloc((size_t)batch, sizeof(mynah_asr_word *)) : NULL;
+    int *wnwords = words ? calloc((size_t)batch, sizeof(int)) : NULL;
+    int *seg_item = NULL;
+    size_t *seg_off = NULL, *seg_len = NULL;
+    int n_segs = 0;
+
+    if (!feats || !encs || !valids || !t_encs || !prompts || !acc_len || !seen ||
+        !plans || !n_plan || !wsamp || !wns || !wlangs || !wprompts || !wtexts ||
+        !wlangs_out || (words && (!wwords || !wnwords)))
         goto done;
 
-    mynah_asr_parallel_for(batch, batch_decode_worker, &c);
+    for (int b = 0; b < batch; b++) {
+        prompts[b] = resolve_prompt(m, langs ? langs[b] : NULL);
+        if (prompts[b] == -2) goto done;
+        n_plan[b] = plan_segments(m, samples[b], n_samples[b], &plans[b]);
+        if (n_plan[b] < 0) goto done;
+        n_segs += n_plan[b];
+    }
+
+    /* flatten (item, offset, length) so a wave can mix segments of any items */
+    seg_item = calloc((size_t)n_segs, sizeof(int));
+    seg_off = calloc((size_t)n_segs, sizeof(size_t));
+    seg_len = calloc((size_t)n_segs, sizeof(size_t));
+    if (!seg_item || !seg_off || !seg_len) goto done;
+    for (int b = 0, k = 0; b < batch; b++)
+        for (int i = 0; i < n_plan[b]; i++, k++) {
+            seg_item[k] = b;
+            seg_off[k] = plans[b][i].off;
+            seg_len[k] = plans[b][i].len;
+        }
+
+    batch_ctx c = {.m = m, .samples = wsamp, .n_samples = wns, .langs = wlangs,
+                   .feats = feats, .encs = encs, .valids = valids, .t_encs = t_encs,
+                   .texts = wtexts, .langs_out = wlangs_out,
+                   .words = wwords, .n_words = wnwords};
+
+    for (int w = 0; w < n_segs; w += batch) {
+        const int W = n_segs - w < batch ? n_segs - w : batch;
+        for (int i = 0; i < W; i++) {
+            const int b = seg_item[w + i];
+            wsamp[i] = samples[b] + seg_off[w + i];
+            wns[i] = seg_len[w + i];
+            wlangs[i] = langs ? langs[b] : NULL;
+            wprompts[i] = prompts[b];
+            wtexts[i] = NULL;
+            wlangs_out[i][0] = '\0';
+            if (wwords) { wwords[i] = NULL; wnwords[i] = 0; }
+        }
+
+        mynah_asr_parallel_for(W, batch_feat_worker, &c);
+        int ok = 1;
+        for (int i = 0; i < W; i++)
+            if (!feats[i]) ok = 0;
+        if (ok && mynah_asr_encoder_forward_batch(&m->enc, (const float *const *)feats, valids,
+                                             W, m->feat.n_mels, wprompts, m->left_ctx,
+                                             right, encs, t_encs) != 0)
+            ok = 0;
+        if (ok) mynah_asr_parallel_for(W, batch_decode_worker, &c);
+
+        /* stitch each segment onto its item (same helper as the single path) */
+        for (int i = 0; i < W && ok; i++) {
+            const int b = seg_item[w + i];
+            if (!wtexts[i]) { ok = 0; break; }
+            if (langs_out && !seen[b] && wlangs_out[i][0])
+                memcpy(langs_out[b], wlangs_out[i], sizeof(wlangs_out[i]));
+            seen[b] = 1;
+            if (append_segment(&texts[b], &acc_len[b], words ? &words[b] : NULL,
+                               words ? &n_words[b] : NULL, wtexts[i],
+                               wwords ? wwords[i] : NULL, wnwords ? wnwords[i] : 0,
+                               (double)seg_off[w + i] / sr) != 0) {
+                /* append_segment owns seg and sw on failure too: drop both handles
+                 * here or the per-wave cleanup below double-frees them */
+                wtexts[i] = NULL;
+                if (wwords) { wwords[i] = NULL; wnwords[i] = 0; }
+                ok = 0;
+                break;
+            }
+            wtexts[i] = NULL;
+            if (wwords) { wwords[i] = NULL; wnwords[i] = 0; }
+        }
+
+        /* All `batch` slots, not just W: a partial wave can only be the last one,
+         * so slots >= W are already NULL — but freeing the whole array keeps this
+         * leak-free without depending on that argument. */
+        for (int i = 0; i < batch; i++) {   /* per-wave buffers, freed either way */
+            free(feats[i]); feats[i] = NULL;
+            free(encs[i]); encs[i] = NULL;
+            free(wtexts[i]); wtexts[i] = NULL;
+            if (wwords) { mynah_asr_words_free(wwords[i], wnwords[i]); wwords[i] = NULL; wnwords[i] = 0; }
+        }
+        if (!ok) goto done;
+    }
+
+    /* No empty-string fallback needed: every item has at least one segment, and a
+     * stitched segment always leaves texts[b] non-NULL (append_segment writes at
+     * least the NUL) — anything else took `goto done` above. */
     rc = 0;
 
 done:
-    for (int b = 0; b < batch; b++) {
-        if (feats) free(feats[b]);
-        if (encs) free(encs[b]);
+    if (rc != 0) {
+        for (int b = 0; b < batch; b++) {
+            free(texts[b]);
+            texts[b] = NULL;
+            if (words) { mynah_asr_words_free(words[b], n_words[b]); words[b] = NULL; n_words[b] = 0; }
+        }
     }
-    free(feats); free(encs); free(valids); free(prompts); free(t_encs);
+    if (plans) for (int b = 0; b < batch; b++) free(plans[b]);
+    free(plans); free(n_plan);
+    free(seg_item); free(seg_off); free(seg_len);
+    free(feats); free(encs); free(valids); free(t_encs); free(prompts);
+    free(acc_len); free(seen);
+    free((void *)wsamp); free(wns); free((void *)wlangs); free(wprompts);
+    free(wtexts); free(wlangs_out); free(wwords); free(wnwords);
     return rc;
 }
 
@@ -835,6 +966,88 @@ static size_t find_split_point(const float *s, size_t lo, size_t hi, int sr) {
     return best_pos;
 }
 
+/* Ranges the offline path decodes independently (see the forward declaration).
+ * Returns the count and a malloc'd array, or -1. Audio short enough for one
+ * segment yields exactly one covering the whole input, so the callers have no
+ * special case; empty input yields one empty segment, matching what the direct
+ * call used to do. */
+static int plan_segments(const mynah_asr_model *m, const float *samples,
+                         size_t n_samples, seg_range **out) {
+    const int sr = m->feat.sample_rate;
+    const size_t seg_max = (size_t)(m->seg_sec * sr);
+    seg_range *segs = NULL;
+    int n = 0, cap = 0;
+    size_t cur = 0;
+    while (cur < n_samples) {
+        size_t end = n_samples;
+        if (n_samples - cur > seg_max + seg_max / 10) {   /* +10%: no split for a small overrun */
+            /* look for silence in the last 20 s of the window (at least 1 s in) */
+            const size_t hi = cur + seg_max;
+            size_t lo = seg_max > 20u * (size_t)sr ? hi - 20u * (size_t)sr : cur + (size_t)sr;
+            if (lo <= cur) lo = cur + 1;
+            end = find_split_point(samples, lo, hi, sr);
+        }
+        if (end <= cur) end = cur + 1;   /* progress, so termination is local */
+        if (n == cap) {
+            const int nc = cap ? cap * 2 : 8;
+            seg_range *ns = realloc(segs, (size_t)nc * sizeof(*ns));
+            if (!ns) { free(segs); return -1; }
+            segs = ns;
+            cap = nc;
+        }
+        segs[n].off = cur;
+        segs[n].len = end - cur;
+        n++;
+        cur = end;
+    }
+    if (n == 0) {
+        segs = malloc(sizeof(*segs));
+        if (!segs) return -1;
+        segs[0].off = 0;
+        segs[0].len = 0;
+        n = 1;
+    }
+    *out = segs;
+    return n;
+}
+
+/* Appends one segment's result to an item's accumulator: text joined with a
+ * space, word timestamps shifted to absolute time. Takes ownership of seg and sw
+ * either way, so a failure here needs no cleanup from the caller beyond the
+ * accumulator itself. Shared so the single and batch paths stitch identically. */
+static int append_segment(char **text, size_t *text_len, mynah_asr_word **words,
+                          int *n_words, char *seg, mynah_asr_word *sw, int sn,
+                          double off_sec) {
+    const size_t sl = strlen(seg);
+    char *nt = realloc(*text, *text_len + sl + 2);
+    if (!nt) {                      /* a failed realloc does NOT free the old block */
+        free(seg);
+        mynah_asr_words_free(sw, sn);
+        return -1;
+    }
+    *text = nt;
+    if (*text_len > 0 && sl > 0) (*text)[(*text_len)++] = ' ';
+    memcpy(*text + *text_len, seg, sl + 1);
+    *text_len += sl;
+    free(seg);
+
+    if (words && sn > 0) {
+        mynah_asr_word *nw = realloc(*words, ((size_t)*n_words + (size_t)sn) * sizeof(*nw));
+        if (!nw) { mynah_asr_words_free(sw, sn); return -1; }
+        *words = nw;
+        for (int i = 0; i < sn; i++) {
+            nw[*n_words + i] = sw[i];
+            nw[*n_words + i].t0 += off_sec;
+            nw[*n_words + i].t1 += off_sec;
+        }
+        *n_words += sn;
+        free(sw);                   /* the strings have been transferred */
+    } else if (sw) {
+        mynah_asr_words_free(sw, sn);
+    }
+    return 0;
+}
+
 char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n_samples,
                           const char *lang, int lookahead, char *lang_out,
                           mynah_asr_word **words, int *n_words) {
@@ -845,69 +1058,34 @@ char *mynah_asr_transcribe_ts(mynah_asr_model *m, const float *samples, size_t n
     const int right = lookahead >= 0 ? lookahead : m->default_right;
 
     const int sr = m->feat.sample_rate;
-    const size_t seg_max = (size_t)(m->seg_sec * sr);
-    if (n_samples <= seg_max + seg_max / 10)   /* +10%: don't split for a small overrun */
-        return transcribe_segment(m, samples, n_samples, prompt, right, lang, lang_out,
-                                  words, n_words);
+    seg_range *segs = NULL;
+    const int n_segs = plan_segments(m, samples, n_samples, &segs);
+    if (n_segs < 0) return NULL;
 
-    /* long audio: independent segments split on silence, results concatenated */
+    /* independent segments split on silence, results concatenated (one segment
+     * for anything short enough — the common case) */
     char *text = NULL;
     size_t text_len = 0;
-    size_t cur = 0;
-    while (cur < n_samples) {
-        size_t end = n_samples;
-        if (n_samples - cur > seg_max + seg_max / 10) {
-            /* look for silence in the last 20 s of the window (at least 1 s in) */
-            const size_t hi = cur + seg_max;
-            size_t lo = seg_max > 20u * (size_t)sr ? hi - 20u * (size_t)sr : cur + (size_t)sr;
-            if (lo <= cur) lo = cur + 1;
-            end = find_split_point(samples, lo, hi, sr);
-        }
-
+    for (int i = 0; i < n_segs; i++) {
         char seg_lang[16] = "";
         mynah_asr_word *sw = NULL;
         int sn = 0;
-        char *seg = transcribe_segment(m, samples + cur, end - cur, prompt, right,
+        char *seg = transcribe_segment(m, samples + segs[i].off, segs[i].len, prompt, right,
                                        lang, seg_lang, words ? &sw : NULL, &sn);
-        if (!seg) { free(text); if (words) mynah_asr_words_free(*words, *n_words); return NULL; }
-        if (lang_out && seg_lang[0] && cur == 0) memcpy(lang_out, seg_lang, sizeof(seg_lang));
-
-        const size_t sl = strlen(seg);
-        char *nt = realloc(text, text_len + sl + 2);
-        if (!nt) {
-            free(seg); free(text); mynah_asr_words_free(sw, sn);
-            if (words) { mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0; }
-            return NULL;
-        }
-        text = nt;
-        if (text_len > 0 && sl > 0) text[text_len++] = ' ';
-        memcpy(text + text_len, seg, sl + 1);
-        text_len += sl;
-        free(seg);
-
-        if (words && sn > 0) {
-            mynah_asr_word *nw = realloc(*words, ((size_t)*n_words + (size_t)sn) * sizeof(mynah_asr_word));
-            if (!nw) {
-                mynah_asr_words_free(sw, sn); free(text);
-                /* a failed realloc does NOT free the old block */
-                mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0;
-                return NULL;
-            }
-            *words = nw;
-            const double off = (double)cur / sr;
-            for (int i = 0; i < sn; i++) {
-                nw[*n_words + i] = sw[i];
-                nw[*n_words + i].t0 += off;
-                nw[*n_words + i].t1 += off;
-            }
-            *n_words += sn;
-            free(sw);   /* the strings have been transferred */
-        } else if (sw) {
-            mynah_asr_words_free(sw, sn);
-        }
-        cur = end;
+        if (!seg) goto fail;
+        if (lang_out && seg_lang[0] && i == 0) memcpy(lang_out, seg_lang, sizeof(seg_lang));
+        if (append_segment(&text, &text_len, words, n_words, seg, sw, sn,
+                           (double)segs[i].off / sr) != 0)
+            goto fail;
     }
+    free(segs);
     return text ? text : calloc(1, 1);
+
+fail:
+    free(segs);
+    free(text);
+    if (words) { mynah_asr_words_free(*words, *n_words); *words = NULL; *n_words = 0; }
+    return NULL;
 }
 
 char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_samples,

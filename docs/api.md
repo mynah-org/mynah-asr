@@ -74,6 +74,7 @@ form: `lang = "src>tgt"` (e.g. `"en>de"`) in `mynah_asr_transcribe*` — it wins
 ```c
 int  mynah_asr_set_decoder(mynah_asr_model *m, const char *name);      /* "default" | "ctc" */
 void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec);      /* default 300 s */
+double mynah_asr_segment_limit(const mynah_asr_model *m);              /* the one in force */
 ```
 `"ctc"` uses the CTC head of hybrid models (`parakeet-tdt_ctc-*`) — faster,
 slightly lower quality; on pure CTC models it is already the default. -1 if the

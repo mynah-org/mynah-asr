@@ -70,6 +70,9 @@ int mynah_asr_can_translate(const mynah_asr_model *m);
  * sec >= 5; 0 = restore the default. */
 void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec);
 
+/* The limit currently in force, in seconds (the resolved default if never set). */
+double mynah_asr_segment_limit(const mynah_asr_model *m);
+
 /* Lookaheads (right context) valid for the model, e.g. {3,0,6,13}. */
 int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]);
 
@@ -98,8 +101,18 @@ void mynah_asr_words_free(mynah_asr_word *words, int n_words);
 
 /* Weight-stationary BATCH transcription: N requests processed together — the
  * weights (2.5 GB) are read once per layer instead of N times. Variable lengths,
- * no padding. texts[i] receives the text (malloc'd, freed by the caller; NULL when
- * that single item failed); langs_out[i] (>= 16 bytes each) is optional. 0 = ok. */
+ * no padding. texts[i] receives the text (malloc'd, freed by the caller);
+ * langs_out[i] (>= 16 bytes each) is optional.
+ *
+ * Items longer than the segment limit are split exactly as mynah_asr_transcribe
+ * splits them, so both entry points return the same text (they did not before:
+ * the batch path encoded each item whole and long audio came out worse).
+ *
+ * Returns 0 on success, -1 on failure — and failure is ALL-OR-NOTHING: every
+ * texts[]/words[] slot comes back NULL/0, not just the item that failed. On
+ * success every texts[i] is non-NULL (possibly ""). Every output slot is
+ * initialized before anything that can fail, so a -1 never leaves a caller's
+ * array holding uninitialized pointers. */
 /* Like mynah_asr_transcribe_batch, plus words[b]/n_words[b] per item (arrays of
  * `batch` slots provided by the caller; each words[b] must be freed with
  * mynah_asr_words_free). words == NULL = text only. */

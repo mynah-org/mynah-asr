@@ -134,9 +134,12 @@ on 300 s audio — it stays opt-in until the resident-activation encoder
   parallel regions — weak-symbol pattern from qwen-tts, `OPENBLAS_NUM_THREADS`
   still wins). macOS/Accelerate is unaffected.
 
-Known issue (TODO): `mynah_asr_transcribe_batch` skips long-file segmentation, so
-full-attention models drift slightly vs the single path on >30 s items (caught
-by the `bench_throughput` consistency check; windowed nemotron is identical).
+~~Known issue: `mynah_asr_transcribe_batch` skips long-file segmentation~~ **fixed
+2026-07-30**: batching now happens over SEGMENTS, planned by the same code the
+single path uses, so a long item gives the same text through either entry point
+(it used to come out worse through the batch). Guarded by phase 2 of
+`tests/test_batch`, which forces a 5 s limit so the case is exercised on every
+model rather than only on the full-attention ones.
 
 ## Streaming (Nemotron, cache-aware)
 
