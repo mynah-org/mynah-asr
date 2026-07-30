@@ -42,6 +42,7 @@ struct mynah_asr_model {
     double frame_sec;               /* duration of one encoder frame (hop*sub/sr) */
     double seg_sec;                 /* offline per-segment limit (default 300 s) */
     mynah_asr_vad *vad;             /* optional (mynah_asr_enable_vad): NULL = energy split */
+    char vad_dir[512];              /* kept so each stream can open its OWN instance */
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -366,12 +367,14 @@ double mynah_asr_segment_limit(const mynah_asr_model *m) { return m->seg_sec; }
 int mynah_asr_enable_vad(mynah_asr_model *m, const char *vad_dir) {
     if (!m) return -1;
     if (m->vad) { mynah_asr_vad_close(m->vad); m->vad = NULL; }
+    m->vad_dir[0] = '\0';
     if (!vad_dir) return 0;
     m->vad = mynah_asr_vad_open(vad_dir);
     if (!m->vad) {
         fprintf(stderr, "mynah-asr: cannot load the VAD from %s (see make fetch-vad)\n", vad_dir);
         return -1;
     }
+    snprintf(m->vad_dir, sizeof(m->vad_dir), "%s", vad_dir);
     return 0;
 }
 
@@ -658,6 +661,15 @@ struct mynah_asr_stream {
     size_t chars_emitted;       /* bytes of text already handed to the callback */
     char lang[16];
     size_t samples_fed;
+    /* endpointing (VAD-5c): its own VAD instance — the object carries LSTM state,
+     * so it cannot be shared with the offline path or with another stream */
+    mynah_asr_vad *vad;
+    mynah_asr_vad_policy pol;
+    mynah_asr_vad_seg seg;
+    float *vbuf;                /* partial frame: the VAD only accepts whole frames */
+    int vhave, vframe;
+    int eou_pending;            /* a span closed: report it on the next callback */
+    double eou_sec;
 };
 
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead) {
@@ -685,6 +697,19 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
     s->cap_tokens = 4096;
     s->tokens = malloc((size_t)s->cap_tokens * sizeof(int));
     if (!s->mel_buf || !s->enc_buf || !s->tokens) { mynah_asr_stream_close(s); return NULL; }
+
+    /* endpointing: opt-in, inherited from the model. Its OWN instance, because the
+     * VAD carries LSTM state across frames — sharing it would interleave two
+     * unrelated audio streams into one state. */
+    if (m->vad_dir[0]) {
+        s->vad = mynah_asr_vad_open(m->vad_dir);
+        if (!s->vad) { mynah_asr_stream_close(s); return NULL; }
+        s->pol = mynah_asr_vad_policy_of(s->vad);
+        s->vframe = mynah_asr_vad_frame_samples(s->vad);
+        s->vbuf = malloc((size_t)s->vframe * sizeof(float));
+        if (!s->vbuf) { mynah_asr_stream_close(s); return NULL; }
+        mynah_asr_vad_seg_reset(&s->seg);
+    }
     return s;
 }
 
@@ -692,7 +717,8 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
     if (!s) return;
     mynah_asr_mel_stream_free(&s->mel);
     mynah_asr_enc_stream_free(&s->es);
-    free(s->mel_buf); free(s->enc_buf); free(s->tokens);
+    mynah_asr_vad_close(s->vad);
+    free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->vbuf);
     free(s);
 }
 
@@ -739,9 +765,54 @@ static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
     return 0;
 }
 
+/* Endpointing pass over the incoming samples: the VAD only accepts whole frames,
+ * so partial ones wait in vbuf. A closing span means "speech ended", and its end
+ * is where the SILENCE started, min_silence_ms before we could know it. */
+static void stream_vad_scan(mynah_asr_stream *s, const float *samples, size_t n) {
+    /* vframe > 0 is what makes the loop below advance: guard it explicitly rather
+     * than rely on the caller, because getting it wrong is an infinite loop (found
+     * exactly that way, by breaking the guard on purpose) */
+    if (!s->vad || s->vframe <= 0 || !s->vbuf) return;
+    const int sr = s->m->feat.sample_rate;
+    size_t off = 0;
+    while (off < n) {
+        const int room = s->vframe - s->vhave;
+        const size_t take = (n - off) < (size_t)room ? (n - off) : (size_t)room;
+        memcpy(s->vbuf + s->vhave, samples + off, take * sizeof(float));
+        s->vhave += (int)take;
+        off += take;
+        if (s->vhave < s->vframe) break;
+        const float prob = mynah_asr_vad_feed(s->vad, s->vbuf, (size_t)s->vframe);
+        s->vhave = 0;
+        if (prob < 0.0f) continue;
+        mynah_asr_vad_span span;
+        if (mynah_asr_vad_seg_feed(&s->pol, &s->seg, prob, &span)) {
+            s->eou_pending = 1;
+            s->eou_sec = (double)span.t1 / (double)sr;
+        }
+    }
+}
+
+/* Reports a detected endpoint AFTER the text deltas of the same call, so a
+ * consumer sees "text ... then the utterance ended at t1". */
+static void stream_emit_eou(mynah_asr_stream *s, mynah_asr_result_cb cb, void *ud) {
+    if (!s->eou_pending) return;
+    s->eou_pending = 0;
+    if (!cb) return;
+    mynah_asr_result res = {
+        .text = "",
+        .t0 = 0.0, .t1 = s->eou_sec,
+        .is_final = true,
+        .lang = s->lang[0] ? s->lang : NULL,
+        .is_eou = true,
+    };
+    cb(&res, ud);
+}
+
 int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                       mynah_asr_result_cb cb, void *ud) {
     mynah_asr_model *m = s->m;
+    stream_vad_scan(s, samples, n);
     s->samples_fed += n;
     const float *src = samples;
     size_t left = n;
@@ -758,6 +829,7 @@ int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
         if (s->mel_have < need) break;          /* more samples needed */
         if (stream_flush_chunk(s, need, 0, cb, ud) != 0) return -1;
     }
+    stream_emit_eou(s, cb, ud);
     return 0;
 }
 
@@ -777,6 +849,14 @@ int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
         }
         /* full chunk: is_last only when the mel stream has nothing left after it */
         if (stream_flush_chunk(s, need, 0, cb, ud) != 0) return -1;
+    }
+    if (s->vad) {
+        mynah_asr_vad_span span;
+        if (mynah_asr_vad_seg_finish(&s->pol, &s->seg, s->samples_fed, &span)) {
+            s->eou_pending = 1;
+            s->eou_sec = (double)span.t1 / (double)s->m->feat.sample_rate;
+        }
+        stream_emit_eou(s, cb, ud);
     }
     return 0;
 }

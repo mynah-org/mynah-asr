@@ -115,6 +115,11 @@ void mynah_asr_stream_close(mynah_asr_stream *s);
 - The callback receives `mynah_asr_result`: `text` = text **delta** (final,
   `is_final = true` always with Nemotron greedy), `t1` = seconds of audio consumed,
   `lang` = detected language (or NULL).
+- **Endpointing**: with a VAD attached to the model (`mynah_asr_enable_vad`), each
+  end of utterance produces an extra callback with `is_eou = true`, empty `text`
+  and `t1` = the time speech stopped. It does not change the transcription — the
+  text is byte-identical with and without a VAD. Latency ~160 ms of audio plus one
+  feed chunk (measured: 160 ms with 32 ms feeds, 312-376 ms with 250 ms feeds).
 - `feed` returns 0/-1; accepts any input size.
 - Memory per stream: ~12 MB of cache, independent of duration.
 
@@ -133,6 +138,7 @@ typedef struct {
     double t0, t1;
     bool is_final;
     const char *lang;
+    bool is_eou;          /* VAD endpoint: text is "", t1 = when speech stopped */
 } mynah_asr_result;
 typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata);
 ```

@@ -24,7 +24,8 @@ cut a long file. Nothing detects speech. A real VAD buys three things:
    the quietest 20 ms window, which is only a proxy. **Measured: the real win** —
    CER 0.195 → 0.112 on parakeet-ctc-1.1b, though it costs ~1 point on the 110m.
 3. **Endpointing / EOU in streaming** — decide that an utterance ended, rather
-   than inferring it from decoder output. Still open.
+   than inferring it from decoder output. **Done**, ~160 ms of audio latency plus
+   the caller's feed granularity, with no effect on the transcription.
 
 Points 1 and 2 were guesses when this file was written; the numbers below are what
 they turned into, and one of them was wrong.
@@ -214,8 +215,13 @@ build was the same binary. The numbers above come from forced rebuilds and from
    than the two separate commits the plan assumed. Verdict and measurements in
    "Using it on the offline path" above; `tests/test_e2e.sh` gates it by requiring
    that enabling the VAD leaves a single-utterance fixture unchanged.
-   **Still open: streaming endpointing (EOU)**, which reuses the same incremental
-   `mynah_asr_vad_seg_feed` and needs its own latency measurement.
+   **Streaming endpointing: done too** — the stream opens its own VAD instance and
+   reports each utterance end through the callback (`is_eou`, `t1` = when speech
+   stopped), reusing the same incremental `mynah_asr_vad_seg_feed`. It does not
+   touch decoding, so the text stays byte-identical, which is what
+   `tests/test_e2e.sh` asserts. Latency ~160 ms of audio (min_silence_ms plus frame
+   quantization) plus one feed chunk: measured 160 ms at 32 ms chunks, 176-212 ms at
+   100 ms, 312-376 ms at 250 ms. Details in docs/streaming.md.
 
 Steps 1-4 are what make step 5 safe to attempt; the span parity makes it cheap.
 

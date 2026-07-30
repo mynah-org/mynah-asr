@@ -10,6 +10,10 @@ NAME=$(sed -n 's/.*"name": "\([^"]*\)".*/\1/p' "$MODEL_DIR/mynah.json")
 
 echo "--- e2e $NAME [$ENGINE]"
 fail=0
+# cache-aware streaming exists only for the streaming models
+STREAM_OK=""
+STREAM_LANG="auto"
+if [ "$ENGINE" = "nemotron-streaming" ]; then STREAM_OK=1; STREAM_LANG="it-IT"; fi
 check() { # wav, lang, expected substring
     out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$1" --lang "$2" 2>/dev/null)
     case "$out" in
@@ -150,6 +154,26 @@ if [ -f models/silero-vad/mynah.json ]; then
         echo "e2e vad OK: unchanged on a single utterance"
     else
         printf 'e2e vad FAIL:\n  without: %s\n  with:    %s\n' "$plain" "$vad"; fail=1
+    fi
+fi
+
+# Streaming endpointing (only for streaming models, and only with the VAD there).
+# Two things, and the first is the important one: the VAD does not touch decoding
+# in streaming, it only REPORTS where speech ended, so the text must come out
+# byte-identical. If it does not, endpointing has side effects it should not have.
+if [ -n "$STREAM_OK" ] && [ -f models/silero-vad/mynah.json ]; then
+    plain=$(./mynah-asr stream -m "$MODEL_DIR" -i "$Q_WAV" --lang "$STREAM_LANG" 2>/dev/null)
+    vout=$(./mynah-asr stream -m "$MODEL_DIR" -i "$Q_WAV" --lang "$STREAM_LANG" \
+           --vad models/silero-vad 2>&1 >/dev/null)
+    vtext=$(./mynah-asr stream -m "$MODEL_DIR" -i "$Q_WAV" --lang "$STREAM_LANG" \
+            --vad models/silero-vad 2>/dev/null)
+    if [ "$plain" != "$vtext" ]; then
+        printf 'e2e eou FAIL: the VAD changed the streamed text\n  without: %s\n  with:    %s\n' \
+            "$plain" "$vtext"; fail=1
+    elif ! printf '%s' "$vout" | grep -q "eou at"; then
+        echo "e2e eou FAIL: no endpoint reported on a fixture that ends in silence"; fail=1
+    else
+        echo "e2e eou OK: $(printf '%s' "$vout" | grep -c 'eou at') endpoint(s), text unchanged"
     fi
 fi
 

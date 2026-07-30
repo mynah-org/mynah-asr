@@ -20,8 +20,8 @@ static void usage(void) {
     printf("             offline transcription (WAV PCM16 16 kHz);\n");
     printf("             --timestamps prints one word per line: t0 t1 word\n");
     printf("             --decoder ctc uses the CTC head of hybrid models (tdt_ctc)\n");
-    printf("  stream     -m <model_dir> [--lang auto] [--quant int8|int4]\n");
-    printf("             live streaming from stdin (raw s16le 16 kHz mono)\n");
+    printf("  stream     -m <model_dir> [-i file.wav] [--chunk-ms N] [--lang auto] [--quant int8|int4] [--vad <dir>]\n");
+    printf("             live streaming: -i a WAV, or raw s16le 16 kHz mono on stdin\n");
     printf("  quantize   -m <model_dir> --quant int8|int4\n");
     printf("             writes the pre-quantized checkpoint (instant load)\n");
     printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8] [--vad <dir>]\n");
@@ -113,19 +113,31 @@ static int cmd_transcribe(int argc, char **argv) {
     return 0;
 }
 
+/* Audio fed so far, so the endpoint report can show its own latency: the VAD can
+ * only know speech ended min_silence_ms after it did. */
+static double g_fed_sec;
+
 static void print_partial(const mynah_asr_result *res, void *ud) {
     (void)ud;
+    if (res->is_eou) {
+        fprintf(stderr, "\n[eou at %.2fs, reported after %.0f ms]\n",
+                res->t1, (g_fed_sec - res->t1) * 1000.0);
+        return;
+    }
     fputs(res->text, stdout);
     fflush(stdout);
 }
 
 static int cmd_stream(int argc, char **argv) {
-    const char *model_dir = NULL, *lang = "auto";
-    int lookahead = -1, quant = MYNAH_ASR_QUANT_F32;
+    const char *model_dir = NULL, *lang = "auto", *vad_dir = NULL, *wav = NULL;
+    int lookahead = -1, quant = MYNAH_ASR_QUANT_F32, chunk_ms = 100;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) lang = argv[++i];
         else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) lookahead = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) vad_dir = argv[++i];
+        else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) wav = argv[++i];
+        else if (strcmp(argv[i], "--chunk-ms") == 0 && i + 1 < argc) chunk_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             i++;
             quant = strcmp(argv[i], "int8") == 0 ? MYNAH_ASR_QUANT_INT8
@@ -136,19 +148,50 @@ static int cmd_stream(int argc, char **argv) {
         else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 2; }
     }
     if (!model_dir) { usage(); return 2; }
+    if (chunk_ms < 1) chunk_ms = 1;
 
     mynah_asr_model *m = mynah_asr_load_quant(model_dir, quant);
     if (!m) return 1;
+    if (vad_dir && mynah_asr_enable_vad(m, vad_dir) != 0) { mynah_asr_free(m); return 1; }
     mynah_asr_stream *s = mynah_asr_stream_open(m, lang, lookahead);
     if (!s) { mynah_asr_free(m); return 1; }
+    const size_t chunk = (size_t)chunk_ms * 16;      /* 16 kHz -> samples per chunk */
+
+    if (wav) {
+        /* same path from a WAV: the library parses the container, so the caller
+         * does not have to know where the data chunk starts (test fixtures have a
+         * padding chunk before it), and the feed granularity is explicit */
+        fprintf(stderr, "[stream: %s in %d ms chunks, lang=%s]\n", wav, chunk_ms, lang);
+        size_t n_samples;
+        int sr;
+        float *all = mynah_asr_wav_load(wav, &n_samples, &sr);
+        if (!all) { mynah_asr_stream_close(s); mynah_asr_free(m); return 1; }
+        if (sr != 16000) {
+            size_t n_rs;
+            float *rs = mynah_asr_resample(all, n_samples, sr, 16000, &n_rs);
+            free(all);
+            if (!rs) { mynah_asr_stream_close(s); mynah_asr_free(m); return 1; }
+            all = rs;
+            n_samples = n_rs;
+        }
+        for (size_t off = 0; off < n_samples; off += chunk) {
+            const size_t take = n_samples - off < chunk ? n_samples - off : chunk;
+            g_fed_sec += (double)take / 16000.0;
+            if (mynah_asr_stream_feed(s, all + off, take, print_partial, NULL) != 0) break;
+        }
+        free(all);
+    } else {
     fprintf(stderr, "[stream: raw s16le 16 kHz mono from stdin, lang=%s]\n", lang);
 
-    short pcm[1600]; /* 100 ms per read */
+    short pcm[1600];
     float buf[1600];
     size_t got;
-    while ((got = fread(pcm, sizeof(short), 1600, stdin)) > 0) {
+    const size_t want = chunk > 1600 ? 1600 : chunk;
+    while ((got = fread(pcm, sizeof(short), want, stdin)) > 0) {
         for (size_t i = 0; i < got; i++) buf[i] = (float)pcm[i] / 32768.0f;
+        g_fed_sec += (double)got / 16000.0;
         if (mynah_asr_stream_feed(s, buf, got, print_partial, NULL) != 0) break;
+    }
     }
     mynah_asr_stream_finish(s, print_partial, NULL);
     printf("\n");

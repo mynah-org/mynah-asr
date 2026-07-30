@@ -25,6 +25,7 @@ typedef struct {
     double      t0, t1;    /* time window in seconds (when available) */
     bool        is_final;  /* false = partial (may still change), true = commit */
     const char *lang;      /* detected language tag, NULL when unavailable   */
+    bool        is_eou;    /* the VAD saw the utterance END at t1 (text is "") */
 } mynah_asr_result;
 
 typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata);
@@ -147,6 +148,20 @@ int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
  * is ALWAYS final (monotonic greedy, never retracted): is_final = true. */
 typedef struct mynah_asr_stream mynah_asr_stream;
 
+/* Inherits endpointing from the model: if mynah_asr_enable_vad was called, the
+ * stream opens its OWN VAD instance (the VAD carries LSTM state, so it cannot be
+ * shared between streams or with the offline path) and reports each end of
+ * utterance with an extra callback carrying text = "", is_eou = true and t1 = the
+ * time speech stopped.
+ *
+ * Endpointing does NOT touch decoding: the transcribed text is byte-identical with
+ * and without a VAD, it only tells you where utterances end (gated in
+ * tests/test_e2e.sh). The report arrives ~160 ms of audio after speech actually
+ * stopped — min_silence_ms plus frame quantization — plus however much audio you
+ * feed per call, so smaller feeds mean lower endpoint latency. Measured on
+ * nemotron: 160 ms at 32 ms chunks, 176-212 ms at 100 ms, 312-376 ms at 250 ms.
+ * Note the text for the audio just before an endpoint may still arrive AFTER it:
+ * the encoder works in chunks and the VAD is ahead of the decoder. */
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead);
 
 /* Feed float32 16 kHz mono samples; the callback receives the text deltas. */

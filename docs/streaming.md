@@ -75,3 +75,37 @@ rec -q -t raw -r 16000 -e signed -b 16 -c 1 - | mynah-asr stream -m <model_dir> 
 # file, via ffmpeg
 ffmpeg -v quiet -i audio.mp3 -f s16le -ar 16000 -ac 1 - | mynah-asr stream -m <model_dir>
 ```
+
+## Endpointing (end of utterance)
+
+With a VAD attached to the model, the stream also tells you **where utterances
+end** — useful for committing a turn, driving a UI, or deciding when to reply:
+
+```c
+mynah_asr_enable_vad(m, "models/silero-vad");   /* before opening the stream */
+mynah_asr_stream *s = mynah_asr_stream_open(m, "auto", -1);
+/* in the callback: */
+if (res->is_eou) commit_turn(res->t1);          /* text is "", t1 = speech stopped */
+```
+
+Three properties worth knowing, all of them measured rather than assumed:
+
+- **It does not change the transcription.** Endpointing only observes; the text is
+  byte-identical with and without a VAD. `tests/test_e2e.sh` fails if it is not.
+- **Latency is ~160 ms of audio plus one feed chunk.** The 160 ms is
+  `min_silence_ms` (100) plus frame quantization: the VAD cannot know speech ended
+  until enough silence has passed. Feeding smaller buffers lowers the rest —
+  measured on nemotron: 160 ms with 32 ms feeds, 176-212 ms with 100 ms, 312-376 ms
+  with 250 ms.
+- **The endpoint can arrive before the last words of that utterance.** The VAD runs
+  ahead of the encoder, which works in chunks. If you need the full text of a turn,
+  wait for the deltas that follow the endpoint (or `finish` at the end of the
+  stream), rather than treating the endpoint as "text complete".
+
+Each stream keeps its own VAD instance, so concurrent streams do not interfere
+(the VAD carries LSTM state; sharing it would mix two conversations).
+
+```sh
+# a WAV through the streaming path, 32 ms at a time, with endpoints on stderr
+mynah-asr stream -m <model_dir> -i audio.wav --chunk-ms 32 --vad models/silero-vad
+```
