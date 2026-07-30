@@ -54,9 +54,56 @@ static int piece_starts_word(const char *p) {
            (unsigned char)p[2] == 0x81;
 }
 
+/* Longest piece that matches at `text`; -1 when none does. `want_start` selects
+ * the ▁-prefixed variant (word start) or the continuation one. */
+static int longest_match(const mynah_asr_tokenizer *tk, const char *text, int want_start,
+                         size_t *len_out) {
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < tk->n_pieces; i++) {
+        const char *p = tk->pieces[i];
+        const size_t pl = strlen(p);
+        if (pl == 0 || piece_is_special(p, pl)) continue;
+        const int starts = pl >= 3 && piece_starts_word(p);
+        if (starts != want_start) continue;
+        const char *body = starts ? p + 3 : p;          /* skip the ▁ */
+        const size_t bl = starts ? pl - 3 : pl;
+        if (bl == 0 || bl <= best_len) continue;        /* only look for longer ones */
+        if (strncmp(text, body, bl) == 0) { best = i; best_len = bl; }
+    }
+    *len_out = best_len;
+    return best;
+}
+
+int mynah_asr_tokenize(const mynah_asr_tokenizer *tk, const char *text, int *ids, int cap,
+                       int *n_skipped) {
+    if (!tk || !text || !ids || cap <= 0) return -1;
+    int n = 0, skipped = 0;
+    int at_word_start = 1;                              /* the first piece carries ▁ */
+    for (const char *s = text; *s; ) {
+        if (*s == ' ') { s++; at_word_start = 1; continue; }
+        size_t len = 0;
+        int id = longest_match(tk, s, at_word_start, &len);
+        if (id < 0 && at_word_start) {                  /* no ▁ variant: try a continuation */
+            id = longest_match(tk, s, 0, &len);
+        }
+        if (id < 0) {                                   /* nothing covers this byte */
+            skipped++;
+            s++;
+            continue;
+        }
+        if (n >= cap) break;
+        ids[n++] = id;
+        s += len;
+        at_word_start = 0;
+    }
+    if (n_skipped) *n_skipped = skipped;
+    return n;
+}
+
 int mynah_asr_detokenize_words(const mynah_asr_tokenizer *tk, const int *tokens,
-                           const int *frames, int n, double frame_sec,
-                           mynah_asr_word **out, int *n_out) {
+                           const int *frames, const int *frames_end, int n,
+                           double frame_sec, mynah_asr_word **out, int *n_out) {
     *out = NULL;
     *n_out = 0;
     mynah_asr_word *words = calloc((size_t)(n > 0 ? n : 1), sizeof(mynah_asr_word));
@@ -90,7 +137,7 @@ int mynah_asr_detokenize_words(const mynah_asr_tokenizer *tk, const int *tokens,
         if (i == n || special) continue;
 
         if (wlen == 0) first_frame = frames[i];
-        last_frame = frames[i];
+        last_frame = frames_end ? frames_end[i] : frames[i];
         if (wlen + pl + 1 > wcap) {
             wcap = (wcap + pl + 1) * 2;
             char *nb = realloc(wbuf, wcap);

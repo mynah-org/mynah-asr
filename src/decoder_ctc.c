@@ -21,6 +21,18 @@ int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st) {
     return 0;
 }
 
+int mynah_asr_ctc_scores(const mynah_asr_ctc *c, const float *enc_out, int T, float *out) {
+    if (!c || !c->w || !enc_out || !out || T <= 0) return -1;
+    const int V = c->vocab, d = c->d_in;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, V, d,
+                1.0f, enc_out, d, c->w, d, 0.0f, out, V);
+    for (int t = 0; t < T; t++) {
+        float *row = out + (size_t)t * (size_t)V;
+        for (int k = 0; k < V; k++) row[k] += c->b[k];
+    }
+    return 0;
+}
+
 int mynah_asr_ctc_decode(const mynah_asr_ctc *c, const float *enc_out, int T,
                      int *tokens, int *frames, int cap) {
     const int V = c->vocab, d = c->d_in, blank = V - 1;

@@ -54,7 +54,11 @@ Like `mynah_asr_transcribe`, but also fills `words` (`malloc`'d array). Resoluti
 (accurate); on Nemotron they include the algorithmic latency of chunking. On AED
 models (Canary) requesting `words` enables the `<|timestamp|>` tokens in the prompt:
 accurate per-word times, but the model's punctuation may differ slightly from the
-decode without timestamps (model behavior).
+decode without timestamps (model behavior). On **canary-1b-v2** those tokens do not
+work at all, so the times come from the CTC aligner bundled in its `.nemo`
+(`<model_dir>/aligner/`, extracted by the converter): the text is still the AED's,
+the times come from Viterbi-aligning it against the aligner's posteriors. Requesting
+`words` then costs a second encoder pass over the same audio.
 
 ## Speech translation (AED models — Canary)
 

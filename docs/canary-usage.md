@@ -8,7 +8,7 @@ tokenizer, prompt format) in [canary-arch.md](canary-arch.md); catalog in
 |---|---|---|---|---|
 | canary-180m-flash | en, de, es, fr | en ↔ de/es/fr | yes (experimental) | 0.060 / 0.054 (0.030) |
 | canary-1b-flash | en, de, es, fr | en ↔ de/es/fr | yes | 0.143 / 0.081 (~0.07) |
-| canary-1b-v2 | **25 EU languages** | **en ↔ 24** | no (see below) | to be measured |
+| canary-1b-v2 | **25 EU languages** | **en ↔ 24** | yes, via the bundled aligner | to be measured |
 
 ## Speech translation
 
@@ -33,9 +33,17 @@ Output language ≠ source language = translation:
   The e2e expectations in `tests/test_e2e.sh` encode exactly this difference.
 - **Timestamps**: flash models bracket words with generative `<|N|>` tokens
   (80 ms frames) — `--timestamps` / verbose_json work; in ts-mode punctuation
-  can differ slightly (model behavior). **v2 does not support them** (its
-  `.nemo` bundles a separate ASR aligner model — extraction is a TODO);
-  `timestamp_tokens: false` in mynah.json makes the e2e skip them.
+  can differ slightly (model behavior).
+  **v2 works differently**: the generative tokens do nothing on it (non-monotonic
+  attention — it emits EOS immediately), so the times come from the **CTC aligner
+  bundled in its `.nemo`**. The converter extracts it to `<model_dir>/aligner/`
+  (see [canary-arch.md](canary-arch.md)) and `--timestamps` then works normally:
+  the text still comes from the AED, only the times come from the aligner, by
+  Viterbi-aligning that text against the aligner's per-frame CTC scores.
+  Without the aligner directory `timestamp_tokens: false` still means no times.
+  Cross-check on `test_en.wav`: the aligned times are **identical** to the ones the
+  aligner produces decoding on its own, word for word — which is the expected
+  outcome when both look at the same posteriors.
 - **Decoder int8**: the AED decode loop is autoregressive and dot-bound —
   int8 gives 2.8–3.2× on the decoder (SDOT T=1 beats sgemv f32).
 - 1b models on 16 GB machines: first Metal runs pay swap (3.4 GB f32 +

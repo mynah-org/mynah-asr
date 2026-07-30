@@ -16,6 +16,11 @@ typedef struct {
 /* 0 = head found, -1 = absent (not an error: a model without CTC). */
 int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st);
 
+/* enc_out [T, d_in] -> raw head scores [T, vocab] (row-major, caller-allocated).
+ * No softmax: for both argmax and Viterbi alignment the per-frame normalizer is
+ * the same for every candidate and cancels (see src/align.c). 0 = ok. */
+int mynah_asr_ctc_scores(const mynah_asr_ctc *c, const float *enc_out, int T, float *out);
+
 /* enc_out [T, d_in] -> collapsed tokens in tokens[] (capacity cap); when
  * frames != NULL it writes the frame of each token's first argmax (timestamps).
  * Returns the token count. */

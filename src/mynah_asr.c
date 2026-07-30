@@ -12,6 +12,7 @@
 #include "encoder.h"
 #include "engine.h"
 #include "features.h"
+#include "align.h"
 #include "threads.h"
 #include "tokenizer.h"
 #include "vad.h"
@@ -43,6 +44,7 @@ struct mynah_asr_model {
     double seg_sec;                 /* offline per-segment limit (default 300 s) */
     mynah_asr_vad *vad;             /* optional (mynah_asr_enable_vad): NULL = energy split */
     char vad_dir[512];              /* kept so each stream can open its OWN instance */
+    struct mynah_asr_model *aligner;/* <dir>/aligner: CTC model for word timestamps (AED) */
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -324,6 +326,21 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
          * external aligner) — capability read from mynah.json, default yes */
         const cJSON *jts = cJSON_GetObjectItem(jdec, "timestamp_tokens");
         m->aed_ts = !(jts && cJSON_IsFalse(jts));
+        /* ...and when it does not, the .nemo's CTC aligner does the timing, if the
+         * converter extracted it. mmap'd like any model, so an unused aligner costs
+         * address space rather than RAM; a missing one is not an error (no times). */
+        if (!m->aed_ts) {
+            snprintf(path, sizeof(path), "%s/aligner", model_dir);
+            char probe[1100];
+            snprintf(probe, sizeof(probe), "%s/mynah.json", path);
+            FILE *pf = fopen(probe, "rb");
+            if (pf) {
+                fclose(pf);
+                m->aligner = mynah_asr_load(path);
+                if (!m->aligner)
+                    fprintf(stderr, "mynah-asr: %s exists but did not load: no word timestamps\n", path);
+            }
+        }
     }
     return m;
 
@@ -342,6 +359,7 @@ void mynah_asr_free(mynah_asr_model *m) {
     /* the cached GPU weights point into the mmap we are about to close */
     mynah_asr_metal_weights_evict();
 #endif
+    if (m->aligner) mynah_asr_free(m->aligner);
     mynah_asr_vad_close(m->vad);
     mynah_asr_st_close(m->weights);
     mynah_asr_st_close(m->mel_filters);
@@ -477,7 +495,7 @@ static void batch_decode_worker(void *ctx, int b) {
         c->texts[b] = mynah_asr_detokenize(&m->tok, tokens, n_tok,
                                        c->langs_out ? c->langs_out[b] : NULL);
     if (n_tok >= 0 && c->texts[b] && c->words && frames)
-        mynah_asr_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
+        mynah_asr_detokenize_words(&m->tok, tokens, frames, NULL, n_tok, m->frame_sec,
                                &c->words[b], &c->n_words[b]);
     free(tokens);
     free(frames);
@@ -1020,6 +1038,50 @@ static int aed_words_from_tokens(const mynah_asr_tokenizer *tk, const int *toks,
     return 0;
 }
 
+/* Word timestamps for an AED model through the bundled CTC aligner.
+ *
+ * canary-1b-v2 cannot time its own output (non-monotonic attention, and asking for
+ * <|timestamp|> makes it emit EOS), so the times come from a second model: run the
+ * aligner over the SAME audio, take its per-frame CTC scores, spell the AED text in
+ * the aligner's own vocabulary, and Viterbi-align the two (src/align.c).
+ *
+ * Returns 0 when it produced words, -1 otherwise — and -1 is not fatal: the caller
+ * keeps the text and simply has no times, which is what happened before this existed.
+ */
+static int align_words_ctc(mynah_asr_model *m, const float *samples, size_t n_samples,
+                           const char *text, mynah_asr_word **words, int *n_words) {
+    mynah_asr_model *a = m->aligner;
+    if (!a || !a->ctc.w || !text || !*text) return -1;
+
+    int T_mel = 0, valid = 0;
+    float *feats = mynah_asr_log_mel(&a->feat, samples, n_samples, &T_mel, &valid);
+    if (!feats) return -1;
+    int T = 0;
+    float *enc = mynah_asr_encoder_forward_raw(&a->enc, feats, valid, a->feat.n_mels,
+                                           a->left_ctx, a->default_right, &T);
+    free(feats);
+    if (!enc || T <= 0) { free(enc); return -1; }
+
+    const int V = a->ctc.vocab;
+    float *scores = malloc((size_t)T * (size_t)V * sizeof(float));
+    /* one id per byte is a safe upper bound: no piece is shorter than one byte */
+    const int cap = (int)strlen(text) + 1;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int *t0 = malloc((size_t)cap * sizeof(int));
+    int *t1 = malloc((size_t)cap * sizeof(int));
+    int rc = -1;
+    if (scores && ids && t0 && t1 && mynah_asr_ctc_scores(&a->ctc, enc, T, scores) == 0) {
+        int skipped = 0;
+        const int n_ids = mynah_asr_tokenize(&a->tok, text, ids, cap, &skipped);
+        if (n_ids > 0 &&
+            mynah_asr_align_ctc(scores, T, V, ids, n_ids, V - 1, t0, t1) == 0)
+            rc = mynah_asr_detokenize_words(&a->tok, ids, t0, t1, n_ids, a->frame_sec,
+                                        words, n_words);
+    }
+    free(enc); free(scores); free(ids); free(t0); free(t1);
+    return rc;
+}
+
 /* Transcription of ONE segment (the whole audio, or a slice between silences). */
 static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t n_samples,
                                 int prompt, int right, const char *lang, char *lang_out,
@@ -1048,11 +1110,13 @@ static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t
     char *text = mynah_asr_detokenize(&m->tok, tokens, n_tok, lang_out);
     if (text && words) {
         if (frames)
-            mynah_asr_detokenize_words(&m->tok, tokens, frames, n_tok, m->frame_sec,
+            mynah_asr_detokenize_words(&m->tok, tokens, frames, NULL, n_tok, m->frame_sec,
                                    words, n_words);
         else if (m->is_aed && m->aed_ts)   /* AED: times in the <|N|> tokens */
             aed_words_from_tokens(&m->tok, tokens, n_tok, m->frame_sec,
                                   words, n_words);
+        else if (m->aligner)               /* AED without them (v2): external aligner */
+            align_words_ctc(m, samples, n_samples, text, words, n_words);
     }
     free(tokens);
     free(frames);

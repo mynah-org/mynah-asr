@@ -132,9 +132,10 @@ checkq() { # quant, expected substring
 # per-word timestamps: "t0 t1 word" lines, t0 monotonically non-decreasing,
 # t1 within the audio duration (fixture <= 5.2s + one frame of margin).
 # AED (Canary flash): <|timestamp|> prompt -> words bracketed with <|N|>.
-# Skipped when the model has no support (v2: external aligner, not implemented)
-if grep -q '"timestamp_tokens": false' "$MODEL_DIR/mynah.json"; then
-    echo "e2e timestamps SKIP: this model has no generative <|timestamp|> tokens"
+# Skipped only when the model has neither: no generative tokens AND no aligner
+if grep -q '"timestamp_tokens": false' "$MODEL_DIR/mynah.json" && \
+   [ ! -f "$MODEL_DIR/aligner/mynah.json" ]; then
+    echo "e2e timestamps SKIP: no generative <|timestamp|> tokens and no aligner"
 else
 ts=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --timestamps 2>/dev/null)
 ts_ok=$(printf '%s\n' "$ts" | awk 'NF<3 {bad=1} $1+0>$2+0 {bad=1} $1+0<prev {bad=1}
