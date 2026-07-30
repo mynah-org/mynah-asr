@@ -52,12 +52,18 @@ first-class citizen.
   emitted text is never retracted, **byte-identical to the offline path**
 - **40 languages** with language detection (Nemotron), 25 EU languages with
   PnC+ITN (Parakeet v3, canary-1b-v2)
-- **Per-word timestamps**, automatic silence-based segmentation of long files
-  (model-aware), weight-stationary batching, OpenAI-compatible REST + WebSocket
-  server
-- **Two weight containers**: safetensors (default, zero-copy mmap) or **GGUF**
-  (F32/F16/BF16/Q8_0/Q4_0, `tools/export_gguf.py`) — same code path after load;
-  can also **import third-party community GGUFs** without torch
+- **Per-word timestamps** on every family — including canary-1b-v2, aligned by the
+  CTC aligner bundled in its own checkpoint — automatic silence-based segmentation
+  of long files (model-aware), weight-stationary batching, OpenAI-compatible
+  REST + WebSocket server
+- **Silero VAD ported to C** (2.3 MB, no ONNX runtime at inference): opt-in `--vad`
+  to cut segments on speech boundaries offline, and end-of-utterance events while
+  streaming — documented trade-off, not a default
+  ([docs/vad-silero.md](docs/vad-silero.md))
+- **Two weight containers**: safetensors (default, zero-copy mmap) or **GGUF** —
+  reads F32/F16/BF16/Q8_0/Q4_0 and the K-quants **Q2_K…Q6_K**, writes
+  F32/F16/Q8_0/Q4_0/Q4_K (`tools/export_gguf.py`); same code path after load, and
+  it can **import third-party community GGUFs** without torch
   (`tools/import_gguf.py`, Parakeet/TDT — *WIP*)
 - **Lightweight bindings**: Python (ctypes) and **Node** (koffi) over `libmynah_asr` —
   thin FFI wrappers, no build step committed to the repo
@@ -79,7 +85,7 @@ first-class citizen.
 | [parakeet-rnnt-0.6b](https://huggingface.co/nvidia/parakeet-rnnt-0.6b) / [ctc-0.6b](https://huggingface.co/nvidia/parakeet-ctc-0.6b) | offline EN | ✅ |
 | [parakeet-rnnt-1.1b](https://huggingface.co/nvidia/parakeet-rnnt-1.1b) / [ctc-1.1b](https://huggingface.co/nvidia/parakeet-ctc-1.1b) | offline EN, 42 layers | ✅ |
 | [canary-180m-flash](https://huggingface.co/nvidia/canary-180m-flash) / [1b-flash](https://huggingface.co/nvidia/canary-1b-flash) | ASR en/de/es/fr + **translation** + word timestamps | ✅ |
-| [canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2) | ASR in **25 EU languages** + en↔24 translation, ITN | ✅ |
+| [canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2) | ASR in **25 EU languages** + en↔24 translation, ITN, word timestamps | ✅ |
 
 ## Performance — one runtime, four backends
 
@@ -219,12 +225,16 @@ mynah-asr transcribe -m <model_dir> -i <file.wav>
     --decoder default|ctc    CTC head of hybrid models (faster)
     --lookahead N            Nemotron streaming preset (0|1|3|6|13)
     --segment-sec S          per-segment limit (model-aware default: 30s/300s)
+    --vad <dir>              Silero VAD: cut segments on speech boundaries
+                             (`make fetch-vad`; opt-in, see docs/vad-silero.md)
     --quant int8|int4        quantized checkpoint (or quantize at load)
     --backend cpu|metal|cuda GEMM backend (graceful CPU fallback)
     --caps auto|scalar|avx2|vnni   x86 SIMD level (default: cpuid)
 
-mynah-asr stream -m <model_dir> [--lang auto] [--lookahead N] [--quant int8|int4]
+mynah-asr stream -m <model_dir> [--lang auto] [--lookahead N] [--quant int8|int4] [--vad <dir>]
     live transcription from stdin (raw s16le 16 kHz mono), text never retracted
+    --vad also reports the end of each utterance (endpointing), without
+    changing a single byte of the transcription
 
 mynah-asr quantize -m <model_dir> --quant int8|int4
     writes the pre-quantized checkpoint (⅓ of the RAM, zero-copy load)
@@ -307,6 +317,8 @@ make install      # PREFIX=/usr/local: bin + lib + include
 make test         # parity vs oracle + e2e (exit 77 = skip without models)
 make test-samples # quality on real audio: ASR CER + translations, cpu+metal
 make test-server  # REST + concurrency + WebSocket + translations
+make fetch-vad    # Silero VAD checkpoint (2.3 MB) into models/silero-vad/
+make test-vad     # VAD parity vs onnxruntime (77 = skip without the checkpoint)
 make bench        # RTF on the fixtures   make leaks / make ubsan / make asan
 make golden-dump  # regenerate reference dumps (requires tools/ + model)
 ```
@@ -320,6 +332,7 @@ make golden-dump  # regenerate reference dumps (requires tools/ + model)
 | [docs/streaming.md](docs/streaming.md) | cache-aware streaming, latency presets, WebSocket protocol |
 | [docs/quantization.md](docs/quantization.md) | int8/int4 checkpoint format and SDOT/VNNI kernels |
 | [docs/gguf.md](docs/gguf.md) | GGUF weight container (export, supported types, lookup order) |
+| [docs/vad-silero.md](docs/vad-silero.md) | Silero VAD: verified architecture, span hysteresis, `--vad` trade-offs |
 | [docs/backends.md](docs/backends.md) | CPU SIMD dispatch, Metal, CUDA |
 | [docs/server.md](docs/server.md) | REST + WebSocket server, OpenAI compatibility |
 | [docs/api.md](docs/api.md) | C API reference (libmynah_asr) |

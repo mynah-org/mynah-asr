@@ -13,7 +13,7 @@
 | parakeet-rnnt-0.6b / ctc-0.6b | parakeet-rnnt/ctc | EN, lowercase — import from `.nemo`¹ |
 | parakeet-rnnt-1.1b / ctc-1.1b | parakeet-rnnt/ctc | EN, 42L — import from `.nemo`¹ |
 | canary-180m-flash / 1b-flash | canary-aed | ASR en/de/es/fr + **translation** + word-ts |
-| canary-1b-v2 | canary-aed | ASR **25 EU languages** (it!) + translation en↔24, ITN; no word-ts (external aligner, TODO) |
+| canary-1b-v2 | canary-aed | ASR **25 EU languages** (it!) + translation en↔24, ITN; word-ts via the CTC aligner bundled in its `.nemo` |
 
 All with: int8/int4 (`mynah-asr quantize`), Metal, batch, long-file segmentation,
 REST/WS server. Measured RTFs in [benchmarks.md](benchmarks.md).
