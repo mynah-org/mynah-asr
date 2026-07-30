@@ -178,6 +178,19 @@ test-server: mynah-asr-server
 	@sh tests/test_serve_repro.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP serve-repro: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_concurrency.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
+# test-server it asserts nothing about the transcript, so it runs with ANY
+# converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
+# the server finally gets exercised there at all.
+CONC_MODEL_DIR ?= $(PARAKEET110_DIR)
+test-server-concurrency: mynah-asr-server
+	@sh tests/test_server_concurrency.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 # Multilingual suite: real audio samples (Tatoeba, CC) for every supported
 # language, checking language detection + CER against the reference text.

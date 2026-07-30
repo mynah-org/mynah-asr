@@ -91,6 +91,14 @@ jobs:
           node bindings/node/example.js models/${{ env.MODEL }} \
             tests/audio/test_en.wav | tee /dev/stderr | grep -qi 'speech recognition test'
 
+      # The server was NEVER exercised in CI: tests/test_server.sh asserts
+      # Nemotron-specific transcripts, so with the 110m it just exits 77 — its
+      # concurrency and WebSocket cases have been dead here all along. This
+      # model-agnostic check covers concurrent requests plus the adaptive-BLAS
+      # accounting (a leaked inflight slot caps BLAS for the whole process life).
+      - name: Server under concurrent load (model-agnostic)
+        run: make test-server-concurrency CONC_MODEL_DIR=models/${{ env.MODEL }}
+
       - name: Quality on real audio (samples/ FLEURS, CER with the 110m)
         run: make test-samples
 

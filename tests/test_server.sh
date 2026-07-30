@@ -92,21 +92,8 @@ else
     echo "server ws-stream SKIP (uv missing)"
 fi
 
-# Adaptive BLAS accounting, checked AFTER the concurrent burst and the stream:
-# every inference_begin must have been paired with an inference_end. A leaked
-# slot would leave BLAS capped for the rest of the process life — same output,
-# just slower, so nothing else would catch it.
-health=$(curl -s "http://localhost:$PORT/v1/health")
-case "$health" in
-    *'"inflight":0'*) echo "server blas-inflight-at-rest OK" ;;
-    *) echo "server blas-inflight-at-rest FAIL: $health"; fail=1 ;;
-esac
-nth=$(printf '%s' "$health" | sed -n 's/.*"threads":\([0-9]*\).*/\1/p')
-bud=$(printf '%s' "$health" | sed -n 's/.*"blas_budget":\([0-9]*\).*/\1/p')
-if [ -n "$nth" ] && [ "$nth" = "$bud" ]; then
-    echo "server blas-budget-restored OK (budget $bud == threads $nth)"
-else
-    echo "server blas-budget-restored FAIL: budget='$bud' threads='$nth'"; fail=1
-fi
+# The adaptive-BLAS accounting (inflight/blas_budget back to rest) lives in
+# tests/test_server_concurrency.sh: it needs no particular model, so unlike this
+# file it also runs in CI.
 
 exit $fail
