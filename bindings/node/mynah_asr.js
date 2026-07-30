@@ -13,7 +13,7 @@
 //   console.log(new MynahASR('models/canary-180m-flash').transcribe('de.wav', { lang: 'de>en' }));
 //   m.close();
 //
-// Twin of bindings/python/mynah.py: same surface, same 7 symbols.
+// Twin of bindings/python/mynah_asr.py: same surface, same 7 symbols.
 
 const fs = require('fs');
 const path = require('path');

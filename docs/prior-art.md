@@ -53,7 +53,7 @@ OpenAI-compatible server, multi-engine design from the start.
 7. **Frame-local StreamingMel** (possible ONLY with normalize=NA — our case):
    preemphasis carried across feeds, O(n_fft) buffer, tail emitted at finalize.
 8. **C-API**: opaque handle, `abi_version()`, per-ctx `last_error`, typed EOU/EOB events
-   + bitmask, `finalize` that does not fabricate an EOU. Design to copy in `mynah.h`.
+   + bitmask, `finalize` that does not fabricate an EOU. Design to copy in `mynah_asr.h`.
 9. **Quantization**: only the large linears that enter the matmul (FFN, attn q/k/v/out/pos,
    pre_encode.out, joint enc/pred = 90%+ of the weights); conv/LSTM/bias/norm in F32. Evidence:
    WER 0 down to q4_k. → our INT8 (M5) can be just as surgical.
