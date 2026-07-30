@@ -40,6 +40,7 @@ CFLAGS += -DMYNAH_ASR_BUILD='"$(MYNAH_ASR_BUILD)"'
 MODEL_DIR ?= models/nemotron-3.5-asr-streaming-0.6b
 PARAKEET_DIR ?= models/parakeet-tdt-0.6b-v3
 PARAKEET110_DIR ?= models/parakeet-tdt_ctc-110m
+VAD_DIR ?= models/silero-vad
 
 all: mynah-asr mynah-asr-server
 
@@ -68,7 +69,9 @@ tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ)
 # Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
 # with: make golden-dump
 PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tests/test_batch
-test: $(TESTS) mynah-asr examples/minimal
+# tests driven by a shell script (their own arguments): built here, run below
+SCRIPTED_TESTS := tests/test_vad
+test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	@for t in $(TESTS); do \
 	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
@@ -96,6 +99,9 @@ test: $(TESTS) mynah-asr examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_kquant.sh; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP kquant parity: uv or the gguf package missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: $(VAD_DIR)/silero_vad.onnx or uv missing (see tests/test_vad.sh)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
@@ -192,6 +198,20 @@ test-server-concurrency: mynah-asr-server
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# Silero VAD parity on its own (no ASR model needed: the VAD is 2.3 MB and the
+# oracle is onnxruntime). fetch-vad downloads the checkpoint.
+test-vad: tests/test_vad
+	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: run make fetch-vad first"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+SILERO_URL := https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+fetch-vad:
+	@mkdir -p $(VAD_DIR)
+	@if [ -f $(VAD_DIR)/silero_vad.onnx ]; then echo "already there: $(VAD_DIR)/silero_vad.onnx"; \
+	 else curl -sSLo $(VAD_DIR)/silero_vad.onnx $(SILERO_URL) && \
+	      echo "downloaded $(VAD_DIR)/silero_vad.onnx (Silero VAD v5, MIT)"; fi
+
 # Multilingual suite: real audio samples (Tatoeba, CC) for every supported
 # language, checking language detection + CER against the reference text.
 # First time: make fetch-lang-samples (needs ffmpeg + tools/ uv).
@@ -212,14 +232,15 @@ test-samples: mynah-asr
 
 # fast leak check on macOS (the native `leaks` tool, no rebuild — ASan is very
 # slow on a Mac: use it only in Linux CI. Same pattern as qwen-tts).
-leaks: mynah-asr tests/test_streaming
+leaks: mynah-asr tests/test_streaming tests/test_vad
 	leaks --atExit -- ./mynah-asr transcribe -m $(MODEL_DIR) -i tests/audio/test_it.wav \
 	  --lang it-IT 2>&1 | tail -3
 	leaks --atExit -- tests/test_streaming $(MODEL_DIR) tests/audio/test_it.wav \
 	  tests/golden/test_it 2>&1 | tail -3
+	@WRAP="leaks --atExit --" sh tests/test_vad.sh $(VAD_DIR) 2>&1 | tail -4
 
 clean:
-	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) examples/minimal dist
+	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist
 
 # install: CLI + server + static library + header
 PREFIX ?= /usr/local
@@ -250,4 +271,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-nemo-langs fetch-lang-samples test-server test-samples cuda
+.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda

@@ -69,6 +69,11 @@ jobs:
       - name: Setup uv                # needed by test-samples (Python eval)
         uses: astral-sh/setup-uv@v9.0.0   # no floating v9 tag: pin the exact release (node24)
 
+      # Without the checkpoint the VAD parity inside `make test` exits 77 and
+      # proves nothing; it is 2.3 MB and MIT, so CI simply fetches it.
+      - name: Silero VAD checkpoint (make the vad parity in `make test` real)
+        run: make fetch-vad
+
       - name: Int8 checkpoint (exercises the quantize path)
         run: ./mynah-asr quantize -m models/${{ env.MODEL }} --quant int8
 
