@@ -110,3 +110,58 @@ words — support deferred (v1 engine: notimestamp).
 2. C: per-stage parity vs the oracle (enc_proj, emb, layer 0/N, first-step logits)
    then identical e2e text.
 3. Goldens in `make test` with the 180m (downloadable in CI? 735 MB — evaluate).
+
+## The timestamp aligner (canary-1b-v2)
+
+`<|timestamp|>` does not work on canary-1b-v2: it is an AED model, its attention is
+not monotonic, and asking for the tokens makes it emit EOS immediately. NVIDIA's own
+answer is to ship a **second model** inside the `.nemo` — an alignment ASR whose CTC
+posteriors the text is aligned against.
+
+What it actually is, read out of `timestamps_asr_model_config.yaml`:
+
+| | |
+|---|---|
+| encoder | `ConformerEncoder`, 24 layers, d_model 1024, 8 heads, ffn 4096 |
+| subsampling | `dw_striding` 8×, 256 channels, **non-causal** (`att_context_style: regular`) |
+| conv | kernel 9, **batch_norm**, `use_bias: false`, `xscaling: false` |
+| head | `ConvASRDecoder` → 16384 classes + blank |
+| features | 128 mel, n_fft 512, hop 160, **per_feature** normalization |
+| weights | 2.5 GB f32, 686 tensors |
+
+That is **the parakeet-ctc family verbatim**, so it converts through the existing
+`build_parakeet_ctc_from_yaml` and runs on the existing CTC engine — no new encoder,
+no new decoder. `tools/convert_nemo.py` writes it to `<model_dir>/aligner/` with
+`"role": "timestamp_aligner"`.
+
+The conversion has an unusually strong test available: the aligner IS an ASR model,
+so a correct conversion **transcribes**. It does:
+
+```
+$ mynah-asr transcribe -m models/canary-1b-v2/aligner -i tests/audio/test_en.wav
+Hello, this is a speech recognition test. The weather is nice today.
+```
+`tests/test_e2e.sh` asserts exactly that whenever `<model_dir>/aligner/` exists.
+
+### Getting it without downloading 6.4 GB
+
+`canary-1b-v2.nemo` is 6.36 GB and the aligner is 2.5 GB of it. A `.nemo` is an
+**uncompressed tar**, so its index can be walked with HTTP range requests — one
+512-byte read per member, each header giving the size and therefore the next offset
+— and only the wanted members pulled:
+
+| member | size |
+|---|---|
+| `timestamps_asr_model_weights.ckpt` | 2503.3 MB |
+| `timestamps_asr_model_config.yaml` | 0.2 MB |
+| `model_weights.ckpt` (the AED model) | 3853.8 MB |
+
+Then `convert_nemo.py --aligner <cfg.yaml> <weights.ckpt> <out_dir>`.
+
+**The trap, paid for once:** the offsets a tar index reports are the offsets of the
+*headers*. Member content starts 512 bytes later. Getting that wrong yields a file
+shifted by one header, which torch reports as `Cannot use weights_only=True with
+files saved in the legacy .tar format` — a message that sends you looking for a
+checkpoint-format problem when the real bug is arithmetic. Once the range is right,
+the checkpoint is an ordinary zip-format torch file and `weights_only=True` works,
+so there is no reason to disable that safety.

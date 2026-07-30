@@ -19,6 +19,12 @@ the NeMo tensors to the canonical (HF) naming the runtime reads, and writes
 model.safetensors in f32.
 
 Usage: uv run python convert_nemo.py ../models/<model_dir>
+       uv run python convert_nemo.py --aligner <cfg.yaml> <weights.ckpt> <out_dir>
+
+The second form converts ONLY the CTC aligner that canary-1b-v2 bundles for word
+timestamps, from members extracted out of the .nemo (see convert_aligner_files:
+the archive is 6.4 GB, the aligner 2.5 GB of it, and a tar index can be walked
+with range requests).
 """
 
 from __future__ import annotations
@@ -445,6 +451,51 @@ def canary_pieces(tar, names, y: dict) -> tuple[list[str], int]:
     return pieces, spl_size
 
 
+def write_weights_and_mel(out_dir: Path, sd: dict) -> int:
+    """model.safetensors (renamed to the canonical naming) + mel_filters.safetensors
+    taken FROM the checkpoint, which is what makes the filterbank bit-exact against
+    NeMo. Returns the tensor count. Shared by the main model and the aligner."""
+    tensors: dict[str, np.ndarray] = {}
+    for k, v in sd.items():
+        nk = rename_nemo_key(k)
+        if nk is None:
+            continue
+        assert nk not in tensors, f"duplicate rename: {k} -> {nk}"
+        tensors[nk] = v.float().numpy()
+    save_file(tensors, out_dir / "model.safetensors")
+
+    assert "preprocessor.featurizer.fb" in sd, \
+        "no preprocessor.featurizer.fb in the checkpoint: cannot rebuild the mel filterbank"
+    fb = sd["preprocessor.featurizer.fb"].numpy()[0].T          # [1,M,257] -> [257,M]
+    window = sd["preprocessor.featurizer.window"].numpy()
+    save_file({"mel_fb": np.ascontiguousarray(fb.astype(np.float32)),
+               "window": window.astype(np.float32)},
+              out_dir / "mel_filters.safetensors")
+    return len(tensors)
+
+
+def convert_aligner(out_dir: Path, ycfg: dict, sd: dict) -> None:
+    """The CTC aligner canary-1b-v2 bundles for timestamps.
+
+    It is a plain FastConformer CTC model (24L/1024, non-causal, batch_norm conv,
+    ConvASRDecoder head), i.e. exactly the parakeet-ctc family the runtime already
+    runs — so it converts through the same builder and loads through the same
+    engine. Which also gives a strong check: the aligner is a real ASR model, so if
+    the conversion is right it TRANSCRIBES.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mynah = build_parakeet_ctc_from_yaml(out_dir, ycfg)
+    mynah["role"] = "timestamp_aligner"
+    n = write_weights_and_mel(out_dir, sd)
+    pieces = list(ycfg["decoder"]["vocabulary"]) + ["<blank>"]
+    assert len(pieces) == mynah["decoder"]["vocab_size"], \
+        f"{len(pieces)} pieces vs vocab_size {mynah['decoder']['vocab_size']}"
+    (out_dir / "tokens.json").write_text(json.dumps(pieces, ensure_ascii=False))
+    (out_dir / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
+    print(f"OK {out_dir.name} [aligner, {mynah['engine']}]: {n} tensors f32, "
+          f"{len(pieces)} pieces")
+
+
 def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
     import io
     import tarfile
@@ -479,22 +530,8 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
 
     sd = torch.load(io.BytesIO(tar.extractfile(member("model_weights.ckpt")).read()),
                     map_location="cpu", weights_only=True)
-
-    tensors: dict[str, np.ndarray] = {}
-    for k, v in sd.items():
-        nk = rename_nemo_key(k)
-        if nk is None:
-            continue
-        assert nk not in tensors, f"duplicate rename: {k} -> {nk}"
-        tensors[nk] = v.float().numpy()
-    save_file(tensors, model_dir / "model.safetensors")
-
-    # filterbank and window FROM the checkpoint (bit-exact against NeMo)
-    fb = sd["preprocessor.featurizer.fb"].numpy()[0].T          # [1,M,257] -> [257,M]
-    window = sd["preprocessor.featurizer.window"].numpy()
-    save_file({"mel_fb": np.ascontiguousarray(fb.astype(np.float32)),
-               "window": window.astype(np.float32)},
-              model_dir / "mel_filters.safetensors")
+    n_tensors = write_weights_and_mel(model_dir, sd)
+    fb_shape = sd["preprocessor.featurizer.fb"].shape
 
     if aed:
         # tokenizer (aggregate or unified) from the SPE models inside the tar
@@ -514,8 +551,17 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
     assert len(pieces) == mynah["decoder"]["vocab_size"]
     (model_dir / "tokens.json").write_text(json.dumps(pieces, ensure_ascii=False))
     (model_dir / "mynah.json").write_text(json.dumps(mynah, indent=1, ensure_ascii=False))
-    print(f"OK {model_dir.name} [{mynah['engine']}] from .nemo: {len(tensors)} tensors "
-          f"f32, {len(pieces)} pieces, mel fb {fb.shape} from the checkpoint")
+    print(f"OK {model_dir.name} [{mynah['engine']}] from .nemo: {n_tensors} tensors "
+          f"f32, {len(pieces)} pieces, mel fb {tuple(fb_shape)} from the checkpoint")
+
+    # the timestamp aligner, when the archive carries one (canary-1b-v2)
+    acfg = [n for n in names if n.endswith("timestamps_asr_model_config.yaml")]
+    ackpt = [n for n in names if n.endswith("timestamps_asr_model_weights.ckpt")]
+    if acfg and ackpt:
+        aycfg = yaml.safe_load(tar.extractfile(acfg[0]).read())
+        asd = torch.load(io.BytesIO(tar.extractfile(ackpt[0]).read()),
+                         map_location="cpu", weights_only=True)
+        convert_aligner(model_dir / "aligner", aycfg, asd)
 
 
 def convert(model_dir: Path) -> None:
@@ -555,7 +601,26 @@ def convert(model_dir: Path) -> None:
               f"(default idx {mynah['streaming']['default_preset_index']})")
 
 
+def convert_aligner_files(cfg_path: Path, ckpt_path: Path, out_dir: Path) -> None:
+    """The aligner from LOOSE files instead of the whole .nemo.
+
+    canary-1b-v2.nemo is 6.4 GB and the aligner is 2.5 GB of it. Since a .nemo is
+    an uncompressed tar, its index can be walked with HTTP range requests and only
+    those members pulled — 2.5 GB instead of 6.4. Recipe in docs/canary-arch.md.
+    """
+    import torch  # extra 'oracle': uv sync --extra oracle
+    import yaml
+
+    ycfg = yaml.safe_load(cfg_path.read_text())
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    convert_aligner(out_dir, ycfg, sd)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) == 5 and sys.argv[1] == "--aligner":
+        convert_aligner_files(Path(sys.argv[2]).resolve(), Path(sys.argv[3]).resolve(),
+                              Path(sys.argv[4]).resolve())
+    elif len(sys.argv) == 2:
+        convert(Path(sys.argv[1]).resolve())
+    else:
         sys.exit(__doc__)
-    convert(Path(sys.argv[1]).resolve())

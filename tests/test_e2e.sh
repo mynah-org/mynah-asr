@@ -107,6 +107,17 @@ else
     check tests/audio/test_es.wav auto  "la reunión empieza"
 fi
 
+# The timestamp aligner canary-1b-v2 bundles, when the converter extracted it.
+# It is itself a CTC ASR model, which is the strongest available check on the
+# conversion: if the weights or the vocabulary were wrong it would not transcribe.
+if [ -f "$MODEL_DIR/aligner/mynah.json" ]; then
+    out=$(./mynah-asr transcribe -m "$MODEL_DIR/aligner" -i tests/audio/test_en.wav 2>/dev/null)
+    case "$out" in
+        *"speech recognition test"*) echo "e2e aligner OK: $out" ;;
+        *) echo "e2e aligner FAIL: $out"; fail=1 ;;
+    esac
+fi
+
 # pre-quantized checkpoints (when generated with: mynah-asr quantize)
 checkq() { # quant, expected substring
     out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --quant "$1" 2>/dev/null)
