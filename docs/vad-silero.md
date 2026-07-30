@@ -17,12 +17,17 @@ Today "silence handling" is one energy heuristic: `find_split_point`
 (src/mynah_asr.c) picks the RMS minimum over 20 ms windows to choose *where* to
 cut a long file. Nothing detects speech. A real VAD buys three things:
 
-1. **Skip silence offline** — large RTF win on real recordings (meetings, voice
-   notes), where a good fraction of the audio is nobody talking.
+1. **Skip silence offline** — expected to be an RTF win on real recordings, where a
+   good fraction of the audio is nobody talking. **Measured: it is not** (see "Using
+   it on the offline path"). It does cut peak memory by ~20 %.
 2. **Better long-file segmentation** — cut on actual speech boundaries instead of
-   the quietest 20 ms window, which is only a proxy.
+   the quietest 20 ms window, which is only a proxy. **Measured: the real win** —
+   CER 0.195 → 0.112 on parakeet-ctc-1.1b, though it costs ~1 point on the 110m.
 3. **Endpointing / EOU in streaming** — decide that an utterance ended, rather
-   than inferring it from decoder output.
+   than inferring it from decoder output. Still open.
+
+Points 1 and 2 were guesses when this file was written; the numbers below are what
+they turned into, and one of them was wrong.
 
 ## Model
 
@@ -129,7 +134,8 @@ spans identical, exact sample offsets**, on the 305 s fixture. It is a separate
 target because `get_speech_timestamps` needs the silero-vad package (hence torch);
 the everyday gate stays onnxruntime-only.
 
-What the VAD says about the fixtures, which bounds what skipping silence can buy:
+What the VAD says about the fixtures — the *upper bound* on what skipping silence
+could buy, not the saving itself:
 
 | fixture | audio | spans | speech | silence |
 |---|---|---|---|---|
@@ -138,9 +144,57 @@ What the VAD says about the fixtures, which bounds what skipping silence can buy
 | `samples/en/fleurs_long.wav` | 94.6 s | 21 | 66.8 s | 29.4 % |
 | `samples/it/fleurs_1521.wav` | 11.0 s | 3 | 8.3 s | 24.0 % |
 
-That is an **upper bound on the RTF win, not a measurement of it**: the real
-saving depends on the ASR model and is measured in step 5a, which needs a
-converted ASR model this machine does not have yet.
+## Using it on the offline path (`--vad`)
+
+`mynah_asr_enable_vad` makes `plan_segments` cut on speech instead of on the
+quietest 20 ms window, and never feed the silence between spans to the encoder.
+**Opt-in**, because as measured below it is not a free win.
+
+Each span is widened by 0.6 s of context and overlapping spans are merged. Both
+details were forced by measurement, not taste:
+
+- With silero's own 30 ms padding the model **loses words at the boundaries** — 29
+  of 591 on the 305 s fixture, "The UN also hopes to finalize" becoming "hopes to
+  finalize". That padding exists to SHOW where speech is; an ASR needs context.
+- Merging fights fragmentation. Without it, 64 short segments cost more in
+  per-segment overhead than the 33 % of skipped audio saves.
+
+The 0.6 s comes from a CER sweep over {0.3, 0.6, 1.0, 2.0} — best on all four
+cells, and 2.0 s is worse than no VAD at all:
+
+| context | 110m en_long | 110m fleurs_long | 1.1b en_long | 1.1b fleurs_long |
+|---|---|---|---|---|
+| no VAD | 0.1008 | 0.1024 | 0.1949 | 0.1893 |
+| 0.3 s | 0.1214 | 0.1145 | 0.1184 | 0.1248 |
+| **0.6 s** | **0.1111** | **0.1059** | **0.1119** | **0.1162** |
+| 1.0 s | 0.1263 | 0.0972 | 0.1593 | 0.1076 |
+| 2.0 s | 0.1360 | 0.1652 | 0.2206 | 0.1997 |
+
+**The honest verdict: the VAD is not a uniform improvement, it depends on the
+model.** On `parakeet-ctc-1.1b` the CER drops from 0.195 to 0.112 (−42 % relative)
+— cutting on speech boundaries repairs a segmentation that was hurting that model
+badly. On `parakeet-tdt_ctc-110m` it costs about one CER point (0.101 → 0.111),
+because that model's plain segmentation already works and it only pays the
+fragmentation.
+
+And the RTF win the plan expected from "skip the silence" **is not there**, on
+either model (`mynah-asr bench`, 5 runs after 2 warmups, `fleurs_long.wav`):
+
+| model | RTF min/median off | RTF min/median on | peak RAM off | peak RAM on |
+|---|---|---|---|---|
+| parakeet-tdt_ctc-110m | 0.011 / 0.011 | 0.011 / 0.012 | 0.76 GB | **0.61 GB** |
+| parakeet-ctc-1.1b | 0.055 / 0.058 | 0.054 / 0.063 | 4.33 GB | **4.16 GB** |
+
+The encoder is cheap enough that the VAD's own cost (0.36 s per 305 s) plus the
+extra segments cancel the 33 % of audio not decoded. What DOES improve is peak
+memory (−20 % on the 110m), because the segments are shorter. So the feature is a
+flag with a documented trade-off — better CER on models whose segmentation was
+hurting them, lower peak RAM, no speed-up — rather than a default.
+
+An earlier RTF sweep looked like it showed differences; it was measuring nothing,
+because `EXTRA_CFLAGS` is not a dependency in the Makefile and every "different"
+build was the same binary. The numbers above come from forced rebuilds and from
+`bench`, which repeats runs and reports min/median instead of one sample.
 
 ## Plan
 
@@ -154,12 +208,14 @@ converted ASR model this machine does not have yet.
 4. **done** — `tests/test_vad.c` + `tests/test_vad.sh`: full-sequence parity, exit 77
    without the checkpoint (`make fetch-vad` gets it), `make test-vad` on its own.
    Clean under `make ubsan` and `make leaks` (0 leaks).
-5. Integration, one at a time and each with its own gate: offline silence skip →
-   segmentation on speech boundaries → streaming endpointing. Each changes output,
-   so each needs a before/after quality number (WER/CER on the samples), not just
-   "it runs". **The decision layer is done and at parity** (see above); what is
-   left in each of the three is the wiring into `src/mynah_asr.c` plus its
-   measurement, and the measurement needs a converted ASR model.
+5. **done for the offline path** — `mynah_asr_enable_vad` / `--vad`. Silence skip
+   and speech-boundary segmentation turned out to be the SAME mechanism (one
+   segment per widened span), so they are one flag with one set of numbers rather
+   than the two separate commits the plan assumed. Verdict and measurements in
+   "Using it on the offline path" above; `tests/test_e2e.sh` gates it by requiring
+   that enabling the VAD leaves a single-utterance fixture unchanged.
+   **Still open: streaming endpointing (EOU)**, which reuses the same incremental
+   `mynah_asr_vad_seg_feed` and needs its own latency measurement.
 
 Steps 1-4 are what make step 5 safe to attempt; the span parity makes it cheap.
 

@@ -75,10 +75,20 @@ form: `lang = "src>tgt"` (e.g. `"en>de"`) in `mynah_asr_transcribe*` — it wins
 int  mynah_asr_set_decoder(mynah_asr_model *m, const char *name);      /* "default" | "ctc" */
 void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec);      /* default 300 s */
 double mynah_asr_segment_limit(const mynah_asr_model *m);              /* the one in force */
+int  mynah_asr_enable_vad(mynah_asr_model *m, const char *vad_dir);    /* NULL = detach */
+int  mynah_asr_has_vad(const mynah_asr_model *m);
 ```
 `"ctc"` uses the CTC head of hybrid models (`parakeet-tdt_ctc-*`) — faster,
 slightly lower quality; on pure CTC models it is already the default. -1 if the
 model has no such head.
+
+`mynah_asr_enable_vad` attaches a Silero VAD (`make fetch-vad`, then
+`tools/convert_silero.py`): segments are cut on speech boundaries and the silence
+between them is never decoded. **Opt-in and model-dependent** — it cut CER from
+0.195 to 0.112 on parakeet-ctc-1.1b and cost ~1 point on the 110m, with no RTF win
+on fast models (measurements in [vad-silero.md](vad-silero.md)). Mutates the model
+like `set_target_lang`: call it before transcribing, not concurrently. On the CLI:
+`--vad <dir>` for `transcribe` and `bench`.
 
 ## Batch transcription
 

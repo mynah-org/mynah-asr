@@ -14,6 +14,7 @@
 #include "features.h"
 #include "threads.h"
 #include "tokenizer.h"
+#include "vad.h"
 #include "weights.h"
 #include "../vendor/cJSON.h"
 
@@ -40,6 +41,7 @@ struct mynah_asr_model {
     int default_prompt;
     double frame_sec;               /* duration of one encoder frame (hop*sub/sr) */
     double seg_sec;                 /* offline per-segment limit (default 300 s) */
+    mynah_asr_vad *vad;             /* optional (mynah_asr_enable_vad): NULL = energy split */
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -50,6 +52,18 @@ struct mynah_asr_model {
  * bounds memory. */
 #define MYNAH_ASR_SEG_DEFAULT 300.0
 #define MYNAH_ASR_SEG_OFFLINE 30.0
+
+/* Context kept around each VAD speech span before decoding it, and merged when
+ * two widened spans touch. Silero's own speech_pad_ms (30 ms) is tuned for SHOWING
+ * where speech is; an ASR needs real context, and without this the model loses
+ * words at the boundaries (29 of 591 on a 305 s file).
+ *
+ * 0.6 s comes from a CER sweep over {0.3, 0.6, 1.0, 2.0} on two models and two
+ * long fixtures (numbers in docs/vad-silero.md): it is the best cell on all four,
+ * and 2.0 is clearly worse than no VAD at all. */
+#ifndef MYNAH_ASR_VAD_CONTEXT_SEC
+#define MYNAH_ASR_VAD_CONTEXT_SEC 0.6
+#endif
 
 static cJSON *load_json(const char *dir, const char *file) {
     char path[1024];
@@ -327,6 +341,7 @@ void mynah_asr_free(mynah_asr_model *m) {
     /* the cached GPU weights point into the mmap we are about to close */
     mynah_asr_metal_weights_evict();
 #endif
+    mynah_asr_vad_close(m->vad);
     mynah_asr_st_close(m->weights);
     mynah_asr_st_close(m->mel_filters);
     cJSON_Delete(m->cfg);
@@ -347,6 +362,20 @@ void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec) {
 }
 
 double mynah_asr_segment_limit(const mynah_asr_model *m) { return m->seg_sec; }
+
+int mynah_asr_enable_vad(mynah_asr_model *m, const char *vad_dir) {
+    if (!m) return -1;
+    if (m->vad) { mynah_asr_vad_close(m->vad); m->vad = NULL; }
+    if (!vad_dir) return 0;
+    m->vad = mynah_asr_vad_open(vad_dir);
+    if (!m->vad) {
+        fprintf(stderr, "mynah-asr: cannot load the VAD from %s (see make fetch-vad)\n", vad_dir);
+        return -1;
+    }
+    return 0;
+}
+
+int mynah_asr_has_vad(const mynah_asr_model *m) { return m && m->vad ? 1 : 0; }
 
 int mynah_asr_set_decoder(mynah_asr_model *m, const char *name) {
     if (strcmp(name, "ctc") == 0) {
@@ -966,6 +995,95 @@ static size_t find_split_point(const float *s, size_t lo, size_t hi, int sr) {
     return best_pos;
 }
 
+/* Grows a segment array by one, returning the new element or NULL. */
+static seg_range *segs_push(seg_range **segs, int *n, int *cap) {
+    if (*n == *cap) {
+        const int nc = *cap ? *cap * 2 : 8;
+        seg_range *ns = realloc(*segs, (size_t)nc * sizeof(*ns));
+        if (!ns) return NULL;
+        *segs = ns;
+        *cap = nc;
+    }
+    return &(*segs)[(*n)++];
+}
+
+/* VAD-driven plan: one segment per speech span, so the silence BETWEEN spans is
+ * never fed to the encoder — that is the whole point, and it is also why the cut
+ * points land on speech boundaries instead of on the quietest 20 ms window.
+ *
+ * A span longer than the limit is split by the same energy rule as below: inside
+ * continuous speech there is no better information to use. Spans are contiguous
+ * ranges of the ORIGINAL buffer, so word timestamps keep mapping through
+ * append_segment's offset with no extra bookkeeping.
+ *
+ * Returns -1 to mean "no VAD plan": the caller falls back to the energy planner
+ * rather than failing a transcription because the VAD had a bad day. */
+static int plan_segments_vad(const mynah_asr_model *m, const float *samples,
+                            size_t n_samples, seg_range **out) {
+    const int sr = m->feat.sample_rate;
+    const size_t seg_max = (size_t)(m->seg_sec * sr);
+    const int frame = mynah_asr_vad_frame_samples(m->vad);
+    if (frame <= 0 || n_samples == 0) return -1;
+
+    const int cap_spans = (int)(n_samples / (2u * (size_t)frame)) + 2;
+    mynah_asr_vad_span *spans = malloc((size_t)cap_spans * sizeof(*spans));
+    if (!spans) return -1;
+    int n_spans = mynah_asr_vad_speech_spans(m->vad, samples, n_samples, spans, cap_spans);
+    if (n_spans < 0) { free(spans); return -1; }
+
+    /* Widen every span by MYNAH_ASR_VAD_CONTEXT_SEC and merge whatever then
+     * overlaps. Silero's own speech_pad_ms (30 ms) is tuned for SHOWING where
+     * speech is; an ASR needs real context around it, and without this the model
+     * loses words at the boundaries (measured: 29 of 591 on a 305 s file). Merging
+     * also fights fragmentation, which is what made the first version slower. */
+    const size_t ctx = (size_t)(MYNAH_ASR_VAD_CONTEXT_SEC * sr);
+    for (int i = 0; i < n_spans; i++) {
+        spans[i].t0 = spans[i].t0 > ctx ? spans[i].t0 - ctx : 0;
+        spans[i].t1 = spans[i].t1 + ctx < n_samples ? spans[i].t1 + ctx : n_samples;
+    }
+    int w = 0;
+    for (int i = 1; i < n_spans; i++) {
+        if (spans[i].t0 <= spans[w].t1) {                 /* touching: one segment */
+            if (spans[i].t1 > spans[w].t1) spans[w].t1 = spans[i].t1;
+        } else {
+            spans[++w] = spans[i];
+        }
+    }
+    if (n_spans > 0) n_spans = w + 1;
+
+    seg_range *segs = NULL;
+    int n = 0, cap = 0;
+    for (int i = 0; i < n_spans; i++) {
+        size_t cur = spans[i].t0;
+        const size_t stop = spans[i].t1;
+        while (cur < stop) {
+            size_t end = stop;
+            if (stop - cur > seg_max + seg_max / 10) {
+                const size_t hi = cur + seg_max;
+                size_t lo = seg_max > 20u * (size_t)sr ? hi - 20u * (size_t)sr : cur + (size_t)sr;
+                if (lo <= cur) lo = cur + 1;
+                end = find_split_point(samples, lo, hi, sr);
+                if (end <= cur || end > stop) end = hi;
+            }
+            seg_range *s = segs_push(&segs, &n, &cap);
+            if (!s) { free(segs); free(spans); return -1; }
+            s->off = cur;
+            s->len = end - cur;
+            cur = end;
+        }
+    }
+    free(spans);
+    if (n == 0) {                    /* no speech at all: one empty segment, empty text */
+        segs = malloc(sizeof(*segs));
+        if (!segs) return -1;
+        segs[0].off = 0;
+        segs[0].len = 0;
+        n = 1;
+    }
+    *out = segs;
+    return n;
+}
+
 /* Ranges the offline path decodes independently (see the forward declaration).
  * Returns the count and a malloc'd array, or -1. Audio short enough for one
  * segment yields exactly one covering the whole input, so the callers have no
@@ -974,6 +1092,10 @@ static size_t find_split_point(const float *s, size_t lo, size_t hi, int sr) {
 static int plan_segments(const mynah_asr_model *m, const float *samples,
                          size_t n_samples, seg_range **out) {
     const int sr = m->feat.sample_rate;
+    if (m->vad) {
+        const int n = plan_segments_vad(m, samples, n_samples, out);
+        if (n > 0) return n;
+    }
     const size_t seg_max = (size_t)(m->seg_sec * sr);
     seg_range *segs = NULL;
     int n = 0, cap = 0;
@@ -988,16 +1110,10 @@ static int plan_segments(const mynah_asr_model *m, const float *samples,
             end = find_split_point(samples, lo, hi, sr);
         }
         if (end <= cur) end = cur + 1;   /* progress, so termination is local */
-        if (n == cap) {
-            const int nc = cap ? cap * 2 : 8;
-            seg_range *ns = realloc(segs, (size_t)nc * sizeof(*ns));
-            if (!ns) { free(segs); return -1; }
-            segs = ns;
-            cap = nc;
-        }
-        segs[n].off = cur;
-        segs[n].len = end - cur;
-        n++;
+        seg_range *s = segs_push(&segs, &n, &cap);
+        if (!s) { free(segs); return -1; }
+        s->off = cur;
+        s->len = end - cur;
         cur = end;
     }
     if (n == 0) {

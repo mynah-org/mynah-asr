@@ -24,9 +24,11 @@ static void usage(void) {
     printf("             live streaming from stdin (raw s16le 16 kHz mono)\n");
     printf("  quantize   -m <model_dir> --quant int8|int4\n");
     printf("             writes the pre-quantized checkpoint (instant load)\n");
-    printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8]\n");
+    printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8] [--vad <dir>]\n");
     printf("             warm RTF (min/median over N runs) + peak RAM, one model at a time\n");
     printf("  --version                                 prints the version\n\n");
+    printf("  --vad <dir>                 (transcribe) cut segments on speech with the Silero\n");
+    printf("                              VAD and skip the silence between them (make fetch-vad)\n");
     printf("Common options (transcribe/stream):\n");
     printf("  --backend cpu|metal|cuda    GEMM backend (falls back to CPU if unavailable)\n");
     printf("  --caps auto|scalar|avx2|vnni  x86 SIMD level (default: cpuid; env MYNAH_ASR_CAPS)\n");
@@ -40,7 +42,7 @@ static double now_sec(void) {
 
 static int cmd_transcribe(int argc, char **argv) {
     const char *model_dir = NULL, *wav = NULL, *lang = "auto", *decoder = "default";
-    const char *target_lang = NULL;
+    const char *target_lang = NULL, *vad_dir = NULL;
     int lookahead = -1, quant = MYNAH_ASR_QUANT_F32, timestamps = 0;
     double segment_sec = 0.0;
     for (int i = 0; i < argc; i++) {
@@ -51,6 +53,7 @@ static int cmd_transcribe(int argc, char **argv) {
         else if (strcmp(argv[i], "--timestamps") == 0) timestamps = 1;
         else if (strcmp(argv[i], "--decoder") == 0 && i + 1 < argc) decoder = argv[++i];
         else if (strcmp(argv[i], "--segment-sec") == 0 && i + 1 < argc) segment_sec = atof(argv[++i]);
+        else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) vad_dir = argv[++i];
         else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) lookahead = atoi(argv[++i]);
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             i++;
@@ -69,6 +72,7 @@ static int cmd_transcribe(int argc, char **argv) {
     if (mynah_asr_set_decoder(m, decoder) != 0) { mynah_asr_free(m); return 1; }
     if (target_lang && mynah_asr_set_target_lang(m, target_lang) != 0) { mynah_asr_free(m); return 1; }
     if (segment_sec > 0.0) mynah_asr_set_segment_limit(m, segment_sec);
+    if (vad_dir && mynah_asr_enable_vad(m, vad_dir) != 0) { mynah_asr_free(m); return 1; }
     double t_load = now_sec() - t0;
 
     size_t n_samples;
@@ -285,12 +289,14 @@ static int cmp_double(const void *a, const void *b) {
  * time and with explicit A/B parameters (repo rule 6). */
 static int cmd_bench(int argc, char **argv) {
     const char *model_dir = NULL, *wav = "tests/audio/test_it.wav", *lang = "auto";
+    const char *vad_dir = NULL;
     int lookahead = -1, quant = MYNAH_ASR_QUANT_F32, runs = 5, warmup = 2;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) wav = argv[++i];
         else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) lang = argv[++i];
         else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) lookahead = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) vad_dir = argv[++i];
         else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
@@ -309,6 +315,7 @@ static int cmd_bench(int argc, char **argv) {
     double t0 = now_sec();
     mynah_asr_model *m = mynah_asr_load_quant(model_dir, quant);
     if (!m) return 1;
+    if (vad_dir && mynah_asr_enable_vad(m, vad_dir) != 0) { mynah_asr_free(m); return 1; }
     const double t_load = now_sec() - t0;
 
     size_t n_samples;

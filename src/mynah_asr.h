@@ -73,6 +73,24 @@ void mynah_asr_set_segment_limit(mynah_asr_model *m, double sec);
 /* The limit currently in force, in seconds (the resolved default if never set). */
 double mynah_asr_segment_limit(const mynah_asr_model *m);
 
+/* Attaches a Silero VAD (the directory produced by tools/convert_silero.py) to
+ * the offline path: segments are then cut on speech boundaries and the silence
+ * between them is never fed to the encoder. OPT-IN — it changes both the timing
+ * and, potentially, the text, so it is never enabled behind the caller's back.
+ *
+ * vad_dir NULL detaches it. Returns 0, or -1 when the directory cannot be loaded
+ * (the model keeps working without a VAD). Call before transcribing, not
+ * concurrently: like set_target_lang, it mutates the model.
+ *
+ * Consequence worth knowing: audio in which the VAD finds no speech at all is not
+ * decoded at all and comes back as an EMPTY string. Usually what you want, but it
+ * means a file the VAD misjudges transcribes to nothing rather than to something
+ * wrong. (On the models tested, silence already decoded to "" either way.) */
+int mynah_asr_enable_vad(mynah_asr_model *m, const char *vad_dir);
+
+/* 1 when a VAD is attached. */
+int mynah_asr_has_vad(const mynah_asr_model *m);
+
 /* Lookaheads (right context) valid for the model, e.g. {3,0,6,13}. */
 int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]);
 

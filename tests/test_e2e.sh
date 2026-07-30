@@ -139,6 +139,20 @@ case "$seg" in
     *) echo "e2e segment FAIL: $seg"; fail=1 ;;
 esac
 
+# VAD segmentation (only when the checkpoint is there: make fetch-vad). On a
+# single short utterance the VAD must find one span covering it, so the text has
+# to come out the same as without it — if enabling the VAD changes a 4-second
+# fixture, it is cutting speech.
+if [ -f models/silero-vad/mynah.json ]; then
+    plain=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" 2>/dev/null)
+    vad=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --vad models/silero-vad 2>/dev/null)
+    if [ "$plain" = "$vad" ]; then
+        echo "e2e vad OK: unchanged on a single utterance"
+    else
+        printf 'e2e vad FAIL:\n  without: %s\n  with:    %s\n' "$plain" "$vad"; fail=1
+    fi
+fi
+
 # Metal backend (macOS only; for non-causal models the Metal kernel does not
 # apply and the gate falls back to CPU: the check validates the text anyway)
 out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i "$Q_WAV" --backend metal 2>/dev/null)
