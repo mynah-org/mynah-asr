@@ -28,8 +28,20 @@ if [ ! -f "$VAD_DIR/mynah.json" ]; then
 fi
 
 WAV_ABS=$(cd "$(dirname "$WAV")" && pwd)/$(basename "$WAV")
-if ! (cd tools && uv run --extra vad python -m oracle.vad "$ONNX" "$WAV_ABS" \
-        --out "$TMP/probs.npy" >"$TMP/oracle.log" 2>&1); then
+
+# VAD_SPANS=1 also compares the speech segmentation against silero's own
+# get_speech_timestamps. Off by default because it drags in torch; `make
+# test-vad-spans` turns it on.
+UV_EXTRA=""
+ORACLE_SPANS=""
+SPANS_ARG=""
+if [ "$VAD_SPANS" = 1 ]; then
+    UV_EXTRA="--with silero-vad"
+    ORACLE_SPANS="--spans $TMP/spans.npy"
+    SPANS_ARG="$TMP/spans.npy"
+fi
+if ! (cd tools && uv run --extra vad $UV_EXTRA python -m oracle.vad "$ONNX" "$WAV_ABS" \
+        --out "$TMP/probs.npy" $ORACLE_SPANS >"$TMP/oracle.log" 2>&1); then
     cat "$TMP/oracle.log"
     echo "vad parity SKIP (onnxruntime unavailable: offline?)"
     exit 77
@@ -37,4 +49,4 @@ fi
 cat "$TMP/oracle.log"
 
 # WRAP lets `make leaks` run the binary under a checker without rebuilding the dump
-${WRAP} ./tests/test_vad "$VAD_DIR" "$WAV" "$TMP/probs.npy"
+${WRAP} ./tests/test_vad "$VAD_DIR" "$WAV" "$TMP/probs.npy" $SPANS_ARG

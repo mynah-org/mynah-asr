@@ -41,6 +41,7 @@ MODEL_DIR ?= models/nemotron-3.5-asr-streaming-0.6b
 PARAKEET_DIR ?= models/parakeet-tdt-0.6b-v3
 PARAKEET110_DIR ?= models/parakeet-tdt_ctc-110m
 VAD_DIR ?= models/silero-vad
+VAD_WAV ?= samples/long/en_long.wav
 
 all: mynah-asr mynah-asr-server
 
@@ -60,7 +61,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_gguf tests/test_threads tests/test_align tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
+TESTS := tests/test_qmat tests/test_gguf tests/test_threads tests/test_align tests/test_vadseg tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
 
 tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -73,7 +74,7 @@ PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tes
 SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	@for t in $(TESTS); do \
-	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ]; then $$t; rc=$$?; \
+	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -205,6 +206,14 @@ test-vad: tests/test_vad
 	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: run make fetch-vad first"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# Speech-span parity against silero's own get_speech_timestamps. Separate target
+# because it needs the silero-vad package (hence torch): the hysteresis itself is
+# covered model-free by tests/test_vadseg, this pins it to the reference.
+test-vad-spans: tests/test_vad
+	@VAD_SPANS=1 sh tests/test_vad.sh $(VAD_DIR) $(VAD_WAV); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP vad spans: run make fetch-vad first"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 SILERO_URL := https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 fetch-vad:
 	@mkdir -p $(VAD_DIR)
@@ -272,4 +281,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda
+.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda

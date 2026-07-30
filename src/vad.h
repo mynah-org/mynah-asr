@@ -35,4 +35,52 @@ int mynah_asr_vad_min_silence_ms(const mynah_asr_vad *v);
 int mynah_asr_vad_min_speech_ms(const mynah_asr_vad *v);
 int mynah_asr_vad_speech_pad_ms(const mynah_asr_vad *v);
 
+/* ------------------------------------------------------- speech segmentation
+ * Probabilities are not decisions: turning them into "here is speech" needs
+ * hysteresis, and the reference for it is silero's own get_speech_timestamps.
+ * The policy is a plain struct, separate from the network, for two reasons: the
+ * numbers travel in mynah.json instead of being magic constants, and the logic
+ * is then testable with synthetic probabilities and no checkpoint at all
+ * (tests/test_vadseg.c).
+ *
+ * Not implemented: silero's max_speech_duration_s (default infinity). Bounding
+ * segment length is the ASR side's job — it already does it in plan_segments,
+ * with limits that depend on the model. */
+typedef struct { size_t t0, t1; } mynah_asr_vad_span;   /* sample offsets, [t0, t1) */
+
+typedef struct {
+    int sample_rate, frame_samples;
+    double threshold, neg_threshold;
+    int min_speech_ms, min_silence_ms, speech_pad_ms;
+} mynah_asr_vad_policy;
+
+mynah_asr_vad_policy mynah_asr_vad_policy_of(const mynah_asr_vad *v);
+
+/* Incremental decision state: the same code serves the offline scan and (later)
+ * streaming endpointing, instead of two implementations that drift apart. */
+typedef struct { int triggered; long start, temp_end, i; } mynah_asr_vad_seg;
+
+void mynah_asr_vad_seg_reset(mynah_asr_vad_seg *s);
+
+/* One probability in. Returns 1 and fills `out` when a speech span just closed
+ * (which happens min_silence_ms AFTER the speech actually ended), else 0. */
+int mynah_asr_vad_seg_feed(const mynah_asr_vad_policy *p, mynah_asr_vad_seg *s,
+                           float prob, mynah_asr_vad_span *out);
+
+/* Closes a span still open at the end of the audio. 1 if it emitted one. */
+int mynah_asr_vad_seg_finish(const mynah_asr_vad_policy *p, mynah_asr_vad_seg *s,
+                             size_t n_samples, mynah_asr_vad_span *out);
+
+/* Widens spans by speech_pad_ms, splitting the difference when two spans are
+ * closer than twice the padding (silero's rule, in place). */
+void mynah_asr_vad_pad_spans(const mynah_asr_vad_policy *p, mynah_asr_vad_span *spans,
+                             int n, size_t n_samples);
+
+/* Whole buffer -> padded speech spans, equivalent to silero's
+ * get_speech_timestamps. Returns the number of spans, or -1 (more than `cap`
+ * spans, or a failure): an upper bound for cap is n_samples / (2 * frame) + 1.
+ * Resets the model state first, so it is independent of previous calls. */
+int mynah_asr_vad_speech_spans(mynah_asr_vad *v, const float *samples, size_t n_samples,
+                               mynah_asr_vad_span *out, int cap);
+
 #endif

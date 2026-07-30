@@ -63,6 +63,25 @@ def load_wav(path: str) -> np.ndarray:
     return audio
 
 
+def official_spans(onnx_path: str, audio: np.ndarray) -> np.ndarray:
+    """[n, 2] sample offsets from silero's own get_speech_timestamps.
+
+    Needs silero-vad (and therefore torch), so this is not part of the default
+    parity run — see `make test-vad-spans`. The thresholds are the ones the
+    converter writes into mynah.json, so C and reference decide on equal terms.
+    """
+    import torch
+    from silero_vad.utils_vad import OnnxWrapper, get_speech_timestamps
+
+    model = OnnxWrapper(onnx_path, force_onnx_cpu=True)
+    spans = get_speech_timestamps(
+        torch.from_numpy(audio), model,
+        threshold=0.5, neg_threshold=0.35, sampling_rate=SAMPLE_RATE,
+        min_speech_duration_ms=250, min_silence_duration_ms=100, speech_pad_ms=30,
+    )
+    return np.array([[s["start"], s["end"]] for s in spans], dtype=np.float64).reshape(-1, 2)
+
+
 def verify_official(onnx_path: str, audio: np.ndarray, probs: np.ndarray) -> None:
     """Cross-check the framing against silero's own wrapper (needs silero-vad)."""
     import torch
@@ -83,6 +102,8 @@ def main() -> None:
     ap.add_argument("onnx")
     ap.add_argument("wav")
     ap.add_argument("--out", default=None, help="write the probabilities as .npy")
+    ap.add_argument("--spans", default=None,
+                    help="write silero's own speech spans (sample offsets) as .npy")
     ap.add_argument("--verify-official", action="store_true",
                     help="cross-check the framing against silero's own wrapper")
     args = ap.parse_args()
@@ -93,6 +114,10 @@ def main() -> None:
         verify_official(args.onnx, audio, probs)
     if args.out:
         np.save(args.out, probs)
+    if args.spans:
+        spans = official_spans(args.onnx, audio)
+        np.save(args.spans, spans)
+        print(f"[spans] {len(spans)} speech spans from silero's get_speech_timestamps")
     speech = float((probs > 0.5).mean())
     print(f"[{len(audio) / SAMPLE_RATE:.1f}s audio | {len(probs)} frames | "
           f"{speech * 100:.1f}% above 0.5 | mean {probs.mean():.3f}]")

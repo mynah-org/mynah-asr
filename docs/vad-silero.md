@@ -100,6 +100,48 @@ so the VAD is free relative to the ASR it is meant to save work for.
 Deliberately broken once each, to prove the test is not green for free: no reflect
 pad → 1.1e-01, no head ReLU → 9.2e-01, lookbehind dropped → 3.9e-01.
 
+## From probabilities to spans
+
+A probability per 32 ms frame is not a decision. The hysteresis that turns it into
+"speech here" is silero's `get_speech_timestamps`, and it is ported faithfully:
+open above `threshold`, close below `neg_threshold` but only after
+`min_silence_ms` has passed (and the span ends where the silence STARTED, not
+where the close fired), drop spans shorter than `min_speech_ms`, then widen by
+`speech_pad_ms`, splitting the difference when two spans are closer than twice the
+padding. All five numbers travel in `mynah.json`.
+
+Two design choices worth keeping:
+
+- The state machine is **incremental** (`mynah_asr_vad_seg_feed`, one probability
+  at a time), so offline scanning and streaming endpointing will use the same code
+  instead of two implementations that drift apart (repo rule 2).
+- The policy is a **plain struct**, separate from the network, so the decision
+  logic is testable with synthetic probabilities and no checkpoint at all —
+  `tests/test_vadseg.c` runs in CI and states every expected boundary in samples,
+  computed by hand from the policy.
+
+Not ported: silero's `max_speech_duration_s` (its default is infinity, and the
+branch is intricate). Bounding segment length is the ASR side's job, which already
+does it in `plan_segments` with model-dependent limits.
+
+Parity: `make test-vad-spans` compares against silero's own function — **64 of 64
+spans identical, exact sample offsets**, on the 305 s fixture. It is a separate
+target because `get_speech_timestamps` needs the silero-vad package (hence torch);
+the everyday gate stays onnxruntime-only.
+
+What the VAD says about the fixtures, which bounds what skipping silence can buy:
+
+| fixture | audio | spans | speech | silence |
+|---|---|---|---|---|
+| `samples/long/en_long.wav` | 305.0 s | 64 | 203.6 s | 33.3 % |
+| `samples/long/de_long.wav` | 122.8 s | 21 | 89.7 s | 27.0 % |
+| `samples/en/fleurs_long.wav` | 94.6 s | 21 | 66.8 s | 29.4 % |
+| `samples/it/fleurs_1521.wav` | 11.0 s | 3 | 8.3 s | 24.0 % |
+
+That is an **upper bound on the RTF win, not a measurement of it**: the real
+saving depends on the ASR model and is measured in step 5a, which needs a
+converted ASR model this machine does not have yet.
+
 ## Plan
 
 1. **done** — `tools/convert_silero.py`: ONNX → mynah layout, weights pulled out of
@@ -115,9 +157,11 @@ pad → 1.1e-01, no head ReLU → 9.2e-01, lookbehind dropped → 3.9e-01.
 5. Integration, one at a time and each with its own gate: offline silence skip →
    segmentation on speech boundaries → streaming endpointing. Each changes output,
    so each needs a before/after quality number (WER/CER on the samples), not just
-   "it runs".
+   "it runs". **The decision layer is done and at parity** (see above); what is
+   left in each of the three is the wiring into `src/mynah_asr.c` plus its
+   measurement, and the measurement needs a converted ASR model.
 
-Step 5 is where the value is, but steps 1-4 are what make it safe to attempt.
+Steps 1-4 are what make step 5 safe to attempt; the span parity makes it cheap.
 
 ## Using it
 

@@ -364,3 +364,129 @@ float mynah_asr_vad_feed(mynah_asr_vad *v, const float *samples, size_t n) {
         if (v->h[i] > 0.0f) acc += v->head_w[i] * v->h[i];
     return mynah_asr_sigmoid(acc);
 }
+
+/* ------------------------------------------------------- speech segmentation
+ * Faithful port of silero's get_speech_timestamps with max_speech_duration_s at
+ * its default (infinity), which removes the whole possible_ends / next_start
+ * branch. Everything is in samples, like the original.
+ *
+ * One deliberate difference: silero uses 0 as "no pending end" for temp_end,
+ * which is ambiguous with a real end at sample 0; here the sentinel is -1. The
+ * ambiguous case cannot arise anyway (triggering `continue`s, so a frame never
+ * both opens a span and tests for silence). */
+
+mynah_asr_vad_policy mynah_asr_vad_policy_of(const mynah_asr_vad *v) {
+    mynah_asr_vad_policy p;
+    p.sample_rate = 16000;
+    p.frame_samples = v ? v->frame : 512;
+    p.threshold = mynah_asr_vad_threshold(v);
+    p.neg_threshold = mynah_asr_vad_neg_threshold(v);
+    p.min_speech_ms = mynah_asr_vad_min_speech_ms(v);
+    p.min_silence_ms = mynah_asr_vad_min_silence_ms(v);
+    p.speech_pad_ms = mynah_asr_vad_speech_pad_ms(v);
+    return p;
+}
+
+void mynah_asr_vad_seg_reset(mynah_asr_vad_seg *s) {
+    if (!s) return;
+    s->triggered = 0;
+    s->start = 0;
+    s->temp_end = -1;
+    s->i = 0;
+}
+
+static double ms_samples(const mynah_asr_vad_policy *p, int ms) {
+    return (double)p->sample_rate * (double)ms / 1000.0;
+}
+
+int mynah_asr_vad_seg_feed(const mynah_asr_vad_policy *p, mynah_asr_vad_seg *s,
+                           float prob, mynah_asr_vad_span *out) {
+    if (!p || !s || !out) return 0;
+    const long cur = (long)p->frame_samples * s->i++;
+
+    if ((double)prob >= p->threshold) {
+        s->temp_end = -1;                       /* speech is back: cancel the close */
+        if (!s->triggered) { s->triggered = 1; s->start = cur; }
+        return 0;
+    }
+    if ((double)prob < p->neg_threshold && s->triggered) {
+        if (s->temp_end < 0) s->temp_end = cur;
+        if ((double)(cur - s->temp_end) < ms_samples(p, p->min_silence_ms)) return 0;
+        const long end = s->temp_end;
+        s->triggered = 0;
+        s->temp_end = -1;
+        if ((double)(end - s->start) > ms_samples(p, p->min_speech_ms)) {
+            out->t0 = (size_t)s->start;
+            out->t1 = (size_t)end;
+            return 1;
+        }
+    }
+    return 0;                                   /* between the thresholds: hold */
+}
+
+int mynah_asr_vad_seg_finish(const mynah_asr_vad_policy *p, mynah_asr_vad_seg *s,
+                             size_t n_samples, mynah_asr_vad_span *out) {
+    if (!p || !s || !out || !s->triggered) return 0;
+    s->triggered = 0;
+    if ((double)((long)n_samples - s->start) <= ms_samples(p, p->min_speech_ms)) return 0;
+    out->t0 = (size_t)s->start;
+    out->t1 = n_samples;
+    return 1;
+}
+
+void mynah_asr_vad_pad_spans(const mynah_asr_vad_policy *p, mynah_asr_vad_span *spans,
+                             int n, size_t n_samples) {
+    if (!p || !spans || n <= 0) return;
+    const long pad = (long)((double)p->sample_rate * (double)p->speech_pad_ms / 1000.0);
+    const long total = (long)n_samples;
+    for (int i = 0; i < n; i++) {
+        if (i == 0) {
+            const long s0 = (long)spans[0].t0 - pad;
+            spans[0].t0 = (size_t)(s0 > 0 ? s0 : 0);
+        }
+        if (i != n - 1) {
+            const long gap = (long)spans[i + 1].t0 - (long)spans[i].t1;
+            if (gap < 2 * pad) {                /* too close to pad both fully: share */
+                spans[i].t1 += (size_t)(gap / 2);
+                const long s1 = (long)spans[i + 1].t0 - gap / 2;
+                spans[i + 1].t0 = (size_t)(s1 > 0 ? s1 : 0);
+            } else {
+                const long e = (long)spans[i].t1 + pad;
+                spans[i].t1 = (size_t)(e < total ? e : total);
+                const long s1 = (long)spans[i + 1].t0 - pad;
+                spans[i + 1].t0 = (size_t)(s1 > 0 ? s1 : 0);
+            }
+        } else {
+            const long e = (long)spans[i].t1 + pad;
+            spans[i].t1 = (size_t)(e < total ? e : total);
+        }
+    }
+}
+
+int mynah_asr_vad_speech_spans(mynah_asr_vad *v, const float *samples, size_t n_samples,
+                               mynah_asr_vad_span *out, int cap) {
+    if (!v || !samples || !out || cap < 0) return -1;
+    const mynah_asr_vad_policy p = mynah_asr_vad_policy_of(v);
+    mynah_asr_vad_seg seg;
+    mynah_asr_vad_seg_reset(&seg);
+    mynah_asr_vad_reset(v);
+
+    int n = 0;
+    for (size_t off = 0; off < n_samples; off += (size_t)v->frame) {
+        const size_t take = n_samples - off < (size_t)v->frame ? n_samples - off : (size_t)v->frame;
+        const float prob = mynah_asr_vad_feed(v, samples + off, take);
+        if (prob < 0.0f) return -1;
+        mynah_asr_vad_span span;
+        if (mynah_asr_vad_seg_feed(&p, &seg, prob, &span)) {
+            if (n >= cap) return -1;
+            out[n++] = span;
+        }
+    }
+    mynah_asr_vad_span span;
+    if (mynah_asr_vad_seg_finish(&p, &seg, n_samples, &span)) {
+        if (n >= cap) return -1;
+        out[n++] = span;
+    }
+    mynah_asr_vad_pad_spans(&p, out, n, n_samples);
+    return n;
+}

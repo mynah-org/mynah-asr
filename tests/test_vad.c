@@ -22,12 +22,46 @@ static int failures;
 
 double *npy_load_f(const char *path, size_t *n_elems);   /* shared from npy.c */
 
+/* Optional 4th argument: silero's own get_speech_timestamps output. Compared
+ * EXACTLY (they are integer sample offsets — "close enough" would hide an
+ * off-by-one frame, which is 32 ms of audio). */
+static void check_spans(mynah_asr_vad *v, const float *audio, size_t n_samples,
+                        const char *spans_npy) {
+    char msg[256];
+    size_t n_ref = 0;
+    double *ref = npy_load_f(spans_npy, &n_ref);
+    if (!ref || n_ref % 2 != 0) {
+        snprintf(msg, sizeof(msg), "reference spans %s unreadable", spans_npy);
+        CHECK(0, msg);
+        free(ref);
+        return;
+    }
+    const int n_want = (int)(n_ref / 2);
+    const int cap = (int)(n_samples / (2 * (size_t)mynah_asr_vad_frame_samples(v))) + 2;
+    mynah_asr_vad_span *got = malloc((size_t)cap * sizeof(*got));
+    if (!got) { free(ref); CHECK(0, "out of memory"); return; }
+
+    const int n_got = mynah_asr_vad_speech_spans(v, audio, n_samples, got, cap);
+    snprintf(msg, sizeof(msg), "%d speech spans vs silero's get_speech_timestamps (%d)",
+             n_got, n_want);
+    CHECK(n_got == n_want, msg);
+    CHECK(n_want > 1, "the fixture has more than one speech span (else this proves little)");
+    for (int i = 0; i < n_got && i < n_want; i++) {
+        snprintf(msg, sizeof(msg), "span %d [%zu, %zu) == silero [%lld, %lld)", i,
+                 got[i].t0, got[i].t1, (long long)ref[2 * i], (long long)ref[2 * i + 1]);
+        CHECK((double)got[i].t0 == ref[2 * i] && (double)got[i].t1 == ref[2 * i + 1], msg);
+    }
+    free(got);
+    free(ref);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <vad_dir> <file.wav> <probs.npy>\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s <vad_dir> <file.wav> <probs.npy> [spans.npy]\n", argv[0]);
         return 1;
     }
     const char *vad_dir = argv[1], *wav_path = argv[2], *npy_path = argv[3];
+    const char *spans_npy = argc == 5 ? argv[4] : NULL;
 
     char cfg[1024];
     snprintf(cfg, sizeof(cfg), "%s/mynah.json", vad_dir);
@@ -86,6 +120,8 @@ int main(int argc, char **argv) {
     const float again = mynah_asr_vad_feed(v, audio, n_samples < (size_t)F ? n_samples : (size_t)F);
     snprintf(msg, sizeof(msg), "reset restores frame 0 (%.6f vs oracle %.6f)", again, ref[0]);
     CHECK(fabs((double)again - ref[0]) <= 1e-5, msg);
+
+    if (spans_npy) check_spans(v, audio, n_samples, spans_npy);
 
     mynah_asr_vad_close(v);
     free(ref);
