@@ -2,7 +2,7 @@
  * builds synthetic GGUFs in /tmp and checks
  *   1. parsing of the valid file: reversed dims (ggml ne[0] = the fastest one),
  *      F32 zero-copy bit-exact, dequant F16/BF16/Q8_0/Q4_0 within tolerance and
- *      the K-quants Q4_K/Q5_K/Q6_K exact against the spec formula;
+ *      the K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K exact against the spec formula;
  *   2. that malformed files (magic, v1, truncated, offset past EOF, absurd
  *      string, alignment not a power of 2, unknown ggml type) are rejected
  *      cleanly (NULL, no crash) — the same class of harness used to validate
@@ -387,12 +387,18 @@ int main(int argc, char **argv) {
     put_u32(&bad[5].f, 4);
     put_u32(&bad[5].f, 33);
 
-    /* Q2_K (type 10, 84B super-block): a real ggml type we deliberately do not
-     * support — rejected with a clear message instead of a bogus dequant */
-    bad[6].what = "unsupported ggml type (Q2_K)";
+    /* IQ2_XXS (type 16, 66B super-block): a real ggml type we deliberately do not
+     * support — it needs a lookup codebook, which is out of scope — so it must be
+     * rejected with a clear message instead of a bogus dequant.
+     *
+     * This case has to be re-pointed every time a type gains support, or it silently
+     * stops testing anything: it used to be Q6_K, then Q2_K, and both were adopted.
+     * An IQ type is the stable choice here precisely because the codebook family is
+     * out of scope by decision, not by schedule. */
+    bad[6].what = "unsupported ggml type (IQ2_XXS)";
     hdr(&bad[6].f, 3, 1);
-    { const uint64_t ne[1] = {256}; tinfo(&bad[6].f, "t", 1, ne, 10, 0); pad_to(&bad[6].f, 32);
-      static const unsigned char blk[84] = {0}; put(&bad[6].f, blk, 84); }
+    { const uint64_t ne[1] = {256}; tinfo(&bad[6].f, "t", 1, ne, 16, 0); pad_to(&bad[6].f, 32);
+      static const unsigned char blk[66] = {0}; put(&bad[6].f, blk, 66); }
 
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
         CHECK(write_tmp(&bad[k].f, junk) != NULL, "malformed fixture written");

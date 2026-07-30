@@ -43,6 +43,28 @@ def f16_bytes(rng: np.random.Generator, lo: float, hi: float) -> bytes:
     return np.asarray([rng.uniform(lo, hi)], dtype=np.float16).tobytes()
 
 
+def build_q2k(rng: np.random.Generator) -> bytes:
+    """84B: 16B scales/mins (4 bits each) + 64B of 2-bit quants + d f16 + dmin f16."""
+    out = bytearray()
+    for _ in range(N_BLOCKS):
+        out += rand_bytes(rng, 16)            # scales/mins
+        out += rand_bytes(rng, 64)            # qs
+        out += f16_bytes(rng, 0.01, 0.5)      # d
+        out += f16_bytes(rng, 0.01, 0.3)      # dmin
+    return bytes(out)
+
+
+def build_q3k(rng: np.random.Generator) -> bytes:
+    """110B: hmask[32] + qs[64] + 12B packed 6-bit scales + d f16."""
+    out = bytearray()
+    for _ in range(N_BLOCKS):
+        out += rand_bytes(rng, 32)            # hmask (high bit, inverted)
+        out += rand_bytes(rng, 64)            # qs (low 2 bits)
+        out += rand_bytes(rng, 12)            # 16 six-bit scales
+        out += f16_bytes(rng, 0.01, 0.5)      # d
+    return bytes(out)
+
+
 def build_q4k(rng: np.random.Generator) -> bytes:
     """144B: d f16 + dmin f16 + 12B packed 6-bit scales/mins + 128B nibbles."""
     out = bytearray()
@@ -78,6 +100,8 @@ def build_q6k(rng: np.random.Generator) -> bytes:
 
 
 CASES = (
+    ("t.q2k", T.Q2_K, 84, build_q2k),
+    ("t.q3k", T.Q3_K, 110, build_q3k),
     ("t.q4k", T.Q4_K, 144, build_q4k),
     ("t.q5k", T.Q5_K, 176, build_q5k),
     ("t.q6k", T.Q6_K, 210, build_q6k),

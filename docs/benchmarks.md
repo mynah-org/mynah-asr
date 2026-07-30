@@ -1,8 +1,11 @@
 # Benchmarks — measured RTF and RAM
 
-> Measurements from **2026-07-18** on M-series (16 GB), models on local disk,
-> **warm** runs (2 warm-ups before measuring — see the methodology note at the
-> bottom). Reproducible with `make bench` (short fixtures) + manual runs on the
+> Measurements from **2026-07-18** on M-series (16 GB, canary-1b-v2 row 2026-07-30),
+> models on local disk — **never over a network mount**: the same model mmap'd from
+> SMB measured RTF 1.1 against 0.015 locally (70× slower, the process sits at 3% CPU
+> waiting on the network). Correctness is fine over the mount, timing is meaningless.
+> All runs are **warm** (2 warm-ups before measuring — see the methodology note at
+> the bottom). Reproducible with `make bench` (short fixtures) + manual runs on the
 > long file. RTF = inference time / audio duration (lower = faster; 0.05 ≈ 20×
 > faster than realtime).
 
@@ -33,13 +36,17 @@ picture is below, on long audio.
 | parakeet-rnnt-1.1b¹ | 0.068 | 0.041 | — |
 | parakeet-ctc-1.1b¹ | 0.062 | 0.033 | — |
 | canary-1b-flash¹ | 0.143 | 0.081 | 0.133² |
-| canary-1b-v2 | to be measured³ | — | — |
+| canary-1b-v2³ | 0.153 | 0.132 | **0.083** |
 
 ¹ measured before the move to the NAS (same day, same protocol).
 ² 4 s fixture (long run not re-measured); the AED int8/f32 ratio (~2×) applies
 here as well.
-³ encoder = 1b-flash (32L) + 8L decoder (2× the flash's): expected ~1.3-1.5× the
-1b-flash. Measure with weights on local disk (the NAS numbers don't count).
+³ measured 2026-07-30, weights on LOCAL disk, same protocol (1 warm-up + 3 runs on
+`tests/audio/long_60s.wav`). Peak RAM 3.85 / 3.13 / 1.31 GB. The estimate this row
+replaced said "expected ~1.3-1.5× the 1b-flash" — it is **1.07×** (0.153 vs 0.143),
+so the extra decoder depth costs far less than the layer count suggested. int8 is
+the interesting cell: 1.84× faster than f32, which is the AED-decode effect the
+takeaways below describe, and it lands v2 *below* the f32 1b-flash.
 
 Key takeaways:
 - **Metal** wins on the encoder of every model (−25…45%); the gain shrinks

@@ -12,7 +12,7 @@ cd tools && uv run python export_gguf.py ../models/parakeet-tdt_ctc-110m --dtype
 
 **safetensors stays the default.** GGUF is an *alternative container* for the
 same weights: at load everything is normalized into the same internal tensor
-table (F32 zero-copy from mmap; F16/BF16/Q8_0/Q4_0 and the K-quants Q4_K/Q5_K/Q6_K
+table (F32 zero-copy from mmap; F16/BF16/Q8_0/Q4_0 and the K-quants Q2_K…Q6_K
 dequantized to f32), so the
 encoder/decoder/Metal/CUDA code paths are identical for both containers — one
 code path, per repo rule.
@@ -22,7 +22,7 @@ code path, per repo rule.
 | | |
 |---|---|
 | GGUF versions | v2 and v3 (v1 has a different, u32-based layout: rejected) |
-| ggml types (read) | F32, F16, BF16, Q8_0, Q4_0, **Q4_K, Q5_K, Q6_K** — anything else (Q2_K, Q3_K, the IQ family) fails with a clear error |
+| ggml types (read) | F32, F16, BF16, Q8_0, Q4_0, **Q2_K, Q3_K, Q4_K, Q5_K, Q6_K** — anything else (the IQ codebook family, the legacy Q5_0/Q5_1) fails with a clear error |
 | ggml types (write) | `export_gguf.py`: F32, F16, Q8_0, Q4_0, Q4_K — the 5/6-bit K-quants are read-only for now (see "Not (yet) supported") |
 | model config | **always from `mynah.json`** (config-driven rule): the GGUF KV metadata is not trusted for hyperparameters |
 | lookup order | `model.int8/int4.safetensors` (with `--quant`) → `model.safetensors` → `model.gguf` |
@@ -60,7 +60,7 @@ for lowest RAM and the native SDOT/VNNI kernels use mynah's own
   must reproduce it. Blocks are filled with deterministic pseudo-random bytes so
   every scale, min, nibble and high-bit position is exercised (quantized smooth
   data leaves most bit patterns untouched). Result: **bit-exact**, err_rel 0 for
-  Q4_K/Q5_K/Q6_K.
+  Q2_K/Q3_K/Q4_K/Q5_K/Q6_K.
 
 ## Third-party GGUFs (parakeet.cpp ecosystem)
 
@@ -86,16 +86,17 @@ other repos/architectures get enabled as they are tested on real files.
 
 ## Not (yet) supported
 
-**Writing** Q5_K/Q6_K: reading them is done and validated (see the parity test
-above), but the exporter cannot produce them — a good K-quant writer needs the
-per-sub-block scale search that llama.cpp does in C (its own numpy `gguf`
-package raises `NotImplementedError` for these types). Not a blocker: the point
-of the 5/6-bit K-quants is consuming third-party files, and for our own weights
-q4_k/q8_0 already cover the size/quality range.
+**Writing** Q2_K/Q3_K/Q5_K/Q6_K: reading them is done and validated bit-exactly
+against llama.cpp (see the parity test above), but the exporter cannot produce
+them — a good K-quant writer needs the per-sub-block scale search that llama.cpp
+does in C (its own numpy `gguf` package raises `NotImplementedError` for these
+types). Not a blocker: the point of these types is consuming third-party files,
+and for our own weights q4_k/q8_0 already cover the size/quality range.
 
-Also missing: Q2_K/Q3_K and the IQ family (no verified real file needs them; the
-loader rejects them explicitly rather than guessing), and non-parakeet
-third-party architectures. Q4_K dequant is ported from the keyra project and
+Also missing: the **IQ family**, which needs lookup codebooks and is out of scope
+by decision rather than by schedule (`tests/test_gguf.c` uses IQ2_XXS as its
+"rejected cleanly" case for exactly that reason), the legacy Q5_0/Q5_1, and
+non-parakeet third-party architectures. Q4_K dequant is ported from the keyra project and
 validated both on the real community file above and against llama.cpp.
 The parser is hardened against hostile input (overflow-checked arithmetic,
 bounded strings/arrays/recursion, mmap range validation; origin: the keyra

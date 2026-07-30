@@ -17,7 +17,8 @@ enum {
 
 /* ggml tensor types (only the ones the runtime accepts; anything else -> error). */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
-       GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30 };
+       GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13,
+       GGML_Q6_K = 14, GGML_BF16 = 30 };
 
 struct mynah_asr_gguf {
     int fd;
@@ -147,6 +148,8 @@ static int type_geometry(uint32_t type, uint64_t *block_elems, uint64_t *block_b
     case GGML_F16:  case GGML_BF16: *block_elems = 1; *block_bytes = 2; return 0;
     case GGML_Q8_0: *block_elems = 32; *block_bytes = 34; return 0;
     case GGML_Q4_0: *block_elems = 32; *block_bytes = 18; return 0;
+    case GGML_Q2_K: *block_elems = 256; *block_bytes = 84; return 0;
+    case GGML_Q3_K: *block_elems = 256; *block_bytes = 110; return 0;
     case GGML_Q4_K: *block_elems = 256; *block_bytes = 144; return 0;
     case GGML_Q5_K: *block_elems = 256; *block_bytes = 176; return 0;
     case GGML_Q6_K: *block_elems = 256; *block_bytes = 210; return 0;
@@ -221,6 +224,69 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
             for (int i = 0; i < 16; i++) {
                 dst[b * 32 + i]      = d * (float)((int)(q[i] & 0x0f) - 8);
                 dst[b * 32 + i + 16] = d * (float)((int)(q[i] >> 4) - 8);
+            }
+        }
+        break;
+    case GGML_Q2_K:  /* 84B super-block: 16B scales/mins (4+4 bits) + 64B of 2-bit
+                      * quants + d,dmin f16. x = d*sc*q - dmin*m over 16 sub-blocks
+                      * of 16; the 2-bit fields of one byte belong to FOUR different
+                      * sub-blocks, advancing by shift (0,2,4,6) */
+        for (size_t b = 0; b < n_elems / 256; b++) {
+            const unsigned char *blk = src + b * 84;
+            const unsigned char *scales = blk;
+            const unsigned char *q = blk + 16;
+            const float d = f16_to_f32(ld_u16(blk + 80));
+            const float dmin = f16_to_f32(ld_u16(blk + 82));
+            float *out = dst + b * 256;
+            int is = 0, o = 0;
+            for (int base = 0; base < 256; base += 128) {
+                for (int shift = 0; shift < 8; shift += 2) {
+                    for (int half = 0; half < 32; half += 16) {
+                        const unsigned char sc = scales[is++];
+                        const float dl = d * (float)(sc & 0x0f);
+                        const float ml = dmin * (float)(sc >> 4);
+                        for (int l = 0; l < 16; l++)
+                            out[o++] = dl * (float)((q[base / 4 + half + l] >> shift) & 3) - ml;
+                    }
+                }
+            }
+        }
+        break;
+    case GGML_Q3_K:  /* 110B super-block: 32B high-bit mask + 64B of 2-bit quants +
+                      * 12B of 6-bit scales + d f16. x = d*(sc-32)*(q - 4*(hbit==0)):
+                      * the high bit is INVERTED, so a clear bit subtracts 4 */
+        for (size_t b = 0; b < n_elems / 256; b++) {
+            const unsigned char *blk = src + b * 110;
+            const unsigned char *hmask = blk;
+            const unsigned char *q = blk + 32;
+            const unsigned char *sc6 = blk + 96;
+            const float d = f16_to_f32(ld_u16(blk + 108));
+            float *out = dst + b * 256;
+            /* the 16 six-bit scales live in 12 bytes: low 4 bits in [0..7], the
+             * missing 2 high bits packed 4-per-byte in [8..11] */
+            signed char sc[16];
+            for (int i = 0; i < 16; i++) {
+                const int lo = (i < 8) ? (sc6[i] & 0x0f) : (sc6[i - 8] >> 4);
+                const int hi = (sc6[8 + (i % 4)] >> (2 * (i / 4))) & 3;
+                sc[i] = (signed char)((lo | (hi << 4)) - 32);
+            }
+            int is = 0, o = 0;
+            unsigned char m = 1;
+            for (int base = 0; base < 256; base += 128) {
+                for (int shift = 0; shift < 8; shift += 2) {
+                    for (int half = 0; half < 32; half += 16) {
+                        const float dl = d * (float)sc[is++];
+                        for (int l = 0; l < 16; l++) {
+                            const int lo2 = (q[base / 4 + half + l] >> shift) & 3;
+                            /* hmask is 32 bytes = one bit per element: the BYTE index
+                             * stays in 0..31 and the walking bit `m` (1..128) is what
+                             * distinguishes the two 128-element halves */
+                            const int sub = (hmask[half + l] & m) ? 0 : 4;
+                            out[o++] = dl * (float)(lo2 - sub);
+                        }
+                    }
+                    m <<= 1;
+                }
             }
         }
         break;
