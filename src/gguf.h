@@ -4,11 +4,10 @@
  * config stays in mynah.json (config-driven rule), mel filters and tokenizer are
  * unchanged.
  *
- * Supported ggml types: F32 (zero-copy from the mmap), F16/BF16/Q8_0/Q4_0
- * (dequantized to f32 into buffers at load). Q4_K/Q6_K: deferred to the
- * parakeet.cpp interop milestone. GGUF v2/v3 only (v1 has a different, u32
- * layout). Origin: the keyra parser (../keyra), exercised with a harness of
- * malformed files. */
+ * Supported ggml types: F32 (zero-copy from the mmap), F16/BF16/Q8_0/Q4_0 and
+ * the K-quants Q4_K/Q5_K/Q6_K (dequantized to f32 into buffers at load).
+ * GGUF v2/v3 only (v1 has a different, u32 layout). Origin: the keyra parser
+ * (../keyra), exercised with a harness of malformed files. */
 #ifndef MYNAH_ASR_GGUF_H
 #define MYNAH_ASR_GGUF_H
 

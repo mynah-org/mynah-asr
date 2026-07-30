@@ -94,6 +94,9 @@ test: $(TESTS) mynah-asr examples/minimal
 	@sh tests/test_gguf.sh $(PARAKEET110_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP gguf parity: converted 110m or uv missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_kquant.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP kquant parity: uv or the gguf package missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
 	cd tools && uv run python -m oracle.transcribe ../$(MODEL_DIR) ../tests/audio/test_it.wav \

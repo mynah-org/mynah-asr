@@ -17,7 +17,7 @@ enum {
 
 /* ggml tensor types (only the ones the runtime accepts; anything else -> error). */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
-       GGML_Q4_K = 12, GGML_BF16 = 30 };
+       GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30 };
 
 struct mynah_asr_gguf {
     int fd;
@@ -148,6 +148,8 @@ static int type_geometry(uint32_t type, uint64_t *block_elems, uint64_t *block_b
     case GGML_Q8_0: *block_elems = 32; *block_bytes = 34; return 0;
     case GGML_Q4_0: *block_elems = 32; *block_bytes = 18; return 0;
     case GGML_Q4_K: *block_elems = 256; *block_bytes = 144; return 0;
+    case GGML_Q5_K: *block_elems = 256; *block_bytes = 176; return 0;
+    case GGML_Q6_K: *block_elems = 256; *block_bytes = 210; return 0;
     default: return -1;
     }
 }
@@ -176,9 +178,9 @@ static float f16_to_f32(uint16_t v) {
 
 static uint16_t ld_u16(const unsigned char *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
-/* Q4_K: decoding of the 8 six-bit scales/mins packed into 12 bytes
- * (ggml layout; ported from keyra/gguf_quant.c, validated there against real
- * files). */
+/* Q4_K/Q5_K: decoding of the 8 six-bit scales/mins packed into 12 bytes
+ * (ggml layout, get_scale_min_k4; ported from keyra/gguf_quant.c, validated
+ * there against real files). */
 static void q4k_scale_min(const unsigned char *scales, int idx,
                           unsigned char *sc, unsigned char *mn) {
     if (idx < 4) {
@@ -242,6 +244,65 @@ static void dequant(uint32_t type, const unsigned char *src, size_t n_elems, flo
                     out[base + i + 32] = d1 * (float)(q[i] >> 4) - m1;
                 }
                 q += 32;
+            }
+        }
+        break;
+    case GGML_Q5_K:  /* 176B super-block: Q4_K + a 5th bit per quant in qh[32].
+                      * x = d*sc*(q|bit<<4) - dmin*m; the qh bit pair advances by
+                      * 2 every group of 64 (l:1,2 -> 4,8 -> 16,32 -> 64,128) */
+        for (size_t b = 0; b < n_elems / 256; b++) {
+            const unsigned char *blk = src + b * 176;
+            const float d = f16_to_f32(ld_u16(blk));
+            const float dmin = f16_to_f32(ld_u16(blk + 2));
+            const unsigned char *scales = blk + 4;
+            const unsigned char *qh = blk + 16;
+            const unsigned char *q = blk + 48;
+            float *out = dst + b * 256;
+            unsigned u1 = 1, u2 = 2;
+            for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
+                unsigned char sc0, mn0, sc1, mn1;
+                q4k_scale_min(scales, si, &sc0, &mn0);
+                q4k_scale_min(scales, si + 1, &sc1, &mn1);
+                const float d0 = d * sc0, m0 = dmin * mn0;
+                const float d1 = d * sc1, m1 = dmin * mn1;
+                for (int i = 0; i < 32; i++) {
+                    const int hi0 = (qh[i] & u1) ? 16 : 0;
+                    const int hi1 = (qh[i] & u2) ? 16 : 0;
+                    out[base + i]      = d0 * (float)((q[i] & 0x0f) + hi0) - m0;
+                    out[base + i + 32] = d1 * (float)((q[i] >> 4) + hi1) - m1;
+                }
+                q += 32;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        break;
+    case GGML_Q6_K:  /* 210B super-block: ql[128] low nibbles + qh[64] bit pairs +
+                      * 16 SIGNED 8-bit scales + d f16. x = d*sc*(q-32), no mins.
+                      * Two halves of 128 elements, each with 8 scales. */
+        for (size_t b = 0; b < n_elems / 256; b++) {
+            const unsigned char *blk = src + b * 210;
+            const unsigned char *ql = blk;
+            const unsigned char *qh = blk + 128;
+            const signed char *sc = (const signed char *)(blk + 192);
+            const float d = f16_to_f32(ld_u16(blk + 208));
+            float *out = dst + b * 256;
+            for (int half = 0; half < 2; half++) {
+                for (int i = 0; i < 32; i++) {
+                    const int is = i / 16;
+                    const int q1 = (int)((ql[i]      & 0x0f) | (((qh[i] >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[i + 32] & 0x0f) | (((qh[i] >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql[i]      >> 4)   | (((qh[i] >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[i + 32] >> 4)   | (((qh[i] >> 6) & 3) << 4)) - 32;
+                    out[i]      = d * (float)sc[is]     * (float)q1;
+                    out[i + 32] = d * (float)sc[is + 2] * (float)q2;
+                    out[i + 64] = d * (float)sc[is + 4] * (float)q3;
+                    out[i + 96] = d * (float)sc[is + 6] * (float)q4;
+                }
+                out += 128;
+                ql += 64;
+                qh += 32;
+                sc += 8;
             }
         }
         break;

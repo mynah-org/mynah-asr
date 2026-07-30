@@ -1,7 +1,8 @@
 /* Self-test of the GGUF loader (no model required — it runs in CI too):
  * builds synthetic GGUFs in /tmp and checks
  *   1. parsing of the valid file: reversed dims (ggml ne[0] = the fastest one),
- *      F32 zero-copy bit-exact, dequant F16/BF16/Q8_0/Q4_0 within tolerance;
+ *      F32 zero-copy bit-exact, dequant F16/BF16/Q8_0/Q4_0 within tolerance and
+ *      the K-quants Q4_K/Q5_K/Q6_K exact against the spec formula;
  *   2. that malformed files (magic, v1, truncated, offset past EOF, absurd
  *      string, alignment not a power of 2, unknown ggml type) are rejected
  *      cleanly (NULL, no crash) — the same class of harness used to validate
@@ -86,8 +87,59 @@ static void tinfo(buf *b, const char *name, int rank, const uint64_t *ne,
 /* ------------------------------------------------------------- test */
 static float src_val(int i) { return (float)(i - 32) * 0.03125f; } /* [-1, 1] */
 
-int main(void) {
+double *npy_load_f(const char *path, size_t *n_elems);   /* shared from npy.c */
+
+/* Parity mode: open a GGUF written by llama.cpp's own writer (see
+ * tools/gen_kquant_ref.py) and compare every tensor against the .npy that its
+ * reference dequantizer produced. This is what makes the K-quant support
+ * trustworthy: the synthetic fixtures below share our reading of the spec, this
+ * does not. Tolerance is scaled by max|ref| as in tools/eval/compare.py. */
+static int parity_vs_reference(const char *gguf_path, const char *ref_dir) {
+    mynah_asr_safetensors *st = mynah_asr_st_open(gguf_path);
+    CHECK(st != NULL, "reference GGUF opened");
+    if (!st) return 1;
+    const size_t n = mynah_asr_st_count(st);
+    CHECK(n > 0, "reference GGUF has tensors");
+    for (size_t i = 0; i < n; i++) {
+        const mynah_asr_tensor *t = mynah_asr_st_at(st, i);
+        char npy[512], msg[256];
+        snprintf(npy, sizeof(npy), "%s/%s.npy", ref_dir, t->name);
+        size_t n_ref = 0;
+        double *ref = npy_load_f(npy, &n_ref);
+        if (!ref) {
+            snprintf(msg, sizeof(msg), "reference %s.npy missing", t->name);
+            CHECK(0, msg);
+            continue;
+        }
+        double worst = 0, scale = 0;
+        if (n_ref != t->n_elems) {
+            worst = 1e9;
+        } else {
+            for (size_t k = 0; k < n_ref; k++) {
+                const double a = ((const float *)t->data)[k], b = ref[k];
+                const double e = fabs(a - b);
+                if (e > worst) worst = e;
+                if (fabs(b) > scale) scale = fabs(b);
+            }
+        }
+        free(ref);
+        const double rel = worst / (scale > 0 ? scale : 1.0);
+        snprintf(msg, sizeof(msg), "%s vs llama.cpp dequant (%zu elems, err_rel %.2e)",
+                 t->name, t->n_elems, rel);
+        CHECK(rel <= 1e-6, msg);
+    }
+    mynah_asr_st_close(st);
+    return failures;
+}
+
+int main(int argc, char **argv) {
     char path[64], junk[64];
+
+    if (argc == 3) return parity_vs_reference(argv[1], argv[2]);
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [<reference.gguf> <ref_dir>]\n", argv[0]);
+        return 2;
+    }
 
     /* ---- valid file: f32 4x8 + f16/bf16/q8_0/q4_0 with 64 elements + q4_k 256 ---- */
     enum { N = 64, NK = 256 };
@@ -95,17 +147,20 @@ int main(void) {
     for (int i = 0; i < N; i++) vals[i] = src_val(i);
 
     buf b = {0};
-    hdr(&b, 3, 6);
+    hdr(&b, 3, 8);
     const uint64_t ne_f32[2] = {8, 4};    /* ggml: ne[0]=8 fastest -> mynah [4][8] */
     const uint64_t ne_v[1] = {N};
     const uint64_t ne_k[1] = {NK};
-    /* payload: f32 (128B) | f16 (128B) | bf16 (128B) | q8_0 (68B, pad) | q4_0 | q4_k */
+    /* payload: f32 (128B) | f16 (128B) | bf16 (128B) | q8_0 (68B, pad) | q4_0 |
+     * q4_k (144B) | q5_k (176B) | q6_k (210B) */
     tinfo(&b, "t.f32", 2, ne_f32, 0, 0);
     tinfo(&b, "t.f16", 1, ne_v, 1, 128);
     tinfo(&b, "t.bf16", 1, ne_v, 30, 256);
     tinfo(&b, "t.q8", 1, ne_v, 8, 384);
     tinfo(&b, "t.q4", 1, ne_v, 2, 480);   /* 384+68 -> pad to 480 */
     tinfo(&b, "t.q4k", 1, ne_k, 12, 544); /* 480+36 -> pad to 544, 1 super-block */
+    tinfo(&b, "t.q5k", 1, ne_k, 13, 704); /* 544+144=688 -> pad to 704 */
+    tinfo(&b, "t.q6k", 1, ne_k, 14, 896); /* 704+176=880 -> pad to 896 */
     pad_to(&b, 32);
 
     for (int i = 0; i < 32; i++) put(&b, &vals[i], 4);          /* t.f32: 4x8 = 32 elem */
@@ -175,11 +230,83 @@ int main(void) {
             }
     }
 
+    /* q5_k at offset 704: Q4_K plus a 5th bit per quant in qh[32]. The quants go
+     * up to 31, so the fixture only passes if the qh bit pair advances by 2 every
+     * group of 64 (1,2 -> 4,8 -> 16,32 -> 64,128) — the easiest layout to get wrong */
+    unsigned char q5[NK];
+    float expect_q5[NK];
+    for (int i = 0; i < NK; i++) q5[i] = (unsigned char)((i * 11) % 32);
+    for (int i = 0; i < NK; i++) {
+        int j = i / 32;
+        expect_q5[i] = KD * (float)ksc[j] * (float)q5[i] - KDMIN * (float)kmn[j];
+    }
+    pad_to(&b, 32);
+    {
+        uint16_t dh = f32_to_f16(KD), dminh = f32_to_f16(KDMIN);
+        put(&b, &dh, 2);
+        put(&b, &dminh, 2);
+        unsigned char scales[12];
+        for (int j = 0; j < 4; j++) {                     /* same 6-bit packing as q4_k */
+            scales[j]     = (unsigned char)(ksc[j] | ((ksc[j + 4] >> 4) << 6));
+            scales[j + 4] = (unsigned char)(kmn[j] | ((kmn[j + 4] >> 4) << 6));
+            scales[j + 8] = (unsigned char)((ksc[j + 4] & 0x0f) | ((kmn[j + 4] & 0x0f) << 4));
+        }
+        put(&b, scales, 12);
+        unsigned char qh[32] = {0};
+        unsigned char qs[128];
+        for (int g = 0; g < 4; g++) {                     /* group of 64 -> 32 qs bytes */
+            const int base = g * 64;
+            for (int i = 0; i < 32; i++) {
+                const unsigned char lo = q5[base + i], hi = q5[base + i + 32];
+                qs[g * 32 + i] = (unsigned char)((lo & 0x0f) | ((hi & 0x0f) << 4));
+                if (lo & 0x10) qh[i] |= (unsigned char)(1u << (2 * g));
+                if (hi & 0x10) qh[i] |= (unsigned char)(1u << (2 * g + 1));
+            }
+        }
+        put(&b, qh, 32);
+        put(&b, qs, 128);
+    }
+
+    /* q6_k at offset 896: ql[128] + qh[64] bit pairs + 16 SIGNED scales + d.
+     * x = d*sc*(q-32), no mins. Half the scales are negative on purpose: with an
+     * unsigned read those elements would come out with the wrong sign */
+    static const float Q6D = 0.25f;
+    signed char s6[16];
+    unsigned char q6[NK];
+    float expect_q6[NK];
+    for (int j = 0; j < 16; j++) s6[j] = (signed char)((j % 2) ? -(j + 1) : (j + 1));
+    for (int i = 0; i < NK; i++) q6[i] = (unsigned char)((i * 13) % 64);
+    for (int i = 0; i < NK; i++) {
+        const int half = i / 128, e = i % 128;
+        const int si = half * 8 + (e / 32) * 2 + ((e % 32) / 16);
+        expect_q6[i] = Q6D * (float)s6[si] * (float)((int)q6[i] - 32);
+    }
+    pad_to(&b, 32);
+    {
+        unsigned char ql[128], qh[64];
+        for (int half = 0; half < 2; half++) {
+            const int o = half * 128;                     /* element base of the half */
+            for (int i = 0; i < 32; i++) {
+                const unsigned char a = q6[o + i], c = q6[o + i + 32];
+                const unsigned char e = q6[o + i + 64], f = q6[o + i + 96];
+                ql[half * 64 + i]      = (unsigned char)((a & 0x0f) | ((e & 0x0f) << 4));
+                ql[half * 64 + i + 32] = (unsigned char)((c & 0x0f) | ((f & 0x0f) << 4));
+                qh[half * 32 + i] = (unsigned char)(((a >> 4) & 3) | (((c >> 4) & 3) << 2) |
+                                                    (((e >> 4) & 3) << 4) | (((f >> 4) & 3) << 6));
+            }
+        }
+        put(&b, ql, 128);
+        put(&b, qh, 64);
+        put(&b, s6, 16);
+        uint16_t dh = f32_to_f16(Q6D);
+        put(&b, &dh, 2);
+    }
+
     CHECK(write_tmp(&b, path) != NULL, "fixture written");
     mynah_asr_safetensors *st = mynah_asr_st_open(path);
     CHECK(st != NULL, "valid GGUF opened (via mynah_asr_st_open)");
     if (st) {
-        CHECK(mynah_asr_st_count(st) == 6, "count == 6");
+        CHECK(mynah_asr_st_count(st) == 8, "count == 8");
         const mynah_asr_tensor *f32 = mynah_asr_st_get(st, "t.f32");
         CHECK(f32 && f32->n_dims == 2 && f32->shape[0] == 4 && f32->shape[1] == 8,
               "ggml dims reversed -> [4][8]");
@@ -203,18 +330,27 @@ int main(void) {
                      deq[k].name, worst, deq[k].tol);
             CHECK(worst <= deq[k].tol, msg);
         }
-        const mynah_asr_tensor *tqk = mynah_asr_st_get(st, "t.q4k");
-        double worst_k = 1e9;
-        if (tqk && tqk->n_elems == NK) {
-            worst_k = 0;
-            for (int i = 0; i < NK; i++) {
-                double e = fabs((double)((const float *)tqk->data)[i] - (double)expect_k[i]);
-                if (e > worst_k) worst_k = e;
+        /* K-quants vs the spec formula: d/dmin are exact in f16, so the expected
+         * error is 0 — anything else means a wrong layout, not a rounding loss */
+        struct { const char *name; const float *expect; } kq_cases[] = {
+            {"t.q4k", expect_k}, {"t.q5k", expect_q5}, {"t.q6k", expect_q6},
+        };
+        for (size_t k = 0; k < sizeof(kq_cases) / sizeof(kq_cases[0]); k++) {
+            const mynah_asr_tensor *t = mynah_asr_st_get(st, kq_cases[k].name);
+            double worst_k = 1e9;
+            if (t && t->n_elems == NK) {
+                worst_k = 0;
+                for (int i = 0; i < NK; i++) {
+                    double e = fabs((double)((const float *)t->data)[i] -
+                                    (double)kq_cases[k].expect[i]);
+                    if (e > worst_k) worst_k = e;
+                }
             }
+            char kmsg[128];
+            snprintf(kmsg, sizeof(kmsg), "dequant %s vs formula spec (max err %.2e)",
+                     kq_cases[k].name, worst_k);
+            CHECK(worst_k <= 1e-6, kmsg);
         }
-        char kmsg[128];
-        snprintf(kmsg, sizeof(kmsg), "dequant t.q4k vs formula spec (max err %.2e)", worst_k);
-        CHECK(worst_k <= 1e-6, kmsg);   /* d/dmin exact in f16: expect 0 */
         mynah_asr_st_close(st);
     }
     unlink(path);
@@ -251,10 +387,12 @@ int main(void) {
     put_u32(&bad[5].f, 4);
     put_u32(&bad[5].f, 33);
 
-    bad[6].what = "unsupported ggml type (Q6_K: interop milestone)";
+    /* Q2_K (type 10, 84B super-block): a real ggml type we deliberately do not
+     * support — rejected with a clear message instead of a bogus dequant */
+    bad[6].what = "unsupported ggml type (Q2_K)";
     hdr(&bad[6].f, 3, 1);
-    { const uint64_t ne[1] = {256}; tinfo(&bad[6].f, "t", 1, ne, 14, 0); pad_to(&bad[6].f, 32);
-      static const unsigned char blk[210] = {0}; put(&bad[6].f, blk, 210); }
+    { const uint64_t ne[1] = {256}; tinfo(&bad[6].f, "t", 1, ne, 10, 0); pad_to(&bad[6].f, 32);
+      static const unsigned char blk[84] = {0}; put(&bad[6].f, blk, 84); }
 
     for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
         CHECK(write_tmp(&bad[k].f, junk) != NULL, "malformed fixture written");
