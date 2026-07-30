@@ -53,6 +53,10 @@ jobs:
 
       - name: Kernel self-test (no model needed)
         run: make tests/test_qmat && tests/test_qmat
+        # the forced aligner is model-free too, and it runs again inside `make
+        # test` below; here it fails fast, before the model download
+      - name: Forced alignment self-test (no model needed)
+        run: make tests/test_align && tests/test_align
 
       - name: Kernel self-test — explicit SIMD levels (x86)
         if: matrix.os == 'ubuntu-latest'

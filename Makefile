@@ -60,7 +60,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_gguf tests/test_threads tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
+TESTS := tests/test_qmat tests/test_gguf tests/test_threads tests/test_align tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
 
 tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -73,7 +73,7 @@ PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tes
 SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	@for t in $(TESTS); do \
-	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ]; then $$t; rc=$$?; \
+	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -232,7 +232,8 @@ test-samples: mynah-asr
 
 # fast leak check on macOS (the native `leaks` tool, no rebuild — ASan is very
 # slow on a Mac: use it only in Linux CI. Same pattern as qwen-tts).
-leaks: mynah-asr tests/test_streaming tests/test_vad
+leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align
+	leaks --atExit -- tests/test_align 2>&1 | tail -2
 	leaks --atExit -- ./mynah-asr transcribe -m $(MODEL_DIR) -i tests/audio/test_it.wav \
 	  --lang it-IT 2>&1 | tail -3
 	leaks --atExit -- tests/test_streaming $(MODEL_DIR) tests/audio/test_it.wav \
