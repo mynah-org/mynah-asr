@@ -26,6 +26,7 @@
 #include "../src/backend.h"
 #include "../src/mynah_asr.h"
 #include "../src/qmat.h"      /* mynah_asr_set_caps (--caps) */
+#include "../src/threads.h"   /* mynah_asr_blas_set_concurrency (inflight -> BLAS) */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
 
@@ -36,6 +37,35 @@
 static mynah_asr_model *g_model;
 static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
+
+/* Inferences computing RIGHT NOW (a batch call counts as one, however many items
+ * it carries). Only the server knows this number, and BLAS needs it: N calls
+ * each asking for every core thrash on the OpenBLAS lock instead of going
+ * faster. Kept around the compute calls only, so an idle WebSocket stream — open
+ * but between chunks — does not hold a slot down. */
+static int g_inflight;
+static pthread_mutex_t g_inflight_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void inference_begin(void) {
+    pthread_mutex_lock(&g_inflight_mu);
+    const int n = ++g_inflight;
+    pthread_mutex_unlock(&g_inflight_mu);
+    mynah_asr_blas_set_concurrency(n);
+}
+
+static void inference_end(void) {
+    pthread_mutex_lock(&g_inflight_mu);
+    const int n = --g_inflight;
+    pthread_mutex_unlock(&g_inflight_mu);
+    mynah_asr_blas_set_concurrency(n > 0 ? n : 1);
+}
+
+static int inflight_now(void) {
+    pthread_mutex_lock(&g_inflight_mu);
+    const int n = g_inflight;
+    pthread_mutex_unlock(&g_inflight_mu);
+    return n;
+}
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
 /* --------------------------------------------------- micro-batching scheduler
@@ -119,8 +149,10 @@ static void *batch_worker(void *arg) {
         }
         /* words are always extracted: negligible next to inference, and a batch
          * can mix json and verbose_json requests */
+        inference_begin();
         mynah_asr_transcribe_batch_ts(g_model, samples, ns, B, langs, lookahead,
                                   texts, louts, wordsv, nwordsv);
+        inference_end();
 
         for (int b = 0; b < B; b++) {
             pthread_mutex_lock(&jobs[b]->mu);
@@ -342,8 +374,10 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         pthread_mutex_destroy(&j.mu);
         pthread_cond_destroy(&j.cv);
     } else {
+        inference_begin();
         text = mynah_asr_transcribe_ts(g_model, samples, n_samples, f.language, f.lookahead,
                                    lang_out, want_words ? &words : NULL, &n_words);
+        inference_end();
     }
     const double duration = (double)n_samples / 16000.0;
     free(samples);
@@ -492,18 +526,24 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
             const size_t ns = plen / 2;
             const int16_t *pcm = (const int16_t *)payload;
             size_t off = 0;
+            /* one frame = one compute burst: counted as a whole, not per 64k
+             * chunk, so a busy stream does not churn the BLAS knob */
+            inference_begin();
             while (off < ns) {
                 const size_t chunk = ns - off < 65536 ? ns - off : 65536;
                 for (size_t i = 0; i < chunk; i++) fbuf[i] = (float)pcm[off + i] / 32768.0f;
                 mynah_asr_stream_feed(s, fbuf, chunk, ws_on_text, &ctx);
                 off += chunk;
             }
+            inference_end();
         }
         free(payload);
         if (ctx.failed) break;
     }
 
+    inference_begin();
     mynah_asr_stream_finish(s, ws_on_text, &ctx);
+    inference_end();
     cJSON *done = cJSON_CreateObject();
     cJSON_AddBoolToObject(done, "done", 1);
     if (mynah_asr_stream_lang(s)[0]) cJSON_AddStringToObject(done, "language", mynah_asr_stream_lang(s));
@@ -538,8 +578,15 @@ static void handle_conn(int fd) {
     if (strcmp(method, "OPTIONS") == 0) {
         send_response(fd, 204, "No Content", "text/plain", "", 0);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/health") == 0) {
-        const char *ok = "{\"status\":\"ok\"}";
-        send_response(fd, 200, "OK", "application/json", ok, strlen(ok));
+        /* inflight/blas_budget are the adaptive BLAS state: useful to see under
+         * load, and what lets a test assert the accounting returns to rest */
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "status", "ok");
+        cJSON_AddNumberToObject(j, "inflight", inflight_now());
+        cJSON_AddNumberToObject(j, "blas_budget", mynah_asr_blas_budget());
+        cJSON_AddNumberToObject(j, "threads", mynah_asr_num_threads());
+        send_json(fd, 200, j);
+        cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
         cJSON *j = cJSON_CreateObject();
         cJSON *arr = cJSON_AddArrayToObject(j, "data");

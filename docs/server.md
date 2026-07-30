@@ -53,6 +53,16 @@ Reference client (Python stdlib): `tools/eval/ws_client.py`.
 
 ### GET /v1/models · GET /v1/health · OPTIONS (CORS)
 
+`/v1/health` also reports the adaptive-BLAS state, handy under load:
+
+```json
+{"status":"ok","inflight":1,"blas_budget":5,"threads":10}
+```
+
+`inflight` = inferences computing right now (a batch counts as one), `threads` =
+`mynah_asr_num_threads()`, `blas_budget` = threads one inference may ask of BLAS.
+At rest `blas_budget == threads`.
+
 ## Concurrency
 
 The model is **read-only** (mmap'd weights) and shared across workers: each request
@@ -71,6 +81,28 @@ throughput (a single GEMM already saturates the cores) — batching is worth ~1.
 sequential with a warm cache and reduces contention/footprint. The big gain is expected
 on many-core x86/OpenBLAS and on future GPU backends (M5), where reading weights once
 really matters. `--batch 1` disables it (back to per-request in the workers).
+
+### Adaptive BLAS threads (OpenBLAS)
+
+Several inferences running at once must NOT each ask OpenBLAS for every core: the
+concurrent calls thrash on its internal lock and aggregate throughput collapses
+(measured on the A100 host: fine at 2 concurrent requests, collapsing from 4 up;
+capping the threads restored it). The server therefore counts the inferences
+actually computing and sets the per-call budget to `threads / inflight` —
+previously this needed `OPENBLAS_NUM_THREADS` tuned by hand.
+
+The count is kept around the compute calls only, so a WebSocket stream sitting
+idle between chunks does not hold a slot down, and the knob is written only when
+the value really changes, so a steady-state server pays nothing for it. An
+explicit `OPENBLAS_NUM_THREADS` in the environment still wins, and
+`MYNAH_ASR_THREADS` sets the ceiling being divided.
+
+No effect with **Accelerate** (macOS), which nests through GCD and needs no knob:
+there the budget is only bookkeeping, reported in `/v1/health`. Consequence worth
+stating plainly: the *policy* is unit-tested (`tests/test_threads`) and the
+*accounting* is asserted end-to-end (`make test-server`), but the throughput win
+itself has only been measured on the A100 host — re-measuring it needs a
+many-core Linux box with OpenBLAS.
 
 ## Tests
 

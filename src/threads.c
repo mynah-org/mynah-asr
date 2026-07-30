@@ -99,6 +99,43 @@ static void blas_set_threads(int n) {
 #endif
 }
 
+/* Per-call BLAS thread budget (see threads.h). 0 = never set -> num_threads.
+ * `applied` caches what the knob was last given: openblas_set_num_threads is
+ * process-global and not free, and parallel_for touches it twice per region, so
+ * skipping the no-op writes matters. The mutex only serializes the rare change,
+ * never the read path. */
+static int g_blas_budget;
+static int g_blas_applied;
+static pthread_mutex_t g_blas_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void blas_apply(int n) {
+    if (n < 1) n = 1;
+    pthread_mutex_lock(&g_blas_mu);
+    if (g_blas_applied != n) {
+        g_blas_applied = n;
+        blas_set_threads(n);
+    }
+    pthread_mutex_unlock(&g_blas_mu);
+}
+
+int mynah_asr_blas_budget(void) {
+    pthread_mutex_lock(&g_blas_mu);
+    const int b = g_blas_budget;
+    pthread_mutex_unlock(&g_blas_mu);
+    return b > 0 ? b : mynah_asr_num_threads();
+}
+
+void mynah_asr_blas_set_concurrency(int n_inflight) {
+    const int nth = mynah_asr_num_threads();
+    if (n_inflight < 1) n_inflight = 1;
+    int budget = nth / n_inflight;
+    if (budget < 1) budget = 1;
+    pthread_mutex_lock(&g_blas_mu);
+    g_blas_budget = budget;
+    pthread_mutex_unlock(&g_blas_mu);
+    blas_apply(budget);
+}
+
 void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
     const int nth = mynah_asr_num_threads();
@@ -111,15 +148,18 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     pf_state st = {.fn = fn, .ctx = ctx, .n = n};
     atomic_init(&st.next, 0);
     /* BLAS quota per worker: with only 2 jobs each concurrent cblas can use half
-     * the cores (measured on a 22-core EPYC, batch 2×60 s nemotron: 15.7→33.3×
+     * the budget (measured on a 22-core EPYC, batch 2×60 s nemotron: 15.7→33.3×
      * aggregate realtime); from 3 workers up, concurrent OpenBLAS calls fight
      * over the internal lock and a quota >1 makes it WORSE (B=8: 34→11×) →
-     * single-threaded. */
+     * single-threaded. The ceiling is the budget, not nth: a server with several
+     * inferences in flight has already lowered it, and restoring nth here would
+     * silently undo that cap. */
+    const int budget = mynah_asr_blas_budget();
     const int active = n < nth ? n : nth;
-    blas_set_threads(active <= 2 ? nth / active : 1);
+    blas_apply(active <= 2 ? budget / active : 1);
     if (g_workers == 0 || pthread_mutex_trylock(&g_pool_mu) != 0) {
         pf_run(&st);              /* no pool or busy: run inline */
-        blas_set_threads(nth);
+        blas_apply(budget);
         return;
     }
     pthread_mutex_lock(&g_job_mu);
@@ -133,5 +173,5 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     while (g_pending > 0) pthread_cond_wait(&g_done_cv, &g_job_mu);
     pthread_mutex_unlock(&g_job_mu);
     pthread_mutex_unlock(&g_pool_mu);
-    blas_set_threads(nth);
+    blas_apply(budget);
 }
