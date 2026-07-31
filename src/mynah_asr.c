@@ -1391,3 +1391,89 @@ char *mynah_asr_transcribe(mynah_asr_model *m, const float *samples, size_t n_sa
     return mynah_asr_transcribe_ts(m, samples, n_samples, lang, lookahead, lang_out,
                                NULL, NULL);
 }
+
+/* ---------------------------------------------------------- language identification
+ * LID is a short first pass: decode a prefix with the "auto" prompt and keep only
+ * the tag, throwing the text away. The window is small on purpose — this sits in
+ * front of a translation and has to be paid once, not felt. */
+#define MYNAH_ASR_LID_SEC     8.0    /* first window                                */
+#define MYNAH_ASR_LID_SEC_MAX 24.0   /* retry when the first window detects nothing */
+
+int mynah_asr_can_detect_lang(const mynah_asr_model *m) {
+    return m && mynah_asr_lang_id(m, "auto") >= 0 ? 1 : 0;
+}
+
+/* First sample of actual speech, so a file that opens with silence does not spend
+ * its whole LID window on it: per-frame RMS, first frame above a fraction of the
+ * loudest one, backed off by 100 ms. Peak searched over the first minute only
+ * (this runs on files of any length and one pass over the whole thing is waste). */
+static size_t lid_speech_start(const float *s, size_t n, int sr) {
+    const size_t win = (size_t)sr / 50;                    /* 20 ms */
+    const size_t scan = n < (size_t)sr * 60 ? n : (size_t)sr * 60;
+    if (scan < win) return 0;
+    double peak = 0.0;
+    for (size_t p = 0; p + win <= scan; p += win) {
+        double e = 0.0;
+        for (size_t i = 0; i < win; i++) e += (double)s[p + i] * (double)s[p + i];
+        if (e > peak) peak = e;
+    }
+    if (peak <= 0.0) return 0;
+    const double thr = peak * 0.01;                        /* -20 dB below the peak */
+    for (size_t p = 0; p + win <= scan; p += win) {
+        double e = 0.0;
+        for (size_t i = 0; i < win; i++) e += (double)s[p + i] * (double)s[p + i];
+        if (e > thr) return p > (size_t)sr / 10 ? p - (size_t)sr / 10 : 0;
+    }
+    return 0;
+}
+
+int mynah_asr_detect_lang(mynah_asr_model *m, const float *samples, size_t n_samples,
+                          char *out) {
+    if (out) out[0] = '\0';
+    if (!m || !samples || !out) return -1;
+    if (!mynah_asr_can_detect_lang(m)) {
+        fprintf(stderr, "mynah-asr: this model cannot detect the language "
+                        "(it has no 'auto' prompt)\n");
+        return -1;
+    }
+    const int sr = m->feat.sample_rate;
+    const size_t off = lid_speech_start(samples, n_samples, sr);
+    const double windows[2] = { MYNAH_ASR_LID_SEC, MYNAH_ASR_LID_SEC_MAX };
+    for (int i = 0; i < 2; i++) {
+        const size_t want = (size_t)(windows[i] * sr);
+        const size_t avail = n_samples - off;
+        const size_t n = avail < want ? avail : want;
+        if (n < (size_t)sr / 2) break;                     /* under 0.5 s: nothing to look at */
+        char tag[16] = "";
+        char *text = mynah_asr_transcribe(m, samples + off, n, "auto", -1, tag);
+        free(text);
+        if (!text) return -1;
+        if (tag[0]) { snprintf(out, 16, "%s", tag); return 0; }
+        if (avail <= want) break;                          /* the file was already seen whole */
+    }
+    return -1;
+}
+
+int mynah_asr_map_lang(const mynah_asr_model *m, const char *tag, char *out) {
+    if (out) out[0] = '\0';
+    if (!m || !tag || !*tag || !out) return -1;
+    const cJSON *jp = cJSON_GetObjectItem(m->cfg, "prompt");
+    if (!jp) { snprintf(out, 16, "%s", tag); return 0; }   /* no prompt (Parakeet): lang ignored */
+
+    char base[16];
+    snprintf(base, sizeof(base), "%s", tag);
+    for (char *p = base; *p; p++)
+        if (*p == '-' || *p == '_') { *p = '\0'; break; }
+
+    const cJSON *jl = cJSON_GetObjectItem(jp, "languages");
+    const char *cand[2] = { tag, base };
+    for (int i = 0; i < 2; i++) {
+        if (mynah_asr_lang_id(m, cand[i]) >= 0) { snprintf(out, 16, "%s", cand[i]); return 0; }
+        for (const cJSON *e = jl ? jl->child : NULL; e; e = e->next)
+            if (cJSON_IsString(e) && strcmp(e->valuestring, cand[i]) == 0) {
+                snprintf(out, 16, "%s", cand[i]);
+                return 0;
+            }
+    }
+    return -1;
+}

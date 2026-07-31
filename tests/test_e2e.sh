@@ -107,6 +107,25 @@ else
     check tests/audio/test_es.wav auto  "la reunión empieza"
 fi
 
+# --lid-model: the models that take the source language as an INPUT (Canary: "auto"
+# there means "en", nothing is detected) paired with one that reports what it heard.
+# Checked on German because every Canary has it; needs both models on disk.
+LID_DIR=models/nemotron-3.5-asr-streaming-0.6b
+if [ "$ENGINE" = "canary-aed" ] && [ -f "$LID_DIR/mynah.json" ]; then
+    err=$(./mynah-asr transcribe -m "$MODEL_DIR" -i tests/audio/test_de.wav --lang auto \
+          --lid-model "$LID_DIR" --target-lang en 2>&1 >/tmp/mynah_asr_lid_out)
+    out=$(cat /tmp/mynah_asr_lid_out)
+    rm -f /tmp/mynah_asr_lid_out
+    case "$err" in
+        *"detected de-DE -> --lang de"*) echo "e2e lid OK: $out" ;;
+        *) echo "e2e lid FAIL (detection): $err"; fail=1 ;;
+    esac
+    case "$out" in
+        *"at 9"*|*"nine o'clock"*) ;;   # same translation as the explicit --lang de
+        *) echo "e2e lid FAIL (translation): $out"; fail=1 ;;
+    esac
+fi
+
 # The timestamp aligner canary-1b-v2 bundles, when the converter extracted it.
 # It is itself a CTC ASR model, which is the strongest available check on the
 # conversion: if the weights or the vocabulary were wrong it would not transcribe.

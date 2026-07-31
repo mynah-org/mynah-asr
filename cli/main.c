@@ -17,6 +17,9 @@ static void usage(void) {
     printf("  transcribe -m <model_dir> -i <file.wav> [--lang auto] [--lookahead N] [--quant int8]\n");
     printf("             [--target-lang xx]   (AED/Canary: translation, e.g. --lang en --target-lang de)\n");
     printf("             [--timestamps] [--decoder default|ctc]\n");
+    printf("             [--lid-model <dir>]  with --lang auto on a model that cannot detect\n");
+    printf("                                  (Canary): that model identifies the language on a\n");
+    printf("                                  few seconds, then this one transcribes/translates\n");
     printf("             offline transcription (WAV PCM16 16 kHz);\n");
     printf("             --timestamps prints one word per line: t0 t1 word\n");
     printf("             --decoder ctc uses the CTC head of hybrid models (tdt_ctc)\n");
@@ -42,7 +45,7 @@ static double now_sec(void) {
 
 static int cmd_transcribe(int argc, char **argv) {
     const char *model_dir = NULL, *wav = NULL, *lang = "auto", *decoder = "default";
-    const char *target_lang = NULL, *vad_dir = NULL;
+    const char *target_lang = NULL, *vad_dir = NULL, *lid_dir = NULL;
     int lookahead = -1, quant = MYNAH_ASR_QUANT_F32, timestamps = 0;
     double segment_sec = 0.0;
     for (int i = 0; i < argc; i++) {
@@ -54,6 +57,7 @@ static int cmd_transcribe(int argc, char **argv) {
         else if (strcmp(argv[i], "--decoder") == 0 && i + 1 < argc) decoder = argv[++i];
         else if (strcmp(argv[i], "--segment-sec") == 0 && i + 1 < argc) segment_sec = atof(argv[++i]);
         else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) vad_dir = argv[++i];
+        else if (strcmp(argv[i], "--lid-model") == 0 && i + 1 < argc) lid_dir = argv[++i];
         else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) lookahead = atoi(argv[++i]);
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             i++;
@@ -87,6 +91,35 @@ static int cmd_transcribe(int argc, char **argv) {
         if (!rs) { mynah_asr_free(m); return 1; }
         samples = rs;
         n_samples = n_rs;
+    }
+
+    /* --lid-model: detect the language with a second model and hand it to this one.
+     * Only for models that cannot do it themselves (Canary takes the source language
+     * as an input and never predicts it, so "auto" there silently means "en").
+     * The detector is loaded, run on a few seconds and freed BEFORE the real
+     * transcription, so only one large model is ever resident. */
+    char det[16] = "";
+    if (lid_dir && strcmp(lang, "auto") == 0) {
+        if (mynah_asr_can_detect_lang(m)) {
+            fprintf(stderr, "[lid: skipped, this model detects the language itself]\n");
+        } else {
+            const double t_lid0 = now_sec();
+            mynah_asr_model *lid = mynah_asr_load_quant(lid_dir, quant);
+            char tag[16] = "";
+            const int got = lid && mynah_asr_detect_lang(lid, samples, n_samples, tag) == 0;
+            if (lid) mynah_asr_free(lid);
+            const double t_lid = now_sec() - t_lid0;
+            if (got && mynah_asr_map_lang(m, tag, det) == 0) {
+                fprintf(stderr, "[lid %.2fs | detected %s -> --lang %s]\n", t_lid, tag, det);
+                lang = det;
+            } else if (got) {
+                fprintf(stderr, "[lid %.2fs | detected %s, NOT supported by this model — "
+                                "falling back to its default language]\n", t_lid, tag);
+            } else {
+                fprintf(stderr, "[lid %.2fs | no language detected — "
+                                "falling back to this model's default language]\n", t_lid);
+            }
+        }
     }
 
     char lang_out[16];

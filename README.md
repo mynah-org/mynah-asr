@@ -43,7 +43,9 @@ first-class citizen.
 - **10 models across 4 decoder families** — RNNT, TDT, CTC and AED (Canary)
 - **Speech translation**: Canary translates speech (25 EU languages ↔ English
   with canary-1b-v2, en↔de/es/fr with the flash models) — CLI `--target-lang`,
-  server `/v1/audio/translations`
+  server `/v1/audio/translations`. Source language unknown? `--lid-model` puts
+  Nemotron's language detection in front of it (a few seconds of audio, ~0.5 s)
+  and hands it the answer
 - **CPU-first** — warm offline RTF 0.015–0.06 on Apple Silicon (long audio);
   optional **Metal** backend (−25…45%) and **CUDA** (validated on A100: up to 2.9×
   vs a 22-core EPYC, identical transcripts); int8/int4

@@ -48,6 +48,35 @@ void mynah_asr_free(mynah_asr_model *m);
 /* Resolve a language tag ("it-IT", "auto", ...) into a prompt id. -1 if unknown. */
 int mynah_asr_lang_id(const mynah_asr_model *m, const char *lang);
 
+/* ------------------------------------------------------- language identification
+ * Only some models can be ASKED which language they heard: Nemotron emits the
+ * locale as a token ("auto" prompt), Parakeet detects it internally but never
+ * says so, and the AED models (Canary) take the source language as an INPUT and
+ * predict nothing — feed one the wrong source and the text comes out wrong, so
+ * "auto" on those means "the model's default" (en), not detection.
+ *
+ * Hence the pairing: run a model that CAN detect over a short prefix, hand the
+ * tag to the one that cannot. */
+
+/* 1 when this model reports the language it detected (usable as a detector). */
+int mynah_asr_can_detect_lang(const mynah_asr_model *m);
+
+/* Language of `samples`, from a SHORT prefix (a few seconds starting at the first
+ * speech, retried once on a longer window when nothing comes out) — the text is
+ * decoded and thrown away, only the tag is kept. Writes the locale ("it-IT") into
+ * out (>= 16 bytes) and returns 0; -1 when the model has no detection or nothing
+ * was detected (out is then ""), which the caller is expected to handle by
+ * falling back rather than failing. */
+int mynah_asr_detect_lang(mynah_asr_model *m, const float *samples, size_t n_samples,
+                          char *out);
+
+/* Adapt a tag to what THIS model accepts and write it into out (>= 16 bytes):
+ * the detector's locale ("it-IT") becomes what the target takes ("it" on Canary,
+ * whose set of languages is smaller). Returns 0, or -1 when the model does not
+ * support that language at all — the case a detect->translate pipeline must
+ * report instead of silently transcribing as something else. */
+int mynah_asr_map_lang(const mynah_asr_model *m, const char *tag, char *out);
+
 /* Select the decoder for subsequent transcriptions: "default" (the model's
  * RNNT/TDT) or "ctc" (the auxiliary head of hybrid models, faster, offline only).
  * -1 when the model does not support the requested decoder. */

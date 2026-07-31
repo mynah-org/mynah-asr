@@ -35,6 +35,7 @@
 #define QUEUE_CAP 128
 
 static mynah_asr_model *g_model;
+static mynah_asr_model *g_lid;       /* --lid-model: language detector for language=auto */
 static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
 
@@ -330,13 +331,13 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
 
     char src_lang[24];
     snprintf(src_lang, sizeof(src_lang), "%s", f.language);
+    const char *tgt = NULL;
     if (translate || f.target_language[0]) {
         if (!mynah_asr_can_translate(g_model)) {
             send_error(fd, 400, "this model does not support translation (an AED engine is required, e.g. Canary)");
             return;
         }
-        const char *tgt = f.target_language[0] ? f.target_language : "en";
-        snprintf(f.language, sizeof(f.language), "%s>%s", src_lang, tgt);
+        tgt = f.target_language[0] ? f.target_language : "en";
     }
 
     size_t n_samples;
@@ -351,6 +352,22 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         samples = rs;
         n_samples = n2;
     }
+
+    /* language=auto on a model that cannot detect (Canary: the source language is an
+     * INPUT, "auto" there means "en") — the --lid-model detector answers first, on a
+     * few seconds of audio, and its answer becomes the source language. When it has
+     * no answer, or names a language this model does not have, the request still
+     * goes through with the model's default rather than failing. */
+    if (g_lid && strcmp(src_lang, "auto") == 0 && !mynah_asr_can_detect_lang(g_model)) {
+        char tag[16] = "", mapped[16] = "";
+        inference_begin();
+        const int got = mynah_asr_detect_lang(g_lid, samples, n_samples, tag) == 0;
+        inference_end();
+        if (got && mynah_asr_map_lang(g_model, tag, mapped) == 0)
+            snprintf(src_lang, sizeof(src_lang), "%s", mapped);
+    }
+    if (tgt) snprintf(f.language, sizeof(f.language), "%s>%s", src_lang, tgt);
+    else     snprintf(f.language, sizeof(f.language), "%s", src_lang);
 
     char lang_out[16] = "";
     char *text;
@@ -637,10 +654,11 @@ static void *worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    const char *model_dir = NULL;
+    const char *model_dir = NULL, *lid_dir = NULL;
     int port = 8090, n_threads = 4;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
+        else if (strcmp(argv[i], "--lid-model") == 0 && i + 1 < argc) lid_dir = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) g_max_batch = atoi(argv[++i]);
@@ -653,7 +671,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_asr_set_caps(argv[++i]);
         else {
             fprintf(stderr, "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] "
-                            "[--batch 8] [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n");
+                            "[--batch 8] [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n"
+                            "       [--lid-model <dir>]  detector for language=auto on models that\n"
+                            "                            cannot detect it themselves (Canary)\n");
             return 2;
         }
     }
@@ -667,6 +687,21 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     g_model = mynah_asr_load_quant(model_dir, g_quant);
     if (!g_model) return 1;
+    if (lid_dir) {
+        g_lid = mynah_asr_load_quant(lid_dir, g_quant);
+        if (!g_lid) return 1;
+        if (!mynah_asr_can_detect_lang(g_lid)) {
+            fprintf(stderr, "mynah-asr-server: %s cannot detect the language "
+                            "(use a model with an 'auto' prompt, e.g. nemotron)\n", lid_dir);
+            return 1;
+        }
+        if (mynah_asr_can_detect_lang(g_model)) {   /* it would never be consulted */
+            fprintf(stderr, "mynah-asr-server: --lid-model ignored, the served model "
+                            "detects the language itself\n");
+            mynah_asr_free(g_lid);
+            g_lid = NULL;
+        }
+    }
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;

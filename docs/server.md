@@ -40,6 +40,28 @@ curl -F file=@audio_en.wav -F language=en -F target_language=de \
 # {"text": "Hallo, ...", "task": "translate", "language": "en", "duration": 4.34}
 ```
 
+#### `language=auto` on a Canary: `--lid-model`
+
+On the AED models the source language is an INPUT — `auto` there means the model's
+default (`en`), not detection. Start the server with a detector and every request
+with `language=auto` gets one:
+
+```sh
+./mynah-asr-server -m models/canary-1b-v2 \
+    --lid-model models/nemotron-3.5-asr-streaming-0.6b --quant int8
+
+curl -F file=@unknown.wav -F target_language=en -F response_format=verbose_json \
+     http://localhost:8090/v1/audio/translations
+# {"text": "Hello, ...", "task": "translate", "language": "it", "duration": 5.23}
+```
+
+The detector reads a few seconds (~0.5 s of CPU with int8, independent of the file
+length) and stays resident, serving every worker; the language it returns is adapted
+to what the served model accepts and reported in `verbose_json`. When it detects
+nothing, or a language this model does not have, the request still goes through with
+the model's default rather than failing. Requests that name a language explicitly
+never pay for it. Ignored (with a note) on a model that already detects by itself.
+
 ### GET /v1/audio/stream — WebSocket streaming
 
 Query: `?lang=auto&lookahead=3`. Protocol:

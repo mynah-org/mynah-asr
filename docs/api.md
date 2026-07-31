@@ -73,6 +73,38 @@ form: `lang = "src>tgt"` (e.g. `"en>de"`) in `mynah_asr_transcribe*` — it wins
 `set_target_lang`. Supported languages: the `prompt.languages` field of mynah.json
 (canary-flash: en/de/es/fr, all pairs).
 
+## Language identification (detect → translate)
+
+```c
+int mynah_asr_can_detect_lang(const mynah_asr_model *m);          /* 1 = usable as a detector */
+int mynah_asr_detect_lang(mynah_asr_model *m, const float *samples, size_t n_samples,
+                          char *out);                             /* out >= 16: "it-IT" */
+int mynah_asr_map_lang(const mynah_asr_model *m, const char *tag, char *out);
+```
+Only Nemotron reports the language it heard (it emits the locale as a token with the
+`auto` prompt). Parakeet detects it internally but never says so, and on the AED
+models the source language is an **input**: `"auto"` on a Canary is not detection, it
+is the model's default (`en`) — feed it the wrong source and the text comes out wrong.
+`mynah_asr_can_detect_lang` is the honest test, so pair the two:
+
+```c
+char tag[16], src[16];
+if (mynah_asr_detect_lang(nemotron, pcm, n, tag) == 0 &&      /* "it-IT" */
+    mynah_asr_map_lang(canary, tag, src) == 0)                /* "it": what Canary takes */
+    text = mynah_asr_transcribe(canary, pcm, n, src, -1, NULL);
+```
+`mynah_asr_detect_lang` decodes a **short prefix** (8 s from the first speech, retried
+once at 24 s when nothing is detected) and throws the text away, so the cost is
+constant in the length of the file: ~0.5 s for int8 nemotron on CPU, whether the audio
+is 5 s or an hour. It does not mutate the model, so one detector can serve several
+threads (like `mynah_asr_transcribe`).
+
+Both return -1 rather than guessing: nothing detected (silence, a clip too short), or
+a language the target model does not have — `map_lang` is what tells a 40-locale
+detector's answer apart from the 25 a canary-1b-v2 accepts. Callers are expected to
+fall back to the model's default on -1, which is what the CLI (`--lid-model`) and the
+server do.
+
 ## Decoder selection and segmentation
 
 ```c

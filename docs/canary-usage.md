@@ -21,10 +21,40 @@ Output language ≠ source language = translation:
 ```
 
 - flash models: EN↔{DE,ES,FR} only. v2: EN↔24 (both directions), it included.
+- **The source language is an input, not a guess**: `--lang auto` on a Canary does
+  NOT detect anything, it falls back to the model's default (`en`). For audio of
+  unknown language, pair it with a detector (below).
 - The FLEURS samples in `samples/` are parallel across languages: the English
   clip doubles as reference for scoring translations (`make test-samples`).
 - fr→en on the 180m emits EOS immediately (model limitation, verified against
   the oracle too) — use the 1b models for that pair.
+
+## Unknown source language: `--lid-model`
+
+Nemotron is the only model here that says which language it heard. Point Canary at
+one and the source language stops being something the caller has to know:
+
+```sh
+./mynah-asr transcribe -m models/canary-1b-v2 -i unknown.wav --lang auto \
+    --lid-model models/nemotron-3.5-asr-streaming-0.6b --target-lang en --quant int8
+# [lid 0.53s | detected it-IT -> --lang it]
+```
+
+- The detector runs on a **short prefix** (8 s from the first speech, 24 s on a retry)
+  and only its language tag is kept, so the cost does not grow with the file: **~0.5 s
+  on CPU with int8** — run `mynah-asr quantize -m <lid_dir> --quant int8` first, f32
+  costs several times that. On the CLI the detector is freed before the real
+  transcription, so only one large model is ever resident.
+- The locale is adapted to what the target accepts (`it-IT` → `it`), which is also
+  where a mismatch surfaces: Nemotron knows 40 locales, canary-1b-v2 takes 25.
+- **Never fails the request.** Nothing detected, or a language this Canary does not
+  have → a warning on stderr and the model's default (`en`) is used. The warning is
+  the signal that the text may be wrong; there is no silent version of it.
+- Server: `mynah-asr-server -m <canary> --lid-model <nemotron>` does the same for
+  every request with `language=auto`, and reports the detected language in
+  `verbose_json`. See [server.md](server.md).
+- Not needed on Nemotron itself (`--lang auto` already detects); passing it there is
+  ignored with a note.
 
 ## Behavior notes
 
