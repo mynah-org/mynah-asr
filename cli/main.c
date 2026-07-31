@@ -105,9 +105,26 @@ static int cmd_transcribe(int argc, char **argv) {
         } else {
             const double t_lid0 = now_sec();
             mynah_asr_model *lid = mynah_asr_load_quant(lid_dir, quant);
+            /* asking for detection and not getting it is an error, not a fallback:
+             * the caller said the language is unknown, and guessing it is the one
+             * thing this flag exists to avoid */
+            if (lid && !mynah_asr_can_detect_lang(lid)) {
+                fprintf(stderr, "mynah-asr: %s cannot detect the language (it needs an "
+                                "'auto' prompt — e.g. nemotron-3.5-asr-streaming-0.6b)\n", lid_dir);
+                mynah_asr_free(lid);
+                free(samples);
+                mynah_asr_free(m);
+                return 1;
+            }
+            if (!lid) {
+                fprintf(stderr, "mynah-asr: cannot load the detector from %s\n", lid_dir);
+                free(samples);
+                mynah_asr_free(m);
+                return 1;
+            }
             char tag[16] = "";
-            const int got = lid && mynah_asr_detect_lang(lid, samples, n_samples, tag) == 0;
-            if (lid) mynah_asr_free(lid);
+            const int got = mynah_asr_detect_lang(lid, samples, n_samples, tag) == 0;
+            mynah_asr_free(lid);
             const double t_lid = now_sec() - t_lid0;
             if (got && mynah_asr_map_lang(m, tag, det) == 0) {
                 fprintf(stderr, "[lid %.2fs | detected %s -> --lang %s]\n", t_lid, tag, det);

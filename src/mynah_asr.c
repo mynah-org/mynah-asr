@@ -930,6 +930,19 @@ static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids
         for (; lang[i] && lang[i] != '-' && lang[i] != '_' && lang[i] != '>' && i < 7; i++)
             src[i] = (char)(lang[i] >= 'A' && lang[i] <= 'Z' ? lang[i] + 32 : lang[i]);
         src[i] = '\0';
+    } else {
+        /* "auto" here is NOT detection: this engine takes the source language as an
+         * input and never predicts it, so the request quietly becomes English. Said
+         * once per process, because the wrong source does not fail — it produces a
+         * fluent transcript of a language the model never heard. */
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "mynah-asr: 'auto' is not language detection on this model — "
+                            "the source language falls back to 'en'.\n"
+                            "           Pair a detector to identify it: --lid-model <dir> "
+                            "(CLI and server), mynah_asr_detect_lang (API).\n");
+        }
     }
     const char *gt = lang ? strchr(lang, '>') : NULL;
     if (gt && gt[1]) {

@@ -291,6 +291,10 @@ from mynah_asr import MynahASR
 m = MynahASR("models/parakeet-tdt-0.6b-v3")
 text, words, lang = m.transcribe("audio.wav", timestamps=True)
 MynahASR("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translation
+
+# unknown source language: a detector in front of the translator (= --lid-model)
+lid = MynahASR("models/nemotron-3.5-asr-streaming-0.6b", "int8")
+MynahASR("models/canary-1b-v2", "int8").transcribe("x.wav", lang="auto>en", detector=lid)
 ```
 
 ```js
@@ -298,7 +302,14 @@ MynahASR("models/canary-1b-v2").transcribe("it.wav", lang="it>en")   # translati
 const { MynahASR } = require("./mynah_asr");
 const m = new MynahASR("models/parakeet-tdt-0.6b-v3");
 const { text, words, lang } = m.transcribe("audio.wav", { timestamps: true });
+
+const lid = new MynahASR("models/nemotron-3.5-asr-streaming-0.6b", "int8");
+canary.transcribe("x.wav", { lang: "auto>en", detector: lid });   // same as --lid-model
 ```
+
+Both expose the detection primitives too (`can_detect_lang` / `detect_lang` /
+`map_lang`, camelCase in Node), and both raise on a detected language the target
+model does not support instead of transcribing it as something else.
 
 ## C API (libmynah_asr)
 

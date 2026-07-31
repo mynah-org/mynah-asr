@@ -22,8 +22,9 @@ Output language ≠ source language = translation:
 
 - flash models: EN↔{DE,ES,FR} only. v2: EN↔24 (both directions), it included.
 - **The source language is an input, not a guess**: `--lang auto` on a Canary does
-  NOT detect anything, it falls back to the model's default (`en`). For audio of
-  unknown language, pair it with a detector (below).
+  NOT detect anything, it falls back to the model's default (`en`) — and says so
+  once on stderr, whichever front-end you came through. For audio of unknown
+  language, pair it with a detector (below).
 - The FLEURS samples in `samples/` are parallel across languages: the English
   clip doubles as reference for scoring translations (`make test-samples`).
 - fr→en on the 180m emits EOS immediately (model limitation, verified against
@@ -54,7 +55,11 @@ one and the source language stops being something the caller has to know:
   transcribing Japanese as English: fluent, confident and entirely invented.
 - Server: `mynah-asr-server -m <canary> --lid-model <nemotron>` does the same for
   every request with `language=auto`, and reports the detected language in
-  `verbose_json`. See [server.md](server.md).
+  `verbose_json`. See [server.md](server.md). Bindings: `detector=` (Python) /
+  `{ detector }` (Node) in `transcribe`.
+- Asking for a detector and not getting one is an error, not a fallback: a
+  `--lid-model` that cannot be loaded, or that cannot detect (no `auto` prompt),
+  fails the run instead of quietly transcribing as English.
 - Not needed on Nemotron itself (`--lang auto` already detects); passing it there is
   ignored with a note.
 

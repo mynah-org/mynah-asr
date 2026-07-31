@@ -8,12 +8,17 @@ Prerequisite: `make shared` in the repo root (produces libmynah_asr.dylib/.so).
     text, words, lang = m.transcribe("audio.wav", timestamps=True)
     # translation (AED/Canary models):
     print(MynahASR("models/canary-180m-flash").transcribe("de.wav", lang="de>en"))
+    # unknown source language: a detector in front of the translator
+    lid = MynahASR("models/nemotron-3.5-asr-streaming-0.6b", "int8")
+    canary = MynahASR("models/canary-1b-v2", "int8")
+    print(canary.transcribe("unknown.wav", lang="auto>en", detector=lid))
 """
 
 from __future__ import annotations
 
 import array
 import ctypes
+import warnings
 import wave
 from pathlib import Path
 
@@ -54,6 +59,10 @@ def _api() -> ctypes.CDLL:
         _lib.mynah_asr_words_free.argtypes = [ctypes.POINTER(_Word), ctypes.c_int]
         _lib.mynah_asr_set_target_lang.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _lib.mynah_asr_can_translate.argtypes = [ctypes.c_void_p]
+        _lib.mynah_asr_can_detect_lang.argtypes = [ctypes.c_void_p]
+        _lib.mynah_asr_detect_lang.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                                           ctypes.c_size_t, ctypes.c_char_p]
+        _lib.mynah_asr_map_lang.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
         _lib.mynah_asr_set_segment_limit.argtypes = [ctypes.c_void_p, ctypes.c_double]
         _lib.mynah_asr_resample.restype = ctypes.POINTER(ctypes.c_float)
         _lib.mynah_asr_resample.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
@@ -111,13 +120,29 @@ class MynahASR:
     def set_segment_limit(self, sec: float) -> None:
         self._lib.mynah_asr_set_segment_limit(self._m, sec)
 
-    def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
-                   timestamps: bool = False):
-        """Transcribe a WAV (resampled automatically). lang also accepts "src>tgt"
-        for AED translation. Returns str, or (str, [(word, t0, t1), ...], lang)
-        with timestamps=True — lang is the detected language, "" when the model
-        does not emit one (English-only models have no LID). Same shape as the
-        Node binding's { text, words, lang }."""
+    def can_detect_lang(self) -> bool:
+        """True when this model REPORTS the language it heard (only Nemotron does:
+        Parakeet detects it internally without saying so, and on Canary the source
+        language is an input, so lang="auto" there means the default, "en")."""
+        return self._lib.mynah_asr_can_detect_lang(self._m) == 1
+
+    def detect_lang(self, wav: str) -> str | None:
+        """Locale of a WAV ("it-IT"), from a short prefix — None when nothing was
+        detected. Raises when the model cannot detect at all."""
+        if not self.can_detect_lang():
+            raise RuntimeError("this model cannot detect the language (needs an 'auto' prompt)")
+        buf, n = self._samples(wav)
+        return self._detect(buf, n)
+
+    def map_lang(self, tag: str) -> str | None:
+        """A detector's tag in the form THIS model takes ("it-IT" -> "it"), or None
+        when it does not support that language at all."""
+        out = ctypes.create_string_buffer(16)
+        if self._lib.mynah_asr_map_lang(self._m, tag.encode(), out) != 0:
+            return None
+        return out.value.decode()
+
+    def _samples(self, wav: str):
         samples, sr = _load_wav(wav)
         buf = (ctypes.c_float * len(samples)).from_buffer(samples)
         n = ctypes.c_size_t(len(samples))
@@ -128,6 +153,39 @@ class MynahASR:
             if not p:
                 raise RuntimeError("resampling failed")
             buf, n = p, n_out
+        return buf, n
+
+    def _detect(self, buf, n) -> str | None:
+        tag = ctypes.create_string_buffer(16)
+        if self._lib.mynah_asr_detect_lang(self._m, buf, n, tag) != 0:
+            return None
+        return tag.value.decode()
+
+    def transcribe(self, wav: str, lang: str = "auto", lookahead: int = -1,
+                   timestamps: bool = False, detector: "MynahASR | None" = None):
+        """Transcribe a WAV (resampled automatically). lang also accepts "src>tgt"
+        for AED translation. Returns str, or (str, [(word, t0, t1), ...], lang)
+        with timestamps=True — lang is the detected language, "" when the model
+        does not emit one (English-only models have no LID). Same shape as the
+        Node binding's { text, words, lang }.
+
+        detector: another MynahASR (a Nemotron) used to identify the language when
+        lang is "auto" and THIS model cannot — the equivalent of the CLI's
+        --lid-model. It reads a few seconds and its answer becomes the source
+        language. Detecting nothing warns and leaves the model's default; detecting
+        a language this model does not have raises, exactly as naming it would."""
+        buf, n = self._samples(wav)
+        if detector is not None and lang.split(">")[0] == "auto" and not self.can_detect_lang():
+            tag = detector._detect(buf, n)
+            if tag is None:
+                warnings.warn(f"no language detected, falling back to this model's default"
+                              f" ({wav})", stacklevel=2)
+            else:
+                src = self.map_lang(tag)
+                if src is None:
+                    raise ValueError(f"detected language {tag!r} is not supported by this model")
+                tgt = lang.split(">", 1)[1] if ">" in lang else ""
+                lang = f"{src}>{tgt}" if tgt else src
         lang_out = ctypes.create_string_buffer(16)
         words_p = ctypes.POINTER(_Word)()
         n_words = ctypes.c_int(0)

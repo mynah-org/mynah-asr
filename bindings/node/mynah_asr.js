@@ -11,9 +11,13 @@
 //   const { text, words, lang } = m.transcribe('audio.wav', { timestamps: true });
 //   // translation (AED/Canary models): lang "src>tgt"
 //   console.log(new MynahASR('models/canary-180m-flash').transcribe('de.wav', { lang: 'de>en' }));
+//   // unknown source language: a detector in front of the translator
+//   const lid = new MynahASR('models/nemotron-3.5-asr-streaming-0.6b', 'int8');
+//   const canary = new MynahASR('models/canary-1b-v2', 'int8');
+//   console.log(canary.transcribe('unknown.wav', { lang: 'auto>en', detector: lid }));
 //   m.close();
 //
-// Twin of bindings/python/mynah_asr.py: same surface, same 7 symbols.
+// Twin of bindings/python/mynah_asr.py: same surface, same 10 symbols.
 
 const fs = require('fs');
 const path = require('path');
@@ -59,6 +63,12 @@ const fn = {
   version: lib.func('const char *mynah_asr_version()'),
   set_target_lang: lib.func('int mynah_asr_set_target_lang(void *m, const char *lang)'),
   can_translate: lib.func('int mynah_asr_can_translate(void *m)'),
+  can_detect_lang: lib.func('int mynah_asr_can_detect_lang(void *m)'),
+  // out buffers are uint8_t* for the same reason as lang_out below: char* would be
+  // read as an input string and koffi would drop what C writes back
+  detect_lang: lib.func(
+    'int mynah_asr_detect_lang(void *m, float *s, size_t n, uint8_t *out)'),
+  map_lang: lib.func('int mynah_asr_map_lang(void *m, const char *tag, uint8_t *out)'),
   set_segment_limit: lib.func('void mynah_asr_set_segment_limit(void *m, double sec)'),
   words_free: lib.func('void mynah_asr_words_free(mynah_asr_word *w, int n)'),
   resample: lib.func(
@@ -131,14 +141,30 @@ class MynahASR {
 
   setSegmentLimit(sec) { fn.set_segment_limit(this._m, sec); }
 
-  // Transcribe a WAV (resampled to 16 kHz automatically). opts: { lang, lookahead, timestamps }.
-  // lang accepts "src>tgt" for AED translation. Returns a string, or
-  // { text, words: [{ word, t0, t1 }, ...] } with timestamps: true.
-  transcribe(wav, opts = {}) {
-    const { lang = 'auto', lookahead = -1, timestamps = false } = opts;
+  // True when this model REPORTS the language it heard (only Nemotron does: Parakeet
+  // detects it internally without saying so, and on Canary the source language is an
+  // input, so lang 'auto' there means the default, 'en').
+  canDetectLang() { return fn.can_detect_lang(this._m) === 1; }
+
+  // Locale of a WAV ('it-IT') from a short prefix; null when nothing was detected.
+  detectLang(wav) {
+    if (!this.canDetectLang()) {
+      throw new Error("this model cannot detect the language (needs an 'auto' prompt)");
+    }
+    const { samples, n } = this._samples(wav);
+    return this._detect(samples, n);
+  }
+
+  // A detector's tag in the form THIS model takes ('it-IT' -> 'it'), or null when it
+  // does not support that language at all.
+  mapLang(tag) {
+    const out = Buffer.alloc(16);
+    return fn.map_lang(this._m, tag, out) === 0 ? cstr(out) : null;
+  }
+
+  _samples(wav) {
     let { samples, sampleRate } = loadWav(wav);
     let n = samples.length;
-
     if (sampleRate !== 16000) {
       const nOut = [0n];
       const p = fn.resample(samples, n, sampleRate, 16000, nOut);
@@ -147,6 +173,39 @@ class MynahASR {
       samples = Float32Array.from(koffi.decode(p, 'float', count));
       cfree(p);
       n = count;
+    }
+    return { samples, n };
+  }
+
+  _detect(samples, n) {
+    const out = Buffer.alloc(16);
+    return fn.detect_lang(this._m, samples, n, out) === 0 ? cstr(out) : null;
+  }
+
+  // Transcribe a WAV (resampled to 16 kHz automatically).
+  // opts: { lang, lookahead, timestamps, detector }.
+  // lang accepts "src>tgt" for AED translation. Returns a string, or
+  // { text, words: [{ word, t0, t1 }, ...] } with timestamps: true.
+  //
+  // detector: another MynahASR (a Nemotron) that identifies the language when lang is
+  // 'auto' and THIS model cannot — the equivalent of the CLI's --lid-model. Detecting
+  // nothing warns and leaves the model's default; detecting a language this model does
+  // not have throws, exactly as naming it would.
+  transcribe(wav, opts = {}) {
+    const { lang: langOpt = 'auto', lookahead = -1, timestamps = false, detector = null } = opts;
+    let lang = langOpt;
+    const { samples, n } = this._samples(wav);
+
+    if (detector && lang.split('>')[0] === 'auto' && !this.canDetectLang()) {
+      const tag = detector._detect(samples, n);
+      if (tag === null) {
+        console.warn(`mynah-asr: no language detected in ${wav}, falling back to this model's default`);
+      } else {
+        const src = this.mapLang(tag);
+        if (src === null) throw new Error(`detected language '${tag}' is not supported by this model`);
+        const tgt = lang.includes('>') ? lang.slice(lang.indexOf('>') + 1) : '';
+        lang = tgt ? `${src}>${tgt}` : src;
+      }
     }
 
     const langOut = Buffer.alloc(16);

@@ -99,6 +99,12 @@ constant in the length of the file: ~0.5 s for int8 nemotron on CPU, whether the
 is 5 s or an hour. It does not mutate the model, so one detector can serve several
 threads (like `mynah_asr_transcribe`).
 
+Asking an AED model for `"auto"` without pairing a detector is not silent either: the
+runtime says once, on stderr, that `auto` is not detection on that engine and the
+source language is falling back to `en`. It is a warning and not an error because
+`auto` is the default everywhere (CLI, server, bindings) and the request is still
+served — but the text may be a transcript of a language the model never heard.
+
 Both return -1 rather than guessing, and the two -1s deserve different answers.
 `detect_lang` returning -1 means nothing was heard (silence, a clip too short): the
 CLI and the server fall back to the model's default and warn. `map_lang` returning -1
