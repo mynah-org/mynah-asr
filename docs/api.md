@@ -99,11 +99,14 @@ constant in the length of the file: ~0.5 s for int8 nemotron on CPU, whether the
 is 5 s or an hour. It does not mutate the model, so one detector can serve several
 threads (like `mynah_asr_transcribe`).
 
-Both return -1 rather than guessing: nothing detected (silence, a clip too short), or
-a language the target model does not have — `map_lang` is what tells a 40-locale
-detector's answer apart from the 25 a canary-1b-v2 accepts. Callers are expected to
-fall back to the model's default on -1, which is what the CLI (`--lid-model`) and the
-server do.
+Both return -1 rather than guessing, and the two -1s deserve different answers.
+`detect_lang` returning -1 means nothing was heard (silence, a clip too short): the
+CLI and the server fall back to the model's default and warn. `map_lang` returning -1
+means the language WAS identified and the target model does not have it — a 40-locale
+detector against the 25 a canary-1b-v2 accepts — and there both fail the call exactly
+as naming that language would (`--lang ja` on a Canary is an error, so a detected `ja`
+is too). Falling back there produces a fluent transcript of a language the model never
+heard.
 
 ## Decoder selection and segmentation
 

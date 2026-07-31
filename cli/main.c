@@ -113,8 +113,15 @@ static int cmd_transcribe(int argc, char **argv) {
                 fprintf(stderr, "[lid %.2fs | detected %s -> --lang %s]\n", t_lid, tag, det);
                 lang = det;
             } else if (got) {
-                fprintf(stderr, "[lid %.2fs | detected %s, NOT supported by this model — "
-                                "falling back to its default language]\n", t_lid, tag);
+                /* same answer as `--lang <that language>` would have given: an error.
+                 * Falling back to the default here means transcribing, say, Japanese
+                 * as English — fluent, confident and entirely invented. */
+                fprintf(stderr, "[lid %.2fs | detected %s]\n"
+                                "mynah-asr: language '%s' is not supported by the model\n",
+                        t_lid, tag, tag);
+                free(samples);
+                mynah_asr_free(m);
+                return 1;
             } else {
                 fprintf(stderr, "[lid %.2fs | no language detected — "
                                 "falling back to this model's default language]\n", t_lid);

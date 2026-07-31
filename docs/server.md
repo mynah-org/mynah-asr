@@ -57,10 +57,12 @@ curl -F file=@unknown.wav -F target_language=en -F response_format=verbose_json 
 
 The detector reads a few seconds (~0.5 s of CPU with int8, independent of the file
 length) and stays resident, serving every worker; the language it returns is adapted
-to what the served model accepts and reported in `verbose_json`. When it detects
-nothing, or a language this model does not have, the request still goes through with
-the model's default rather than failing. Requests that name a language explicitly
-never pay for it. Ignored (with a note) on a model that already detects by itself.
+to what the served model accepts and reported in `verbose_json`. Detecting **nothing**
+(silence, a clip too short) is not an error: the request goes through with the model's
+default. Detecting a language the served model **does not have** is — same `400` as
+sending that language in the request, because the alternative is a fluent invented
+transcript. Requests that name a language explicitly never pay for any of this.
+Ignored (with a note) on a model that already detects by itself.
 
 ### GET /v1/audio/stream — WebSocket streaming
 

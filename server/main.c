@@ -363,8 +363,16 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         inference_begin();
         const int got = mynah_asr_detect_lang(g_lid, samples, n_samples, tag) == 0;
         inference_end();
-        if (got && mynah_asr_map_lang(g_model, tag, mapped) == 0)
+        if (got && mynah_asr_map_lang(g_model, tag, mapped) == 0) {
             snprintf(src_lang, sizeof(src_lang), "%s", mapped);
+        } else if (got) {   /* same 400 as naming that language in the request */
+            char msg[128];
+            snprintf(msg, sizeof(msg), "detected language '%s', which this model does "
+                                       "not support", tag);
+            free(samples);
+            send_error(fd, 400, msg);
+            return;
+        }
     }
     if (tgt) snprintf(f.language, sizeof(f.language), "%s>%s", src_lang, tgt);
     else     snprintf(f.language, sizeof(f.language), "%s", src_lang);

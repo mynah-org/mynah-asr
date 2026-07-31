@@ -47,9 +47,11 @@ one and the source language stops being something the caller has to know:
   transcription, so only one large model is ever resident.
 - The locale is adapted to what the target accepts (`it-IT` → `it`), which is also
   where a mismatch surfaces: Nemotron knows 40 locales, canary-1b-v2 takes 25.
-- **Never fails the request.** Nothing detected, or a language this Canary does not
-  have → a warning on stderr and the model's default (`en`) is used. The warning is
-  the signal that the text may be wrong; there is no silent version of it.
+- **Nothing detected** (silence, a clip too short) → warning on stderr and the model's
+  default (`en`), so the request still goes through.
+- **A language this Canary does not have** → the same error `--lang <that language>`
+  would have given (exit 1, `400` on the server). Falling back there would mean
+  transcribing Japanese as English: fluent, confident and entirely invented.
 - Server: `mynah-asr-server -m <canary> --lid-model <nemotron>` does the same for
   every request with `language=auto`, and reports the detected language in
   `verbose_json`. See [server.md](server.md).

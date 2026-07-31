@@ -124,6 +124,18 @@ if [ "$ENGINE" = "canary-aed" ] && [ -f "$LID_DIR/mynah.json" ]; then
         *"at 9"*|*"nine o'clock"*) ;;   # same translation as the explicit --lang de
         *) echo "e2e lid FAIL (translation): $out"; fail=1 ;;
     esac
+    # A language no Canary has: detecting it must FAIL like naming it would, not
+    # fall back to English and invent a fluent transcript.
+    if [ -f samples/ja/fleurs_1521.wav ]; then
+        err=$(./mynah-asr transcribe -m "$MODEL_DIR" -i samples/ja/fleurs_1521.wav \
+              --lang auto --lid-model "$LID_DIR" --target-lang en 2>&1 >/dev/null)
+        rc=$?
+        case "$rc:$err" in
+            0:*) echo "e2e lid-unsupported FAIL: exited 0 on ja"; fail=1 ;;
+            *"is not supported by the model"*) echo "e2e lid-unsupported OK (ja rejected)" ;;
+            *) echo "e2e lid-unsupported FAIL: $err"; fail=1 ;;
+        esac
+    fi
 fi
 
 # The timestamp aligner canary-1b-v2 bundles, when the converter extracted it.
