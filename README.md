@@ -217,12 +217,34 @@ Longer clips (~2–5 min) exercise segmentation, timestamps and streaming.
 Full locale tables with quality tiers and prompt ids:
 [docs/nemotron-languages.md](docs/nemotron-languages.md).
 
+**Who actually knows the language.** Only Nemotron *reports* it (it emits the locale
+as a token). Parakeet detects it internally but never says so, and on Canary the
+source language is an **input**, not a prediction: `--lang auto` there means the
+model's default (`en`), and the wrong source gives confident wrong text. For audio
+of unknown language, put one in front of the other:
+
+```sh
+./mynah-asr transcribe -m models/canary-1b-v2 -i unknown.wav --lang auto \
+    --lid-model models/nemotron-3.5-asr-streaming-0.6b --target-lang en --quant int8
+# [lid 0.53s | detected it-IT -> --lang it]
+```
+
+The detector reads a **short prefix** (8 s from the first speech), so it costs the
+same ~0.5 s whether the file is 5 seconds or an hour, and the text that comes out is
+byte-identical to naming the language by hand (checked on parallel FLEURS clips in
+de/ru/pl/nl). A language the target model does not have is an error, not a silent
+fallback. Same thing on the server: `--lid-model <dir>` covers every request with
+`language=auto`.
+
 ## CLI
 
 ```
 mynah-asr transcribe -m <model_dir> -i <file.wav>
     --lang <tag|auto>        source language (it-IT, en, auto for detection)
     --target-lang <xx>       AED/Canary: OUTPUT language ≠ source = translation
+    --lid-model <dir>        with --lang auto on a model that cannot detect
+                             (Canary): that model names the language on a few
+                             seconds, this one transcribes/translates
     --timestamps             one word per line: t0 t1 word
     --decoder default|ctc    CTC head of hybrid models (faster)
     --lookahead N            Nemotron streaming preset (0|1|3|6|13)
@@ -255,7 +277,8 @@ curl -F file=@audio_de.wav -F language=de http://localhost:8090/v1/audio/transla
 ```
 
 `verbose_json` includes per-word timestamps; `--batch N` enables
-weight-stationary micro-batching across concurrent requests.
+weight-stationary micro-batching across concurrent requests; `--lid-model <dir>`
+answers `language=auto` on the models that cannot detect it themselves.
 Details: [docs/server.md](docs/server.md).
 
 ## Bindings (Python · Node)
