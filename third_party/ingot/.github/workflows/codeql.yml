@@ -1,24 +1,21 @@
-# Static analysis: CodeQL + clang-tidy (same pattern as qwen-tts).
 name: Code Quality
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   codeql:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       security-events: write
 
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - uses: actions/checkout@v5
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -26,7 +23,7 @@ jobs:
           languages: c-cpp
 
       - name: Build
-        run: make
+        run: make lib tools
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
@@ -34,19 +31,22 @@ jobs:
   clang-tidy:
     name: clang-tidy
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev clang-tidy
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy
 
-      - name: Run clang-tidy
+      # src/iq_tables.inc is generated data, not hand-written code, and the
+      # amalgam is src/ concatenated — analysing either would only report the
+      # same findings twice.
+      - name: Run clang-tidy over the sources
         run: |
           clang-tidy \
             -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone' \
             -warnings-as-errors='' \
-            src/*.c cli/main.c server/main.c server/http_util.c \
-            -- -std=c11 -iquote src -Ithird_party/ingot/include -D_DEFAULT_SOURCE -DMYNAH_ASR_BLAS_OPENBLAS \
-               -DMYNAH_ASR_BUILD='"ci"'
+            src/*.c tools/ingot_dump.c \
+            -- -std=c11 -Iinclude

@@ -29,6 +29,13 @@ endif
 CFLAGS  += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 
+# ingot: the GGUF/safetensors reader, vendored as a subtree and built by its own
+# Makefile so this one never learns how it is compiled.
+INGOT_DIR := third_party/ingot
+INGOT_LIB := $(INGOT_DIR)/libingot.a
+CFLAGS  += -I$(INGOT_DIR)/include
+LDFLAGS += $(INGOT_LIB)
+
 SRC := $(wildcard src/*.c) vendor/cJSON.c
 OBJ := $(SRC:%.c=build/%.o) $(OBJ_EXTRA)
 HDR := $(wildcard src/*.h)
@@ -61,10 +68,15 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_gguf tests/test_threads tests/test_align tests/test_vadseg tests/test_tokenize tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
+TESTS := tests/test_qmat tests/test_threads tests/test_align tests/test_vadseg tests/test_tokenize tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
 
-tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(INGOT_LIB):
+	$(MAKE) -C $(INGOT_DIR) lib
+
+$(OBJ): | $(INGOT_LIB)
+
+tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 # C vs oracle parity (Nemotron streaming + Parakeet TDT offline).
 # Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
@@ -74,7 +86,7 @@ PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tes
 SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	@for t in $(TESTS); do \
-	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_gguf ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ]; then $$t; rc=$$?; \
+	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -153,17 +165,17 @@ build/src/cuda_gemm.o: src/cuda_gemm.cu
 # overhead). ASan is VERY SLOW on a Mac and tends to hang with the large model:
 # Linux CI only.
 debug:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF)"
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF)"
 # NOTE: clean at the end too — the sanitized objects (without -DMYNAH_ASR_METAL
 # and referencing the ubsan runtime) must NOT be left behind to pollute the
 # normal build
 ubsan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g -fsanitize=undefined \
-	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
+	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=undefined" all test && $(MAKE) clean
 asan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined \
-	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
+	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test && $(MAKE) clean
 
 # reproducible bench: warm RTF + peak RAM for every model present

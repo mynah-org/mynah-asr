@@ -1,147 +1,149 @@
+/* Weight loading over ingot (third_party/ingot).
+ *
+ * This replaces the hand-rolled safetensors reader that used to live here and
+ * the GGUF reader that used to live in src/gguf.c. The API above it does not
+ * change: mynah_asr_st_open() still sniffs the magic and opens either
+ * container, so encoder and decoder still never learn where the weights came
+ * from.
+ *
+ * The two containers behave differently, and that is preserved exactly:
+ *
+ *   safetensors — dtype and pointer are handed over untouched. An int8
+ *                 checkpoint's I8 tensors must reach qmat.c as raw bytes.
+ *   GGUF        — F32 is zero-copy; every other block type is decoded to f32
+ *                 at load into a buffer this handle owns, and reported as F32.
+ *                 That was the policy of src/gguf.c, and the engine relies on
+ *                 it: after a load, a GGUF tensor is always f32.
+ *
+ * The eager decode is a policy of THIS engine, not of the library, and keeping
+ * it here is the point: a 110M-1B encoder can afford it, and the library stays
+ * usable by consumers that cannot. */
 #include "weights.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-#include "../vendor/cJSON.h"
-#include "gguf.h"
+#include "ingot/wfile.h"
 
 struct mynah_asr_safetensors {
-    void *map;
-    size_t map_len;
-    cJSON *header;         /* keeps the name strings alive */
-    mynah_asr_tensor *tensors;
-    size_t n_tensors;
-    mynah_asr_gguf *gguf;      /* alternative container: if set, tensors point there */
+    ingot_wfile *w;
+    mynah_asr_tensor *views;   /* parallel to ingot's tensor order */
+    float **owned;             /* decoded f32 for the GGUF block types */
+    size_t count;
 };
 
-static int dtype_of(const char *s, mynah_asr_dtype *out) {
-    if (strcmp(s, "F32") == 0) { *out = MYNAH_ASR_DT_F32; return 0; }
-    if (strcmp(s, "F64") == 0) { *out = MYNAH_ASR_DT_F64; return 0; }
-    if (strcmp(s, "BF16") == 0) { *out = MYNAH_ASR_DT_BF16; return 0; }
-    if (strcmp(s, "F16") == 0) { *out = MYNAH_ASR_DT_F16; return 0; }
-    if (strcmp(s, "I8") == 0) { *out = MYNAH_ASR_DT_I8; return 0; }
-    if (strcmp(s, "U8") == 0) { *out = MYNAH_ASR_DT_U8; return 0; }
-    if (strcmp(s, "I64") == 0) { *out = MYNAH_ASR_DT_I64; return 0; } /* BatchNorm num_batches_tracked */
-    return -1;
+static int dtype_from_ingot(ingot_dtype d, mynah_asr_dtype *out) {
+    switch (d) {
+    case INGOT_DT_F32:  *out = MYNAH_ASR_DT_F32;  return 0;
+    case INGOT_DT_F64:  *out = MYNAH_ASR_DT_F64;  return 0;
+    case INGOT_DT_BF16: *out = MYNAH_ASR_DT_BF16; return 0;
+    case INGOT_DT_F16:  *out = MYNAH_ASR_DT_F16;  return 0;
+    case INGOT_DT_I8:   *out = MYNAH_ASR_DT_I8;   return 0;
+    case INGOT_DT_U8:   *out = MYNAH_ASR_DT_U8;   return 0;
+    case INGOT_DT_I64:  *out = MYNAH_ASR_DT_I64;  return 0;
+    default: return -1;
+    }
 }
 
-mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
-    close(fd);
-    return mynah_asr_st_open(path);
-}
-
-mynah_asr_safetensors *mynah_asr_st_open(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "weights: cannot open %s\n", path); return NULL; }
-    struct stat sb;
-    if (fstat(fd, &sb) != 0 || sb.st_size < 8) { close(fd); return NULL; }
-
-    /* GGUF container? (magic "GGUF"): same API, the consumers do not change */
-    char magic[4] = {0};
-    if (pread(fd, magic, 4, 0) == 4 && memcmp(magic, "GGUF", 4) == 0) {
-        close(fd);
-        mynah_asr_gguf *g = mynah_asr_gguf_open(path);
-        if (!g) return NULL;
-        mynah_asr_safetensors *st = calloc(1, sizeof(*st));
-        if (!st) { mynah_asr_gguf_close(g); return NULL; }
-        st->gguf = g;
-        st->tensors = (mynah_asr_tensor *)mynah_asr_gguf_tensors(g, &st->n_tensors);
-        return st;
-    }
-
-    void *map = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) { fprintf(stderr, "weights: mmap failed for %s\n", path); return NULL; }
-
-    uint64_t hlen;
-    memcpy(&hlen, map, 8); /* little-endian; we assume an LE host (arm64/x86_64) */
-    if (8 + hlen > (uint64_t)sb.st_size) {
-        fprintf(stderr, "weights: corrupt safetensors header in %s\n", path);
-        munmap(map, (size_t)sb.st_size);
-        return NULL;
-    }
-
-    char *hjson = malloc(hlen + 1);
-    memcpy(hjson, (const char *)map + 8, hlen);
-    hjson[hlen] = '\0';
-    cJSON *header = cJSON_Parse(hjson);
-    free(hjson);
-    if (!header) {
-        fprintf(stderr, "weights: invalid JSON header in %s\n", path);
-        munmap(map, (size_t)sb.st_size);
-        return NULL;
-    }
-
-    mynah_asr_safetensors *st = calloc(1, sizeof(*st));
-    st->map = map;
-    st->map_len = (size_t)sb.st_size;
-    st->header = header;
-
-    size_t count = 0;
-    for (cJSON *it = header->child; it; it = it->next)
-        if (strcmp(it->string, "__metadata__") != 0) count++;
-    st->tensors = calloc(count, sizeof(mynah_asr_tensor));
-
-    const uint8_t *base = (const uint8_t *)map + 8 + hlen;
-    size_t i = 0;
-    for (cJSON *it = header->child; it; it = it->next) {
-        if (strcmp(it->string, "__metadata__") == 0) continue;
-        mynah_asr_tensor *t = &st->tensors[i];
-        t->name = it->string;
-
-        const cJSON *jd = cJSON_GetObjectItemCaseSensitive(it, "dtype");
-        const cJSON *js = cJSON_GetObjectItemCaseSensitive(it, "shape");
-        const cJSON *jo = cJSON_GetObjectItemCaseSensitive(it, "data_offsets");
-        if (!cJSON_IsString(jd) || !cJSON_IsArray(js) || !cJSON_IsArray(jo) ||
-            dtype_of(jd->valuestring, &t->dtype) != 0) {
-            fprintf(stderr, "weights: invalid entry '%s' (dtype %s)\n", it->string,
-                    cJSON_IsString(jd) ? jd->valuestring : "?");
-            mynah_asr_st_close(st);
-            return NULL;
-        }
-        t->n_dims = cJSON_GetArraySize(js);
-        t->n_elems = 1;
-        for (int d = 0; d < t->n_dims && d < 8; d++) {
-            t->shape[d] = (int64_t)cJSON_GetArrayItem(js, d)->valuedouble;
-            t->n_elems *= (size_t)t->shape[d];
-        }
-        double off0 = cJSON_GetArrayItem(jo, 0)->valuedouble;
-        t->data = base + (size_t)off0;
-        i++;
-    }
-    st->n_tensors = i;
-    return st;
-}
-
-void mynah_asr_st_close(mynah_asr_safetensors *st) {
-    if (!st) return;
-    if (st->gguf) {           /* the tensors belong to the GGUF handle */
-        mynah_asr_gguf_close(st->gguf);
-        free(st);
-        return;
-    }
-    if (st->map) munmap(st->map, st->map_len);
-    cJSON_Delete(st->header);
-    free(st->tensors);
+static void st_free(mynah_asr_safetensors *st) {
+    if (st == NULL) return;
+    if (st->owned != NULL)
+        for (size_t i = 0; i < st->count; i++) free(st->owned[i]);
+    free(st->owned);
+    free(st->views);
+    ingot_wfile_close(st->w);
     free(st);
 }
 
-const mynah_asr_tensor *mynah_asr_st_get(const mynah_asr_safetensors *st, const char *name) {
-    for (size_t i = 0; i < st->n_tensors; i++)
-        if (strcmp(st->tensors[i].name, name) == 0) return &st->tensors[i];
-    return NULL;
+/* `quiet` keeps the old open_quiet() contract: a missing file is not news. */
+static mynah_asr_safetensors *st_open(const char *path, int quiet) {
+    char err[256] = {0};
+    mynah_asr_safetensors *st = calloc(1, sizeof(*st));
+    if (st == NULL) {
+        if (!quiet) fprintf(stderr, "weights: out of memory\n");
+        return NULL;
+    }
+    if (ingot_wfile_open(&st->w, path, err, sizeof err) != 0) {
+        if (!quiet) fprintf(stderr, "weights: %s\n", err);
+        free(st);
+        return NULL;
+    }
+
+    st->count = ingot_wfile_count(st->w);
+    st->views = calloc(st->count ? st->count : 1, sizeof(*st->views));
+    st->owned = calloc(st->count ? st->count : 1, sizeof(*st->owned));
+    if (st->views == NULL || st->owned == NULL) {
+        if (!quiet) fprintf(stderr, "weights: out of memory\n");
+        st_free(st);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < st->count; i++) {
+        const ingot_wtensor *t = ingot_wfile_at(st->w, i);
+        mynah_asr_tensor *v = &st->views[i];
+        v->name = t->name;
+        v->n_dims = (int)t->rank;
+        v->n_elems = (size_t)t->nelem;
+        for (uint32_t d = 0; d < t->rank && d < 8; d++) v->shape[d] = (int64_t)t->shape[d];
+
+        const int is_gguf_block = t->ggml_type >= 0 && t->dtype != INGOT_DT_F32;
+        if (!is_gguf_block) {
+            if (dtype_from_ingot(t->dtype, &v->dtype) != 0) {
+                if (!quiet)
+                    fprintf(stderr, "weights: '%s' has a dtype this engine cannot use (%s)\n",
+                            t->name, ingot_dtype_name(t->dtype));
+                st_free(st);
+                return NULL;
+            }
+            v->data = t->data;                       /* zero-copy from the mmap */
+            continue;
+        }
+
+        /* A GGUF block type: decode now, exactly as the old loader did. */
+        if ((size_t)t->nelem > SIZE_MAX / sizeof(float)) { st_free(st); return NULL; }
+        st->owned[i] = malloc((size_t)t->nelem * sizeof(float));
+        if (st->owned[i] == NULL || ingot_wfile_to_f32(st->w, t, st->owned[i]) != 0) {
+            if (!quiet)
+                fprintf(stderr, "weights: cannot decode '%s' (%s)\n",
+                        t->name, ingot_type_name(t->ggml_type));
+            st_free(st);
+            return NULL;
+        }
+        v->dtype = MYNAH_ASR_DT_F32;                 /* after the load it is always f32 */
+        v->data = st->owned[i];
+    }
+    return st;
 }
 
-size_t mynah_asr_st_count(const mynah_asr_safetensors *st) { return st->n_tensors; }
+mynah_asr_safetensors *mynah_asr_st_open(const char *path) { return st_open(path, 0); }
+mynah_asr_safetensors *mynah_asr_st_open_quiet(const char *path) { return st_open(path, 1); }
+
+void mynah_asr_st_close(mynah_asr_safetensors *st) { st_free(st); }
+
+size_t mynah_asr_st_count(const mynah_asr_safetensors *st) {
+    return st != NULL ? st->count : 0;
+}
 
 const mynah_asr_tensor *mynah_asr_st_at(const mynah_asr_safetensors *st, size_t i) {
-    return i < st->n_tensors ? &st->tensors[i] : NULL;
+    return (st != NULL && i < st->count) ? &st->views[i] : NULL;
+}
+
+const mynah_asr_tensor *mynah_asr_st_get(const mynah_asr_safetensors *st, const char *name) {
+    if (st == NULL || name == NULL) return NULL;
+    const ingot_wtensor *t = ingot_wfile_find(st->w, name);   /* O(1), was a strcmp sweep */
+    if (t == NULL) return NULL;
+
+    /* ingot hands back a pointer into its own tensor array and the views here
+     * are built in the same order, so the index is the offset. The equality
+     * check makes that assumption self-verifying: if it ever stops holding,
+     * the scan below is still correct, only slower. */
+    const ingot_wtensor *base = ingot_wfile_at(st->w, 0);
+    if (base != NULL) {
+        const size_t index = (size_t)(t - base);
+        if (index < st->count && ingot_wfile_at(st->w, index) == t) return &st->views[index];
+    }
+    for (size_t i = 0; i < st->count; i++)
+        if (strcmp(st->views[i].name, name) == 0) return &st->views[i];
+    return NULL;
 }
