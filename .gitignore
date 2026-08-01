@@ -61,3 +61,4 @@ libmynah_asr.dylib
 *.so
 node_modules/
 package-lock.json
+tests/test_ingot_parity

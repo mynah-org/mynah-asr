@@ -1,4 +1,4 @@
-#include "gguf.h"
+#include "legacy_gguf.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -20,13 +20,13 @@ enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
        GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13,
        GGML_Q6_K = 14, GGML_BF16 = 30 };
 
-struct mynah_asr_gguf {
+struct legacy_asr_gguf {
     int fd;
     uint64_t size;
     uint64_t data_base;
     uint64_t alignment;
     unsigned char *map;
-    mynah_asr_tensor *tensors;
+    legacy_asr_tensor *tensors;
     char **names;          /* owned by us (in safetensors they point into the JSON) */
     float **dequant;       /* f32 buffers of the non-F32 tensors (NULL when zero-copy) */
     uint32_t *ggml_type;
@@ -119,7 +119,7 @@ static int skip_value(reader *r, uint32_t type, unsigned depth) {
 
 /* Of the metadata only general.alignment matters: the model config does NOT come
  * from the GGUF but from mynah.json (extra KVs are skipped, not an error). */
-static int rd_metadata(mynah_asr_gguf *g, reader *r, uint64_t count) {
+static int rd_metadata(legacy_asr_gguf *g, reader *r, uint64_t count) {
     if (count > 100000000u) return -1;
     for (uint64_t i = 0; i < count; i++) {
         char *key = NULL;
@@ -385,13 +385,13 @@ static uint64_t align_up(uint64_t v, uint64_t a, int *valid) {
     return (v + a - 1) & ~(a - 1);
 }
 
-mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
+legacy_asr_gguf *legacy_asr_gguf_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
     struct stat sb;
     if (fstat(fd, &sb) != 0 || sb.st_size < 24) { close(fd); return NULL; }
 
-    mynah_asr_gguf *g = calloc(1, sizeof(*g));
+    legacy_asr_gguf *g = calloc(1, sizeof(*g));
     if (!g) { close(fd); return NULL; }
     g->fd = fd;
     g->size = (uint64_t)sb.st_size;
@@ -420,7 +420,7 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
     uint64_t *offsets = calloc(g->count ? g->count : 1, sizeof(*offsets));
     if (!offsets) goto fail;
     for (size_t i = 0; i < g->count; i++) {
-        mynah_asr_tensor *t = &g->tensors[i];
+        legacy_asr_tensor *t = &g->tensors[i];
         uint32_t rank, type;
         uint64_t ne[8];
         if (rd_string(&r, &g->names[i]) != 0 || rd_u32(&r, &rank) != 0 || rank > 8) goto fail_off;
@@ -438,7 +438,7 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
             goto fail_off;
         }
         t->name = g->names[i];
-        t->dtype = MYNAH_ASR_DT_F32;                /* after the load it is always f32 */
+        t->dtype = LEGACY_ASR_DT_F32;                /* after the load it is always f32 */
         t->n_dims = (int)rank;
         for (uint32_t d = 0; d < rank; d++) t->shape[d] = (int64_t)ne[rank - 1 - d];
         t->n_elems = (size_t)elems;
@@ -454,7 +454,7 @@ mynah_asr_gguf *mynah_asr_gguf_open(const char *path) {
     if (g->map == MAP_FAILED) { g->map = NULL; goto fail_off; }
 
     for (size_t i = 0; i < g->count; i++) {
-        mynah_asr_tensor *t = &g->tensors[i];
+        legacy_asr_tensor *t = &g->tensors[i];
         uint64_t be, bb, bytes, abs_off, end;
         /* unknown ggml type: without this check we divided by a `be` that was
          * never written (UB) — caught by GCC 13 on the first Linux build */
@@ -484,11 +484,11 @@ fail_off:
     free(offsets);
 fail:
     fprintf(stderr, "gguf: failed to load %s\n", path);
-    mynah_asr_gguf_close(g);
+    legacy_asr_gguf_close(g);
     return NULL;
 }
 
-void mynah_asr_gguf_close(mynah_asr_gguf *g) {
+void legacy_asr_gguf_close(legacy_asr_gguf *g) {
     if (!g) return;
     for (size_t i = 0; i < g->count; i++) {
         if (g->names) free(g->names[i]);
@@ -503,7 +503,7 @@ void mynah_asr_gguf_close(mynah_asr_gguf *g) {
     free(g);
 }
 
-const mynah_asr_tensor *mynah_asr_gguf_tensors(const mynah_asr_gguf *g, size_t *count) {
+const legacy_asr_tensor *legacy_asr_gguf_tensors(const legacy_asr_gguf *g, size_t *count) {
     if (count) *count = g ? g->count : 0;
     return g ? g->tensors : NULL;
 }
