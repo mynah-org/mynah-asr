@@ -78,22 +78,6 @@ $(OBJ): | $(INGOT_LIB)
 tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-# A/B gate for the ingot migration: the readers this branch replaces — the old
-# safetensors and GGUF loaders, kept as test fixtures under their own legacy_
-# prefix — and ingot, in one binary, asked the same questions about the same
-# file. Deliberately does NOT link $(OBJ): the product now contains the new
-# loader, and comparing that against ingot would be comparing ingot with
-# itself. Needs no model on disk; pass ASR_MODEL to add a real checkpoint.
-# Fixtures, target and gate all go away when this branch is merged.
-LEGACY_OBJ := build/tests/legacy_weights.o build/tests/legacy_gguf.o build/vendor/cJSON.o
-
-tests/test_ingot_parity: build/tests/test_ingot_parity.o $(LEGACY_OBJ) $(INGOT_LIB)
-	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
-
-.PHONY: parity-test
-parity-test: tests/test_ingot_parity
-	@./tests/test_ingot_parity $(if $(ASR_MODEL),"$(ASR_MODEL)",)
-
 # C vs oracle parity (Nemotron streaming + Parakeet TDT offline).
 # Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
 # with: make golden-dump
