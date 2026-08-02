@@ -263,6 +263,16 @@ leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align
 
 clean:
 	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist
+	@# Without this, libingot.a survives a clean: update the subtree and the
+	@# next build silently links the previous library.
+	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
+
+# Refresh the vendored ingot subtree from upstream. A plain clone already
+# contains ingot (subtree = real files in-tree, nothing to init); this is only
+# needed to pick up new upstream commits. Requires a clean working tree.
+update-ingot:
+	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
+	@$(MAKE) -C $(INGOT_DIR) clean
 
 # install: CLI + server + static library + header
 PREFIX ?= /usr/local
@@ -293,4 +303,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda
+.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot

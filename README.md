@@ -357,7 +357,14 @@ make fetch-vad    # Silero VAD checkpoint (2.3 MB) into models/silero-vad/
 make test-vad     # VAD parity vs onnxruntime (77 = skip without the checkpoint)
 make bench        # RTF on the fixtures   make leaks / make ubsan / make asan
 make golden-dump  # regenerate reference dumps (requires tools/ + model)
+make update-ingot # pull the latest vendored ingot (weight reader) from upstream
 ```
+
+Weights are read through [ingot](https://github.com/mynah-org/ingot), vendored
+as a **git subtree** in `third_party/ingot`: a plain `git clone` already
+contains it — no submodule init, nothing extra to fetch. When upstream ingot
+gains something you want, `make update-ingot` (on a clean working tree) pulls
+it in as a single squashed commit.
 
 ## Documentation
 
