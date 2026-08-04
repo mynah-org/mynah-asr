@@ -116,6 +116,10 @@ M1: 16 GB, ~65 s file (2026-07-18) · x86/CUDA: Ubuntu 24.04, 60 s LibriSpeech
 (2026-07-20, TF32 tensor-core default — transcripts identical to CPU on
 every model). Parallel requests on the A100 via the batch API: 110m ~94×,
 nemotron ~46× realtime aggregate (`make bench-throughput`).
+**AVX-512 + VNNI validated on real silicon** (2026-08-04, AMD EPYC 9555P
+Zen 5, 4 vCPU): unit suite green with the int8 q8/q4 kernels on native VNNI,
+110m e2e (auto/ctc/timestamps/segment) all OK at **RTF 0.016** — the first
+run of the VNNI lane outside emulation.
 
 RAM: 110m 0.44 GB · 180m 0.71 · 0.6B ~2.4 · 1b-flash 3.3 · 1.1b 4.0 GB
 (int8: ~⅓; on M1 int8 halves Canary's AED decode and triples Nemotron
