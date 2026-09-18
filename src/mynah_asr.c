@@ -1,6 +1,7 @@
 #include "mynah_asr.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,11 @@
 const char *mynah_asr_version(void) { return MYNAH_ASR_VERSION; }
 
 #define MYNAH_ASR_AED_PROMPT_MAX 16
+
+/* Largest B one mynah_asr_stream_step_batch call accepts. A bound on the fixed
+ * per-call arrays, not a serving policy: the per-worker slot cap comes from a
+ * measured T_step(B) (.work/serving-v2-design.md §3). */
+#define MYNAH_ASR_STREAM_BATCH_MAX 256
 
 struct mynah_asr_model {
     cJSON *cfg;                     /* mynah.json (kept alive for the prompt dictionary) */
@@ -45,6 +51,9 @@ struct mynah_asr_model {
     mynah_asr_vad *vad;             /* optional (mynah_asr_enable_vad): NULL = energy split */
     char vad_dir[512];              /* kept so each stream can open its OWN instance */
     struct mynah_asr_model *aligner;/* <dir>/aligner: CTC model for word timestamps (AED) */
+    /* scratch of the batched stream step (S1-4), carved on first use / reserve:
+     * one per model because one scheduler thread owns a model */
+    mynah_asr_enc_batch *batch;
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -360,6 +369,7 @@ void mynah_asr_free(mynah_asr_model *m) {
     mynah_asr_metal_weights_evict();
 #endif
     if (m->aligner) mynah_asr_free(m->aligner);
+    mynah_asr_enc_batch_free(m->batch);
     mynah_asr_vad_close(m->vad);
     mynah_asr_st_close(m->weights);
     mynah_asr_st_close(m->mel_filters);
@@ -828,14 +838,24 @@ double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s) {
     return (double)s->samples_fed / (double)s->m->feat.sample_rate;
 }
 
-/* Encode the current mel chunk, decode it, emit the text delta. */
-static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
-                              mynah_asr_result_cb cb, void *ud) {
-    mynah_asr_model *m = s->m;
-    const int q = mynah_asr_enc_stream_step(&s->es, s->mel_buf, n_mel, m->feat.n_mels,
-                                        s->prompt, is_last, s->enc_buf);
-    if (q < 0) return -1;
+/* Pull mel frames into s->mel_buf until the current chunk is complete or the
+ * samples run out. audio != NULL only on the first call of a feed: afterwards
+ * the mel stream serves what it already buffered.
+ * Returns 1 when a whole chunk is ready to encode, 0 otherwise. */
+static int stream_pull_mel(mynah_asr_stream *s, const float *audio, size_t n) {
+    const int need = mynah_asr_enc_stream_need(&s->es);
+    const int got = mynah_asr_mel_stream_feed(&s->mel, audio, n,
+                                          s->mel_buf + (size_t)s->mel_have * (size_t)s->m->feat.n_mels,
+                                          need - s->mel_have);
+    s->mel_have += got;
+    return s->mel_have >= need;
+}
 
+/* Decode the q encoder frames already in s->enc_buf, append them to the
+ * incremental transcript and emit the delta. Shared by the single and the
+ * batched step: the text a stream produces cannot depend on which one ran. */
+static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb, void *ud) {
+    mynah_asr_model *m = s->m;
     if (s->n_tokens + q * m->dec.max_symbols > s->cap_tokens) {
         s->cap_tokens = (s->cap_tokens + q * m->dec.max_symbols) * 2;
         int *nb = realloc(s->tokens, (size_t)s->cap_tokens * sizeof(int));
@@ -872,6 +892,15 @@ static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
         }
     }
     return 0;
+}
+
+/* Encode the current mel chunk, decode it, emit the text delta. */
+static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
+                              mynah_asr_result_cb cb, void *ud) {
+    const int q = mynah_asr_enc_stream_step(&s->es, s->mel_buf, n_mel, s->m->feat.n_mels,
+                                        s->prompt, is_last, s->enc_buf);
+    if (q < 0) return -1;
+    return stream_decode_emit(s, q, cb, ud);
 }
 
 /* Endpointing pass over the incoming samples: the VAD only accepts whole frames,
@@ -920,25 +949,153 @@ static void stream_emit_eou(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
 
 int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                       mynah_asr_result_cb cb, void *ud) {
-    mynah_asr_model *m = s->m;
     stream_vad_scan(s, samples, n);
     s->samples_fed += n;
-    const float *src = samples;
-    size_t left = n;
     int first_pass = 1;
 
     for (;;) {
         const int need = mynah_asr_enc_stream_need(&s->es);
-        const int got = mynah_asr_mel_stream_feed(&s->mel, first_pass ? src : NULL,
-                                              first_pass ? left : 0,
-                                              s->mel_buf + (size_t)s->mel_have * (size_t)m->feat.n_mels,
-                                              need - s->mel_have);
+        const int ready = stream_pull_mel(s, first_pass ? samples : NULL, first_pass ? n : 0);
         first_pass = 0;
-        s->mel_have += got;
-        if (s->mel_have < need) break;          /* more samples needed */
+        if (!ready) break;                      /* more samples needed */
         if (stream_flush_chunk(s, need, 0, cb, ud) != 0) return -1;
     }
     stream_emit_eou(s, cb, ud);
+    return 0;
+}
+
+/* ------------------------------------------------------- batched step (S1-4)
+ * One encoder pass for every stream whose chunk completed. The mel accumulation,
+ * the VAD, the greedy decode and the callbacks stay strictly per stream: only the
+ * encoder step is shared, and it is shared in a way that is byte-identical to B
+ * separate steps (see mynah_asr_enc_stream_step_batch).
+ *
+ * Rows pushed through the stacked path, so a run can PROVE it batched rather
+ * than quietly degrading to B single steps (ENGINEERING.md §6). */
+static _Atomic unsigned long long g_batch_rows;
+
+unsigned long long mynah_asr_stream_batch_rows_stacked(void) {
+    return atomic_load_explicit(&g_batch_rows, memory_order_relaxed);
+}
+
+/* The batch scratch belongs to the model: one scheduler thread owns a model, so
+ * one scratch per model is exactly the lifetime the server wants, and it is
+ * carved once instead of per step. */
+static int model_batch_ready(mynah_asr_model *m, int max_b) {
+    if (m->n_lookaheads == 0) return -1;
+    int max_q = 1;
+    for (int i = 0; i < m->n_lookaheads; i++)
+        if (m->lookaheads[i] + 1 > max_q) max_q = m->lookaheads[i] + 1;
+    if (m->batch && mynah_asr_enc_batch_max_b(m->batch) >= max_b) return 0;
+    mynah_asr_enc_batch *nb = mynah_asr_enc_batch_new(&m->enc, max_b, max_q);
+    if (!nb) return -1;
+    mynah_asr_enc_batch_free(m->batch);
+    m->batch = nb;
+    return 0;
+}
+
+int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b) {
+    if (!m || max_b < 1) return -1;
+    return model_batch_ready(m, max_b);
+}
+
+/* Is the stacked encoder path usable for this model at all? f32 depends on the
+ * BLAS being row-stable in M, which is measured, not assumed. */
+static int batch_path_allowed(const mynah_asr_model *m) {
+    return m->enc.layers[0].ff1_w1.qtype != MYNAH_ASR_Q_F32 || mynah_asr_enc_batch_f32_ok();
+}
+
+int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
+                            const float *const *samples, const size_t *n_samples,
+                            mynah_asr_result_cb cb, void *const *userdata) {
+    if (!streams || !samples || !n_samples || B < 0) return -1;
+    if (B == 0) return 0;
+    if (B > MYNAH_ASR_STREAM_BATCH_MAX) return -1;
+    /* B == 1 is the single path, verbatim */
+    if (B == 1)
+        return mynah_asr_stream_feed(streams[0], samples[0], n_samples[0], cb,
+                                 userdata ? userdata[0] : NULL);
+
+    mynah_asr_model *m = streams[0]->m;
+    for (int i = 1; i < B; i++)
+        if (streams[i]->m != m) return -1;      /* a batch is drawn from one model */
+
+    /* 1. per-stream ingest: VAD and mel, exactly as a feed does */
+    for (int i = 0; i < B; i++) {
+        stream_vad_scan(streams[i], samples[i], n_samples[i]);
+        streams[i]->samples_fed += n_samples[i];
+        stream_pull_mel(streams[i], samples[i], n_samples[i]);
+    }
+
+    const int batched = batch_path_allowed(m) && model_batch_ready(m, B) == 0;
+    int ready[MYNAH_ASR_STREAM_BATCH_MAX];              /* indices into streams[] */
+    mynah_asr_enc_stream *ess[MYNAH_ASR_STREAM_BATCH_MAX];
+    const float *mels[MYNAH_ASR_STREAM_BATCH_MAX];
+    int n_mel_in[MYNAH_ASR_STREAM_BATCH_MAX], prompts[MYNAH_ASR_STREAM_BATCH_MAX];
+    float *outs[MYNAH_ASR_STREAM_BATCH_MAX];
+    int qout[MYNAH_ASR_STREAM_BATCH_MAX];
+
+    /* 2. rounds: while any stream has a complete chunk, run one stacked pass per
+     * lookahead preset (the preset fixes q, and a pass is one q). A caller that
+     * feeds need_samples per stream does exactly one round. */
+    for (;;) {
+        int n_ready = 0;
+        for (int i = 0; i < B; i++) {
+            mynah_asr_stream *s = streams[i];
+            if (s->mel_have >= mynah_asr_enc_stream_need(&s->es)) ready[n_ready++] = i;
+        }
+        if (n_ready == 0) break;
+
+        int done = 0;
+        while (done < n_ready) {
+            const int right = streams[ready[done]]->es.right;
+            int g = 0;
+            for (int i = done; i < n_ready; i++) {  /* compact the group to the front */
+                if (streams[ready[i]]->es.right != right) continue;
+                const int t = ready[i];
+                ready[i] = ready[done + g];
+                ready[done + g] = t;
+                g++;
+            }
+            if (batched && g > 1) {
+                for (int j = 0; j < g; j++) {
+                    mynah_asr_stream *s = streams[ready[done + j]];
+                    ess[j] = &s->es;
+                    mels[j] = s->mel_buf;
+                    n_mel_in[j] = mynah_asr_enc_stream_need(&s->es);
+                    prompts[j] = s->prompt;
+                    outs[j] = s->enc_buf;
+                }
+                if (mynah_asr_enc_stream_step_batch(m->batch, ess, g, mels, n_mel_in,
+                                                m->feat.n_mels, prompts, outs, qout) != 0)
+                    return -1;
+                for (int j = 0; j < g; j++) {
+                    const int i = ready[done + j];
+                    atomic_fetch_add_explicit(&g_batch_rows, (unsigned long long)qout[j],
+                                              memory_order_relaxed);
+                    if (stream_decode_emit(streams[i], qout[j], cb,
+                                           userdata ? userdata[i] : NULL) != 0)
+                        return -1;
+                }
+            } else {
+                /* a lone stream in its preset group, or the stacked path refused:
+                 * the old path, through the same API */
+                for (int j = 0; j < g; j++) {
+                    const int i = ready[done + j];
+                    mynah_asr_stream *s = streams[i];
+                    if (stream_flush_chunk(s, mynah_asr_enc_stream_need(&s->es), 0, cb,
+                                           userdata ? userdata[i] : NULL) != 0)
+                        return -1;
+                }
+            }
+            done += g;
+        }
+        /* drain whatever the mel stream still holds, then look again */
+        for (int i = 0; i < B; i++) stream_pull_mel(streams[i], NULL, 0);
+    }
+
+    for (int i = 0; i < B; i++)
+        stream_emit_eou(streams[i], cb, userdata ? userdata[i] : NULL);
     return 0;
 }
 

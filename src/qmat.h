@@ -61,6 +61,44 @@ void mynah_asr_qmat_free(mynah_asr_qmat *m);
 /* out[T, n] = x[T, k] @ W^T (PyTorch linear layout). */
 void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int T);
 
+/* ------------------------------------------------- row-stable stacked product
+ * Same product, but with the contract the batched stream step needs: output row
+ * t is BYTE-IDENTICAL to the same input row multiplied alone. Rows stacked from
+ * several streams therefore give exactly what those streams produce on their
+ * own, whatever B is (ENGINEERING.md §9: a transcript never depends on batching).
+ *
+ * Quantized weights: the native int8xint8 per-row dot kernel at ANY T, as a
+ * threaded loop over blocks of WEIGHT rows (weight-stationary: each weight row
+ * is read once and dotted against every activation row). The accumulation is
+ * integer and per row, so it is order-independent by construction — this is
+ * what makes the identity exact rather than approximate. The T > QMAT_SMALL_T
+ * dequant+sgemm fallback of mynah_asr_qmat_mul is NEVER taken here (it would
+ * change the numerics AND malloc per call).
+ *
+ * F32 weights: one cblas_sgemm over the whole [T, k] block. Row stability
+ * across M is a BLAS property, NOT a guarantee — measure it per platform
+ * (tests/test_stream_batch) before relying on it.
+ *
+ * qx/sx: caller-owned scratch, >= T*m->k int8 and >= T floats, so the call
+ * allocates nothing. NULL is allowed and falls back to the per-row path.
+ * Returns the path taken: one of MYNAH_ASR_QC_*. */
+int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out, int T,
+                        int8_t *qx, float *sx);
+
+/* Which implementation ran, counted per call (ENGINEERING.md §6: a fallback is
+ * visible). Cheap relaxed atomics; read with mynah_asr_qmat_counter. */
+enum {
+    MYNAH_ASR_QC_F32 = 0,      /* cblas_sgemm on f32 weights                     */
+    MYNAH_ASR_QC_DOT,          /* native int8 per-row dot, serial small-T path   */
+    MYNAH_ASR_QC_DOT_ROWS,     /* native int8 per-row dot, weight-stationary     */
+    MYNAH_ASR_QC_GENERIC,      /* per-row f32xint8 fallback (no native kernel)   */
+    MYNAH_ASR_QC_QGEMM,        /* opt-in MYNAH_ASR_QGEMM=1 threaded int8 GEMM    */
+    MYNAH_ASR_QC_DEQUANT,      /* dequant whole matrix + sgemm (mallocs!)        */
+    MYNAH_ASR_QC__N
+};
+unsigned long long mynah_asr_qmat_counter(int which);
+void mynah_asr_qmat_counters_reset(void);
+
 /* FFN: out = SiLU(x @ W1^T) @ W2^T. scratch >= T*w1->n floats.
  * When both are F32 it uses the backend's fused path (Metal: a single GPU sync). */
 void mynah_asr_qmat_ffn(const mynah_asr_qmat *w1, const mynah_asr_qmat *w2, const float *x,

@@ -232,6 +232,54 @@ size_t mynah_asr_stream_need_samples(const mynah_asr_stream *s);
 /* Audio seconds fed so far. */
 double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s);
 
+/* ------------------------------------------------------- batched step (S1-4)
+ * Feed B streams at once and run ONE encoder pass for all of them: the chunks
+ * that completed are stacked as a single [Sum q_i, d] activation, so each
+ * conformer layer's linears (FFN1, q/k/v/o, the pointwise convolutions, FFN2)
+ * read the weights once instead of B times. Attention (per-stream K/V cache and
+ * relative positions), the conv cache and the subsampling stay per stream, and
+ * so do the greedy decode and the callbacks.
+ *
+ * This exists because streaming ASR chunks arrive on the real-time grid: at the
+ * default preset every live stream has a chunk ready every 320 ms, so batching
+ * inside one worker is structural, not opportunistic.
+ *
+ * samples[i] / n_samples[i] is what to feed stream i — typically exactly
+ * mynah_asr_stream_need_samples(streams[i]), which gives every stream exactly one
+ * encoder chunk per call. A stream whose chunk does not complete is simply fed
+ * (its mel accumulates) and produces no callback; more than one complete chunk
+ * is handled by repeating the pass. userdata may be NULL, else it is an array of
+ * B pointers, userdata[i] going to stream i's callback.
+ *
+ * IDENTITY (ENGINEERING.md §9): every stream's text is byte-identical to the same
+ * clip fed through mynah_asr_stream_feed alone, whatever B is and whoever it was
+ * batched with. Streams may mix languages and clips freely. Streams with
+ * DIFFERENT lookahead presets are grouped automatically and run as one pass per
+ * group. All streams must belong to the same model.
+ *
+ * B == 1 takes exactly the single-stream path. The f32 weights path may also
+ * degrade to per-stream steps (cblas_sgemm is not row-stable in M on every BLAS
+ * — see mynah_asr_stream_batch_rows_stacked to check what a run actually did).
+ *
+ * THREADING: one thread at a time per model (the serving-v2 scheduler owns it).
+ * Returns 0, -1 on error.
+ *
+ * ALLOCATION: the batch scratch is carved on the first call and grown if a later
+ * call brings a larger B. Call mynah_asr_stream_batch_reserve(m, max_b) once at
+ * start-up and the step allocates nothing after that. */
+int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
+                            const float *const *samples, const size_t *n_samples,
+                            mynah_asr_result_cb cb, void *const *userdata);
+
+/* Pre-carve the batched-step scratch for up to max_b streams (sized for the
+ * model's largest lookahead preset). 0 = ok, -1 = not a streaming model / OOM. */
+int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b);
+
+/* Rows this process has pushed through the STACKED encoder path (a row = one
+ * encoder frame of one stream). 0 after a run means every step degraded to the
+ * single path — the visible-fallback rule of ENGINEERING.md §6. */
+unsigned long long mynah_asr_stream_batch_rows_stacked(void);
+
 void mynah_asr_stream_close(mynah_asr_stream *s);
 
 #ifdef __cplusplus

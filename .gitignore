@@ -55,6 +55,7 @@ tests/test_align
 tests/test_vadseg
 tests/test_tokenize
 tests/test_stream_out
+tests/test_stream_batch
 tests/test_vad
 tests/bench_throughput
 examples/minimal

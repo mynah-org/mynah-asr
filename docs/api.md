@@ -185,6 +185,39 @@ void mynah_asr_stream_close(mynah_asr_stream *s);
 - `feed` returns 0/-1; accepts any input size.
 - Memory per stream: ~12 MB of cache, independent of duration.
 
+### Batched step (several streams, one encoder pass)
+
+```c
+int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
+                            const float *const *samples, const size_t *n_samples,
+                            mynah_asr_result_cb cb, void *const *userdata);
+int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b);
+unsigned long long mynah_asr_stream_batch_rows_stacked(void);
+```
+Feeds B streams and runs **one** encoder pass over every chunk that completed:
+the rows are stacked as a single `[Σq, d]` activation, so each conformer layer's
+linears read the weights once instead of B times. Attention (per-stream K/V
+cache and relative positions), the conv cache, the subsampling, the greedy
+decode and the callbacks stay per stream. Typically `n_samples[i] =
+mynah_asr_stream_need_samples(streams[i])`, which gives each stream exactly one
+chunk per call; a stream whose chunk does not complete is simply fed.
+- **Identity**: every stream's text is byte-identical to the same clip fed alone,
+  whatever B is and whoever it was batched with — the encoder output matches
+  float for float, caches included (`tests/test_stream_batch`). Streams may mix
+  languages, clips and lookahead presets (grouped internally). `B == 1` is the
+  single path. All streams must belong to the same model.
+- **Threading**: one thread at a time per model; the batch scratch lives on the
+  model. Call `mynah_asr_stream_batch_reserve(m, cap)` once at start-up and the
+  step allocates nothing (`make test-stream-batch-allocs`).
+- **Dtype**: int8/int4 always stack (per-row integer accumulation is
+  order-independent). f32 stacks where `cblas_sgemm` has been *measured*
+  row-stable in M — on by default with Accelerate, off with OpenBLAS until its
+  own gate runs, and then the call degrades to per-stream steps through the same
+  API. `MYNAH_ASR_BATCH_F32=0|1` forces it; `stream_batch_rows_stacked()` says
+  what actually happened (0 = nothing was stacked).
+- **Finalizing** a stream is not part of this call: use `mynah_asr_stream_finish`
+  per stream for the tail.
+
 ## Audio helpers
 
 ```c
