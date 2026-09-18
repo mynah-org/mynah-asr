@@ -38,12 +38,24 @@ typedef struct {
     float *cache[3];        /* [C_in, F] last input frame of the stage */
     int cin[3], fdim[3];
     int first;
+    /* hot-path scratch, ONE malloc at init (zero allocations per step), sized
+     * for the largest chunk the stream can be fed (max_n_mel mel frames).
+     * sflat aliases sb: the pointwise GEMM has already consumed sb when the
+     * channel-major flatten runs. */
+    float *scr;
+    float *sa, *sb, *sflat, *sxp, *sim2col, *spad;
+    int pad_slices;         /* per-slice regions available in spad */
+    size_t pad_stride;      /* floats between two slices in spad */
 } mynah_asr_ss_stream;
 
 /* Back to the first-chunk state, keeping the buffers. */
 void mynah_asr_ss_stream_reset(mynah_asr_ss_stream *sst);
 
-int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampling *ss, int n_mels);
+/* max_n_mel: the largest mel chunk the stream will ever be stepped with; the
+ * per-step scratch is carved for it at init. <= 0 = no scratch (every step
+ * allocates its work buffers, the pre-S1-3 behaviour). */
+int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampling *ss,
+                         int n_mels, int max_n_mel);
 void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst);
 
 /* mel chunk [n_mel, n_mels] (EXACT size: first = 1+8r, then 8(r+1)) ->

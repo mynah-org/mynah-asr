@@ -127,11 +127,14 @@ static int argmax_bias(const float *lg, const float *bias, int V) {
  * max_symbols). No blocking over blank runs: TDT already skips frames (dur>1) and
  * the visited grid is not contiguous. */
 static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
-                             const float *enc, int T, int *tokens, int *frames, int cap) {
+                             const float *enc, int T, int *tokens, int *frames, int cap,
+                             float *scratch) {
     const int H = dec->hidden, V = dec->vocab, ND = dec->n_durations;
     const int VL = V + ND;
     float joint[1024];
-    float *logits = malloc((size_t)VL * sizeof(float));
+    const int owned = scratch == NULL;
+    float *logits = owned ? malloc((size_t)VL * sizeof(float))
+                          : scratch + (size_t)DEC_BMAX * (size_t)H;
     if (!logits) return 0;
 
     /* f32 head for the BLAS GEMM (deterministic across backends); when quantized
@@ -176,19 +179,30 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
         t += dur;
     }
     s->t_abs += T;
-    free(logits); free(wd);
+    if (owned) free(logits);
+    free(wd);
     return n_out;
 }
 
-int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
-                        const float *enc, int T, int *tokens, int *frames, int cap) {
+size_t mynah_asr_greedy_scratch_floats(const mynah_asr_decoder *dec) {
+    return (size_t)DEC_BMAX * (size_t)dec->hidden
+         + (size_t)DEC_BMAX * (size_t)(dec->vocab + dec->n_durations);
+}
+
+int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
+                                const float *enc, int T, int *tokens, int *frames, int cap,
+                                float *scratch) {
     if (dec->n_durations > 0)
-        return greedy_decode_tdt(dec, s, enc, T, tokens, frames, cap);
+        return greedy_decode_tdt(dec, s, enc, T, tokens, frames, cap, scratch);
     const int H = dec->hidden, V = dec->vocab;
     float joint[1024];
-    float *jin = malloc((size_t)DEC_BMAX * (size_t)H * sizeof(float));
-    float *logits = malloc((size_t)DEC_BMAX * (size_t)V * sizeof(float));
-    if (!jin || !logits) { free(jin); free(logits); return 0; }
+    /* caller scratch (>= mynah_asr_greedy_scratch_floats) keeps the streaming
+     * step allocation-free; NULL = allocate here, as before */
+    const int owned = scratch == NULL;
+    float *jin = owned ? malloc((size_t)DEC_BMAX * (size_t)H * sizeof(float)) : scratch;
+    float *logits = owned ? malloc((size_t)DEC_BMAX * (size_t)V * sizeof(float))
+                          : scratch + (size_t)DEC_BMAX * (size_t)H;
+    if (!jin || !logits) { if (owned) { free(jin); free(logits); } return 0; }
     int n_out = 0;
 
     /* The head as an f32 matrix for a direct BLAS GEMM (CPU: deterministic across
@@ -260,6 +274,12 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
         B = 4;                                             /* restart short after an emit */
     }
     s->t_abs += T;
-    free(jin); free(logits); free(wd);
+    if (owned) { free(jin); free(logits); }
+    free(wd);
     return n_out;
+}
+
+int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
+                        const float *enc, int T, int *tokens, int *frames, int cap) {
+    return mynah_asr_greedy_decode_scratch(dec, s, enc, T, tokens, frames, cap, NULL);
 }

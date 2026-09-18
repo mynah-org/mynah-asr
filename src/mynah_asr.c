@@ -703,6 +703,10 @@ done:
 
 /* ----------------------------------------------------------------- streaming */
 
+/* Transcript buffer reserved at open: past it the buffer doubles (amortised,
+ * never once per chunk). ~40 s of speech at a conversational rate. */
+#define STREAM_TEXT_RESERVE 8192
+
 struct mynah_asr_stream {
     mynah_asr_model *m;
     mynah_asr_mel_stream mel;
@@ -714,6 +718,8 @@ struct mynah_asr_stream {
     float *enc_buf;             /* [q, d_out] encoder output per chunk */
     int *tokens;
     int n_tokens, cap_tokens;
+    float *dec_scr;             /* greedy-decode scratch (joint input + logits) */
+    mynah_asr_detok detok;      /* incremental transcript: no re-decode per chunk */
     size_t chars_emitted;       /* bytes of text already handed to the callback */
     char lang[16];
     size_t samples_fed;
@@ -752,7 +758,13 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
     s->enc_buf = malloc((size_t)s->es.q * (size_t)m->enc.d_out * sizeof(float));
     s->cap_tokens = 4096;
     s->tokens = malloc((size_t)s->cap_tokens * sizeof(int));
-    if (!s->mel_buf || !s->enc_buf || !s->tokens) { mynah_asr_stream_close(s); return NULL; }
+    /* per-chunk scratch carved once (S1-3): after warm-up a chunk allocates nothing */
+    s->dec_scr = malloc(mynah_asr_greedy_scratch_floats(&m->dec) * sizeof(float));
+    if (!s->mel_buf || !s->enc_buf || !s->tokens || !s->dec_scr ||
+        mynah_asr_detok_init(&s->detok, STREAM_TEXT_RESERVE) != 0) {
+        mynah_asr_stream_close(s);
+        return NULL;
+    }
 
     /* endpointing: opt-in, inherited from the model. Its OWN instance, because the
      * VAD carries LSTM state across frames — sharing it would interleave two
@@ -774,7 +786,8 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
     mynah_asr_mel_stream_free(&s->mel);
     mynah_asr_enc_stream_free(&s->es);
     mynah_asr_vad_close(s->vad);
-    free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->vbuf);
+    mynah_asr_detok_free(&s->detok);
+    free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->vbuf); free(s->dec_scr);
     free(s);
 }
 
@@ -791,6 +804,7 @@ int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
     mynah_asr_dec_state_reset(&s->m->dec, &s->dec);
     s->mel_have = 0;
     s->n_tokens = 0;
+    mynah_asr_detok_reset(&s->detok);
     s->chars_emitted = 0;
     s->lang[0] = '\0';
     s->samples_fed = 0;
@@ -828,16 +842,22 @@ static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
         if (!nb) return -1;
         s->tokens = nb;
     }
-    s->n_tokens += mynah_asr_greedy_decode(&m->dec, &s->dec, s->enc_buf, q,
-                                       s->tokens + s->n_tokens, NULL,
-                                       s->cap_tokens - s->n_tokens);
+    const int added = mynah_asr_greedy_decode_scratch(&m->dec, &s->dec, s->enc_buf, q,
+                                                 s->tokens + s->n_tokens, NULL,
+                                                 s->cap_tokens - s->n_tokens, s->dec_scr);
     s->mel_have = 0;
 
+    /* Always append, even without a callback: the incremental transcript must
+     * see every token exactly once, whereas the old whole-history detokenisation
+     * could be skipped for a chunk and catch up later. */
+    char lang_tmp[16] = "";
+    const char *text = mynah_asr_detok_append(&s->detok, &m->tok,
+                                          s->tokens + s->n_tokens, added, lang_tmp);
+    s->n_tokens += added;
+    if (!text) return -1;
+    if (lang_tmp[0]) memcpy(s->lang, lang_tmp, sizeof(s->lang));
+
     if (cb) {
-        char lang_tmp[16] = "";
-        char *text = mynah_asr_detokenize(&m->tok, s->tokens, s->n_tokens, lang_tmp);
-        if (!text) return -1;
-        if (lang_tmp[0]) memcpy(s->lang, lang_tmp, sizeof(s->lang));
         const size_t total = strlen(text);
         if (total > s->chars_emitted) {
             const double t1 = (double)s->samples_fed / (double)m->feat.sample_rate;
@@ -850,7 +870,6 @@ static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
             cb(&res, ud);
             s->chars_emitted = total;
         }
-        free(text);
     }
     return 0;
 }

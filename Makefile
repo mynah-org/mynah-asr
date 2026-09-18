@@ -84,6 +84,16 @@ tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ) $(INGOT_
 tests/test_stream_out: build/tests/test_stream_out.o build/server/stream_out.o
 	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
+# Allocation counter for the S1-3 gate: a shared library inserted into the CLI's
+# process (DYLD_INSERT_LIBRARIES / LD_PRELOAD). Nothing in src/ links it.
+ifeq ($(UNAME_S),Darwin)
+  MALLOC_COUNT_LIB := tests/libmalloc_count.dylib
+else
+  MALLOC_COUNT_LIB := tests/libmalloc_count.so
+endif
+$(MALLOC_COUNT_LIB): tests/malloc_count.c
+	$(CC) -std=c11 -O2 -Wall -Wextra -fPIC -shared -o $@ $< $(if $(filter Darwin,$(UNAME_S)),,-ldl)
+
 # C vs oracle parity (Nemotron streaming + Parakeet TDT offline).
 # Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
 # with: make golden-dump
@@ -121,6 +131,13 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: $(VAD_DIR)/silero_vad.onnx or uv missing (see tests/test_vad.sh)"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@$(MAKE) --no-print-directory test-stream-allocs
+
+# S1-3: zero allocations per streaming chunk after warm-up (model-gated).
+test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
+	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP stream-allocs: model missing or interposition unavailable"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
@@ -275,7 +292,8 @@ check:
 	@python3 tools/check_repo_integrity.py
 
 clean:
-	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist
+	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist \
+	       tests/libmalloc_count.dylib tests/libmalloc_count.so
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -316,4 +334,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples test-stream-allocs cuda update-ingot

@@ -570,8 +570,15 @@ static int run_layers(const mynah_asr_encoder *enc, float *x, int T, const float
 }
 
 /* -------------------------------------------------- prompt + projector */
-void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T, int prompt_id,
-                        float *out) {
+size_t mynah_asr_encoder_post_scratch_floats(const mynah_asr_encoder *enc, int T) {
+    if (!enc->encproj_w || !enc->prompt_l1_w) return 0;
+    return (size_t)T * (size_t)(enc->d_model + enc->num_prompts)     /* cat   */
+         + (size_t)T * (size_t)enc->prompt_inter                     /* mid   */
+         + (size_t)T * (size_t)enc->d_model;                         /* fused */
+}
+
+void mynah_asr_encoder_post_scratch(const mynah_asr_encoder *enc, const float *x, int T,
+                                int prompt_id, float *out, float *scratch) {
     const int d = enc->d_model, np = enc->num_prompts, di = enc->prompt_inter;
     const int dcat = d + np;
 
@@ -588,10 +595,21 @@ void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T,
                 out[(size_t)t * (size_t)enc->d_out + (size_t)i] += enc->encproj_b[i];
         return;
     }
-    float *cat = calloc((size_t)T * (size_t)dcat, sizeof(float));
-    float *mid = malloc((size_t)T * (size_t)di * sizeof(float));
-    float *fused = malloc((size_t)T * (size_t)d * sizeof(float));
-    if (!cat || !mid || !fused) { free(cat); free(mid); free(fused); return; }
+    /* caller scratch (>= mynah_asr_encoder_post_scratch_floats) keeps the
+     * streaming step allocation-free; NULL = allocate here, as before */
+    const int owned = scratch == NULL;
+    float *cat, *mid, *fused;
+    if (owned) {
+        cat = calloc((size_t)T * (size_t)dcat, sizeof(float));
+        mid = malloc((size_t)T * (size_t)di * sizeof(float));
+        fused = malloc((size_t)T * (size_t)d * sizeof(float));
+        if (!cat || !mid || !fused) { free(cat); free(mid); free(fused); return; }
+    } else {
+        cat = scratch;
+        mid = cat + (size_t)T * (size_t)dcat;
+        fused = mid + (size_t)T * (size_t)di;
+        memset(cat, 0, (size_t)T * (size_t)dcat * sizeof(float)); /* = the calloc above */
+    }
 
     for (int t = 0; t < T; t++) {
         memcpy(cat + (size_t)t * (size_t)dcat, x + (size_t)t * (size_t)d, (size_t)d * sizeof(float));
@@ -611,7 +629,12 @@ void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T,
     matmul_wt(fused, enc->encproj_w, out, T, enc->d_out, d);
     for (int t = 0; t < T; t++)
         for (int i = 0; i < enc->d_out; i++) out[(size_t)t * (size_t)enc->d_out + (size_t)i] += enc->encproj_b[i];
-    free(cat); free(mid); free(fused);
+    if (owned) { free(cat); free(mid); free(fused); }
+}
+
+void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T, int prompt_id,
+                        float *out) {
+    mynah_asr_encoder_post_scratch(enc, x, T, prompt_id, out, NULL);
 }
 
 /* --------------------------------------------------------------- streaming */
@@ -623,7 +646,10 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
     es->left = left_ctx;
     es->right = right_ctx;
     es->q = right_ctx + 1;
-    if (mynah_asr_ss_stream_init(&es->ss, &enc->ss, n_mels) != 0) return -1;
+    /* the largest mel chunk a step can be fed (see mynah_asr_enc_stream_need:
+     * 1 + 8*right on the first chunk, 8*(right+1) afterwards) */
+    const int max_n_mel = 8 * (right_ctx + 1) + 1;
+    if (mynah_asr_ss_stream_init(&es->ss, &enc->ss, n_mels, max_n_mel) != 0) return -1;
     const size_t kv = (size_t)enc->n_layers * (size_t)left_ctx * (size_t)enc->d_model;
     const size_t cv = (size_t)enc->n_layers * (size_t)(enc->conv_k - 1) * (size_t)enc->d_model;
     es->k_cache = calloc(kv, sizeof(float));
@@ -634,6 +660,9 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
     /* single scratch for the hot path (max sizes, reused on every chunk) */
     const size_t d = (size_t)enc->d_model, ck = (size_t)enc->conv_k;
     const size_t Qm = (size_t)es->q + 2, Km = (size_t)left_ctx + Qm, Pm = 2 * Km - 1;
+    /* SiLU scratch: the FFN intermediate (Qm*ffn_dim) and the conv module's
+     * (Qm*d) share it, so it is sized for the larger of the two */
+    const size_t silu = Qm * (size_t)(enc->ffn_dim > enc->d_model ? enc->ffn_dim : enc->d_model);
     const size_t sz = Qm * d                  /* sx  */
                     + Qm * d                  /* stmp */
                     + Qm * (size_t)enc->ffn_dim /* stmp2 */
@@ -650,7 +679,9 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
                     + Qm * 2 * d              /* sc_h2 */
                     + (Qm + ck - 1) * d       /* sc_gp */
                     + Qm * d                  /* sc_c */
-                    + Qm * d;                 /* sc_t */
+                    + Qm * d                  /* sc_t */
+                    + silu                    /* ssilu */
+                    + mynah_asr_encoder_post_scratch_floats(enc, (int)Qm); /* spost */
     es->scr = malloc(sz * sizeof(float));
     if (!es->scr) return -1;
     float *p = es->scr;
@@ -672,6 +703,8 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
     CARVE(sc_gp, (Qm + ck - 1) * d);
     CARVE(sc_c, Qm * d);
     CARVE(sc_t, Qm * d);
+    CARVE(ssilu, silu);
+    CARVE(spost, mynah_asr_encoder_post_scratch_floats(enc, (int)Qm));
     #undef CARVE
     return 0;
 }
@@ -814,7 +847,7 @@ static void stream_conv_module(mynah_asr_enc_stream *es, const mynah_asr_enc_lay
         }
     }
     layer_norm_f(c, L->cnorm_w, L->cnorm_b, es->sc_t, Q, d);
-    silu_inplace(es->sc_t, (size_t)Q * (size_t)d);
+    mynah_asr_silu_scratch(es->sc_t, (size_t)Q * (size_t)d, es->ssilu);
     mynah_asr_qmat_mul(&L->pw2_w, es->sc_t, out, Q);
 }
 
@@ -848,7 +881,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         /* ½ FFN1 */
         layer_norm_f(x, L->ln_ff1_w, L->ln_ff1_b, tmp, Q, d);
         mynah_asr_qmat_mul(&L->ff1_w1, tmp, tmp2, Q);
-        silu_inplace(tmp2, (size_t)Q * (size_t)enc->ffn_dim);
+        mynah_asr_silu_scratch(tmp2, (size_t)Q * (size_t)enc->ffn_dim, es->ssilu);
         mynah_asr_qmat_mul(&L->ff1_w2, tmp2, tmp, Q);
         for (size_t i = 0; i < nd; i++) x[i] += 0.5f * tmp[i];
 
@@ -870,7 +903,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         /* ½ FFN2 + output LN */
         layer_norm_f(x, L->ln_ff2_w, L->ln_ff2_b, tmp, Q, d);
         mynah_asr_qmat_mul(&L->ff2_w1, tmp, tmp2, Q);
-        silu_inplace(tmp2, (size_t)Q * (size_t)enc->ffn_dim);
+        mynah_asr_silu_scratch(tmp2, (size_t)Q * (size_t)enc->ffn_dim, es->ssilu);
         mynah_asr_qmat_mul(&L->ff2_w2, tmp2, tmp, Q);
         for (size_t i = 0; i < nd; i++) x[i] += 0.5f * tmp[i];
         layer_norm_f(x, L->ln_out_w, L->ln_out_b, xn, Q, d);
@@ -879,7 +912,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
 
     es->cache_valid = (es->cache_valid + Q < es->left) ? es->cache_valid + Q : es->left;
 
-    mynah_asr_encoder_post(enc, x, Q, prompt_id, out);
+    mynah_asr_encoder_post_scratch(enc, x, Q, prompt_id, out, es->spost);
     return Q;
 }
 

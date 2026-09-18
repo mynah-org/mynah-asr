@@ -52,4 +52,14 @@ void mynah_asr_dec_state_reset(const mynah_asr_decoder *dec, mynah_asr_dec_state
 int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                         const float *enc, int T, int *tokens, int *frames, int cap);
 
+/* Same, with caller-owned scratch for the joint input and the logits, so a
+ * streaming step never allocates. NULL = allocate internally, i.e. exactly
+ * mynah_asr_greedy_decode. Floats required: mynah_asr_greedy_scratch_floats.
+ * NOTE: the quantized head is still dequantized into a temporary when T > 16
+ * (offline-sized calls only; a streaming chunk is q = right+1 frames). */
+size_t mynah_asr_greedy_scratch_floats(const mynah_asr_decoder *dec);
+int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
+                                const float *enc, int T, int *tokens, int *frames, int cap,
+                                float *scratch);
+
 #endif
