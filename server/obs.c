@@ -107,7 +107,7 @@ static void print_server_config(FILE *out) {
                                   i ? "," : "", g_cfg.lookaheads[i]);
     }
     fprintf(out,
-        "[SERVER-CONFIG] v=1 model_dir=%s model=%s engine=%s quant=%s "
+        "[SERVER-CONFIG] v=1 model_dir=%s model=%s group=%s engine=%s quant=%s "
         "lid_model=%s streaming=%s lookahead_default=%d lookahead_presets=%s "
         "chunk_ms=%.0f port=%d cap=%d ring_s=%d idle_ms=%d ping_ms=%d "
         "max_audio_s=%.0f max_frame_bytes=%zu max_pending=%d batch=%d "
@@ -115,6 +115,7 @@ static void print_server_config(FILE *out) {
         "metrics=%s\n",
         g_cfg.model_dir ? g_cfg.model_dir : "-",
         g_cfg.model_name ? g_cfg.model_name : "-",
+        g_cfg.group ? g_cfg.group : "-",
         g_cfg.engine ? g_cfg.engine : "-",
         g_cfg.quant ? g_cfg.quant : "-",
         g_cfg.lid_dir ? g_cfg.lid_dir : "none",
@@ -131,9 +132,20 @@ static void print_server_config(FILE *out) {
          * point an operator at a port this pid does not hold. */
         g_cfg.metrics_port <= 0 ? "off"
             : mynah_asr_prefork_worker_index() >= 0 ? "served-by-router" : "on");
-    if (g_cfg.prefork_workers > 0)
-        fprintf(out, "[SERVER-CONFIG] v=1 prefork_workers=%d prefork_threads=%d\n",
-                g_cfg.prefork_workers, g_cfg.prefork_threads);
+    if (g_cfg.prefork_workers > 0) {
+        /* One field, one token: the plan is "a=2 b=1" and this line is parsed
+         * by splitting on spaces, so the separator becomes a comma here. */
+        char plan[256];
+        const char *src = mynah_asr_prefork_model_plan();
+        size_t k = 0;
+        for (size_t i = 0; src[i] != '\0' && k + 1 < sizeof(plan); i++)
+            plan[k++] = src[i] == ' ' ? ',' : src[i];
+        if (k == 0 && sizeof(plan) > 1) plan[k++] = '-';
+        plan[k] = '\0';
+        fprintf(out, "[SERVER-CONFIG] v=1 prefork_workers=%d prefork_threads=%d "
+                     "group_plan=%s\n",
+                g_cfg.prefork_workers, g_cfg.prefork_threads, plan);
+    }
     if (g_cfg.metrics_port > 0)
         fprintf(out, "[SERVER-CONFIG] v=1 metrics_bind=%s metrics_port=%d\n",
                 g_cfg.metrics_bind ? g_cfg.metrics_bind : "127.0.0.1",
@@ -163,9 +175,14 @@ void mynah_asr_obs_health(cJSON *into) {
     cJSON_AddStringToObject(m, "engine", g_cfg.engine ? g_cfg.engine : "-");
     cJSON_AddStringToObject(m, "quant", g_cfg.quant ? g_cfg.quant : "-");
     cJSON_AddNumberToObject(m, "lookahead_default", g_cfg.lookahead_default);
-    /* The fleet's shape, so a probe on one worker can say what the whole
-     * server holds. "" in a single-language fleet. */
-    cJSON_AddStringToObject(into, "groups", mynah_asr_prefork_language_plan());
+    /* WHICH group this worker serves, and the whole fleet's plan beside it, so
+     * one probe answers both "what did I reach" and "what else is there". The
+     * plan is "" in a single-model fleet, which is itself the answer. */
+    cJSON_AddStringToObject(into, "group",
+                            g_cfg.group != NULL && g_cfg.group[0] != '\0'
+                                ? g_cfg.group
+                                : (g_cfg.model_name ? g_cfg.model_name : "-"));
+    cJSON_AddStringToObject(into, "groups", mynah_asr_prefork_model_plan());
 
     cJSON *p = cJSON_AddObjectToObject(into, "process");
     cJSON_AddNumberToObject(p, "worker", mynah_asr_prefork_worker_index());

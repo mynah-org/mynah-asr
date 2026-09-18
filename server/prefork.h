@@ -172,23 +172,31 @@
  *      See the SERVICE CAP note on that function for what is enforced here and
  *      what still needs a call site in the inference loop.
  *
- * AND THE LADDER IS PER LANGUAGE, when there is more than one. Capacity is a
- * property of a language, because a worker holds one model: an English worker's
- * free slot is of no use to an Italian request. So rung 1 picks the
- * least-loaded worker OF THAT LANGUAGE'S GROUP, rung 2's bound is
+ * AND THE LADDER IS PER MODEL GROUP, when there is more than one. Capacity is a
+ * property of a group, because a worker holds one model: a Parakeet worker's
+ * free slot is of no use to a Nemotron request. So rung 1 picks the
+ * least-loaded worker OF THAT GROUP, rung 2's bound is
  * `queue_per_worker * live workers of that group`, and rung 3's deadline is
  * checked at that group's own head.
  *
  * The queue is one array with a group tag rather than N arrays, and it is
  * scanned in arrival order per group, which gives every group its own FIFO.
  * That detail is load bearing: a single FIFO would let one entry for a
- * saturated language block a ready entry for an idle one behind it -- a fresh
+ * saturated group block a ready entry for an idle one behind it -- a fresh
  * starvation channel introduced by the very partitioning that was chosen to
  * make starvation impossible.
  *
- * A request naming a language no group holds is refused at rung 0, before any
- * of this, with `language_not_served` and a 400. See
+ * A request naming a model no group holds is refused at rung 0, before any
+ * of this, with `model_not_found` and a 404. See
  * .work/multi-model-serving.md.
+ *
+ * WHY MODELS AND NOT LANGUAGES, since this module was lifted from a TTS sibling
+ * where a group WAS a language. There a model held one language, so a language
+ * partitioned the fleet. Here one Nemotron serves forty languages and the prompt
+ * is a per-request, post-encoder one-hot: a batch may freely mix languages, and
+ * `lang` travels with the request to the worker. What cannot be mixed is the
+ * WEIGHTS. So the group is the model, and the property "a batch is one model"
+ * is a fact about the address space rather than a check somebody must remember.
  *
  * WHERE THE QUEUE LIVES, and why that differs from the reference. The
  * reference parks rungs 2 and 3 in the CHILD, because in its topology the
@@ -250,18 +258,19 @@ typedef enum {
      * which is an incident, not load. */
     MYNAH_ASR_PREFORK_REFUSE_HANDOFF_FAILED,
     /* Not a rung either, and the only one of these that is NOT a 503: the
-     * request named a language this fleet does not hold. The machine is not
-     * full and there is nothing to wait for -- no worker has those weights and
-     * none will grow them -- so the answer is 400 with
-     * `invalid_request_error`, and Retry-After is deliberately absent. Telling
-     * a client to come back for a language the server will never serve is how
-     * a refusal becomes a retry storm.
+     * request named a MODEL this fleet does not hold. The machine is not full
+     * and there is nothing to wait for -- no worker has those weights and none
+     * will grow them, residency being decided at startup and printed -- so the
+     * answer is 404 with `invalid_request_error`, the accepted set named in the
+     * message, and Retry-After deliberately absent. Telling a client to come
+     * back for a model the server will never serve is how a refusal becomes a
+     * retry storm.
      *
      * Appended last, as this enum's contract requires. See
-     * .work/multi-model-serving.md for why languages partition the fleet at
-     * all: the six PocketTTS language models share nothing, so a batch that
-     * mixed them would read the wrong weights for some of its slots. */
-    MYNAH_ASR_PREFORK_REFUSE_LANGUAGE_NOT_SERVED,
+     * .work/multi-model-serving.md for why models partition the fleet at all:
+     * one process holds one model, so a batch that mixed two would read the
+     * wrong weights for some of its slots. */
+    MYNAH_ASR_PREFORK_REFUSE_MODEL_NOT_FOUND,
     MYNAH_ASR_PREFORK_REFUSE__COUNT
 } mynah_asr_prefork_refusal;
 
@@ -281,23 +290,46 @@ typedef struct {
     int slots_per;      /* requests in flight per worker: the child's max_batch */
     int quiet;          /* suppress the banner (tests) */
 
-    /* ---- LANGUAGE GROUPS (model groups) ----
+    /* ---- MODEL GROUPS ----
      *
-     * The fleet's resident languages, in the order the caller opened their
-     * models; `languages[0]` is the default, used by a request that names none.
-     * NULL, or a count below 2, means a single-language fleet and every
-     * mechanism below is dormant -- the router is then byte-for-byte the
-     * language-agnostic one, which is what keeps the existing path unchanged.
+     * The fleet's resident model names, in the order the caller opened them;
+     * `models[0]` is the default group unless `default_model` says otherwise,
+     * and it is what a request naming no model gets. NULL, or a count below 2,
+     * means a single-model fleet and every mechanism below is dormant -- the
+     * router is then byte-for-byte the model-agnostic one, which is what keeps
+     * the existing server unchanged.
      *
      * With two or more, workers are divided into contiguous groups, one per
-     * language, and a worker holds exactly one model for its life. That is what
-     * makes "a batch never mixes languages" a fact about the address space
-     * rather than a check somebody has to remember: a batch is drawn from one
+     * model, and a worker holds exactly one model for its life. That is what
+     * makes "a batch never mixes models" a fact about the address space rather
+     * than a check somebody has to remember: a batch is drawn from one
      * process's slots, and that process has one model.
      *
      * The strings are borrowed, not copied, and must outlive the call. */
-    const char *const *languages;
-    int language_count;
+    const char *const *models;
+    int model_count;
+    /* The group a request that names no model goes to: an index into `models`.
+     * 0 (the first group) unless the caller asked for another with --default. */
+    int default_model;
+
+    /* Per-group overrides, each NULL for "the same for every group". Every one
+     * of them is what a `--model name=dir:workers=..:cpus=..:cap=..` entry
+     * carries, and every one is honoured rather than parsed and ignored: a flag
+     * that is read and dropped is worse than one that does not exist.
+     *
+     *   model_workers  processes in the group. When given, the entries must sum
+     *                  to `workers`; when they do not, the split falls back to
+     *                  even and says so.
+     *   model_slots    that group's --cap: the requests one of its workers may
+     *                  hold at once. The ladder's rung 1 is then per group in
+     *                  capacity as well as in choice.
+     *   model_cpus     cpus the group's workers share, carved contiguously out
+     *                  of the allowed mask in group order; each of its workers
+     *                  takes an equal share and, unless `threads_per` is
+     *                  explicit, that share is also its thread count. */
+    const int *model_workers;
+    const int *model_slots;
+    const int *model_cpus;
 
     /* ---- the admission ladder. Every one of these is "0 = unset", so a
      * caller that memsets this struct and never hears of the ladder gets the
@@ -399,19 +431,19 @@ void mynah_asr_prefork_reserve_threads(mynah_asr_prefork_config *cfg);
  *
  * IT USED TO SAY "and never parses HTTP", and that is now true only with a
  * qualification, so here is the qualification rather than a quietly deleted
- * clause. In a MULTI-LANGUAGE fleet the router has to know a connection's
- * language before it can choose a worker, because the worker is the thing that
- * holds the weights. What it does is bounded and NON-CONSUMING: a MSG_PEEK of
- * at most a few KiB, a search for one JSON key, and a search of the header
- * block for the two header names that announce a body. It never consumes a
- * byte -- the worker still reads the entire request itself -- and it never
- * interprets a method, a status, a framing rule or a body's meaning. A
- * connection whose prefix has not arrived yet is PARKED with its own deadline,
- * never waited on, because a router that blocks on a slow client is rung 1's
- * disease under another name.
+ * clause. In a MULTI-MODEL fleet the router has to know which model a
+ * connection is for before it can choose a worker, because the worker is the
+ * thing that holds the weights. What it does is bounded and NON-CONSUMING: a
+ * MSG_PEEK of at most a few KiB, a search of the request line's query for
+ * `model=`, and a search of the body for a multipart field named `model`. It
+ * never consumes a byte -- the worker still reads the entire request itself --
+ * and it never interprets a method, a route, a status, a framing rule or a
+ * body's meaning. A connection whose prefix has not arrived yet is PARKED with
+ * its own deadline, never waited on, because a router that blocks on a slow
+ * client is rung 1's disease under another name.
  *
- * In a single-language fleet none of that code runs at all. That is not an
- * optimisation; it is the guarantee that adding languages did not change the
+ * In a single-model fleet none of that code runs at all. That is not an
+ * optimisation; it is the guarantee that adding models did not change the
  * server everybody already has. */
 mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg,
                                      volatile sig_atomic_t *stop,
@@ -424,41 +456,48 @@ int mynah_asr_prefork_worker_index(void);
 /* The threads-per-worker actually in force, or 0 outside a worker. */
 int mynah_asr_prefork_worker_threads(void);
 
-/* ------------------------------------------------------- language groups */
+/* ---------------------------------------------------------- model groups */
 
-/* Which language group this worker was assigned -- an index into the
- * `languages` array the parent was given. 0 outside a prefork worker and in a
- * single-language fleet, which is why a caller with one model can read it
- * unconditionally and always get the one model it has.
+/* Which model group this worker was assigned -- an index into the `models`
+ * array the parent was given. 0 outside a prefork worker and in a single-model
+ * fleet, which is why a caller with one model can read it unconditionally and
+ * always get the one model it has.
  *
  * This is the ONLY thing that tells a worker which model is its own, and it is
  * resolved before the fork so a worker can never disagree with the router
  * about what it holds. */
-int mynah_asr_prefork_worker_language(void);
+int mynah_asr_prefork_worker_model(void);
 
-/* The fleet's capacity split as one printable line -- "english=2 italian=2" --
- * or "" when the fleet holds one language. Resolved before the fork and
+/* The fleet's capacity split as one printable line -- "nemotron=2 parakeet=1" --
+ * or "" when the fleet holds one model. Resolved before the fork and
  * inherited, so a WORKER can print the whole fleet's shape in its own banner
  * and in /health even though it holds one model. Config that is printed is
  * config that can be argued with; config that is assumed has been wrong twice
  * in this repository already. */
-const char *mynah_asr_prefork_language_plan(void);
+const char *mynah_asr_prefork_model_plan(void);
 
-/* Resolves a requested language name against a set of resident ones. Returns
- * the index, -1 when nothing matches, or -2 when the name is AMBIGUOUS.
+/* The accepted set as one comma-separated line -- "nemotron, parakeet" -- or ""
+ * when the fleet holds one model. Published before the fork and inherited, so
+ * the router's 404 and a worker's own 404 name the SAME set; two places that
+ * each built the list would be two places that could disagree about what is
+ * served, which is the most confusing 404 this feature could produce. */
+const char *mynah_asr_prefork_model_set(void);
+
+/* Resolves a requested model name against the resident ones. Returns the index,
+ * -1 when nothing matches, or -2 when the name is AMBIGUOUS.
  *
  * The rule, in one place because the router and the worker must not drift:
  * case-insensitive exact match first; failing that, a case-insensitive prefix
- * of at least two characters that matches exactly one resident name. So `it`
- * and `Italian` both reach a model that calls itself `italian`, which matters
- * because PocketTTS models spell languages out while Magpie models use ISO
- * codes, and a client should not have to know which spelling a model chose.
+ * of at least two characters that matches exactly one resident name. So
+ * `nemo` and `Nemotron-3.5-ASR-streaming-0.6b` both reach a group that calls
+ * itself `nemotron-3.5-asr-streaming-0.6b`, which matters because the name a
+ * pack gives itself is long and a client should not have to paste it.
  *
  * Ambiguity is refused rather than resolved: picking one of two plausible
- * languages is a wrong answer, and a wrong answer here is a whole utterance in
- * the wrong voice. `want` of NULL or "" returns -1, meaning "unspecified" --
- * the caller decides that means the default, not that it is an error. */
-int mynah_asr_prefork_language_match(const char *const *names, int count,
+ * models is a wrong answer, and a wrong answer here is a transcript from the
+ * wrong weights. `want` of NULL or "" returns -1, meaning "unspecified" -- the
+ * caller decides that means the default group, not that it is an error. */
+int mynah_asr_prefork_model_match(const char *const *names, int count,
                                  const char *want);
 
 /* Exactly once per connection the worker was handed, when it is finished with

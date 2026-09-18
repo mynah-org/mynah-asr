@@ -63,6 +63,53 @@ static int    g_default_preset_index;
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
+/* ------------------------------------------------------------ model groups
+ *
+ * SEVERAL MODELS IN ONE FLEET (S2-6). One process holds ONE model -- that is
+ * the decision the whole serving design rests on, because a batch is drawn
+ * from one process's slots and therefore reads one set of weights by the shape
+ * of the address space rather than by a check somebody has to remember. So
+ * "several models" is several WORKER GROUPS, not a registry inside one
+ * address space.
+ *
+ * The table below is the fleet's plan, and it is the SAME table in every
+ * process: the parent builds it, opens every model in it, and forks. A child
+ * then keeps exactly one model -- its group's -- and closes the rest, so the
+ * mapped weights of the model it serves are COW-shared with the parent and the
+ * weights of the others cost it nothing. The table's NAMES survive that close
+ * in every worker, which is what lets any worker answer /v1/models for the
+ * whole fleet and refuse a request that named a model it does not hold.
+ *
+ * Note what is NOT a group: a LANGUAGE. One Nemotron serves forty of them and
+ * the prompt is a per-request post-encoder one-hot, so a batch may freely mix
+ * languages and `lang` travels with the request. Routing is by model only. */
+#define MAX_GROUPS 16
+
+typedef struct {
+    char  name[96];           /* what `?model=` and `--default` match against */
+    char  pack[96];           /* "name" from the pack's own mynah.json        */
+    const char *dir;          /* the pack; borrowed from argv                 */
+    int   workers;            /* :workers= — 0 = unset                        */
+    int   cpus;               /* :cpus=    — 0 = unset                        */
+    int   cap;                /* :cap=     — 0 = the fleet's --cap            */
+    int   quant;              /* :quant=   — the fleet's --quant when unset   */
+    int   lookahead;          /* :lookahead= — -1 = the pack's own default    */
+    mynah_asr_model *model;   /* opened in the PARENT, before the fork        */
+    char  engine[64];
+    double encoder_frame_ms;
+    int   default_preset_index;
+} model_group;
+
+static model_group g_groups[MAX_GROUPS];
+static int g_n_groups;
+static int g_group;                    /* the group THIS process serves */
+static int g_default_group;            /* --default: the group a request naming none gets */
+
+/* Defined with the rest of the group machinery, below the argument parser it
+ * belongs to; declared here because both request paths -- the WebSocket query
+ * and the REST form -- ask it the same question before they do any work. */
+static int check_model_name(const char *want, char *msg, size_t cap);
+
 /* Per-stream service limits (S2-3). Every one of them bounds what ONE connection
  * can cost this worker: time without saying anything, audio, frame size,
  * buffered PCM. A cap that fires is always announced -- an `error` frame with a
@@ -227,6 +274,11 @@ typedef struct {
     const uint8_t *file;
     size_t file_len;
     char language[24], response_format[24], target_language[8];
+    /* The group the client asked for. Read here as well as by the router,
+     * because the router classifies on a bounded prefix and this worker reads
+     * the whole body: the two must agree, and where they cannot, this one is
+     * the one that can refuse rather than answer from the wrong weights. */
+    char model[96];
     int lookahead;
 } form_data;
 
@@ -266,6 +318,9 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
         if (strcmp(name, "file") == 0) {
             out->file = data;
             out->file_len = data_len;
+        } else if (strcmp(name, "model") == 0 && data_len < sizeof(out->model)) {
+            memcpy(out->model, data, data_len);
+            out->model[data_len] = '\0';
         } else if (strcmp(name, "language") == 0 && data_len < sizeof(out->language)) {
             memcpy(out->language, data, data_len);
             out->language[data_len] = '\0';
@@ -293,7 +348,7 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
  * Returns 1 when it took ownership of `fd` (a refusal closed it), 0 when the
  * descriptor is still the caller's. */
 static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
-                             size_t body_len, int translate) {
+                             size_t body_len, const char *query, int translate) {
     form_data f = {.lookahead = -1, .language = "auto", .response_format = "json"};
 
     const char *ct = strstr(headers, "Content-Type:");
@@ -310,6 +365,42 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
         f.file_len = body_len;
     }
     if (!f.file || f.file_len < 44) { send_error(fd, 400, "missing audio file (multipart 'file' or raw WAV body)"); return 0; }
+
+    /* WHICH MODEL, checked before any work: the request may name it in the form
+     * or in the query, and either way this worker holds exactly one. The router
+     * normally decided from the same value; this is what makes a request that
+     * slipped past the classifier a refusal instead of a wrong transcript. */
+    {
+        char want[96] = "";
+        if (f.model[0] != '\0') snprintf(want, sizeof(want), "%s", f.model);
+        else if (query != NULL) {
+            const char *q = query;
+            while (*q != '\0') {
+                const char *amp = strchr(q, '&');
+                const size_t seg = amp != NULL ? (size_t)(amp - q) : strlen(q);
+                if (seg > 6 && strncmp(q, "model=", 6) == 0) {
+                    const size_t vlen = seg - 6;
+                    snprintf(want, sizeof(want), "%.*s",
+                             (int)(vlen < sizeof(want) ? vlen : sizeof(want) - 1), q + 6);
+                    break;
+                }
+                if (amp == NULL) break;
+                q = amp + 1;
+            }
+        }
+        /* 192, not more: refuse_json assembles the body into 288 bytes and a
+         * message that does not fit is dropped whole rather than truncated, so
+         * the cap here is what keeps the refusal deliverable. */
+        char msg[192];
+        const int st = check_model_name(want, msg, sizeof(msg));
+        if (st != 0) {
+            refuse_json(fd, st, "Not Found", "invalid_request_error",
+                        "model_not_found", msg);
+            return 1;
+        }
+    }
+
+    if (f.lookahead < 0) f.lookahead = g_groups[g_group].lookahead;   /* :lookahead= */
 
     char src_lang[24];
     snprintf(src_lang, sizeof(src_lang), "%s", f.language);
@@ -484,7 +575,11 @@ typedef struct {
 static int ws_parse_query(const char *query, ws_params *p, const char **code,
                           char *msg, size_t msgcap) {
     snprintf(p->lang, sizeof(p->lang), "auto");
-    p->lookahead = -1;
+    /* The group's `:lookahead=`, when it named one: a per-group default preset
+     * is what lets two models in one fleet be served at two different latencies
+     * without every client having to know which. -1 keeps the pack's own
+     * default, which is what a group that named none gets. */
+    p->lookahead = g_groups[g_group].lookahead;
     p->f32 = 0;
     if (query == NULL || query[0] == '\0') return 0;
 
@@ -505,15 +600,14 @@ static int ws_parse_query(const char *query, ws_params *p, const char **code,
         if (klen == 0) {
             /* an empty segment ("a=1&&b=2"): nothing to read, nothing to refuse */
         } else if (strcmp(key, "model") == 0) {
-            /* What /v1/models lists is what this accepts; there is one model per
-             * process, so naming another one is a 404 and never a wait. */
-            if (val[0] != '\0' && strcmp(val, g_model_name) != 0) {
-                refuse_token(val, tok, sizeof(tok));
-                snprintf(msg, msgcap, "no model '%s' here; this server serves '%s'",
-                         tok, g_model_name);
-                *code = "model_not_found";
-                return 404;
-            }
+            /* The router already chose this worker from this very parameter, so
+             * in a well-classified fleet this check never fires. It is here for
+             * the two shapes where it can: a single-process server, and a
+             * connection the router had to default because the name was not in
+             * the prefix it could see. Answering from the wrong weights is the
+             * failure that must never happen, so the worker checks too. */
+            const int st = check_model_name(val, msg, msgcap);
+            if (st != 0) { *code = "model_not_found"; (void)tok; return st; }
         } else if (strcmp(key, "lang") == 0) {
             if (val[0] == '\0') {
                 snprintf(p->lang, sizeof(p->lang), "auto");
@@ -972,12 +1066,27 @@ static void handle_conn(int fd) {
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+        /* THE ACTUAL TABLE, not this worker's own model. Every worker holds the
+         * fleet's plan -- the names survive the close of the other groups'
+         * weights -- so whichever worker answers, the list is the same list the
+         * router routes by and the same one a `model_not_found` quotes. This is
+         * what replaced a hard-coded name. */
         cJSON *j = cJSON_CreateObject();
         cJSON *arr = cJSON_AddArrayToObject(j, "data");
-        cJSON *m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "id", g_model_name);
-        cJSON_AddStringToObject(m, "object", "model");
-        cJSON_AddItemToArray(arr, m);
+        for (int i = 0; i < g_n_groups; i++) {
+            cJSON *m = cJSON_CreateObject();
+            cJSON_AddStringToObject(m, "id", g_groups[i].name);
+            cJSON_AddStringToObject(m, "object", "model");
+            cJSON_AddStringToObject(m, "owned_by", "mynah");
+            cJSON_AddStringToObject(m, "engine", g_groups[i].engine);
+            /* True of the GROUP, answered from its pack rather than from this
+             * process: a client choosing where to open a WebSocket needs to
+             * know which groups can stream before it tries one. */
+            cJSON_AddBoolToObject(m, "streaming",
+                                  g_groups[i].encoder_frame_ms > 0.0 ? 1 : 0);
+            if (i == g_default_group) cJSON_AddBoolToObject(m, "default", 1);
+            cJSON_AddItemToArray(arr, m);
+        }
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/audio/stream") == 0) {
@@ -1015,7 +1124,7 @@ static void handle_conn(int fd) {
             have += (size_t)r;
         }
         if (have == content_len) {
-            const int taken = handle_transcribe(fd, hdr, body, content_len, translate);
+            const int taken = handle_transcribe(fd, hdr, body, content_len, query, translate);
             free(body);
             if (taken) return;
         } else {
@@ -1059,9 +1168,9 @@ static void prepare_client_fd(int fd) {
  * library, because the server needs it before it needs anything else and
  * because these three fields are description, not weights. A directory without
  * them still serves; it just cannot name itself. */
-static void read_model_meta(const char *model_dir) {
+static void read_model_meta(model_group *g) {
     char path[1024];
-    snprintf(path, sizeof(path), "%s/mynah.json", model_dir);
+    snprintf(path, sizeof(path), "%s/mynah.json", g->dir);
     FILE *f = fopen(path, "rb");
     if (f == NULL) return;
     fseek(f, 0, SEEK_END);
@@ -1077,23 +1186,192 @@ static void read_model_meta(const char *model_dir) {
     free(buf);
     if (j == NULL) return;
     const cJSON *v = cJSON_GetObjectItem(j, "name");
-    if (cJSON_IsString(v)) snprintf(g_model_name, sizeof(g_model_name), "%s", v->valuestring);
+    /* The pack's own name becomes the group's name when the CLI did not give
+     * one: a fleet started with a bare `-m dir` must still be routable by the
+     * name /v1/models prints, and that name can only come from here. */
+    if (cJSON_IsString(v)) {
+        snprintf(g->pack, sizeof(g->pack), "%s", v->valuestring);
+        if (g->name[0] == '\0')
+            snprintf(g->name, sizeof(g->name), "%s", v->valuestring);
+    }
     v = cJSON_GetObjectItem(j, "engine");
-    if (cJSON_IsString(v)) snprintf(g_model_engine, sizeof(g_model_engine), "%s", v->valuestring);
+    if (cJSON_IsString(v)) snprintf(g->engine, sizeof(g->engine), "%s", v->valuestring);
     const cJSON *st = cJSON_GetObjectItem(j, "streaming");
     if (cJSON_IsObject(st)) {
         v = cJSON_GetObjectItem(st, "encoder_frame_ms");
-        if (cJSON_IsNumber(v)) g_encoder_frame_ms = v->valuedouble;
+        if (cJSON_IsNumber(v)) g->encoder_frame_ms = v->valuedouble;
         v = cJSON_GetObjectItem(st, "default_preset_index");
-        if (cJSON_IsNumber(v)) g_default_preset_index = v->valueint;
+        if (cJSON_IsNumber(v)) g->default_preset_index = v->valueint;
     }
     cJSON_Delete(j);
 }
 
+/* ------------------------------------------------------ --model, the parser
+ *
+ * `name=dir[:workers=W][:cpus=N][:cap=C][:quant=int8|int4|f32][:lookahead=L]`
+ * and, for the shape `-m` has always had, a bare `dir` whose name then comes
+ * from the pack's own mynah.json.
+ *
+ * The directory is everything up to the first `:` that starts a KNOWN option,
+ * so a path containing a colon still works. A `:word=` that is NOT one of the
+ * five options is an ERROR rather than something silently folded into the
+ * path: a typo in `:wrokers=4` that quietly produced a one-worker group is
+ * exactly the kind of mis-plan this repository refuses to ship.
+ *
+ * `spec` is modified in place (it is argv, which lives as long as the process)
+ * and `g->dir` points into it. Returns 0, or -1 having said why on stderr. */
+static const char *const OPT_KEYS[] = { "workers", "cpus", "cap", "quant",
+                                        "lookahead", NULL };
+
+/* The option starting at `s[at]`, or -1 when nothing does. -2 means "this
+ * looks like an option and is not one", which is a typo and not a path. */
+static int opt_at(const char *s, size_t at) {
+    if (s[at] != ':') return -1;
+    for (int k = 0; OPT_KEYS[k] != NULL; k++) {
+        const size_t n = strlen(OPT_KEYS[k]);
+        if (strncmp(s + at + 1, OPT_KEYS[k], n) == 0 && s[at + 1 + n] == '=') return k;
+    }
+    size_t j = at + 1;
+    while ((s[j] >= 'a' && s[j] <= 'z') || s[j] == '_' || s[j] == '-') ++j;
+    return (j > at + 1 && s[j] == '=') ? -2 : -1;
+}
+
+static int parse_quant_name(const char *v, int *out) {
+    if (strcmp(v, "int8") == 0) { *out = MYNAH_ASR_QUANT_INT8; return 0; }
+    if (strcmp(v, "int4") == 0) { *out = MYNAH_ASR_QUANT_INT4; return 0; }
+    if (strcmp(v, "f32") == 0)  { *out = MYNAH_ASR_QUANT_F32;  return 0; }
+    return -1;
+}
+
+#define MAX_SPEC_OPTS 8
+
+static int parse_model_spec(char *spec, model_group *g) {
+    memset(g, 0, sizeof(*g));
+    g->quant = -1;
+    g->lookahead = -1;
+
+    char *rest = spec;
+    char *eq = strchr(spec, '=');
+    char *colon = strchr(spec, ':');
+    /* `name=` only when the `=` comes before any option separator: in
+     * `dir:cap=4` the first `=` belongs to an option, not to a name. */
+    if (eq != NULL && (colon == NULL || eq < colon)) {
+        *eq = '\0';
+        if (spec[0] == '\0') {
+            fprintf(stderr, "mynah-asr-server: --model: empty name before '='\n");
+            return -1;
+        }
+        snprintf(g->name, sizeof(g->name), "%s", spec);
+        rest = eq + 1;
+    }
+
+    int keys[MAX_SPEC_OPTS];
+    size_t at[MAX_SPEC_OPTS];
+    int n_opt = 0;
+    for (size_t j = 0; rest[j] != '\0'; j++) {
+        const int k = opt_at(rest, j);
+        if (k == -1) continue;
+        if (k == -2) {
+            fprintf(stderr, "mynah-asr-server: --model '%s': unknown option at ':%.16s'; "
+                            "accepted: workers, cpus, cap, quant, lookahead\n",
+                    spec, rest + j + 1);
+            return -1;
+        }
+        if (n_opt >= MAX_SPEC_OPTS) {
+            fprintf(stderr, "mynah-asr-server: --model '%s': too many options\n", spec);
+            return -1;
+        }
+        keys[n_opt] = k;
+        at[n_opt] = j;
+        ++n_opt;
+    }
+    for (int a = 0; a < n_opt; a++) rest[at[a]] = '\0';   /* each value now ends at a NUL */
+    for (int a = 0; a < n_opt; a++) {
+        char *val = rest + at[a] + 1 + strlen(OPT_KEYS[keys[a]]) + 1;
+        if (val[0] == '\0') {
+            fprintf(stderr, "mynah-asr-server: --model '%s': ':%s=' has no value\n",
+                    spec, OPT_KEYS[keys[a]]);
+            return -1;
+        }
+        switch (keys[a]) {
+            case 0: g->workers = atoi(val); break;
+            case 1: g->cpus = atoi(val); break;
+            case 2: g->cap = atoi(val); break;
+            case 3:
+                if (parse_quant_name(val, &g->quant) != 0) {
+                    fprintf(stderr, "mynah-asr-server: --model '%s': quant '%s' is not "
+                                    "one of int8, int4, f32\n", spec, val);
+                    return -1;
+                }
+                break;
+            case 4: g->lookahead = atoi(val); break;
+            default: break;
+        }
+    }
+    g->dir = rest;
+    if (g->dir[0] == '\0') {
+        fprintf(stderr, "mynah-asr-server: --model: empty model directory\n");
+        return -1;
+    }
+    if (g->workers < 0 || g->cpus < 0 || g->cap < 0) {
+        fprintf(stderr, "mynah-asr-server: --model '%s': workers/cpus/cap cannot be "
+                        "negative\n", spec);
+        return -1;
+    }
+    return 0;
+}
+
+/* The group names, as prefork wants them and as every refusal quotes them. */
+static const char *g_group_names[MAX_GROUPS];
+static const char *const *group_name_table(void) {
+    for (int i = 0; i < g_n_groups; i++) g_group_names[i] = g_groups[i].name;
+    return g_group_names;
+}
+
+/* A model name a client asked for, checked against the fleet from INSIDE a
+ * worker. Returns 0 when it is this worker's own (or unspecified), and 404
+ * with `msg` filled otherwise.
+ *
+ * Two different failures share the 404, and the message is what separates
+ * them, because the action a client must take differs:
+ *   - a name nobody serves: the accepted set is named, and that is the end;
+ *   - a name ANOTHER group serves, which means the router could not see it in
+ *     the bounded prefix it classifies on -- a multipart `model` field sitting
+ *     after the audio. Serving it here would answer from the wrong weights,
+ *     which is the one outcome that must never happen, so it is refused and
+ *     the message says where to put the name instead. */
+static int check_model_name(const char *want, char *msg, size_t cap) {
+    if (want == NULL || want[0] == '\0') return 0;
+    const int at2 = mynah_asr_prefork_model_match(group_name_table(), g_n_groups, want);
+    if (at2 == g_group) return 0;
+    char tok[64];
+    refuse_token(want, tok, sizeof(tok));
+    const char *set = mynah_asr_prefork_model_set();
+    if (at2 >= 0) {
+        snprintf(msg, cap, "'%s' is another group of this fleet, and this request "
+                           "reached '%s': name the model in ?model= or before the file "
+                           "in the form, where the router can see it",
+                 tok, g_groups[g_group].name);
+    } else if (set != NULL && set[0] != '\0') {
+        snprintf(msg, cap, "no model '%s' here; this fleet serves: %s", tok, set);
+    } else {
+        snprintf(msg, cap, "no model '%s' here; this server serves '%s'",
+                 tok, g_groups[g_group].name);
+    }
+    return 404;
+}
 static void usage(void) {
     fprintf(stderr,
         "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8] [--quant int8|int4]\n"
         "       [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n"
+        "       [--model name=dir[:workers=W][:cpus=N][:cap=C][:quant=int8|int4|f32][:lookahead=L]]\n"
+        "                            one MODEL GROUP, repeatable. One process holds one model,\n"
+        "                            so several --model imply --prefork: if you do not give one\n"
+        "                            the group count becomes it. Requests choose a group with\n"
+        "                            ?model= (WebSocket and REST) or a multipart `model` field;\n"
+        "                            an unknown name is 404 model_not_found. -m is one group\n"
+        "                            named by its own mynah.json.\n"
+        "       [--default <name>]   the group a request naming no model gets (default: the first)\n"
         "       [--lid-model <dir>]  detector for language=auto on models that\n"
         "                            cannot detect it themselves (Canary)\n"
         "       [--prefork W] [--prefork-threads T] [--cap C]\n"
@@ -1130,13 +1408,23 @@ int main(int argc, char **argv) {
         return mynah_asr_dispatch_print(stdout, json) < 0 ? 1 : 0;
     }
 
-    const char *model_dir = NULL, *lid_dir = NULL;
+    const char *model_dir = NULL, *lid_dir = NULL, *default_name = NULL;
     int port = 8090, n_threads = 4;
     int prefork_workers = 0, prefork_threads = 0, cap = 0, plan_only = 0;
     int metrics_port = 0;
     const char *metrics_bind = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            if (g_n_groups >= MAX_GROUPS) {
+                fprintf(stderr, "mynah-asr-server: at most %d --model groups\n",
+                        MAX_GROUPS);
+                return 2;
+            }
+            if (parse_model_spec(argv[++i], &g_groups[g_n_groups]) != 0) return 2;
+            ++g_n_groups;
+        }
+        else if (strcmp(argv[i], "--default") == 0 && i + 1 < argc) default_name = argv[++i];
         else if (strcmp(argv[i], "--lid-model") == 0 && i + 1 < argc) lid_dir = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
@@ -1190,9 +1478,135 @@ int main(int argc, char **argv) {
         mynah_asr_prefork_print_plan(&pf, stdout);
         return 0;
     }
-    if (!model_dir) { usage(); return 2; }
+    /* ---- the fleet's plan, resolved before anything is opened -------------
+     *
+     * `-m dir` is one more group named by its own pack, which is what keeps
+     * every existing invocation working unchanged: one group is the
+     * single-model server this file has always been, and every group-aware
+     * branch below collapses. */
+    if (model_dir != NULL) {
+        if (g_n_groups >= MAX_GROUPS) {
+            fprintf(stderr, "mynah-asr-server: at most %d model groups\n", MAX_GROUPS);
+            return 2;
+        }
+        memset(&g_groups[g_n_groups], 0, sizeof(g_groups[0]));
+        g_groups[g_n_groups].dir = model_dir;
+        g_groups[g_n_groups].quant = -1;
+        g_groups[g_n_groups].lookahead = -1;
+        ++g_n_groups;
+    }
+    if (g_n_groups == 0) { usage(); return 2; }
     if (prefork_workers < 0) { usage(); return 2; }
-    /* BEFORE the model is opened: the pool resolves its width once, on first
+
+    for (int i = 0; i < g_n_groups; i++) {
+        read_model_meta(&g_groups[i]);
+        if (g_groups[i].name[0] == '\0') {
+            /* A pack with no name of its own still has to be routable, so the
+             * directory's last component becomes the name and the banner shows
+             * what happened. Never a made-up "model0": a name nobody can guess
+             * is a name nobody can send. */
+            const char *base = strrchr(g_groups[i].dir, '/');
+            base = (base != NULL && base[1] != '\0') ? base + 1 : g_groups[i].dir;
+            snprintf(g_groups[i].name, sizeof(g_groups[i].name), "%s", base);
+            fprintf(stderr, "mynah-asr-server: %s has no \"name\" in mynah.json; "
+                            "this group is called '%s'\n",
+                    g_groups[i].dir, g_groups[i].name);
+        }
+        if (g_groups[i].quant < 0) g_groups[i].quant = g_quant;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(g_groups[i].name, g_groups[j].name) != 0) continue;
+            fprintf(stderr, "mynah-asr-server: two groups are both called '%s'. "
+                            "A name is how a request chooses its weights, so two "
+                            "groups with one name is a routing table that cannot "
+                            "answer; give one of them `--model othername=%s`\n",
+                    g_groups[i].name, g_groups[i].dir);
+            return 2;
+        }
+    }
+
+    /* --default: which group a request that names no model gets. */
+    g_default_group = 0;
+    if (default_name != NULL) {
+        const int at = mynah_asr_prefork_model_match(group_name_table(), g_n_groups,
+                                                     default_name);
+        if (at < 0) {
+            fprintf(stderr, "mynah-asr-server: --default '%s' names no group%s\n",
+                    default_name, at == -2 ? " unambiguously" : "");
+            return 2;
+        }
+        g_default_group = at;
+    }
+
+    /* ---- how many workers each group gets --------------------------------
+     *
+     * More than one model IMPLIES prefork, because one process holds one model:
+     * there is no shape in which a single process serves two groups. When
+     * --prefork was not given the group count becomes it, and the banner says
+     * that it did rather than leaving an operator to infer a topology. When it
+     * WAS given and does not fit the groups, that is an error: dropping a model
+     * the operator asked for, silently, is the failure this whole feature is
+     * supposed to make impossible. */
+    int grp_workers[MAX_GROUPS], grp_slots[MAX_GROUPS], grp_cpus[MAX_GROUPS];
+    int have_cpus = 0, have_slots = 0;
+    for (int i = 0; i < g_n_groups; i++) {
+        grp_workers[i] = g_groups[i].workers;
+        grp_slots[i] = g_groups[i].cap > 0 ? g_groups[i].cap : cap;
+        grp_cpus[i] = g_groups[i].cpus;
+        if (g_groups[i].cap > 0) have_slots = 1;
+        if (g_groups[i].cpus > 0) have_cpus = 1;
+    }
+    if (g_n_groups > 1) {
+        int want = 0, unspec = 0;
+        for (int i = 0; i < g_n_groups; i++) {
+            if (grp_workers[i] > 0) want += grp_workers[i];
+            else ++unspec;
+        }
+        if (prefork_workers == 0) {
+            prefork_workers = want + unspec;
+            fprintf(stderr, "mynah-asr-server: %d model groups imply prefork; "
+                            "--prefork was not given, so it is %d "
+                            "(one process holds one model)\n",
+                    g_n_groups, prefork_workers);
+        }
+        if (prefork_workers < g_n_groups) {
+            fprintf(stderr, "mynah-asr-server: --prefork %d cannot hold %d model "
+                            "groups; a group with no worker could not be served and "
+                            "would have to be dropped silently. Ask for at least "
+                            "%d workers.\n",
+                    prefork_workers, g_n_groups, g_n_groups);
+            return 2;
+        }
+        if (unspec == 0) {
+            if (want != prefork_workers) {
+                fprintf(stderr, "mynah-asr-server: the per-model `:workers=` counts sum "
+                                "to %d but --prefork says %d. They are the same number; "
+                                "drop one of them rather than leaving the server to "
+                                "guess which you meant.\n", want, prefork_workers);
+                return 2;
+            }
+        } else {
+            const int left = prefork_workers - want;
+            if (left < unspec) {
+                fprintf(stderr, "mynah-asr-server: `:workers=` already claims %d of the "
+                                "%d workers, leaving %d for the %d groups that named "
+                                "none. Raise --prefork to at least %d.\n",
+                        want, prefork_workers, left, unspec, want + unspec);
+                return 2;
+            }
+            const int base = left / unspec, extra = left % unspec;
+            int k = 0;
+            for (int i = 0; i < g_n_groups; i++) {
+                if (grp_workers[i] > 0) continue;
+                grp_workers[i] = base + (k < extra ? 1 : 0);
+                ++k;
+            }
+        }
+    } else if (grp_workers[0] > 0 && prefork_workers == 0) {
+        prefork_workers = grp_workers[0];   /* `--model x=dir:workers=4` alone */
+    }
+
+    pf.workers = prefork_workers;
+    /* BEFORE any model is opened: the pool resolves its width once, on first
      * use, so MYNAH_ASR_THREADS has to be right before anything can dispatch. */
     if (prefork_workers > 0) {
         mynah_asr_prefork_reserve_threads(&pf);
@@ -1213,22 +1627,39 @@ int main(int argc, char **argv) {
         sa.sa_flags = SA_RESTART;
         sigaction(SIGUSR1, &sa, NULL);
     }
-    read_model_meta(model_dir);
-    g_model = mynah_asr_load_quant(model_dir, g_quant);
-    if (!g_model) return 1;
+
+    /* ---- every model, opened HERE, in the parent, before the fork ---------
+     *
+     * Two things follow from that and both are load bearing. The weights are
+     * mapped once and the fork makes them COW-shared, so N groups cost one copy
+     * of each pack rather than one per worker; and a path that cannot be opened
+     * is a STARTUP failure, with nothing yet forked and nothing yet listening,
+     * rather than a group that quietly answers 503 forever. */
+    for (int i = 0; i < g_n_groups; i++) {
+        g_groups[i].model = mynah_asr_load_quant(g_groups[i].dir, g_groups[i].quant);
+        if (g_groups[i].model == NULL) {
+            fprintf(stderr, "mynah-asr-server: could not open the model for group "
+                            "'%s' (%s); refusing to start\n",
+                    g_groups[i].name, g_groups[i].dir);
+            for (int j = 0; j < i; j++) mynah_asr_free(g_groups[j].model);
+            return 1;
+        }
+    }
     if (lid_dir) {
-        g_lid = mynah_asr_load_quant(lid_dir, g_quant);
-        if (!g_lid) return 1;
+        /* NOT a group: a detector in front of the models that cannot detect.
+         * It is resident in the parent like every group's weights, so every
+         * worker inherits it COW and none of them routes to it. */
+        g_lid = mynah_asr_load_quant(lid_dir, g_groups[g_default_group].quant);
+        if (!g_lid) {
+            for (int i = 0; i < g_n_groups; i++) mynah_asr_free(g_groups[i].model);
+            return 1;
+        }
         if (!mynah_asr_can_detect_lang(g_lid)) {
             fprintf(stderr, "mynah-asr-server: %s cannot detect the language "
                             "(use a model with an 'auto' prompt, e.g. nemotron)\n", lid_dir);
-            return 1;
-        }
-        if (mynah_asr_can_detect_lang(g_model)) {   /* it would never be consulted */
-            fprintf(stderr, "mynah-asr-server: --lid-model ignored, the served model "
-                            "detects the language itself\n");
             mynah_asr_free(g_lid);
-            g_lid = NULL;
+            for (int i = 0; i < g_n_groups; i++) mynah_asr_free(g_groups[i].model);
+            return 1;
         }
     }
 
@@ -1242,17 +1673,70 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ---- prefork: fork W workers now, with the model mapped and no thread
-     * yet. The parent routes until shutdown and never enters the model; a
-     * worker continues below with chan_fd as its only source of connections. */
+    /* ---- prefork: fork W workers now, with every model mapped and no thread
+     * yet. The parent routes until shutdown and never enters a model; a worker
+     * continues below with chan_fd as its only source of connections, and with
+     * exactly one of the groups still open. */
     int chan_fd = -1;
     if (prefork_workers > 0) {
         pf.listen_fd = srv;
+        pf.models = group_name_table();
+        pf.model_count = g_n_groups;
+        pf.default_model = g_default_group;
+        pf.model_workers = g_n_groups > 1 ? grp_workers : NULL;
+        pf.model_slots = have_slots ? grp_slots : NULL;
+        pf.model_cpus = have_cpus ? grp_cpus : NULL;
         const mynah_asr_prefork_role role = mynah_asr_prefork_run(&pf, &g_shutdown, &chan_fd);
-        if (role == MYNAH_ASR_PREFORK_ERROR) { close(srv); mynah_asr_free(g_model); return 1; }
-        if (role == MYNAH_ASR_PREFORK_PARENT_DONE) { mynah_asr_free(g_model); return 0; }
+        if (role == MYNAH_ASR_PREFORK_ERROR) {
+            close(srv);
+            for (int i = 0; i < g_n_groups; i++) mynah_asr_free(g_groups[i].model);
+            mynah_asr_free(g_lid);
+            return 1;
+        }
+        if (role == MYNAH_ASR_PREFORK_PARENT_DONE) {
+            for (int i = 0; i < g_n_groups; i++) mynah_asr_free(g_groups[i].model);
+            mynah_asr_free(g_lid);
+            return 0;
+        }
         srv = -1;   /* a worker never accepts: the router closed our copy */
+        g_group = mynah_asr_prefork_worker_model();
+    } else {
+        g_group = g_default_group;
     }
+    if (g_group < 0 || g_group >= g_n_groups) g_group = 0;
+
+    /* ONE MODEL PER PROCESS, made true rather than assumed: every other group's
+     * weights are closed right here, in the child, so this address space can
+     * only ever run the model the router believes it holds. The table's NAMES
+     * stay, which is what lets this worker answer /v1/models for the fleet and
+     * refuse a request that named a model it is not holding. */
+    for (int i = 0; i < g_n_groups; i++) {
+        if (i == g_group) continue;
+        mynah_asr_free(g_groups[i].model);
+        g_groups[i].model = NULL;
+    }
+    g_model = g_groups[g_group].model;
+    g_quant = g_groups[g_group].quant;
+    if (g_groups[g_group].cap > 0) cap = g_groups[g_group].cap;
+    g_encoder_frame_ms = g_groups[g_group].encoder_frame_ms;
+    g_default_preset_index = g_groups[g_group].default_preset_index;
+    snprintf(g_model_name, sizeof(g_model_name), "%s",
+             g_groups[g_group].pack[0] != '\0' ? g_groups[g_group].pack
+                                               : g_groups[g_group].name);
+    snprintf(g_model_engine, sizeof(g_model_engine), "%s",
+             g_groups[g_group].engine[0] != '\0' ? g_groups[g_group].engine : "unknown");
+    model_dir = g_groups[g_group].dir;
+    if (g_lid != NULL && mynah_asr_can_detect_lang(g_model)) {
+        /* It would never be consulted by THIS group, so this worker lets go of
+         * it. Per worker and not per fleet: in a mixed fleet the group that
+         * cannot detect still needs it, and only this process knows which it
+         * is. The parent's copy is what the others inherited. */
+        fprintf(stderr, "mynah-asr-server: --lid-model is not consulted by group '%s', "
+                        "which detects the language itself\n", g_groups[g_group].name);
+        mynah_asr_free(g_lid);
+        g_lid = NULL;
+    }
+
     mynah_asr_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
 
     /* One inference in flight, always: the scheduler. Nothing in the server
@@ -1282,6 +1766,7 @@ int main(int argc, char **argv) {
         memset(&oc, 0, sizeof(oc));
         oc.model_dir = model_dir;
         oc.model_name = g_model_name;
+        oc.group = g_groups[g_group].name;
         oc.engine = g_model_engine;
         oc.quant = g_quant == MYNAH_ASR_QUANT_INT8 ? "int8"
                  : g_quant == MYNAH_ASR_QUANT_INT4 ? "int4" : "f32";
@@ -1340,9 +1825,10 @@ int main(int argc, char **argv) {
         pthread_detach(t);
     }
     if (chan_fd >= 0)
-        fprintf(stderr, "mynah-asr-server %s: prefork worker %d ready (%d http threads, "
-                        "%d stream slots, batch %d, streaming %s)\n",
-                mynah_asr_version(), mynah_asr_prefork_worker_index(), n_threads, cap,
+        fprintf(stderr, "mynah-asr-server %s: prefork worker %d ready, group '%s' "
+                        "(%d http threads, %d stream slots, batch %d, streaming %s)\n",
+                mynah_asr_version(), mynah_asr_prefork_worker_index(),
+                g_groups[g_group].name, n_threads, cap,
                 g_max_batch, mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
     else
         fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, "

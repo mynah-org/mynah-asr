@@ -629,8 +629,11 @@ static volatile sig_atomic_t g_dump_request = 0;
  * That ordering is the reason a worker can never disagree with the router
  * about which model it holds: the assignment is one value computed once and
  * then copied by fork(), not a message that could be lost or reordered. */
-static int  g_worker_language = 0;
-static char g_language_plan[512];
+static int  g_worker_group = 0;
+static char g_group_plan[512];
+/* The accepted set, comma separated, for the message of a `model_not_found`.
+ * Published before the fork so the router and every worker quote one list. */
+static char g_model_set[512];
 
 /* The cpu list this worker was ASKED to take. Written by the child right after
  * pin_to_slice, so `configured` and `actual` can be printed side by side. */
@@ -697,17 +700,18 @@ void mynah_asr_prefork_print_topology(FILE *out, int threads) {
             pinned ? "yes" : "no");
     fflush(out);
 }
-int mynah_asr_prefork_worker_language(void) { return g_worker_language; }
-const char *mynah_asr_prefork_language_plan(void) { return g_language_plan; }
+int mynah_asr_prefork_worker_model(void) { return g_worker_group; }
+const char *mynah_asr_prefork_model_plan(void) { return g_group_plan; }
+const char *mynah_asr_prefork_model_set(void) { return g_model_set; }
 
-/* ------------------------------------------------------ language matching
+/* --------------------------------------------------------- model matching
  *
  * One implementation, used by the router and by the worker, because two
  * spellings of "does this request fit this model" that disagree means a request
- * the router accepts and the worker refuses -- a 400 for a language the server
+ * the router accepts and the worker refuses -- a 404 for a model the server
  * demonstrably holds, which is the most confusing failure this feature could
  * produce. See the contract on the declaration in prefork.h. */
-static int lang_ci_equal(const char *a, const char *b) {
+static int name_ci_equal(const char *a, const char *b) {
     while (*a != '\0' && *b != '\0') {
         const int ca = tolower((unsigned char)*a++);
         const int cb = tolower((unsigned char)*b++);
@@ -716,7 +720,7 @@ static int lang_ci_equal(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
-static int lang_ci_prefix(const char *prefix, const char *name) {
+static int name_ci_prefix(const char *prefix, const char *name) {
     while (*prefix != '\0') {
         if (*name == '\0') return 0;
         if (tolower((unsigned char)*prefix++) != tolower((unsigned char)*name++)) return 0;
@@ -724,18 +728,18 @@ static int lang_ci_prefix(const char *prefix, const char *name) {
     return 1;
 }
 
-int mynah_asr_prefork_language_match(const char *const *names, int count,
+int mynah_asr_prefork_model_match(const char *const *names, int count,
                                  const char *want) {
     if (names == NULL || count <= 0 || want == NULL || want[0] == '\0') return -1;
     for (int i = 0; i < count; ++i) {
-        if (names[i] != NULL && lang_ci_equal(names[i], want)) return i;
+        if (names[i] != NULL && name_ci_equal(names[i], want)) return i;
     }
-    /* A single character is not a language, it is a coin flip between `es` and
-     * `en` spelled shorter. Two is the shortest thing an ISO code can be. */
+    /* A single character is not a model name, it is a coin flip. Two is the
+     * shortest prefix worth resolving. */
     if (strlen(want) < 2u) return -1;
     int found = -1;
     for (int i = 0; i < count; ++i) {
-        if (names[i] == NULL || !lang_ci_prefix(want, names[i])) continue;
+        if (names[i] == NULL || !name_ci_prefix(want, names[i])) continue;
         if (found >= 0) return -2;            /* ambiguous: refuse, never guess */
         found = i;
     }
@@ -1105,13 +1109,13 @@ static const struct {
     { "handoff_failed", "503 Service Unavailable", "server_error",
       "the chosen worker could not be handed the connection", 1 },
     /* The one refusal in this table that is the CLIENT's to fix, which is why
-     * it is the one 400 and the one invalid_request_error. A 503 would tell a
+     * it is the one 404 and the one invalid_request_error. A 503 would tell a
      * client to retry, and the retry would fail identically for as long as the
      * server runs: residency is decided at startup and printed, never grown on
-     * demand. GET /health lists the languages that are actually held. */
-    { "language_not_served", "400 Bad Request", "invalid_request_error",
-      "no worker holds a model for the requested language; GET /health lists "
-      "the resident ones", 0 },
+     * demand. The message names the accepted set (see below), and GET
+     * /v1/models lists it too. */
+    { "model_not_found", "404 Not Found", "invalid_request_error",
+      "no worker holds the requested model", 0 },
 };
 
 const char *mynah_asr_prefork_refusal_code(mynah_asr_prefork_refusal reason) {
@@ -1128,10 +1132,21 @@ size_t mynah_asr_prefork_refusal_response(mynah_asr_prefork_refusal reason,
      * drift away from the body it describes. A hand-counted length is exactly
      * the constant that survives an edit to the message and then silently
      * truncates every refusal. */
-    char body[320];
+    /* `model_not_found` is the one reason whose message is not a constant: a
+     * client that named a model this fleet does not hold can only act on the
+     * list of the ones it does, and making it ask a second endpoint for that
+     * list is how a refusal becomes two round trips. The set comes from
+     * g_model_set, which the parent published before the fork, so the router
+     * and every worker quote the same line. */
+    char body[640];
+    const char *set = (reason == MYNAH_ASR_PREFORK_REFUSE_MODEL_NOT_FOUND)
+                    ? g_model_set : "";
+    char tail[440];
+    tail[0] = '\0';
+    if (set[0] != '\0') snprintf(tail, sizeof(tail), "; this fleet serves: %s", set);
     const int blen = snprintf(body, sizeof(body),
-        "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"code\":\"%s\"}}",
-        REFUSAL[reason].message, REFUSAL[reason].type, REFUSAL[reason].code);
+        "{\"error\":{\"message\":\"%s%s\",\"type\":\"%s\",\"code\":\"%s\"}}",
+        REFUSAL[reason].message, tail, REFUSAL[reason].type, REFUSAL[reason].code);
     if (blen <= 0 || (size_t)blen >= sizeof(body)) return 0;
 
     char retry[40];
@@ -1168,7 +1183,10 @@ size_t mynah_asr_prefork_refusal_response(mynah_asr_prefork_refusal reason,
 typedef struct {
     int    fd;
     double deadline;      /* mono seconds */
-    char   msg[640];
+    /* Sized for the longest refusal body, which is `model_not_found` with the
+     * accepted set spelled out. A response that did not fit would be dropped
+     * whole (refusal_response returns 0), never truncated. */
+    char   msg[1024];
     size_t msg_len;
     size_t msg_sent;
     size_t drained;
@@ -1297,10 +1315,10 @@ int mynah_asr_prefork_service_cap_ms(void) { return g_service_cap_ms; }
 
 /* ------------------------------------------------- classifying a connection
  *
- * Only reached when the fleet holds more than one language. The router has to
- * know which language a connection is for before it can choose a worker,
- * because the worker is the thing that holds the weights -- so this is the one
- * place where the parent looks at bytes a client sent.
+ * Only reached when the fleet holds more than one model. The router has to know
+ * which model a connection is for before it can choose a worker, because the
+ * worker is the thing that holds the weights -- so this is the one place where
+ * the parent looks at bytes a client sent.
  *
  * WHAT IT IS ALLOWED TO DO, stated as a boundary rather than as a description,
  * because "the parent parses a little HTTP" is a door that only opens wider:
@@ -1309,21 +1327,32 @@ int mynah_asr_prefork_service_cap_ms(void) { return g_service_cap_ms; }
  *     entire request from the start and there is no split-buffer to hand over
  *     with the descriptor. The fd remains the only thing that moves.
  *   - it reads a BOUNDED prefix and never more.
- *   - it looks for exactly three things: the end of the header block, the two
- *     header names that announce a body, and the JSON key "language". That is
- *     framing plus one key. It does not interpret a method, a route, a status
- *     or a body's meaning, and it never writes anything but a refusal.
+ *   - it looks for exactly four things: the end of the request line, the value
+ *     of a query parameter named `model` inside it, the end of the header
+ *     block, and a multipart part whose Content-Disposition names `model`.
+ *     That is framing plus one parameter. It does not interpret a method, a
+ *     route, a status or a body's meaning, and it never writes anything but a
+ *     refusal.
  *   - it NEVER BLOCKS. Undecided means "park this and look again", handled by
  *     the caller's poll set with a deadline, because a router that waits on a
  *     slow client is rung 1's mistake wearing a different hat.
  *
- * The residual imprecision, named rather than hidden: with chunked encoding
- * and no Content-Length there is no length to compare against, so completeness
- * falls back to "the object has closed", and a `}` inside a string value in a
- * half-arrived body can end the search early. The cost of that misfire is a
- * connection routed to the default group and refused there by a worker that
- * did parse the body -- a wrong refusal, never a wrong answer, and never a
- * batch that mixed two languages. */
+ * WHY THOSE TWO PLACES AND NOT A JSON KEY. Both routes this server serves put
+ * the model where a bounded prefix can see it: the WebSocket names it in the
+ * query of its GET (`/v1/audio/stream?model=...`), and the REST endpoints take
+ * it as a multipart field -- or in their own query, which is why the query is
+ * searched for every method and not only for the upgrade. `lang` is NOT looked
+ * at at all, and that is the difference from the TTS sibling this file came
+ * from: one Nemotron serves forty languages, so a language decides nothing
+ * about which process should run the request.
+ *
+ * The residual imprecision, named rather than hidden: a multipart `model` field
+ * that arrives AFTER the audio is past the peek bound and will not be seen, so
+ * such a request goes to the default group. It is not then served by the wrong
+ * weights -- the worker parses the same field out of the whole body and refuses
+ * with `model_not_found` if it is not its own -- so the cost is a wrong
+ * refusal, never a wrong answer, and never a batch that mixed two models. Put
+ * `model` before `file` in the form, or in the query, and it is always seen. */
 
 #define PF_PEEK_MAX     8192u
 #define PF_CLASSIFY_MS  2000.0       /* per-connection budget for deciding    */
@@ -1332,7 +1361,7 @@ int mynah_asr_prefork_service_cap_ms(void) { return g_service_cap_ms; }
 /* Negative results. Group indices are >= 0. */
 #define PF_CLASS_DEFAULT   (-1)      /* named nothing: the default group      */
 #define PF_CLASS_WAIT      (-2)      /* too little has arrived: park and retry*/
-#define PF_CLASS_UNKNOWN   (-3)      /* named a language nobody holds: refuse */
+#define PF_CLASS_UNKNOWN   (-3)      /* named a model nobody holds: refuse    */
 
 /* Case-insensitive search for `needle` within [begin, end). */
 static const char *ci_find(const char *begin, const char *end, const char *needle) {
@@ -1363,13 +1392,89 @@ static long header_content_length(const char *begin, const char *end) {
     return digits > 0 ? value : -1;
 }
 
-static const char *skip_json_space(const char *p) {
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
-    return p;
+/* Percent-decoding, for the query only: a client that escaped a character in a
+ * model name must reach the same group as one that did not. Anything malformed
+ * is copied through as-is rather than guessed at. */
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
-static int classify_language(int fd, const char *const *langs, int count,
-                             char *named, size_t named_cap) {
+/* The value of the query parameter `key` within [q, end), written into `out`.
+ * Returns 1 when the parameter was present (the value may be empty), 0
+ * otherwise. Matches only a WHOLE key -- at the start of the query or right
+ * after an `&` -- so `?not_model=x` is never mistaken for `?model=x`. */
+static int query_param(const char *q, const char *end, const char *key,
+                       char *out, size_t cap) {
+    const size_t klen = strlen(key);
+    if (out == NULL || cap == 0) return 0;
+    out[0] = '\0';
+    for (const char *p = q; p < end; ) {
+        const char *amp = (const char *)memchr(p, '&', (size_t)(end - p));
+        const char *seg_end = amp != NULL ? amp : end;
+        if ((size_t)(seg_end - p) > klen && p[klen] == '=' &&
+            strncmp(p, key, klen) == 0) {
+            const char *v = p + klen + 1;
+            size_t used = 0;
+            while (v < seg_end && used + 1u < cap) {
+                if (*v == '%' && seg_end - v >= 3 &&
+                    hexval((unsigned char)v[1]) >= 0 && hexval((unsigned char)v[2]) >= 0) {
+                    out[used++] = (char)(hexval((unsigned char)v[1]) * 16 +
+                                         hexval((unsigned char)v[2]));
+                    v += 3;
+                } else {
+                    out[used++] = *v++;
+                }
+            }
+            out[used] = '\0';
+            return 1;
+        }
+        if (amp == NULL) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+/* The value of the multipart field named `model`, if a complete part carrying
+ * it is inside [body, end). Returns 1 when it was found, 0 when it was not, and
+ * -1 when a part that names it has arrived only partly -- which is the caller's
+ * cue to wait for more bytes rather than to default.
+ *
+ * The `name="model"` match is required to sit inside a Content-Disposition
+ * header, within the 128 bytes that precede it, so the same twelve bytes
+ * appearing inside an uploaded file cannot decide where a request goes. */
+static int multipart_model(const char *body, const char *end,
+                           char *out, size_t cap) {
+    if (out == NULL || cap == 0) return 0;
+    out[0] = '\0';
+    const char *k = ci_find(body, end, "name=\"model\"");
+    if (k == NULL) return 0;
+    const char *win = (k - body) > 128 ? k - 128 : body;
+    if (ci_find(win, k, "content-disposition:") == NULL) return 0;
+    const char *hdr_end = NULL;
+    for (const char *p = k; p + 4 <= end; ++p) {
+        if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
+            hdr_end = p + 4;
+            break;
+        }
+    }
+    if (hdr_end == NULL) return -1;            /* the part is still arriving */
+    const char *stop = NULL;
+    for (const char *p = hdr_end; p + 2 <= end; ++p) {
+        if (p[0] == '\r' && p[1] == '\n') { stop = p; break; }
+    }
+    if (stop == NULL) return -1;               /* the value is still arriving */
+    const char *v = hdr_end;
+    size_t used = 0;
+    while (v < stop && used + 1u < cap) out[used++] = *v++;
+    out[used] = '\0';
+    return 1;
+}
+
+static int classify_model(int fd, const char *const *names, int count,
+                          char *named, size_t named_cap) {
     if (named != NULL && named_cap > 0) named[0] = '\0';
 
     char buf[PF_PEEK_MAX + 1u];
@@ -1385,50 +1490,53 @@ static int classify_language(int fd, const char *const *langs, int count,
     buf[got] = '\0';
     const int full = (size_t)got >= PF_PEEK_MAX;      /* our prefix is all we get */
 
-    /* The header block must be complete before a body can exist. */
+    /* 1. THE QUERY. The request line first, because it is the one place both a
+     *    WebSocket upgrade and a REST call can carry the name, and because it
+     *    arrives in the very first packet of every client there is. */
+    const char *eol = strstr(buf, "\r\n");
+    if (eol == NULL) return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+    {
+        const char *sp = (const char *)memchr(buf, ' ', (size_t)(eol - buf));
+        const char *target = sp != NULL ? sp + 1 : NULL;
+        const char *target_end = target != NULL
+            ? (const char *)memchr(target, ' ', (size_t)(eol - target)) : NULL;
+        if (target != NULL && target_end == NULL) target_end = eol;
+        const char *qs = target != NULL
+            ? (const char *)memchr(target, '?', (size_t)(target_end - target)) : NULL;
+        if (qs != NULL &&
+            query_param(qs + 1, target_end, "model", named, named_cap) &&
+            named[0] != '\0') {
+            const int at = mynah_asr_prefork_model_match(names, count, named);
+            return at >= 0 ? at : PF_CLASS_UNKNOWN;
+        }
+        if (named != NULL && named_cap > 0) named[0] = '\0';
+    }
+
+    /* 2. THE MULTIPART FIELD. The header block must be complete before a body
+     *    can exist. */
     const char *head_end = strstr(buf, "\r\n\r\n");
     if (head_end == NULL) return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
     const char *body = head_end + 4;
+    const char *end = buf + got;
 
-    /* The key, searched for in the BODY only: a path or a header value that
-     * happened to contain the word must not decide where a request goes. */
-    const char *k = strstr(body, "\"language\"");
-    if (k != NULL) {
-        const char *p = skip_json_space(k + strlen("\"language\""));
-        if (*p == ':') {
-            p = skip_json_space(p + 1);
-            if (*p == '"') {
-                ++p;
-                size_t used = 0;
-                while (*p != '\0' && *p != '"' && used + 1u < named_cap) {
-                    named[used++] = *p++;
-                }
-                if (*p == '"') {
-                    named[used] = '\0';
-                    if (named[0] == '\0') return PF_CLASS_DEFAULT;
-                    const int at = mynah_asr_prefork_language_match(langs, count, named);
-                    return at >= 0 ? at : PF_CLASS_UNKNOWN;
-                }
-            }
-        }
-        /* Truncated mid-value, or a shape we do not recognise. More bytes may
-         * settle it; if no more are coming, let the worker's real JSON parser
-         * have the argument. */
-        return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+    const int mp = multipart_model(body, end, named, named_cap);
+    if (mp == 1 && named[0] != '\0') {
+        const int at = mynah_asr_prefork_model_match(names, count, named);
+        return at >= 0 ? at : PF_CLASS_UNKNOWN;
     }
+    if (named != NULL && named_cap > 0) named[0] = '\0';
+    if (mp < 0) return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
 
-    /* No key. Decide whether more could still arrive. */
+    /* 3. Nothing named it yet. Decide whether more could still arrive. */
     const long announced = header_content_length(buf, head_end);
     if (announced < 0) {
         if (ci_find(buf, head_end, "\ntransfer-encoding:") == NULL) {
             return PF_CLASS_DEFAULT;     /* no body announced: none is coming */
         }
-        /* Chunked: no length to compare against, so fall back to "the object
-         * has closed". See the residual named in the block comment above. */
-        return (strchr(body, '}') != NULL || full) ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
+        return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;   /* chunked: bounded */
     }
     const long have = (long)(got - (body - buf));
-    if (have >= announced) return PF_CLASS_DEFAULT;   /* the whole body, no key */
+    if (have >= announced) return PF_CLASS_DEFAULT;   /* the whole body, no field */
     return full ? PF_CLASS_DEFAULT : PF_CLASS_WAIT;
 }
 
@@ -1437,7 +1545,7 @@ static int classify_language(int fd, const char *const *langs, int count,
 typedef struct {
     int    fd;
     double enqueued;      /* mono seconds, stamped at accept() */
-    int    lang;          /* language group; 0 in a single-language fleet */
+    int    grp;           /* model group; 0 in a single-model fleet */
 } pf_queued;
 
 /* A connection accepted but not yet classified. Distinct from a queued one:
@@ -1451,7 +1559,8 @@ typedef struct {
 typedef struct {
     pid_t pid;
     int chan;            /* parent's end of the socketpair */
-    int lang;            /* language group; 0 in a single-language fleet */
+    int grp;             /* model group; 0 in a single-model fleet */
+    int slots;           /* this group's --cap: the rung-1 bound for this worker */
     int active;          /* dispatched minus finished */
     /* Two sets of counters on purpose. The `window_` ones are reset by every
      * SIGUSR1 dump, because "what happened in the last minute" is the question
@@ -1499,7 +1608,7 @@ typedef struct {
     int           slots;
     int           q_per;          /* -1 unbounded, 0 none, >0 per live worker */
     int           deadline_ms;
-    int           groups;         /* language groups; 1 when single-language  */
+    int           groups;         /* model groups; 1 when single-model        */
     pf_queued   **q;              /* by pointer: rung 2 may grow the array    */
     int          *q_alloc;
     int          *q_n;
@@ -1537,34 +1646,35 @@ static void router_refuse(pf_router *R, int fd, mynah_asr_prefork_refusal reason
     (void)linger_step(&L, now + 1.0);
 }
 
-/* Live workers holding `lang`. Recomputed rather than cached because a fleet
+/* Live workers holding `grp`. Recomputed rather than cached because a fleet
  * that has lost a worker has lost the slots behind that group's queue entries
  * too, and a bound that keeps promising capacity the machine no longer has is
  * how a degraded server turns a refusal into a wait. */
-static int group_live(const pf_router *R, int lang) {
+static int group_live(const pf_router *R, int grp) {
     int n = 0;
     for (int i = 0; i < R->workers; ++i) {
-        if (R->w[i].pid > 0 && R->w[i].lang == lang) ++n;
+        if (R->w[i].pid > 0 && R->w[i].grp == grp) ++n;
     }
     return n;
 }
 
-/* Rung 1 within a group: the least-loaded worker of that language with a free
- * slot, or -1. A free slot in another language's worker is not capacity for
- * this request -- that worker does not have these weights. */
-static int group_pick(const pf_router *R, int lang) {
+/* Rung 1 within a group: the least-loaded worker of that group with a free
+ * slot, or -1. A free slot in another group's worker is not capacity for this
+ * request -- that worker does not have these weights. The cap compared against
+ * is the WORKER's own, because --cap is per group. */
+static int group_pick(const pf_router *R, int grp) {
     int best = -1;
     for (int i = 0; i < R->workers; ++i) {
-        if (R->w[i].pid <= 0 || R->w[i].lang != lang) continue;
-        if (R->w[i].active >= R->slots) continue;
+        if (R->w[i].pid <= 0 || R->w[i].grp != grp) continue;
+        if (R->w[i].active >= R->w[i].slots) continue;
         if (best < 0 || R->w[i].active < R->w[best].active) best = i;
     }
     return best;
 }
 
-static int group_queued(const pf_router *R, int lang) {
+static int group_queued(const pf_router *R, int grp) {
     int n = 0;
-    for (int i = 0; i < *R->q_n; ++i) if ((*R->q)[i].lang == lang) ++n;
+    for (int i = 0; i < *R->q_n; ++i) if ((*R->q)[i].grp == grp) ++n;
     return n;
 }
 
@@ -1595,14 +1705,14 @@ static void router_dispatch(pf_router *R, int worker, int fd, double now) {
 }
 
 /* Rungs 1 and 2 for one freshly-decided connection. Takes ownership of `fd`. */
-static void router_admit(pf_router *R, int fd, int lang, double now) {
+static void router_admit(pf_router *R, int fd, int grp, double now) {
     /* A new arrival may only go straight through when its GROUP's queue is
      * empty -- otherwise it would jump ahead of entries that have already
      * waited, and rung 3's deadline would start firing on requests that were
      * merely unlucky rather than late. Another group's queue is irrelevant:
      * those entries are not waiting for this worker. */
-    if (group_queued(R, lang) == 0) {
-        const int best = group_pick(R, lang);
+    if (group_queued(R, grp) == 0) {
+        const int best = group_pick(R, grp);
         if (best >= 0) {
             router_dispatch(R, best, fd, now);
             return;
@@ -1610,8 +1720,8 @@ static void router_admit(pf_router *R, int fd, int lang, double now) {
     }
 
     /* RUNG 2, bounded per group because capacity is per group. */
-    const int bound = (R->q_per < 0) ? -1 : R->q_per * group_live(R, lang);
-    if (bound != 0 && (bound < 0 || group_queued(R, lang) < bound)) {
+    const int bound = (R->q_per < 0) ? -1 : R->q_per * group_live(R, grp);
+    if (bound != 0 && (bound < 0 || group_queued(R, grp) < bound)) {
         if (*R->q_n >= *R->q_alloc) {
             const int grown = *R->q_alloc * 2;
             pf_queued *bigger = (pf_queued *)realloc(*R->q, (size_t)grown * sizeof(**R->q));
@@ -1625,7 +1735,7 @@ static void router_admit(pf_router *R, int fd, int lang, double now) {
         pf_queued *q = *R->q;
         q[*R->q_n].fd = fd;
         q[*R->q_n].enqueued = now;
-        q[*R->q_n].lang = lang;
+        q[*R->q_n].grp = grp;
         ++(*R->q_n);
         ++(*R->queued_total);
         if (*R->q_n > *R->queue_peak) *R->queue_peak = *R->q_n;
@@ -1642,16 +1752,16 @@ static void router_admit(pf_router *R, int fd, int lang, double now) {
  * happened; checking at pop refuses on a fact.
  *
  * Per group rather than over one FIFO, and that is not a detail: a single FIFO
- * would let an entry for a saturated language block a ready entry for an idle
+ * would let an entry for a saturated group block a ready entry for an idle
  * one behind it, which is a starvation channel introduced by the partitioning
  * that exists to prevent starvation. Array order is arrival order, so scanning
  * it for one group's entries gives that group its own FIFO for free. */
 static void router_drain(pf_router *R, double now) {
-    for (int lang = 0; lang < R->groups; ++lang) {
+    for (int grp = 0; grp < R->groups; ++grp) {
         for (;;) {
             int head = -1;
             for (int i = 0; i < *R->q_n; ++i) {
-                if ((*R->q)[i].lang == lang) { head = i; break; }
+                if ((*R->q)[i].grp == grp) { head = i; break; }
             }
             if (head < 0) break;
 
@@ -1662,7 +1772,7 @@ static void router_drain(pf_router *R, double now) {
                 router_refuse(R, fd, MYNAH_ASR_PREFORK_REFUSE_QUEUED_TOO_LONG, now);
                 continue;
             }
-            const int best = group_pick(R, lang);
+            const int best = group_pick(R, grp);
             if (best < 0) break;              /* no slot: it stays queued */
             const int fd = (*R->q)[head].fd;
             queue_erase(R, head);
@@ -1686,12 +1796,33 @@ typedef struct {
     const worker_state *w;
     int workers;
     int slots;
+    /* The group names, for the `model` label. Bounded by the CLI -- one value
+     * per configured group -- so the cardinality rule holds: every label this
+     * file emits is drawn from a set fixed before the first request. NULL, or
+     * a count below 2, means no label is emitted at all. */
+    const char *const *models;
+    int groups;
     long long dispatched, queued_total, client_gone;
     int queued_now, queue_peak;
     const long long *refused;
     const char *build, *blas, *simd, *int8_kernel;
     double uptime;
 } pf_metrics_view;
+
+/* `worker="3",model="parakeet"` -- or just `worker="3"` in a single-model
+ * fleet, so a scrape of the server everybody already had is unchanged. One
+ * place builds it because five series must agree about a worker's group. */
+static void pf_worker_labels(const pf_metrics_view *v, int i, char *out, size_t cap) {
+    if (v->groups > 1 && v->models != NULL) {
+        char m[64];
+        const int g = v->w[i].grp;
+        mynah_asr_metrics_label(g >= 0 && g < v->groups && v->models[g] != NULL
+                                    ? v->models[g] : "unknown", m, sizeof(m));
+        snprintf(out, cap, "worker=\"%d\",model=\"%s\"", i, m);
+    } else {
+        snprintf(out, cap, "worker=\"%d\"", i);
+    }
+}
 
 static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
     const pf_metrics_view *v = (const pf_metrics_view *)ud;
@@ -1720,45 +1851,63 @@ static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_up 1 while the router still holds this worker.\n"
         "# TYPE mynah_asr_worker_up gauge\n");
-    for (int i = 0; i < v->workers; ++i)
-        mynah_asr_metrics_addf(b, "mynah_asr_worker_up{worker=\"%d\"} %d\n",
-                               i, v->w[i].pid > 0 ? 1 : 0);
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_up{%s} %d\n",
+                               lbl, v->w[i].pid > 0 ? 1 : 0);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_inflight connections dispatched to this worker and\n"
         "# not yet reported finished. Router-view: it counts CONNECTIONS, not the\n"
         "# worker's stream slots.\n"
         "# TYPE mynah_asr_worker_inflight gauge\n");
-    for (int i = 0; i < v->workers; ++i)
-        mynah_asr_metrics_addf(b, "mynah_asr_worker_inflight{worker=\"%d\"} %d\n",
-                               i, v->w[i].active);
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_inflight{%s} %d\n",
+                               lbl, v->w[i].active);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_slots the per-worker capacity the router admits\n"
-        "# against (--cap).\n"
+        "# against (--cap), which is per model group.\n"
         "# TYPE mynah_asr_worker_slots gauge\n");
-    for (int i = 0; i < v->workers; ++i)
-        mynah_asr_metrics_addf(b, "mynah_asr_worker_slots{worker=\"%d\"} %d\n",
-                               i, v->slots);
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_slots{%s} %d\n",
+                               lbl, v->w[i].slots);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_assigned_total connections handed to this worker.\n"
         "# TYPE mynah_asr_worker_assigned_total counter\n");
-    for (int i = 0; i < v->workers; ++i)
-        mynah_asr_metrics_addf(b, "mynah_asr_worker_assigned_total{worker=\"%d\"} %lld\n",
-                               i, v->w[i].assigned);
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_assigned_total{%s} %lld\n",
+                               lbl, v->w[i].assigned);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_completed_total connections this worker reported\n"
         "# finished.\n"
         "# TYPE mynah_asr_worker_completed_total counter\n");
-    for (int i = 0; i < v->workers; ++i)
-        mynah_asr_metrics_addf(b, "mynah_asr_worker_completed_total{worker=\"%d\"} %lld\n",
-                               i, v->w[i].completed);
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_completed_total{%s} %lld\n",
+                               lbl, v->w[i].completed);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_over_service_cap_total outstanding connections this\n"
         "# worker was seen holding past --service-cap.\n"
         "# TYPE mynah_asr_worker_over_service_cap_total counter\n");
-    for (int i = 0; i < v->workers; ++i)
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
         mynah_asr_metrics_addf(b,
-            "mynah_asr_worker_over_service_cap_total{worker=\"%d\"} %lld\n",
-            i, v->w[i].over_cap);
+            "mynah_asr_worker_over_service_cap_total{%s} %lld\n",
+            lbl, v->w[i].over_cap);
+    }
 
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_connections_dispatched_total connections routed to a worker.\n"
@@ -1822,49 +1971,117 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     const int deadline_ms = resolve_queue_deadline_ms(&local);
     g_service_cap_ms = resolve_service_cap_ms(&local);
 
-    /* ---- language groups (model groups) ----
+    /* ---- MODEL GROUPS ----
      *
      * One model per worker, workers divided into contiguous groups. Contiguous
-     * rather than round-robin so that a language's workers get adjacent core
+     * rather than round-robin so that a group's workers get adjacent core
      * slices: the slices are already ordered core-major, and a group whose
      * workers are neighbours shares a memory path rather than straddling the
      * machine.
      *
-     * `groups == 1` is the single-language fleet, and from here on every
-     * language-aware branch collapses: one group, every worker in it, the
+     * `groups == 1` is the single-model fleet, and from here on every
+     * model-aware branch collapses: one group, every worker in it, the
      * classifier never called. That is the shape that shipped before this
      * change and it must keep behaving identically. */
-    const int groups = (local.languages != NULL && local.language_count > 1)
-                     ? local.language_count : 1;
+    const int groups = (local.models != NULL && local.model_count > 1)
+                     ? local.model_count : 1;
     if (groups > workers) {
-        fprintf(stderr, "prefork: %d languages need at least %d workers, but W is %d. "
-                        "A language with no worker could not be served and would have "
+        fprintf(stderr, "prefork: %d models need at least %d workers, but W is %d. "
+                        "A model with no worker could not be served and would have "
                         "to be dropped silently; refusing to start instead.\n",
                 groups, groups, workers);
         return MYNAH_ASR_PREFORK_ERROR;
     }
-    int lang_of[PREFORK_MAX_WORKERS];
+    const int default_grp = (local.default_model > 0 && local.default_model < groups)
+                          ? local.default_model : 0;
+
+    /* How many workers each group gets. `model_workers` is the CLI's
+     * `:workers=` and is honoured when it adds up; when it does not, the split
+     * falls back to even and SAYS SO, because a silently corrected topology is
+     * one an operator will quote from the flag rather than from the banner. */
+    int grp_of[PREFORK_MAX_WORKERS];
+    int grp_n[PREFORK_MAX_WORKERS];
     {
+        int explicit_ok = 0;
+        if (local.model_workers != NULL && groups > 1) {
+            int sum = 0, bad = 0;
+            for (int g = 0; g < groups; ++g) {
+                if (local.model_workers[g] < 1) bad = 1;
+                sum += local.model_workers[g];
+            }
+            if (!bad && sum == workers) explicit_ok = 1;
+            else {
+                fprintf(stderr, "prefork: the per-model worker counts sum to %d but W "
+                                "is %d; splitting the %d workers evenly instead\n",
+                        sum, workers, workers);
+            }
+        }
         const int base = workers / groups;
         const int extra = workers % groups;
         int at = 0;
         for (int g = 0; g < groups; ++g) {
-            const int n = base + (g < extra ? 1 : 0);
-            for (int k = 0; k < n && at < workers; ++k) lang_of[at++] = g;
+            grp_n[g] = explicit_ok ? local.model_workers[g] : base + (g < extra ? 1 : 0);
+            for (int k = 0; k < grp_n[g] && at < workers; ++k) grp_of[at++] = g;
         }
-        while (at < workers) lang_of[at++] = groups - 1;   /* cannot happen; be total */
+        while (at < workers) grp_of[at++] = groups - 1;   /* cannot happen; be total */
     }
-    g_language_plan[0] = '\0';
-    if (groups > 1) {
-        size_t used = 0;
+
+    /* The per-worker plan: its group's slot cap, its cpu slice and its thread
+     * count. Uniform unless `model_cpus` asked for something else, so a fleet
+     * that does not use the per-group knobs gets byte-for-byte the topology it
+     * got before they existed. */
+    int slots_of[PREFORK_MAX_WORKERS];
+    int cpu_first[PREFORK_MAX_WORKERS], cpu_n[PREFORK_MAX_WORKERS];
+    int thr_of[PREFORK_MAX_WORKERS];
+    {
+        const int uneven = (local.model_cpus != NULL && groups > 1);
+        int at = 0;   /* next free cpu index, walked in group order */
         for (int g = 0; g < groups; ++g) {
-            int n = 0;
-            for (int i = 0; i < workers; ++i) if (lang_of[i] == g) ++n;
-            const int m = snprintf(g_language_plan + used, sizeof(g_language_plan) - used,
-                                   "%s%s=%d", used > 0 ? " " : "",
-                                   local.languages[g] != NULL ? local.languages[g] : "?", n);
-            if (m <= 0 || (size_t)m >= sizeof(g_language_plan) - used) break;
+            /* A group with no explicit cpu budget gets its proportional share
+             * of the mask, which is exactly the even split when nobody asked
+             * for anything. */
+            int cg = uneven && local.model_cpus[g] > 0
+                   ? local.model_cpus[g]
+                   : (ncpu * grp_n[g]) / (workers > 0 ? workers : 1);
+            if (cg < grp_n[g]) cg = grp_n[g];        /* at least one cpu each */
+            int per_g = cg / grp_n[g];
+            if (per_g < 1) per_g = 1;
+            for (int i = 0; i < workers; ++i) {
+                if (grp_of[i] != g) continue;
+                slots_of[i] = (local.model_slots != NULL && local.model_slots[g] > 0)
+                            ? local.model_slots[g] : slots;
+                cpu_first[i] = at < ncpu ? at : (ncpu > 0 ? ncpu - 1 : 0);
+                cpu_n[i] = at + per_g <= ncpu ? per_g : (ncpu - at > 0 ? ncpu - at : 1);
+                thr_of[i] = local.threads_per > 0 ? local.threads_per : cpu_n[i];
+                at += per_g;
+            }
+        }
+        if (!uneven) {
+            /* The historical plan, restated exactly: contiguous slices of
+             * `per` cpus in worker order. Recomputing it here rather than
+             * trusting the loop above keeps the unchanged case unchanged. */
+            for (int i = 0; i < workers; ++i) {
+                cpu_first[i] = i * per;
+                cpu_n[i] = (i + 1) * per <= ncpu ? per : (ncpu - i * per > 0 ? ncpu - i * per : 1);
+                thr_of[i] = local.threads_per > 0 ? local.threads_per : threads;
+            }
+        }
+    }
+
+    g_group_plan[0] = '\0';
+    g_model_set[0] = '\0';
+    if (groups > 1) {
+        size_t used = 0, sused = 0;
+        for (int g = 0; g < groups; ++g) {
+            const char *nm = local.models[g] != NULL ? local.models[g] : "?";
+            const int m = snprintf(g_group_plan + used, sizeof(g_group_plan) - used,
+                                   "%s%s=%d", used > 0 ? " " : "", nm, grp_n[g]);
+            if (m <= 0 || (size_t)m >= sizeof(g_group_plan) - used) break;
             used += (size_t)m;
+            const int s = snprintf(g_model_set + sused, sizeof(g_model_set) - sused,
+                                   "%s%s", sused > 0 ? ", " : "", nm);
+            if (s <= 0 || (size_t)s >= sizeof(g_model_set) - sused) break;
+            sused += (size_t)s;
         }
     }
 
@@ -1887,29 +2104,30 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
         warn_cpu_budget(workers, threads, ncpu, stderr);
         if (groups > 1) {
             /* Printed, never assumed: how the machine was divided is the first
-             * thing anyone asks when one language is slow and another is not,
+             * thing anyone asks when one model is slow and another is not,
              * and it is a number this process chose rather than one the
              * operator typed. */
-            fprintf(stderr, "prefork: languages   %d resident, one model per worker "
+            fprintf(stderr, "prefork: models      %d resident, one model per worker "
                             "(a batch is one process's slots, so a batch is one "
-                            "language)\n", groups);
+                            "model; `lang` stays a per-request parameter)\n", groups);
             for (int g = 0; g < groups; ++g) {
-                int n = 0, first = -1, last = -1;
+                int first = -1, last = -1, cg = 0, gs = slots;
                 for (int i = 0; i < workers; ++i) {
-                    if (lang_of[i] != g) continue;
-                    ++n;
+                    if (grp_of[i] != g) continue;
                     if (first < 0) first = i;
                     last = i;
+                    cg += cpu_n[i];
+                    gs = slots_of[i];
                 }
-                fprintf(stderr, "prefork:   %-16s workers %d-%d (%d) · %d slots · "
-                                "rung2 queue %s\n",
-                        local.languages[g] != NULL ? local.languages[g] : "?",
-                        first, last, n, n * slots,
+                fprintf(stderr, "prefork:   %-24s workers %d-%d (%d) · %d cpus · "
+                                "%d slots each (%d) · rung2 queue %s\n",
+                        local.models[g] != NULL ? local.models[g] : "?",
+                        first, last, grp_n[g], cg, gs, grp_n[g] * gs,
                         q_per < 0 ? "unbounded"
                                   : (q_per == 0 ? "disabled" : "per worker"));
             }
-            fprintf(stderr, "prefork:   default    %s (a request naming no language)\n",
-                    local.languages[0] != NULL ? local.languages[0] : "?");
+            fprintf(stderr, "prefork:   default    %s (a request naming no model)\n",
+                    local.models[default_grp] != NULL ? local.models[default_grp] : "?");
         }
         describe_ladder(workers, slots, q_per, deadline_ms, g_service_cap_ms, stderr);
 #if !defined(__linux__)
@@ -1984,14 +2202,12 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             *chan_fd = sp[1];
             /* Which model this worker owns, decided in the parent and carried
              * across by fork() rather than sent as a message. The caller reads
-             * it back with mynah_asr_prefork_worker_language() and keeps that one
+             * it back with mynah_asr_prefork_worker_model() and keeps that one
              * model. */
-            g_worker_language = lang_of[i];
+            g_worker_group = grp_of[i];
 
             char slice[192];
-            const int slice_cpus =
-                (i + 1) * per <= ncpu ? per : ncpu - i * per;
-            const int pinned = pin_to_slice(cpus, i * per, slice_cpus,
+            const int pinned = pin_to_slice(cpus, cpu_first[i], cpu_n[i],
                                             slice, sizeof(slice));
             snprintf(g_configured_mask, sizeof(g_configured_mask), "%s", slice);
 
@@ -2027,14 +2243,14 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
              * actually in force rather than what was planned. */
             {
                 char buf[16];
-                snprintf(buf, sizeof(buf), "%d", threads);
+                snprintf(buf, sizeof(buf), "%d", thr_of[i]);
                 setenv("MYNAH_ASR_THREADS", buf, 1);
                 g_worker_threads = mynah_asr_num_threads();
-                if (g_worker_threads != threads) {
+                if (g_worker_threads != thr_of[i]) {
                     fprintf(stderr, "prefork: worker %d WANTED %d threads but the pool "
                                     "is already fixed at %d; export MYNAH_ASR_THREADS=%d "
                                     "before starting the server\n",
-                            i, threads, g_worker_threads, threads);
+                            i, thr_of[i], g_worker_threads, thr_of[i]);
                 }
             }
             /* SIGUSR1, carefully. A worker must NOT get a handler installed
@@ -2060,9 +2276,9 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             }
             fprintf(stderr, "prefork: worker %d pid %d threads %d cpus %s%s%s%s\n",
                     i, (int)getpid(), g_worker_threads, slice,
-                    groups > 1 ? " language " : "",
-                    groups > 1 && local.languages[lang_of[i]] != NULL
-                        ? local.languages[lang_of[i]] : "",
+                    groups > 1 ? " model " : "",
+                    groups > 1 && local.models[grp_of[i]] != NULL
+                        ? local.models[grp_of[i]] : "",
                     pinned ? "" : "  <-- NOT PINNED");
             /* Printed only when someone asked for a lane, or when one is up.
              * The line above states the slice this worker was GIVEN; this one
@@ -2082,7 +2298,8 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
         close(sp[1]);
         w[i].pid = pid;
         w[i].chan = sp[0];
-        w[i].lang = lang_of[i];
+        w[i].grp = grp_of[i];
+        w[i].slots = slots_of[i];
         ++live;
     }
 
@@ -2099,7 +2316,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     /* Per-worker watchdog rings, parent-only: allocated after the fork so no
      * child ever inherits or frees them. */
     for (int i = 0; i < workers; ++i) {
-        w[i].disp_cap = slots + 1;
+        w[i].disp_cap = w[i].slots + 1;
         w[i].disp = (double *)calloc((size_t)w[i].disp_cap, sizeof(double));
     }
 
@@ -2138,7 +2355,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     double prev = window_start;
 
     /* Connections accepted but not yet classified. Only ever non-empty in a
-     * multi-language fleet: with one group the classifier is never called. */
+     * multi-model fleet: with one group the classifier is never called. */
     pf_pending pending[PF_PENDING_MAX];
     int pending_n = 0;
     long long classify_timeouts = 0;
@@ -2385,7 +2602,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             --q_n;
         }
 
-        /* ---- classification: connections whose language is not known yet ----
+        /* ---- classification: connections whose model is not known yet ----
          * Handled before the drain so a connection that becomes decidable this
          * tick gets its slot in the same tick. Walked backwards because a
          * decided entry is removed by swapping the tail into its place. */
@@ -2396,28 +2613,28 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             if (!fired && !expired) continue;
 
             char named[64];
-            int lang = classify_language(pending[i].fd, local.languages, groups,
+            int grp = classify_model(pending[i].fd, local.models, groups,
                                          named, sizeof(named));
-            if (lang == PF_CLASS_WAIT) {
+            if (grp == PF_CLASS_WAIT) {
                 if (!expired) continue;
                 /* Out of time. Route it as unspecified rather than refusing:
                  * the client has not done anything wrong, it is merely slow,
                  * and the worker will read the whole request and refuse it
-                 * properly if the language turns out not to be ours. */
+                 * properly if the model turns out not to be ours. */
                 ++classify_timeouts;
-                lang = PF_CLASS_DEFAULT;
+                grp = PF_CLASS_DEFAULT;
             }
             const int fd = pending[i].fd;
             pending[i] = pending[pending_n - 1];
             --pending_n;
 
-            if (lang == PF_CLASS_UNKNOWN) {
-                fprintf(stderr, "prefork: no worker holds language '%.32s'; refusing\n",
+            if (grp == PF_CLASS_UNKNOWN) {
+                fprintf(stderr, "prefork: no worker holds model '%.32s'; refusing\n",
                         named);
-                router_refuse(&R, fd, MYNAH_ASR_PREFORK_REFUSE_LANGUAGE_NOT_SERVED, now);
+                router_refuse(&R, fd, MYNAH_ASR_PREFORK_REFUSE_MODEL_NOT_FOUND, now);
                 continue;
             }
-            router_admit(&R, fd, lang < 0 ? 0 : lang, now);
+            router_admit(&R, fd, grp < 0 ? default_grp : grp, now);
         }
 
         /* ---- RUNG 3, then RUNG 1: drain the queue ---- */
@@ -2430,6 +2647,8 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             view.w = w;
             view.workers = workers;
             view.slots = slots;
+            view.models = groups > 1 ? local.models : NULL;
+            view.groups = groups;
             view.dispatched = dispatched;
             view.queued_total = queued_total;
             view.client_gone = client_gone;
@@ -2455,39 +2674,39 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             break;
         }
 
-        /* SINGLE-LANGUAGE FLEET: straight to the rungs, exactly as before.
+        /* SINGLE-MODEL FLEET: straight to the rungs, exactly as before.
          * Nothing peeks, nothing parks, nothing about the connection is looked
-         * at. This branch is the guarantee that adding languages did not change
+         * at. This branch is the guarantee that adding models did not change
          * the server that was already running. */
         if (groups <= 1) {
             router_admit(&R, cfd, 0, now);
             continue;
         }
 
-        /* MULTI-LANGUAGE: decide now if the prefix is already here -- which it
-         * is for virtually every request, since a client sends its headers and
-         * a small JSON body in one go -- and park it only when it is not. */
+        /* MULTI-MODEL: decide now if the prefix is already here -- which it is
+         * for virtually every request, since a client sends its request line
+         * and headers in one go -- and park it only when it is not. */
         {
             char named[64];
-            const int lang = classify_language(cfd, local.languages, groups,
+            const int grp = classify_model(cfd, local.models, groups,
                                                named, sizeof(named));
-            if (lang == PF_CLASS_UNKNOWN) {
-                fprintf(stderr, "prefork: no worker holds language '%.32s'; refusing\n",
+            if (grp == PF_CLASS_UNKNOWN) {
+                fprintf(stderr, "prefork: no worker holds model '%.32s'; refusing\n",
                         named);
-                router_refuse(&R, cfd, MYNAH_ASR_PREFORK_REFUSE_LANGUAGE_NOT_SERVED, now);
+                router_refuse(&R, cfd, MYNAH_ASR_PREFORK_REFUSE_MODEL_NOT_FOUND, now);
                 continue;
             }
-            if (lang != PF_CLASS_WAIT) {
-                router_admit(&R, cfd, lang < 0 ? 0 : lang, now);
+            if (grp != PF_CLASS_WAIT) {
+                router_admit(&R, cfd, grp < 0 ? default_grp : grp, now);
                 continue;
             }
             if (pending_n >= PF_PENDING_MAX) {
                 /* The classification set is full. Do NOT block to decide and do
                  * NOT drop it: send it to the default group, where a worker
-                 * that reads the whole body will either serve it or refuse it
-                 * with the same `language_not_served` code. The bound stays a
+                 * that reads the whole request will either serve it or refuse
+                 * it with the same `model_not_found` code. The bound stays a
                  * bound; what it costs is precision, not a connection. */
-                router_admit(&R, cfd, 0, now);
+                router_admit(&R, cfd, default_grp, now);
                 continue;
             }
             pending[pending_n].fd = cfd;
@@ -2507,7 +2726,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     q_n = 0;
     /* Same for a connection still waiting to be classified: it was accepted,
      * so it is owed an answer, and "we are going away" is at-capacity as far as
-     * a client is concerned. Never a language refusal -- we never found out
+     * a client is concerned. Never a model refusal -- we never found out
      * what it was asking for, and inventing a reason is worse than a generic
      * one. */
     for (int i = 0; i < pending_n; ++i) {
@@ -2564,8 +2783,8 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
          * arrive within the budget and was routed as unspecified -- rare, but
          * it is the one path where the router guesses, so it is counted rather
          * than described. */
-        fprintf(stderr, "prefork: languages %s  classify_timeout=%lld\n",
-                g_language_plan, classify_timeouts);
+        fprintf(stderr, "prefork: models %s  classify_timeout=%lld\n",
+                g_group_plan, classify_timeouts);
     }
     long long refused_all = 0;
     for (int r = 0; r < MYNAH_ASR_PREFORK_REFUSE__COUNT; ++r) refused_all += refused[r];
@@ -2588,8 +2807,8 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
                         " still-in-flight=%d over-service-cap=%lld\n",
                 i,
                 groups > 1 ? " " : "",
-                groups > 1 && local.languages[w[i].lang] != NULL
-                    ? local.languages[w[i].lang] : "",
+                groups > 1 && local.models[w[i].grp] != NULL
+                    ? local.models[w[i].grp] : "",
                 w[i].assigned, w[i].completed, w[i].active, w[i].over_cap);
         free(w[i].disp);
     }

@@ -191,7 +191,11 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
     rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
            "events": [], "done_t": None, "t_start": time.monotonic(), "error": None,
            "rejected": False, "status": None, "lang": None, "retry_after": None}
+    # `model=` names a WORKER GROUP in a multi-model fleet (S2-6). Sent only when
+    # asked for, so a single-model server sees exactly the query it always saw.
     path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    if a.model:
+        path += f"&model={a.model}"
     try:
         sock, status, headers = ws_connect(a.host, a.port, path, timeout=a.connect_timeout)
     except OSError as e:
@@ -330,6 +334,9 @@ def build_args():
     ap.add_argument("--streams", type=int, default=1, help="concurrency (streams in flight)")
     ap.add_argument("--clips", nargs="+", required=True, help="16 kHz mono s16 WAVs")
     ap.add_argument("--lang", default="auto")
+    ap.add_argument("--model", default=None,
+                    help="the worker group to stream to, in a multi-model fleet "
+                         "(?model=); omitted, the server's default group answers")
     ap.add_argument("--lookahead", default="3")
     ap.add_argument("--frame-ms", type=int, default=100)
     ap.add_argument("--pace", type=float, default=1.0, help="1.0 = real time; 2.0 = twice as fast")
