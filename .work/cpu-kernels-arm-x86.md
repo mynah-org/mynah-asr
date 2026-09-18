@@ -321,3 +321,33 @@ to be compared against on Linux, not against the per-row loop.
    `s*(ws*sx)`; that this is also what GCC's `-ffast-math` was producing on
    Linux is an assumption until a before/after byte dump says so. If it is not,
    the numbers move on Linux — and the transcripts with them.
+
+## Evidence — S5-1, the gates the implementing agent could not run (owner, 2026-09-18)
+
+The agent that wrote the kernels had no converted model in its worktree, so the
+model-gated half of the gate was owed. Run here on the merged tree (`make` at
+`v0.9.1-56`, Apple M1, Accelerate, `models_local/nemotron-3.5-asr-streaming-0.6b`):
+
+- `tests/test_qmat` kernel identity: `dot-per-row exact OK 82 shape/T cases, 763
+  kernel blocks` · `neon-sdot exact OK 82 shape/T cases, 466 kernel blocks` ·
+  `neon-smmla SKIPPED (compiled, not runnable here): this CPU does not report
+  FEAT_I8MM` · the three x86 kernels `SKIPPED (not compiled)`. The skips carry
+  their reason, which is the point: a claim that was not executed says so.
+- `tests/test_stream_batch` with the model: **IDENTICAL at both levels** for
+  B ∈ {1,2,3,4,8}, int8 and f32, and the per-kernel counters prove the resolved
+  kernel ran (`int8 kernels neon-sdot 171700 | resolved neon-sdot` at B=4).
+  `DEQUANT 0` everywhere.
+- `tests/test_streaming`: parity IDENTICAL and reset+paced IDENTICAL.
+- Transcripts of `test_it.wav` unchanged in int8 and f32 against the pre-merge
+  tree, which is the check the epilogue fix needed: pinning
+  `(float)s*(ws*sx)` moved no shipped byte.
+- In-situ step table: taken at **loadavg 15 on 8 cores** (another agent was
+  building), so the absolute milliseconds are NOT comparable with the S1-7 table
+  and are not quoted. What survives the load, because both arms ran inside the
+  same process under the same load, is the ratio: batched/single 0.53 at B=2,
+  0.37 at B=4, 0.27 at B=8. DIAGNOSTIC.
+
+What Linux still owes for this item is unchanged and listed above: SMMLA on real
+i8mm silicon, the three x86 kernels, and a before/after byte dump of the float
+epilogue under GCC's `-ffast-math` (the barrier pins one grouping; that GCC chose
+the same one is an assumption until dumped).
