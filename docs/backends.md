@@ -7,7 +7,12 @@ is unavailable or not compiled in. GEMMs under 24 rows always stay on CPU
 
 ## CPU (default)
 
-BLAS: Accelerate (macOS) / OpenBLAS (Linux) for GEMMs; own SDOT/VNNI/AVX2 kernels
+f32 GEMM provider: `make BLAS=none|openblas|accelerate`, reported as
+`gemm.f32` by `--dispatch-map` and on the `[EFFECTIVE-CONFIG]` line. `none` is
+the **Linux default** and links no cblas at all — `src/sgemm.c` computes every
+f32 GEMM and GEMV on the same pool as everything else, which is the point: a
+worker pinned to T cpus runs T threads and not 2T. `accelerate` is the macOS
+default and `openblas` the comparison arm. Own SDOT/VNNI/AVX2 kernels
 for quantized dot products (see [quantization.md](quantization.md)). On Apple Silicon
 it is the fastest backend today (AMX): offline RTF 0.10 (int8).
 

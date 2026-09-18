@@ -1,15 +1,11 @@
 #include "subsampling.h"
+
+#include "backend.h"   /* the f32 seam: mynah_asr_gemm_f32 */
 #include "threads.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
 
 int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safetensors *st) {
     memset(ss, 0, sizeof(*ss));
@@ -152,8 +148,8 @@ static void conv2d_s2(const float *x, int C_in, int T, int F, int pl_t, int pr_t
                     }
                 }
             }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C_out, (int)S, 9,
-                        1.0f, w, 9, P, (int)S, 0.0f, out, (int)S);
+            mynah_asr_gemm_f32(0, 0, C_out, (int)S, 9,
+                               1.0f, w, 9, P, (int)S, 0.0f, out, (int)S);
             for (int co = 0; co < C_out; co++) {
                 float *dst = out + (size_t)co * S;
                 for (size_t i = 0; i < S; i++) dst[i] += b[co];
@@ -257,8 +253,8 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
         const size_t S = (size_t)To2 * (size_t)Fo2;
         const float *pw = (const float *)ss->pw_w[i]->data; /* [C, C, 1, 1] -> [C, C] */
         const float *pb = (const float *)ss->pw_b[i]->data;
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C, (int)S, C,
-                    1.0f, pw, C, bbuf, (int)S, 0.0f, a, (int)S);
+        mynah_asr_gemm_f32(0, 0, C, (int)S, C,
+                           1.0f, pw, C, bbuf, (int)S, 0.0f, a, (int)S);
         for (int co = 0; co < C; co++) {
             float *row = a + (size_t)co * S;
             for (size_t j = 0; j < S; j++) row[j] += pb[co];
@@ -279,8 +275,8 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
                    (size_t)Fo * sizeof(float));
 
     /* out = flat @ W^T + b — W [d_model, CF] row-major => GEMM with B transposed */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, To, ss->d_model, CF,
-                1.0f, flat, CF, (const float *)ss->lin_w->data, CF, 0.0f, out, ss->d_model);
+    mynah_asr_gemm_f32(0, 1, To, ss->d_model, CF,
+                       1.0f, flat, CF, (const float *)ss->lin_w->data, CF, 0.0f, out, ss->d_model);
     const float *lb = (const float *)ss->lin_b->data;
     for (int t = 0; t < To; t++)
         for (int d = 0; d < ss->d_model; d++) out[(size_t)t * (size_t)ss->d_model + (size_t)d] += lb[d];
@@ -402,8 +398,8 @@ int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_strea
         const size_t S = (size_t)To2 * (size_t)Fo2;
         const float *pw = (const float *)ss->pw_w[i]->data;
         const float *pb = (const float *)ss->pw_b[i]->data;
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C, (int)S, C,
-                    1.0f, pw, C, bbuf, (int)S, 0.0f, a, (int)S);
+        mynah_asr_gemm_f32(0, 0, C, (int)S, C,
+                           1.0f, pw, C, bbuf, (int)S, 0.0f, a, (int)S);
         for (int co = 0; co < C; co++) {
             float *row = a + (size_t)co * S;
             for (size_t j = 0; j < S; j++) row[j] += pb[co];
@@ -424,8 +420,8 @@ int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_strea
             memcpy(flat + (size_t)t * (size_t)CF + (size_t)c * (size_t)Fo,
                    a + ((size_t)c * (size_t)To + (size_t)t) * (size_t)Fo,
                    (size_t)Fo * sizeof(float));
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, To, ss->d_model, CF,
-                1.0f, flat, CF, (const float *)ss->lin_w->data, CF, 0.0f, out, ss->d_model);
+    mynah_asr_gemm_f32(0, 1, To, ss->d_model, CF,
+                       1.0f, flat, CF, (const float *)ss->lin_w->data, CF, 0.0f, out, ss->d_model);
     const float *lb = (const float *)ss->lin_b->data;
     for (int t = 0; t < To; t++)
         for (int d = 0; d < ss->d_model; d++) out[(size_t)t * (size_t)ss->d_model + (size_t)d] += lb[d];

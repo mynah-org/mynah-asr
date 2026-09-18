@@ -5,6 +5,7 @@
  * one without the other, in either direction. */
 #include "flags.h"
 
+#include "backend.h"
 #include "dispatch.h"
 #include "qmat.h"
 #include "threads.h"
@@ -34,13 +35,23 @@ static const char *inert_qgemm(void) {
                : NULL;
 }
 
+/* Asks the seam which provider was linked instead of re-deriving it from a
+ * #if: src/backend.c owns that branch. */
 static const char *inert_openblas_threads(void) {
-#if MYNAH_ASR_DISPATCH_HAS_ACCELERATE
-    return "this build links Accelerate; openblas_set_num_threads is never "
-           "called and Accelerate nests through GCD";
-#else
-    return NULL;
-#endif
+    const char *p = mynah_asr_gemm_provider();
+    if (strcmp(p, "openblas") == 0) return NULL;
+    if (strcmp(p, "accelerate") == 0)
+        return "this build links Accelerate; openblas_set_num_threads is never "
+               "called and Accelerate nests through GCD";
+    return "this build links no BLAS at all: the f32 GEMMs run on src/sgemm.c "
+           "over the one pool, and there is no OpenBLAS team to size";
+}
+
+static const char *inert_sgemm_profile(void) {
+    return strcmp(mynah_asr_gemm_provider(), "own") == 0
+               ? NULL
+               : "the f32 GEMMs go to a vendor BLAS in this build, so "
+                 "src/sgemm.c never runs and has no shapes to record";
 }
 
 static const char *inert_metal(void) {
@@ -84,11 +95,17 @@ static const mynah_asr_flag g_flags[] = {
      "x86 SIMD level for the int8/int4 dot kernels: auto|scalar|avx2|vnni",
      inert_caps, eff_caps},
 
-    {"MYNAH_ASR_BATCH_F32", MYNAH_ASR_FLAG_KERNEL, "auto (1 on Accelerate, 0 elsewhere)",
+    {"MYNAH_ASR_BATCH_F32", MYNAH_ASR_FLAG_KERNEL, "auto (1 on accelerate and own, 0 on openblas)",
      "1/0 forces the f32 stream step to stack B streams' rows into one sgemm or to step them one by one;"
-     " the default is on only where sgemm is proven row-stable (Accelerate), off where it is unverified (OpenBLAS);"
-     " int8 never consults it, its per-row dot is exact by construction",
+     " the default is on only where sgemm is proven row-stable -- measured for Accelerate, true by construction for our own"
+     " (the stacked GEMM is x @ W^T, the DOT family, one dot per output element over the whole of k) -- and off on"
+     " OpenBLAS, where it is unverified; int8 never consults it, its per-row dot is exact by construction",
      NULL, NULL},
+
+    {"MYNAH_ASR_SGEMM_PROFILE", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "src/sgemm.c: record every f32 GEMM shape AS EXECUTED (family, tasks asked of the pool, wall)"
+     " and print the table at exit; off it costs one relaxed load per GEMM call",
+     inert_sgemm_profile, NULL},
 
     {"MYNAH_ASR_BATCH_ALLOCS", MYNAH_ASR_FLAG_DEBUG, "unset",
      "tests/test_stream_batch: run only the zero-allocation gate of the batched step (same as --allocs)",
@@ -210,15 +227,11 @@ const char *mynah_asr_build_id(void) {
 #endif
 }
 
-const char *mynah_asr_blas_provider(void) {
-#if MYNAH_ASR_DISPATCH_HAS_ACCELERATE
-    return "accelerate";
-#elif MYNAH_ASR_DISPATCH_HAS_OPENBLAS
-    return "openblas";
-#else
-    return "none";
-#endif
-}
+/* One answer, from the file that owns the branch (src/backend.c): "accelerate",
+ * "openblas" or "own".  It used to be a second copy of the compile gates here,
+ * which is the exact shape of bug src/dispatch.h opens with — a report and a
+ * source that agree and are both wrong. */
+const char *mynah_asr_blas_provider(void) { return mynah_asr_gemm_provider(); }
 
 /* The ISA the COMPILER was allowed to emit, plus the target-attributed kernels
  * that are in the binary whatever -march said. Deliberately not a claim about

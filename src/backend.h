@@ -13,14 +13,48 @@ enum { MYNAH_ASR_BACKEND_CPU = 0, MYNAH_ASR_BACKEND_METAL = 1, MYNAH_ASR_BACKEND
 int mynah_asr_set_backend(const char *name);
 int mynah_asr_backend(void);
 
-/* out[T,n] = x[T,k] @ W[n,k]^T — dispatch: Metal for large T when active, else BLAS.
- * W must stay stable for the life of the process (mmap'd weights are): on Metal
- * it is copied ONCE into a resident MTLBuffer (per-pointer cache). */
+/* ------------------------------------------------------------- the f32 seam
+ *
+ * EVERY f32 GEMM and GEMV in this runtime goes through the three entry points
+ * below, and they are the ONLY place that knows which provider computes it:
+ * `accelerate` (macOS, BLAS=accelerate), `openblas` (BLAS=openblas) or `own`
+ * (src/sgemm.c, the Linux default).  No other translation unit includes
+ * <cblas.h> or <Accelerate/Accelerate.h> for arithmetic — that is what makes
+ * `BLAS=none` a build rather than a patch, and what makes
+ * mynah_asr_gemm_provider() a fact instead of a guess (ENGINEERING.md §6).
+ *
+ * The provider this binary linked, as one of those three words.  A pure
+ * compile-time gate answered by the file that owns the branch; src/flags.c and
+ * src/dispatch.c both READ it rather than re-deriving it. */
+const char *mynah_asr_gemm_provider(void);
+
+/* C[m,n] = alpha * op(A) * op(B) + beta * C, row-major — cblas_sgemm's
+ * contract, including beta == 0 meaning "C is written, never read". */
+void mynah_asr_gemm_f32(int trans_a, int trans_b, int m, int n, int k,
+                        float alpha, const float *a, int lda,
+                        const float *b, int ldb, float beta, float *c, int ldc);
+
+/* y = alpha * op(A) * x + beta * y, A row-major [rows, cols] with row stride
+ * lda, x and y unit-stride — cblas_sgemv(CblasRowMajor, ..., incx=1, incy=1).
+ * trans == 0: y has `rows` elements and x has `cols`; trans != 0: the reverse. */
+void mynah_asr_gemv_f32(int trans, int rows, int cols, float alpha,
+                        const float *a, int lda, const float *x,
+                        float beta, float *y);
+
+/* out[T,n] = x[T,k] @ W[n,k]^T — dispatch: Metal/CUDA for large T when active,
+ * else mynah_asr_gemm_f32.  W must stay stable for the life of the process
+ * (mmap'd weights are): on Metal it is copied ONCE into a resident MTLBuffer
+ * (per-pointer cache). */
 void mynah_asr_gemm_wt(const float *x, const float *w, float *out, int T, int n, int k);
 
 /* Fused FFN: out[T,n2] = SiLU(x @ W1^T) @ W2^T. scratch: >= T*n1 floats (used
  * only in the CPU fallback). On Metal the intermediate stays on GPU (one sync). */
-void mynah_asr_silu(float *x, size_t n);   /* x = x*sigmoid(x), vectorized via Accelerate */
+/* x = x*sigmoid(x); vectorized through Accelerate's vForce where that
+ * framework is present, which on macOS is EVERY build — vvexpf is not the BLAS
+ * and does not move with BLAS=none, so the two macOS builds run the same
+ * arithmetic here and a transcript difference between them can only come from
+ * the GEMM. */
+void mynah_asr_silu(float *x, size_t n);
 /* Same, with caller-owned scratch (>= n floats) for the vectorized path, so a
  * hot loop never allocates. scratch == NULL behaves exactly like mynah_asr_silu.
  * Identical arithmetic in both forms (the scratch only replaces the malloc). */

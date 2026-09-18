@@ -258,8 +258,9 @@ double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s);
  * group. All streams must belong to the same model.
  *
  * B == 1 takes exactly the single-stream path. The f32 weights path may also
- * degrade to per-stream steps (cblas_sgemm is not row-stable in M on every BLAS
- * — see mynah_asr_stream_batch_rows_stacked to check what a run actually did).
+ * degrade to per-stream steps (a vendor sgemm is not row-stable in M on every
+ * BLAS — see mynah_asr_stream_batch_rows_stacked to check what a run actually
+ * did).
  *
  * THREADING: one thread at a time per model (the serving-v2 scheduler owns it).
  * Returns 0, -1 on error.

@@ -9,7 +9,7 @@
  *          scales [n * k/32] (Q4_0 style)
  *
  * Product dispatch:
- *  - f32: cblas_sgemm
+ *  - f32: the sgemm seam (src/backend.c: Accelerate, OpenBLAS or our own)
  *  - quantized, small T (streaming/decode): direct dot kernel (bandwidth bound)
  *  - quantized, large T (offline/batch): dequant into scratch + sgemm */
 #ifndef MYNAH_ASR_QMAT_H
@@ -75,9 +75,10 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
  * dequant+sgemm fallback of mynah_asr_qmat_mul is NEVER taken here (it would
  * change the numerics AND malloc per call).
  *
- * F32 weights: one cblas_sgemm over the whole [T, k] block. Row stability
- * across M is a BLAS property, NOT a guarantee — measure it per platform
- * (tests/test_stream_batch) before relying on it.
+ * F32 weights: one sgemm through the seam (src/backend.c) over the whole
+ * [T, k] block. Row stability across M is a property of the PROVIDER, not a
+ * guarantee — measure it per platform (tests/test_stream_batch) before relying
+ * on it.
  *
  * qx/sx: caller-owned scratch, >= T*m->k int8 and >= T floats, so the call
  * allocates nothing. NULL is allowed and falls back to the per-row path.
@@ -88,7 +89,7 @@ int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out,
 /* Which implementation ran, counted per call (ENGINEERING.md §6: a fallback is
  * visible). Cheap relaxed atomics; read with mynah_asr_qmat_counter. */
 enum {
-    MYNAH_ASR_QC_F32 = 0,      /* cblas_sgemm on f32 weights                     */
+    MYNAH_ASR_QC_F32 = 0,      /* the sgemm seam on f32 weights                  */
     MYNAH_ASR_QC_DOT,          /* native int8 per-row dot, serial small-T path   */
     MYNAH_ASR_QC_DOT_ROWS,     /* native int8 per-row dot, weight-stationary     */
     MYNAH_ASR_QC_GENERIC,      /* per-row f32xint8 fallback (no native kernel)   */

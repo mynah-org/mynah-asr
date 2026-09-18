@@ -11,12 +11,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-
 /* ------------------------------------------------------------- quantizers */
 void mynah_asr_quantize_int8(const float *w, int n, int k, int8_t *out_q, float *out_scales) {
     for (int i = 0; i < n; i++) {
@@ -752,8 +746,8 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
     float *wd = malloc((size_t)m->n * (size_t)m->k * sizeof(float));
     if (!wd) return;
     for (int i = 0; i < m->n; i++) dequant_row(m, i, wd + (size_t)i * (size_t)m->k);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, m->n, m->k,
-                1.0f, x, m->k, wd, m->k, 0.0f, out, m->n);
+    mynah_asr_gemm_f32(0, 1, T, m->n, m->k,
+                       1.0f, x, m->k, wd, m->k, 0.0f, out, m->n);
     free(wd);
 }
 

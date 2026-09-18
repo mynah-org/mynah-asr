@@ -39,7 +39,8 @@ models**, in the spirit of `llama.cpp` / `whisper.cpp`. One shared FastConformer
 encoder, interchangeable decoders behind a vtable (`engine.h`), streaming as a
 first-class citizen.
 
-- **Pure C11**, zero runtime dependencies (only BLAS: Accelerate/OpenBLAS)
+- **Pure C11**, zero runtime dependencies — the f32 GEMM is ours (`src/sgemm.c`);
+  `BLAS=openblas` and `BLAS=accelerate` stay as comparison builds
 - **10 models across 4 decoder families** — RNNT, TDT, CTC and AED (Canary)
 - **Speech translation**: Canary translates speech (25 EU languages ↔ English
   with canary-1b-v2, en↔de/es/fr with the flash models) — CLI `--target-lang`,
@@ -137,8 +138,10 @@ header, with `SHA256SUMS`), or build in a few seconds:
 
 ```sh
 git clone https://github.com/mynah-org/mynah-asr.git && cd mynah-asr
-make          # macOS: Accelerate + Metal, zero deps
-              # Linux: sudo apt install libopenblas-dev  (Fedora: openblas-devel)
+make          # Linux: no dependencies at all (our own f32 GEMM)
+              # macOS: Accelerate + Metal, zero deps
+              # comparison arms: make BLAS=openblas (needs libopenblas-dev),
+              #                  make BLAS=none (the Linux default, explicit)
 ```
 
 **2 — Get a model.** `scripts/download_model.sh` fetches any supported

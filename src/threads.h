@@ -28,6 +28,15 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
  *
  * OpenBLAS only: Accelerate nests through GCD and needs no knob, so on macOS
  * this only bookkeeps (mynah_asr_blas_budget stays truthful for tests/health).
+ *
+ * WITH NO BLAS IN THE PROCESS (make BLAS=none, the Linux default) there is no
+ * second pool to budget: src/sgemm.c dispatches onto THIS pool, so
+ * mynah_asr_blas_budget() is the pool width and nothing can move it.
+ * set_concurrency still records the declaration — the server calls it and
+ * /v1/health prints the result — but it does not invent a smaller number for a
+ * team that does not exist. Ask mynah_asr_gemm_provider() (src/backend.h) which
+ * of the three builds this is; do not infer it from the budget.
+ *
  * Thread-safe; the knob is touched only when the value really changes, so a
  * steady-state server pays nothing. */
 void mynah_asr_blas_set_concurrency(int n_inflight);

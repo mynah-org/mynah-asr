@@ -9,12 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-
 /* ------------------------------------------------------------------ helpers */
 static const float *T_(const mynah_asr_safetensors *st, const char *fmt, int li, const char *suffix) {
     char name[160];
@@ -264,16 +258,16 @@ static void attention_banded(const mynah_asr_encoder *enc, const mynah_asr_enc_l
                 for (int i = 0; i < dk; i++)
                     qb[(size_t)r * (size_t)dk + (size_t)i] =
                         q[(size_t)(t0 + r) * (size_t)d + ho + (size_t)i] + L->bias_v[ho + (size_t)i];
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Rb, pW, dk,
-                        1.0f, qb, dk, rk + (size_t)(p0 - pu0) * (size_t)d + ho, d, 0.0f, bdb, pW);
+            mynah_asr_gemm_f32(0, 1, Rb, pW, dk,
+                               1.0f, qb, dk, rk + (size_t)(p0 - pu0) * (size_t)d + ho, d, 0.0f, bdb, pW);
 
             /* ac_block[r, jl] = (q[t0+r]+bias_u) . k[c0+jl] */
             for (int r = 0; r < Rb; r++)
                 for (int i = 0; i < dk; i++)
                     qb[(size_t)r * (size_t)dk + (size_t)i] =
                         q[(size_t)(t0 + r) * (size_t)d + ho + (size_t)i] + L->bias_u[ho + (size_t)i];
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Rb, Wb, dk,
-                        1.0f, qb, dk, k + (size_t)c0 * (size_t)d + ho, d, 0.0f, scb, Wb);
+            mynah_asr_gemm_f32(0, 1, Rb, Wb, dk,
+                               1.0f, qb, dk, k + (size_t)c0 * (size_t)d + ho, d, 0.0f, scb, Wb);
 
             for (int r = 0; r < Rb; r++) {
                 const int t = t0 + r;
@@ -303,8 +297,8 @@ static void attention_banded(const mynah_asr_encoder *enc, const mynah_asr_enc_l
             }
 
             /* ctx_block = scores_block @ v[c0:c1] (strided per head) */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Rb, dk, Wb,
-                        1.0f, scb, Wb, v + (size_t)c0 * (size_t)d + ho, d, 0.0f, cb, dk);
+            mynah_asr_gemm_f32(0, 0, Rb, dk, Wb,
+                               1.0f, scb, Wb, v + (size_t)c0 * (size_t)d + ho, d, 0.0f, cb, dk);
             for (int r = 0; r < Rb; r++)
                 memcpy(ctx + (size_t)(t0 + r) * (size_t)d + ho,
                        cb + (size_t)r * (size_t)dk, (size_t)dk * sizeof(float));
@@ -353,15 +347,15 @@ static void attention(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L
             for (int i = 0; i < dk; i++)
                 qb[(size_t)t * (size_t)dk + (size_t)i] = q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_v[ho + (size_t)i];
         /* bd_full[t, p] = qv[t] . rk[p]  — rk is strided per head: gemm with lda=d */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, P, dk,
-                    1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
+        mynah_asr_gemm_f32(0, 1, T, P, dk,
+                           1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
 
         /* q + bias_u (for matrix_ac) */
         for (int t = 0; t < T; t++)
             for (int i = 0; i < dk; i++)
                 qb[(size_t)t * (size_t)dk + (size_t)i] = q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_u[ho + (size_t)i];
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, dk,
-                    1.0f, qb, dk, k + ho, d, 0.0f, scores, T);
+        mynah_asr_gemm_f32(0, 1, T, T, dk,
+                           1.0f, qb, dk, k + ho, d, 0.0f, scores, T);
 
         /* scores = (ac + rel_shift(bd)) * scaling + softmax, ONLY over the
          * chunked_limited window — which is contiguous per row: jc in [tc-lc, tc]
@@ -399,8 +393,8 @@ static void attention(const mynah_asr_encoder *enc, const mynah_asr_enc_layer *L
         }
 
         /* ctx_h = scores @ v_h (v is strided per head) */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, dk, T,
-                    1.0f, scores, T, v + ho, d, 0.0f, qb, dk);
+        mynah_asr_gemm_f32(0, 0, T, dk, T,
+                           1.0f, scores, T, v + ho, d, 0.0f, qb, dk);
         for (int t = 0; t < T; t++)
             memcpy(ctx + (size_t)t * (size_t)d + ho, qb + (size_t)t * (size_t)dk, (size_t)dk * sizeof(float));
     }
@@ -802,15 +796,15 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
                 for (int i = 0; i < dk; i++)
                     qb[(size_t)t * (size_t)dk + (size_t)i] =
                         q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_v[ho + (size_t)i];
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Q, P, dk,
-                        1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
+            mynah_asr_gemm_f32(0, 1, Q, P, dk,
+                               1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
 
             for (int t = 0; t < Q; t++)
                 for (int i = 0; i < dk; i++)
                     qb[(size_t)t * (size_t)dk + (size_t)i] =
                         q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_u[ho + (size_t)i];
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Q, K, dk,
-                        1.0f, qb, dk, kk + ho, d, 0.0f, scores, K);
+            mynah_asr_gemm_f32(0, 1, Q, K, dk,
+                               1.0f, qb, dk, kk + ho, d, 0.0f, scores, K);
 
             for (int t = 0; t < Q; t++) {
                 float *srow = scores + (size_t)t * (size_t)K;
@@ -828,8 +822,8 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
                 for (int j = 0; j < K; j++) srow[j] *= inv;
             }
 
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Q, dk, K,
-                        1.0f, scores, K, vv + ho, d, 0.0f, qb, dk);
+            mynah_asr_gemm_f32(0, 0, Q, dk, K,
+                               1.0f, scores, K, vv + ho, d, 0.0f, qb, dk);
             for (int t = 0; t < Q; t++)
                 memcpy(ctx + (size_t)t * (size_t)d + ho, qb + (size_t)t * (size_t)dk,
                        (size_t)dk * sizeof(float));
@@ -1060,19 +1054,32 @@ void mynah_asr_enc_batch_free(mynah_asr_enc_batch *bb) {
 int mynah_asr_enc_batch_max_rows(const mynah_asr_enc_batch *bb) { return bb ? bb->max_rows : 0; }
 int mynah_asr_enc_batch_max_b(const mynah_asr_enc_batch *bb) { return bb ? bb->max_b : 0; }
 
-/* May the f32 path stack rows? Unlike the integer one this is NOT a property of
- * the code: cblas_sgemm gives no guarantee that row t of C is the same bytes for
- * M = q and for M = Σq, so the answer is a per-BLAS MEASUREMENT.
+/* May the f32 path stack rows? For a VENDOR BLAS this is not a property of the
+ * code: cblas_sgemm gives no guarantee that row t of C is the same bytes for
+ * M = q and for M = Σq, so the answer there is a per-BLAS MEASUREMENT. It is
+ * one question with three answers, one per provider, and each is stated with
+ * its ground.
  *
- * MEASURED 2026-09-18, macOS arm64 / Accelerate, nemotron-3.5-asr-streaming-0.6b,
- * preset [56,3]: the encoder output of every chunk of every stream is identical
- * float for float between B single steps and one batched step — 74,240 (B=2),
- * 133,120 (B=4) and 266,240 (B=8) floats compared, 0 differ, and the K/V and
- * conv caches match too (tests/test_stream_batch, "encoder bit-exact"). So it is
- * ON for Accelerate. OpenBLAS is UNVERIFIED: the same gate has to run on Linux
- * before the default moves there, and until it does the f32 batched step
- * degrades to per-stream single steps on that build — a visible fallback
- * (mynah_asr_stream_batch_rows_stacked stays 0), not a silent one.
+ * accelerate — MEASURED 2026-09-18, macOS arm64, nemotron-3.5-asr-streaming-0.6b,
+ *   preset [56,3]: the encoder output of every chunk of every stream is
+ *   identical float for float between B single steps and one batched step —
+ *   74,240 (B=2), 133,120 (B=4) and 266,240 (B=8) floats compared, 0 differ,
+ *   and the K/V and conv caches match too (tests/test_stream_batch, "encoder
+ *   bit-exact"). ON.
+ *
+ * own — TRUE BY CONSTRUCTION, and then measured anyway. The stacked GEMM is
+ *   x @ W^T (mynah_asr_gemm_wt and the qmat f32 fallback), i.e. trans_b, which
+ *   src/sgemm.c always sends to the DOT family: output element (t, j) is one
+ *   dot product of row t of x with row j of W over the whole of k, and nothing
+ *   in it — not the family choice, not the column grid, not the row block —
+ *   depends on m. The same tests/test_stream_batch gate runs on this build and
+ *   is what would catch it if that argument were ever falsified by a change.
+ *   ON.
+ *
+ * openblas — still UNVERIFIED: the same gate has to run on Linux before the
+ *   default moves, and until it does the f32 batched step degrades to
+ *   per-stream single steps there — a visible fallback
+ *   (mynah_asr_stream_batch_rows_stacked stays 0), not a silent one. OFF.
  *
  * MYNAH_ASR_BATCH_F32=0|1 forces either way, which is how the Linux gate runs.
  * The integer path never consults this: it is exact by construction. */
@@ -1080,11 +1087,8 @@ int mynah_asr_enc_batch_f32_ok(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("MYNAH_ASR_BATCH_F32");
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-        cached = e ? (e[0] == '1') : 1;
-#else
-        cached = e ? (e[0] == '1') : 0;
-#endif
+        if (e) cached = (e[0] == '1');
+        else cached = strcmp(mynah_asr_gemm_provider(), "openblas") != 0;
     }
     return cached;
 }

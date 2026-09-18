@@ -139,7 +139,10 @@ on 300 s audio — it stays opt-in until the resident-activation encoder
   called from `mynah_asr_parallel_for` workers it oversubscribes catastrophically
   (batch 4×60 s: **257 s → 10 s** after pinning BLAS to 1 thread inside
   parallel regions — weak-symbol pattern from qwen-tts, `OPENBLAS_NUM_THREADS`
-  still wins). macOS/Accelerate is unaffected.
+  still wins). macOS/Accelerate is unaffected. **Since S1-6 this whole class of
+  problem is off the Linux default path**: `BLAS=none` links no OpenBLAS, so
+  there is one pool and nothing to nest. The knob survives for
+  `make BLAS=openblas`, the comparison build.
 
 ~~Known issue: `mynah_asr_transcribe_batch` skips long-file segmentation~~ **fixed
 2026-07-30**: batching now happens over SEGMENTS, planned by the same code the

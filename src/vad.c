@@ -5,15 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "backend.h"              /* the f32 seam: mynah_asr_gemm_f32, _gemv_f32 */
 #include "qmat.h"                 /* mynah_asr_sigmoid */
 #include "weights.h"
 #include "../vendor/cJSON.h"
-
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
 
 /* Structural cap, not a model constant: silero v5 has 4 encoder blocks and a
  * checkpoint with more would need a config change anyway. */
@@ -295,8 +290,8 @@ static void conv1d(const float *in, int cin, int t_in, const float *w, const flo
                 dst[t] = (s >= 0 && s < t_in) ? in[(size_t)ci * (size_t)t_in + (size_t)s] : 0.0f;
             }
         }
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, cout, t_out, cin * k,
-                1.0f, w, cin * k, col, t_out, 0.0f, out, t_out);
+    mynah_asr_gemm_f32(0, 0, cout, t_out, cin * k,
+                       1.0f, w, cin * k, col, t_out, 0.0f, out, t_out);
     for (int o = 0; o < cout; o++) {
         float *row = out + (size_t)o * (size_t)t_out;
         for (int t = 0; t < t_out; t++) {
@@ -323,8 +318,8 @@ float mynah_asr_vad_feed(mynah_asr_vad *v, const float *samples, size_t n) {
     for (int f = 0; f < T0; f++)
         memcpy(v->win + (size_t)f * (size_t)v->n_fft, v->buf + (size_t)f * (size_t)v->hop,
                (size_t)v->n_fft * sizeof(float));
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 2 * B, T0, v->n_fft,
-                1.0f, v->basis, v->n_fft, v->win, v->n_fft, 0.0f, v->spec, T0);
+    mynah_asr_gemm_f32(0, 1, 2 * B, T0, v->n_fft,
+                       1.0f, v->basis, v->n_fft, v->win, v->n_fft, 0.0f, v->spec, T0);
     float *mag = v->act[0];
     for (int b = 0; b < B; b++)
         for (int f = 0; f < T0; f++) {
@@ -346,8 +341,8 @@ float mynah_asr_vad_feed(mynah_asr_vad *v, const float *samples, size_t n) {
      * the same as the RNNT prediction net, see docs/architecture-notes.md §6) */
     const int H = v->hidden;
     for (int i = 0; i < 4 * H; i++) v->z[i] = v->b_ih[i] + v->b_hh[i];
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, v->w_ih, H, v->act[cur], 1, 1.0f, v->z, 1);
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, v->w_hh, H, v->h, 1, 1.0f, v->z, 1);
+    mynah_asr_gemv_f32(0, 4 * H, H, 1.0f, v->w_ih, H, v->act[cur], 1.0f, v->z);
+    mynah_asr_gemv_f32(0, 4 * H, H, 1.0f, v->w_hh, H, v->h, 1.0f, v->z);
     for (int i = 0; i < H; i++) {
         const float ig = mynah_asr_sigmoid(v->z[i]);
         const float fg = mynah_asr_sigmoid(v->z[H + i]);

@@ -4,8 +4,10 @@
 #include "backend.h"
 #include "flags.h"
 #include "qmat.h"
+#include "sgemm.h"
 #include "threads.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -191,12 +193,54 @@ int mynah_asr_dispatch_collect(mynah_asr_dispatch_row *rows, int capacity) {
     }
 
     /* --- f32 GEMM provider: a pure build gate, and a complete answer ------ */
-    row_set(&rows[n++], "gemm.f32",
-            MYNAH_ASR_DISPATCH_HAS_ACCELERATE ? "accelerate"
-              : MYNAH_ASR_DISPATCH_HAS_OPENBLAS ? "openblas" : "none",
-            "-", NULL, mynah_asr_blas_provider(), MYNAH_ASR_DISPATCH_SRC_GATE,
-            "Makefile links one cblas per platform; src/backend.c calls "
-            "cblas_sgemm unconditionally");
+    row_set(&rows[n++], "gemm.f32", mynah_asr_gemm_provider(), "-", NULL,
+            mynah_asr_gemm_provider(), MYNAH_ASR_DISPATCH_SRC_GATE,
+            "src/backend.c mynah_asr_gemm_provider(); make BLAS=none|openblas|"
+            "accelerate picks it, every f32 GEMM and GEMV in the runtime goes "
+            "through that one seam, and 'own' means no cblas symbol is linked "
+            "at all");
+
+    /* --- our own sgemm: the family predicate, the counters, the self-test --
+     * Three facts, and none of them re-derived: the family comes from the
+     * predicate the runtime itself calls, on a shape this runtime really
+     * issues, and the counters are what the dispatcher incremented. */
+    if (strcmp(mynah_asr_gemm_provider(), "own") == 0) {
+        mynah_asr_sgemm_stats st;
+        mynah_asr_sgemm_stats_get(&st);
+        const char *why = NULL;
+        const mynah_asr_sgemm_family head =
+            mynah_asr_sgemm_family_for(0, 1, 64u, 1024u, 1024u, &why);
+        char res[32];
+        snprintf(res, sizeof(res), "%s", mynah_asr_sgemm_isa_name());
+        char reason[200];
+        snprintf(reason, sizeof(reason),
+                 "src/sgemm.c mynah_asr_sgemm_isa_name(): %s micro-kernels, 4 "
+                 "rows, narrow/panel boundary at n=%zu derived from the "
+                 "register file; family_for(64,1024,1024,transB) says '%s'",
+                 mynah_asr_sgemm_isa_name(), mynah_asr_sgemm_narrow_max(),
+                 mynah_asr_sgemm_family_name(head));
+        row_set(&rows[n++], "gemm.f32_kernel", "yes", "yes",
+                "MYNAH_ASR_SGEMM_PROFILE", res,
+                MYNAH_ASR_DISPATCH_SRC_PREDICATE, reason);
+
+        char calls[32];
+        if (st.calls == 0ull) {
+            snprintf(calls, sizeof(calls), "n/a");
+            snprintf(reason, sizeof(reason),
+                     "src/sgemm.c counters: no GEMM has run in this process "
+                     "yet, so there is nothing to report. --dispatch-map loads "
+                     "no model; read this row after a transcription");
+        } else {
+            snprintf(calls, sizeof(calls), "%llu calls", st.calls);
+            snprintf(reason, sizeof(reason),
+                     "src/sgemm.c counters: %llu dot, %llu narrow, %llu panel, "
+                     "%llu matvec, %llu reference, %llu refused",
+                     st.dot, st.narrow, st.panel, st.matvec, st.reference,
+                     st.refused);
+        }
+        row_set(&rows[n++], "gemm.f32_families", "yes", "-", NULL, calls,
+                MYNAH_ASR_DISPATCH_SRC_PREDICATE, reason);
+    }
 
     /* --- Metal: compiled gate + a real device open ------------------------ */
 #if MYNAH_ASR_DISPATCH_HAS_METAL
@@ -241,11 +285,16 @@ int mynah_asr_dispatch_collect(mynah_asr_dispatch_row *rows, int capacity) {
                 "src/threads.c mynah_asr_num_threads(); persistent pool, width "
                 "clamped to [1,64]");
         snprintf(w, sizeof(w), "%d", mynah_asr_blas_budget());
+        const int own = strcmp(mynah_asr_gemm_provider(), "own") == 0;
         row_set(&rows[n++], "threads.blas_budget", "yes",
-                MYNAH_ASR_DISPATCH_HAS_OPENBLAS ? "yes" : "-", "OPENBLAS_NUM_THREADS", w,
-                MYNAH_ASR_DISPATCH_SRC_RUNTIME,
-                "src/threads.c mynah_asr_blas_budget(); Accelerate nests through "
-                "GCD and takes no knob, so on macOS this is bookkeeping");
+                MYNAH_ASR_DISPATCH_HAS_OPENBLAS ? "yes" : "-",
+                "OPENBLAS_NUM_THREADS", w, MYNAH_ASR_DISPATCH_SRC_RUNTIME,
+                own ? "src/threads.c mynah_asr_blas_budget(); there is no second "
+                      "pool in this build, so the budget IS the pool width and "
+                      "mynah_asr_blas_set_concurrency() cannot move it"
+                    : "src/threads.c mynah_asr_blas_budget(); Accelerate nests "
+                      "through GCD and takes no knob, so on macOS this is "
+                      "bookkeeping");
     }
 
     return n;

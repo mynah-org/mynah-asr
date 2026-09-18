@@ -12,7 +12,9 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include "../src/backend.h"
 #include "../src/threads.h"
 
 static int failures;
@@ -34,16 +36,38 @@ int main(void) {
     /* default: one inference owns every core (the CLI case) */
     CHECK(mynah_asr_blas_budget() == nth, "default budget == num_threads");
 
-    struct { int inflight, want; } cases[] = {
-        {1, 8}, {2, 4}, {3, 2}, {4, 2}, {8, 1}, {16, 1},
-        {0, 8}, {-1, 8},   /* nonsense in, clamped to "one caller" */
-    };
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        mynah_asr_blas_set_concurrency(cases[i].inflight);
-        char msg[96];
-        snprintf(msg, sizeof(msg), "concurrency %d -> budget %d",
-                 cases[i].inflight, cases[i].want);
-        CHECK(mynah_asr_blas_budget() == cases[i].want, msg);
+    /* WHAT THE BUDGET MEANS DEPENDS ON WHETHER THERE IS A SECOND POOL.
+     * With a vendor BLAS linked the budget divides its team among the
+     * inferences in flight. With BLAS=none there is no second team — sgemm
+     * runs on this very pool — so the budget is the pool width and nothing may
+     * move it. Asserting the division there would be asserting a fiction, so
+     * the test asks the seam which build this is instead of assuming. */
+    const int own_pool = strcmp(mynah_asr_gemm_provider(), "own") == 0;
+    printf("threads: gemm provider = %s (%s)\n", mynah_asr_gemm_provider(),
+           own_pool ? "one pool: the budget is its width"
+                    : "a second BLAS pool exists: the budget divides it");
+
+    if (own_pool) {
+        int stable = 1;
+        const int inflight[] = {1, 2, 3, 4, 8, 16, 0, -1};
+        for (size_t i = 0; i < sizeof(inflight) / sizeof(inflight[0]); i++) {
+            mynah_asr_blas_set_concurrency(inflight[i]);
+            if (mynah_asr_blas_budget() != nth) stable = 0;
+        }
+        CHECK(stable, "no BLAS in the process: the budget stays the pool width "
+                      "at every declared concurrency");
+    } else {
+        struct { int inflight, want; } cases[] = {
+            {1, 8}, {2, 4}, {3, 2}, {4, 2}, {8, 1}, {16, 1},
+            {0, 8}, {-1, 8},   /* nonsense in, clamped to "one caller" */
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            mynah_asr_blas_set_concurrency(cases[i].inflight);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "concurrency %d -> budget %d",
+                     cases[i].inflight, cases[i].want);
+            CHECK(mynah_asr_blas_budget() == cases[i].want, msg);
+        }
     }
 
     /* the regression this file exists for: a parallel region must leave the
