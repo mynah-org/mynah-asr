@@ -11,7 +11,8 @@ A native C runtime for NeMo speech models (Nemotron streaming, Parakeet,
 Canary) that is **usable as one concurrent server on a CPU box**: tens of
 real-time streams and offline requests per host, several models in one fleet,
 no latency spikes, no stalls, every claim provable from the process itself.
-Production is Linux x86-64 and ARM64; macOS is the development machine.
+**Production is Linux x86-64 and ARM64 and every efficiency decision is taken
+there; macOS is the development machine, nice to have, never the target.**
 
 ## Current trusted state (2026-09-18, HEAD after `5f0f802`)
 
@@ -40,6 +41,7 @@ Production is Linux x86-64 and ARM64; macOS is the development machine.
 - [~] S0-2 Streaming load tool v0: N WebSocket clients paced at 1x, stdlib only → [`.work/bench-harness-streaming.md`](.work/bench-harness-streaming.md)
 - [-] S0-3 The v1 server under N streams — dropped: it is broken by construction and the number would not size v2 → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
 - [ ] S0-4 Allocation count per chunk on Linux, measured not assumed (needs no box: any Linux) → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
+- [ ] S0-5 **Linux functional gates on every server change** (glibc, OpenBLAS, `sched_setaffinity`, `POLLRDHUP`, `LD_PRELOAD` count): the GitHub CI on a pushed `serving-v2` branch, or the ARM box — both need the owner's go; until then every macOS-only result is labelled as such → [`.work/axion-first-run.md`](.work/axion-first-run.md)
 
 ### S1 — Library seams the server needs → [`.work/stream-api-v2.md`](.work/stream-api-v2.md)
 - [x] S1-1 `mynah_asr_stream_reset` + `need_samples`; slots are pooled, not reopened (gate green 2026-09-18)
@@ -48,6 +50,7 @@ Production is Linux x86-64 and ARM64; macOS is the development machine.
 - [ ] S1-4 Batched stream step for B slots, byte-identical to B single steps
 - [ ] S1-5 Lift the mynah-tts pool: spin-then-park, meter, after_fork, lane redirect → [`.work/threadpool-and-lane.md`](.work/threadpool-and-lane.md)
 - [ ] S1-6 BLAS leaves the Linux worker: own sgemm, `BLAS=none` default, `openblas` as the comparison build → [`.work/threadpool-and-lane.md`](.work/threadpool-and-lane.md)
+- [ ] S1-6a Interim, Linux only: OpenBLAS thread count inside a prefork worker (1 vs T; today pool T + OpenBLAS T = 2T threads on a T-cpu slice) measured on the box before BLAS leaves; int8 is the server default on Linux → [`.work/threadpool-and-lane.md`](.work/threadpool-and-lane.md)
 
 ### S2 — The server
 - [~] S2-1 Prefork parent, core-major pinned workers, SCM_RIGHTS handoff, `--prefork-plan` (landed; Linux pinned run pending) → [`.work/server-prefork.md`](.work/server-prefork.md)

@@ -32,6 +32,16 @@ for ownership, not speed. Own f32 GEMM plus the int8 kernels; `BLAS=openblas`
 kept as a comparison build forever; Accelerate stays available on macOS as a
 development convenience behind the same seam, never as a production claim.
 
+Hazard recorded 2026-09-18 (S1-6a): inside a prefork worker pinned to T cpus,
+`mynah_asr_num_threads()` = T builds a pool of T threads AND OpenBLAS builds its
+own team of T (the server sets the budget once, to one inference in flight), so
+a worker runs 2T threads on T cpus and the two pools take turns owning the
+cores. `parallel_for` already forces OpenBLAS to 1 thread inside a region; the
+f32 GEMMs outside regions do not. The int8 stream step barely touches BLAS
+(attention scores, subsampling, LSTM), so the interim Linux default candidate is
+OpenBLAS = 1 thread in a worker; it is a measurement on the box, not a guess,
+and it disappears with S1-6.
+
 Unknowns
 - Whether the own sgemm at the stream-step shapes (m = B·Q ≤ 64, n = 1024/4096,
   k = 1024/4096) is within the OpenBLAS single-thread number; it needs the
