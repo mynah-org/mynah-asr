@@ -69,7 +69,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_threads tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
+TESTS := tests/test_qmat tests/test_threads tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib
@@ -104,6 +104,7 @@ SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@for t in $(TESTS); do \
 	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
+	  elif [ $$t = tests/test_stream_batch ]; then $$t $(MODEL_DIR); rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -137,12 +138,26 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
+	@$(MAKE) --no-print-directory test-stream-batch-allocs
 
 # S1-3: zero allocations per streaming chunk after warm-up (model-gated).
 test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
 	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP stream-allocs: model missing or interposition unavailable"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# S1-4: the BATCHED step allocates nothing per step either. Same counter, but
+# sampled in-process (the batched API has no CLI entry to difference two runs of).
+test-stream-batch-allocs: tests/test_stream_batch $(MALLOC_COUNT_LIB)
+	@if [ "$(UNAME_S)" = "Darwin" ]; then \
+	  DYLD_INSERT_LIBRARIES=$(MALLOC_COUNT_LIB) DYLD_FORCE_FLAT_NAMESPACE=1 \
+	  MALLOC_COUNT_OUT=/dev/null tests/test_stream_batch $(MODEL_DIR) --allocs; rc=$$?; \
+	else \
+	  LD_PRELOAD=$(MALLOC_COUNT_LIB) MALLOC_COUNT_OUT=/dev/null \
+	  tests/test_stream_batch $(MODEL_DIR) --allocs; rc=$$?; \
+	fi; \
+	if [ $$rc -eq 77 ]; then echo "SKIP stream-batch-allocs: model missing or interposition unavailable"; \
+	elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
 	cd tools && uv run python -m oracle.transcribe ../$(MODEL_DIR) ../tests/audio/test_it.wav \
@@ -346,4 +361,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples test-stream-allocs cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples test-stream-allocs test-stream-batch-allocs cuda update-ingot

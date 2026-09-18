@@ -2,7 +2,7 @@
 
 Status: OPEN
 
-Task: S1-1, S1-2, S1-3, S1-4
+Task: S1-1, S1-2, S1-3, S1-4, S1-7, S1-8
 Question: which changes to `libmynah_asr` are required so a single scheduler
 thread can drive B streams as slots, allocation-free, with cross-stream
 batching of the encoder step, without changing any transcript?
@@ -62,9 +62,9 @@ Evidence
   server (the scheduler knows when each sample arrived; `t1` maps a delta to
   its audio position).
 - S1-3 DONE 2026-09-18: see the section below.
-- S1-4: after the scheduler lands.
+- S1-4 DONE 2026-09-18: see the section below.
 Conclusion: the seams the scheduler needs exist.
-Next action: S1-3 (allocation-free chunk) and S1-4 after the scheduler lands.
+Next action: S2 wires the batched step into the scheduler (recipe below).
 
 ## Evidence — S1-3 (allocation-free chunk), 2026-09-18, macOS arm64 (Accelerate)
 
@@ -121,3 +121,198 @@ inside `mynah_asr_qmat_mul`. Linux is NOT measured here: the counter has an
 `LD_PRELOAD`/`dlsym(RTLD_NEXT)` arm and the test skips (77) where interposition
 does not work, but the numbers above are macOS/Accelerate only — S0-4 is the
 Linux count.
+
+## Evidence — S1-4 (batched stream step), 2026-09-18, macOS arm64 (Accelerate)
+
+### What was built
+
+`mynah_asr_stream_step_batch(streams, B, samples, n_samples, cb, userdata)`
+(`src/mynah_asr.h`). It feeds B streams and runs ONE encoder pass over the
+chunks that completed: the rows of every completed chunk are stacked into a
+single `[Σq_i, d]` activation, so each of the 24 conformer layers runs its
+per-row linears — FFN1 ×2, q/k/v/o, pointwise_conv1/2, FFN2 ×2, ten products
+per layer — once for all the rows instead of once per stream. Per stream and
+inside a loop over `i`: subsampling, the K/V cache, the relative-position
+attention (rel-pos projection, per-head softmax, `rel_shift`), the conv cache,
+the prompt + projector, the greedy decode and the callbacks. `B == 1` calls
+`mynah_asr_stream_feed` verbatim. Streams whose chunk did not complete are just
+fed (their mel accumulates). Streams with different lookahead presets are
+GROUPED (one stacked pass per preset), not refused. Languages may mix freely:
+the prompt is a per-row post-encoder one-hot.
+
+Underneath: `mynah_asr_enc_stream_step_batch` + `mynah_asr_enc_batch`
+(`src/encoder.h`), and `mynah_asr_qmat_mul_rows` (`src/qmat.h`), which extends
+the native int8×int8 per-row dot path to ANY `T` as a threaded loop over blocks
+of weight rows — it reuses `qgemm_block` and the existing SDOT/VNNI/AVX2 dot
+kernels, so **no new SIMD kernel was written** (that is S5-1). `stream_attention`
+and `stream_conv_module` were split into a core plus the hoisted linears, and
+the single path is those pieces reassembled in the same order.
+
+`mynah_asr_qmat_mul` itself is UNCHANGED: the offline dispatch, and therefore
+the offline numerics, are untouched. `make test` transcripts are identical.
+
+### Gate A — identity (`tests/test_stream_batch`, model-gated, 77 without Nemotron)
+
+Two levels. Level 2 is the strict one: the encoder output of every chunk of
+every stream, float for float (`memcmp`), plus the final K/V and conv caches,
+between B single `mynah_asr_enc_stream_step` calls and one batched step over the
+same chunks. Level 1 is the transcript: B streams over
+`tests/audio/test_{it,en,de,fr,es}.wav` (5.23 / 4.34 / 3.88 / 3.57 / 3.74 s, so
+the streams finish at different steps and the batch shrinks) fed one chunk each
+per step through the public API with `need_samples`, compared against
+`mynah_asr_transcribe` and against a single-stream `stream_feed` run.
+
+Model `nemotron-3.5-asr-streaming-0.6b`, preset [56,3] (q = 4 encoder frames =
+320 ms per chunk), 17 steps per clip.
+
+| quant | B | floats compared | differ | caches differ |
+|---|---|---|---|---|
+| int8 | 2 | 74,240 | **0** | 0 / 6 |
+| int8 | 4 | 133,120 | **0** | 0 / 12 |
+| int8 | 8 | 266,240 | **0** | 0 / 24 |
+| f32 | 2 | 74,240 | **0** | 0 / 6 |
+| f32 | 4 | 133,120 | **0** | 0 / 12 |
+| f32 | 8 | 266,240 | **0** | 0 / 24 |
+
+Transcripts, B ∈ {1,2,3,4,8}, both dtypes: IDENTICAL for every stream, to the
+single-stream run and to the offline transcription. One caveat recorded rather
+than hidden: at **int8** the offline transcription of `test_es.wav` already
+differs from the streaming one ("a las vuelve" vs "a las nueve") — a pre-existing
+streaming-vs-offline numerical difference at int8, visible in `make test`'s own
+e2e line, NOT a batching effect. The gate prints it and still requires
+batched == single exactly.
+
+### WHAT PATH RAN (counters, `mynah_asr_qmat_counter`)
+
+`src/qmat.c` now counts every product by implementation. int8 run, per B
+(figures from one gate run):
+
+| B | stacked rows | native dot (serial, T≤16) | native dot (weight-stationary) | DEQUANT+sgemm |
+|---|---|---|---|---|
+| 1 | 0 | 4173 | 0 | **0** |
+| 2 | 104 | 1362 | 3120 | **0** |
+| 4 | 196 | 1972 | 3120 | **0** |
+| 8 | 416 | 2508 | 3840 | **0** |
+
+The `T > 16` dequant+sgemm fallback — which mallocs `n*k*4` per call and changes
+the numerics — is never reached: 0 at every B, asserted by the gate. The serial
+column stays non-zero because streams run out of audio at different steps, so
+the last streams of a group step alone (g == 1 → the single path), which is the
+intended behaviour and is itself covered by the identity gate.
+
+### The f32 question, MEASURED
+
+`cblas_sgemm` gives no guarantee that row `t` of C is the same bytes for `M = q`
+and for `M = Σq`, so this was measured, not assumed. On **macOS arm64 /
+Accelerate** it IS row-stable for these shapes: 0 of 266,240 floats differ at
+B = 8 (table above), caches included. The f32 batched path is therefore ON for
+Accelerate — **identical on macOS/Accelerate; OpenBLAS UNVERIFIED (Linux gate
+pending)**, so on a non-Accelerate build the default is OFF and the f32 batched
+step degrades to per-stream single steps through the same API. The degradation
+is visible, not silent: `mynah_asr_stream_batch_rows_stacked()` stays 0.
+`MYNAH_ASR_BATCH_F32=0|1` forces either way — that is how the Linux gate runs.
+The integer path never consults this switch: it is exact by construction
+(per-row integer accumulation is order-independent, the activation quantization
+is per row, and each output row is one dot of the same two int8 vectors).
+
+### Gate B — step time (macOS dev signal, NOT a serving claim)
+
+`tests/test_stream_batch <model> --steptime`. Apple M1, 8 cores, int8, preset
+[56,3] (P = 320 ms of audio per step per stream), 5 clips cycled. Wall per step,
+B separate `stream_feed` calls vs one `stream_step_batch`:
+
+| B | single ms | batched ms | ratio | ms per stream |
+|---|---|---|---|---|
+| 1 | 109.72 | 107.27 | 0.98 | 107.27 |
+| 2 | 194.03 | **84.57** | 0.44 | 42.29 |
+| 4 | 352.27 | **133.38** | 0.38 | 33.35 |
+| 8 | 693.60 | **227.00** | 0.33 | 28.37 |
+
+B = 1 is the same code on both sides, so 0.98 is the noise floor. Fitting the
+cadence law of `serving-v2-design.md` §3 over B ∈ [2,8]: **a ≈ 37 ms, b ≈ 23.7
+ms**, i.e. with ρ = 0.7 and P = 320 ms this host holds B ≈ 7 per worker.
+
+Two honest caveats. (1) The win is NOT only weight-stationarity: the old
+small-`T` int8 path is fully serial, and the new row loop is threaded, so part
+of the 3.06× at B = 8 is threading the linears for the first time. (2) The
+absolute numbers are macOS/Accelerate on a dev box; the Linux/Axion and x86
+numbers are S0/S4's job.
+
+### Where the per-stream slope `b` goes — a finding, not a change
+
+`b ≈ 23.7 ms` is large, and a third of it is one avoidable GEMM. In
+`stream_attention_core` every layer computes `rk = pe @ relk_wᵀ` with
+`P = 2K-1 = 119` rows and d = 1024 — 24 × 119 × 1024 × 1024 MACs per stream per
+step. Measured on this host in isolation (Accelerate sgemm, same shape, scratch
+micro-benchmark): **7.4 ms for the 24 layers**, i.e. ≈ 31 % of `b`. It does not
+depend on the stream at all: at steady state every stream has the same
+`K = left + q`, so every stream recomputes the SAME matrix. Sharing it across
+the streams of a pass that have equal `K` would be bit-exact by construction
+(identical inputs, identical call) and should move B_max on this host from ≈ 7
+to ≈ 9. NOT done here — S1-4 is scoped to "attention stays per stream" —
+recorded as a new board item (S1-7).
+
+### Allocation
+
+`make test-stream-batch-allocs`: `tests/libmalloc_count` inserted, its counter
+sampled in-process (the batched API has no CLI entry to difference two
+processes with). B = 4, 12 steps after a 4-step warm-up: **0 allocations**. The
+batch scratch is one `malloc` carved by `mynah_asr_enc_batch_new`, sized for
+(max_b, max_q + 2); `mynah_asr_stream_batch_reserve(m, max_b)` pre-carves it at
+start-up so the first real step does not. Everything else reuses the per-stream
+scratch S1-3 already carved.
+
+### What remains unknown
+
+- Linux: OpenBLAS f32 row stability; the int8 identity and the step table on
+  Axion / x86 (the counters and the gate are portable, they have not been run).
+- x86 int4 in the stacked path: `mynah_asr_qmat_mul_rows` permutes the
+  activations in place for the AVX2 q4 kernel; that arm is compiled but not
+  exercised here (this host is ARM, and the model is int8).
+- Above B ≈ 8 nothing was measured; `MYNAH_ASR_STREAM_BATCH_MAX` is 256 as a
+  bound on fixed arrays, not a capacity claim.
+- Whether threading the linears inside the step competes with the scheduler's
+  other work (S1-5 pool, S5-5 pool meter).
+
+## Integration recipe for the scheduler (S2, NOT done here)
+
+`server/sched.c` is another agent's file; this is the contract it should use.
+
+1. **Reserve once**, right after the model is loaded in the worker and before
+   any slot is served: `mynah_asr_stream_batch_reserve(model, cap)` with `cap`
+   the worker's slot cap. After that the step allocates nothing. Warm up through
+   the same call so the first real step is not different.
+2. **The ready set maps 1:1 onto one call.** Today `sched_feed(slot, avail,
+   finalize)` is called per slot in the step loop. Split it: a first pass over
+   the slots computes, per slot, `need = mynah_asr_stream_need_samples(s->stream)`
+   and takes `got` samples from the ring when `avail >= need`; collect those
+   slots into `streams[]`, `samples[]`, `n_samples[]`, `userdata[]` (the
+   per-slot `emit_ctx`, so `lag_ms` accounting is unchanged — the callback is
+   still invoked once per completed chunk, from the same thread). Then ONE
+   `mynah_asr_stream_step_batch(streams, B, samples, n_samples,
+   sched_on_result, userdata)`. Slots with `avail < need` are simply not in the
+   set; they are not fed at all, exactly as now.
+3. **Finalize and short tails do NOT go through it.** A slot that is finalizing,
+   or whose last piece is shorter than a chunk, keeps the existing per-slot
+   path: `mynah_asr_stream_feed` for the partial piece and
+   `mynah_asr_stream_finish` for the tail (the tail is a short chunk with the
+   causal right pad — `is_last`, which the batched step deliberately does not
+   accept). Do those after the batched call, in the same step, so the ordering
+   of deltas within a slot is unchanged.
+4. **Cancellation** stays where it is: poll `cancelled()` once per slot per step
+   BEFORE building the ready set, and drop a cancelled slot from the set rather
+   than cancelling mid-pass. A `-1` from the batched call is a worker-level
+   failure: cancel every slot in that set with `decode_failed`, as `sched_feed`
+   does today for one.
+5. **Do not group by language or by model** — a batch already is one model
+   (one process, one model) and languages mix by design. Group by lookahead
+   preset only if you want the grouping visible in the metrics; the library
+   groups internally either way.
+6. **Counters to surface in `/metrics`**: `mynah_asr_stream_batch_rows_stacked()`
+   (0 means every step degraded to the single path — on an OpenBLAS f32 build
+   that is expected, elsewhere it is a bug) and, for a dispatch banner,
+   `mynah_asr_qmat_counter(MYNAH_ASR_QC_DOT_ROWS)` vs
+   `MYNAH_ASR_QC_DEQUANT` (the latter must stay 0 in a serving process).
+7. **Assert the single-owner invariant** around the batched call the same way
+   `mynah_asr_sched_assert_thread` does around `stream_feed`: one thread per
+   model may run a batched step, because the batch scratch lives on the model.

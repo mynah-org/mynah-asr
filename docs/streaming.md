@@ -66,6 +66,23 @@ Notes:
 - Memory cost per stream: ~12 MB of cache (24 layers × K/V 56×1024 + conv).
 - Realtime: ~26 ms of compute per 80 ms chunk on Apple Silicon (~3× headroom).
 
+### Several streams at once
+
+Chunks arrive on the real-time grid: at the default preset every live stream has
+a chunk ready every 320 ms. `mynah_asr_stream_step_batch(streams, B, samples,
+n_samples, cb, userdata)` feeds B streams and runs **one** encoder pass over the
+chunks that completed, stacking their rows so each layer's linears read the
+weights once instead of B times; the caches, the attention and the decode stay
+per stream. Clips, languages and lookahead presets may be mixed, and every
+stream's text is byte-identical to the same clip fed alone — the rule is that a
+transcript never depends on who it was batched with (gate:
+`tests/test_stream_batch`, 0 of 266,240 encoder floats differ at B = 8).
+Details and the `reserve` / dtype caveats: [api.md](api.md#streaming).
+
+On an M1 (8 cores, int8, preset [56,3]) the step wall for B = 8 is 227 ms
+batched against 694 ms for eight separate feeds — a development signal, not a
+serving number.
+
 ## CLI
 
 ```sh

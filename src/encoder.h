@@ -129,4 +129,43 @@ int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es);
 int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_mel,
                           int n_mels, int prompt_id, int is_last, float *out);
 
+/* ------------------------------------------------------ batched stream step (S1-4)
+ * B streams whose chunk is complete, stacked as ONE [Σq_i, d] activation through
+ * the 24 conformer layers: every per-row linear (FFN1, q/k/v/o, the two
+ * pointwise convolutions, FFN2) reads the weights ONCE for all the rows, while
+ * subsampling, the K/V cache, the relative-position attention and the conv cache
+ * stay per stream (a loop over i).
+ *
+ * CONTRACT (ENGINEERING.md §9): out[i] is BYTE-IDENTICAL to what
+ * mynah_asr_enc_stream_step would have written for that stream alone, and the
+ * caches are left in exactly the same state. On the quantized path that is
+ * guaranteed by construction (per-row integer accumulation, see
+ * mynah_asr_qmat_mul_rows); on f32 it depends on the BLAS being row-stable in M,
+ * which is a MEASURED property, not an assumption — see tests/test_stream_batch.
+ *
+ * Every stream must share the encoder AND the lookahead preset (same q): the
+ * caller groups them. The scratch is carved once for (max_b, max_q) so a step
+ * allocates nothing. One thread at a time per mynah_asr_enc_batch. */
+typedef struct mynah_asr_enc_batch mynah_asr_enc_batch;
+
+mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int max_b, int max_q);
+void mynah_asr_enc_batch_free(mynah_asr_enc_batch *bb);
+/* Rows the scratch can hold (max_b * (max_q + 2)) — the caller checks before
+ * splitting a large ready set into several passes. */
+int mynah_asr_enc_batch_max_rows(const mynah_asr_enc_batch *bb);
+int mynah_asr_enc_batch_max_b(const mynah_asr_enc_batch *bb);
+
+/* mel[i] is the exact chunk of stream i (n_mel[i] frames, never a short tail:
+ * is_last is always 0 here — a finalizing stream goes through the single step).
+ * out[i] receives [q_out[i], d_out]. Returns 0, -1 on error. */
+int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
+                                mynah_asr_enc_stream *const *ess, int B,
+                                const float *const *mel, const int *n_mel, int n_mels,
+                                const int *prompt_id, float *const *out, int *q_out);
+
+/* f32 only: whether the batched path is allowed to stack the rows. cblas_sgemm
+ * is not contractually row-stable in M, so the answer is a MEASUREMENT of this
+ * build's BLAS (see the note in encoder.c); MYNAH_ASR_BATCH_F32=0|1 overrides it. */
+int mynah_asr_enc_batch_f32_ok(void);
+
 #endif
