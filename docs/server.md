@@ -37,10 +37,135 @@ so the client reads the status instead of a connection reset. `SIGUSR1` on the
 parent prints the per-worker table and forwards to every worker; `SIGTERM`
 stops the fleet. `/v1/health` reports which worker answered.
 
+`--cap` is the fleet's default; a `--model` group may set its own with `:cap=`,
+and the ladder is evaluated per group (next section).
+
 Design and the measurements it rests on: `.work/serving-v2-design.md`,
-`.work/server-prefork.md`, `.work/server-scheduler.md`. The prefork router, the
-asynchronous writer and the per-worker scheduler are in; multi-model worker
-groups and the batched stream step follow (`PLAN.md` S2).
+`.work/server-prefork.md`, `.work/server-scheduler.md`,
+`.work/multi-model-serving.md`.
+
+## Several models in one fleet (`--model`)
+
+```sh
+./mynah-asr-server \
+    --model nemotron=models/nemotron-3.5-asr-streaming-0.6b:workers=6:cpus=24:cap=8:quant=int8 \
+    --model parakeet=models/parakeet-tdt-0.6b-v3:workers=2:cpus=8:cap=4:quant=int8 \
+    --default nemotron -p 8090
+```
+
+**One process holds one model.** That is the decision everything here rests on:
+a batch is drawn from one process's slots, so it reads one set of weights *by
+the shape of the address space* rather than by a check somebody has to remember.
+So "several models" is several **worker groups**, never a registry inside one
+address space — switching weights per request would cost a whole pass over them,
+and the sibling repos costed exactly that and rejected it.
+
+`--model name=dir[:workers=W][:cpus=N][:cap=C][:quant=int8|int4|f32][:lookahead=L]`
+is repeatable and names one group:
+
+| option | |
+|---|---|
+| `name=` | what a request routes by. Omitted (`--model dir`), the pack's own `name` from `mynah.json` |
+| `:workers=W` | processes in the group. The counts must add up to `--prefork` |
+| `:cpus=N` | cpus the group's workers share, carved contiguously out of the allowed mask in group order; each worker takes an equal share and, unless `--prefork-threads` is explicit, that share is its thread count |
+| `:cap=C` | that group's stream slots per worker: rung 1 of the ladder, per group |
+| `:quant=` | that group's quantization; without it, the fleet's `--quant` |
+| `:lookahead=L` | the default streaming preset for that group's sessions when the client names none |
+
+`--default <name>` picks the group a request that names no model gets; without
+it, the first `--model`. The old `-m <dir>` still works and means exactly one
+group, named by its own `mynah.json` — one group is the single-model server this
+has always been, and every group-aware branch collapses.
+
+**More than one `--model` implies `--prefork`**, because one process cannot hold
+two models. If you did not give `--prefork`, the group count becomes it and the
+banner says that it did:
+
+```
+mynah-asr-server: 2 model groups imply prefork; --prefork was not given, so it is 2
+```
+
+If you did give one and it does not fit the groups, that is an **error** and the
+server refuses to start. Dropping a model the operator asked for, silently, is
+the failure this whole feature exists to prevent.
+
+```
+prefork: models      2 resident, one model per worker (a batch is one process's slots,
+                     so a batch is one model; `lang` stays a per-request parameter)
+prefork:   nemotron                 workers 0-5 (6) · 24 cpus · 8 slots each (48) · rung2 queue per worker
+prefork:   parakeet                 workers 6-7 (2) · 8 cpus · 4 slots each (8) · rung2 queue per worker
+prefork:   default    nemotron (a request naming no model)
+```
+
+**Every model is opened in the parent, before the fork**, so the mapped weights
+are one physical copy behind the whole tree; a child then **closes every group
+but its own**, so one process can only ever run the model the router believes it
+holds. A path that cannot be opened is a start-up failure, with nothing yet
+forked and nothing yet listening — never a group that quietly answers 503
+forever.
+
+`--lid-model` is **not** a group. It is a detector in front of the models that
+cannot detect a language themselves (Canary), resident in the parent like every
+group's weights and inherited by every worker; nothing routes to it.
+
+### How a request chooses its group
+
+| where | shape |
+|---|---|
+| WebSocket | `GET /v1/audio/stream?model=nemotron&lang=it-IT` |
+| REST, query | `POST /v1/audio/transcriptions?model=parakeet` |
+| REST, form | a multipart field `model`, **before** the `file` part |
+| nothing named | the `--default` group |
+
+**Language is not a routing key here, and that is the difference from the TTS
+siblings.** One Nemotron serves forty languages and the prompt is a per-request,
+post-encoder one-hot, so a batch may freely mix languages and `lang` simply
+travels with the request to the worker. Only the weights cannot be mixed.
+
+The router classifies inside a **bounded, non-consuming `MSG_PEEK`** of at most
+8 KiB: it reads the request line's query and, failing that, a multipart part
+whose `Content-Disposition` names `model`. It never consumes a byte — the worker
+still reads the whole request from the start — and it never interprets a method,
+a route or a body's meaning. A connection whose prefix has not arrived yet is
+parked with its own deadline (2 s) and looked at again, never waited on.
+
+One consequence, stated rather than hidden: **a multipart `model` field that
+arrives after the audio is past the peek bound** and the connection goes to the
+default group. It is not then served by the wrong weights — the worker parses
+the same field out of the whole body and refuses — so the cost is a wrong
+refusal, never a wrong transcript. Put `model` before `file`, or in the query.
+
+Names match case-insensitively, exactly first, then as a prefix of at least two
+characters that matches exactly one group: `nemo` reaches `nemotron`. An
+ambiguous prefix is refused rather than resolved.
+
+### The refusals
+
+| status | code | when |
+|---|---|---|
+| `404` | `model_not_found` | no group holds that name. The message names the accepted set; **no `Retry-After`**, because retrying will fail identically for as long as the server runs — residency is decided at start-up and printed, never grown on demand |
+| `400` | `model_not_streaming` | a WebSocket to a group whose model has no cache-aware streaming presets. Before the upgrade, so the client reads a status and not a transport error |
+| `503` | `server_at_capacity` | **that group** is full: every worker of it is at its slot cap and its share of the admission queue is full. A free slot in another group's worker is not capacity for this request |
+
+```
+$ curl -s "localhost:8090/v1/audio/transcriptions?model=whisper" -F file=@clip.wav
+{"error":{"message":"no worker holds the requested model; this fleet serves: nemotron, parakeet",
+          "type":"invalid_request_error","code":"model_not_found"}}
+```
+
+The admission ladder's rungs 1–3 are evaluated **per group**: rung 1 picks the
+least-loaded worker *of that group* with a free slot, rung 2's bound is
+`MYNAH_ASR_PREFORK_QUEUE × live workers of that group`, and rung 3's deadline is
+checked at that group's own head. The queue is one array with a group tag,
+scanned in arrival order per group, so every group has its own FIFO — a single
+FIFO would let an entry for a saturated group block a ready entry for an idle one
+behind it, which is a starvation channel introduced by the very partitioning
+that exists to prevent starvation.
+
+Gate: `tests/test_server_models.sh` (`make test-server-models`), which starts one
+server with two groups and asserts all of the above, including that a REST
+transcription to each group is byte-identical to that model's own CLI answer —
+the two packs disagree about the clip, so a mis-route cannot pass.
 
 ## Endpoints
 
@@ -111,7 +236,7 @@ for.
 
 | key | default | accepted | refusal |
 |---|---|---|---|
-| `model` | the served model | what `/v1/models` lists | `404 model_not_found` |
+| `model` | the `--default` group | what `/v1/models` lists | `404 model_not_found` |
 | `lang` | `auto` | any tag in the model's prompt dictionary | `400 language_not_served` |
 | `lookahead` | model default | the model's presets (Nemotron: 0, 3, 6, 13) | `400 lookahead_not_available` |
 | `format` | `s16le` | `s16le`, `f32le` | `400 unsupported_format` |
@@ -202,6 +327,19 @@ Reference client (Python stdlib): `tools/eval/ws_client.py`. Load harness:
 
 ### GET /v1/models · GET /v1/health · OPTIONS (CORS)
 
+`/v1/models` is the **actual routing table**: one entry per `--model` group, with
+the name a request routes by, the pack's engine, whether that group can stream,
+and which one is the default. Every worker answers it identically — the names
+survive the close of the other groups' weights — so it is the same list the
+router routes by and the same one a `model_not_found` quotes.
+
+```json
+{"data":[{"id":"nemotron","object":"model","owned_by":"mynah",
+          "engine":"nemotron-streaming","streaming":true,"default":true},
+         {"id":"parakeet","object":"model","owned_by":"mynah",
+          "engine":"parakeet-tdt","streaming":false}]}
+```
+
 `/v1/health` reports **facts**: what this process actually did. The
 configuration it was given is on the `[SERVER-CONFIG]` banner line, printed once
 at start — a number that is configuration has no business in a counter, and a
@@ -225,7 +363,8 @@ health endpoint that reports both is one that will be quoted for the wrong one.
                   "4":{"steps":132,"wall_ms_sum":45672.0,"wall_ms_mean":346.0}}},
  "model":{"name":"nemotron-3.5-asr-streaming-0.6b","engine":"nemotron-streaming",
           "quant":"f32","lookahead_default":3},
- "groups":"",
+ "group":"nemotron",
+ "groups":"nemotron=6 parakeet=2",
  "process":{"worker":-1,"pid":6392,"uptime_s":30.2,"pool_threads":8,
             "prefork_threads":0,"http_threads":4,"pinned":false,
             "cpu_mask":"unpinned","build":"v0.9.1-38-gd480467",
@@ -244,7 +383,8 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 | `audio_seconds` | seconds of audio fed to the model, streams and REST alike |
 | `lag_ms` | emission lag since start, from the 8 ms histogram (`bucket_ms`); `p50`/`p95` are therefore quantised to 8 ms, which is a measurement — a percentile computed from a mean is not |
 | `batch` | what the batched stream step did (S2-2b). `batched_steps_total` counts the calls, one per step that had a ready set; `rows_stacked_total` is the library's own count of encoder rows that went through the STACKED path, so **0 next to a non-zero `batched_steps_total` means every step degraded to per-stream steps** rather than a silent fallback; `ready_mean` is `ready_sum / batched_steps_total`; `step_wall_ms` is time spent inside the call (model only: building the set and the frames are outside it); `by_b` is the same sum/count split by ready-set size, which is what the cadence law `T_step(B) = a + b·B` is fitted from |
-| `model`, `groups` | what this process holds, read from the model's own `mynah.json`; `groups` is the fleet's language split, `""` when there is one |
+| `model` | what THIS process holds, read from the pack's own `mynah.json` |
+| `group`, `groups` | the `--model` group this worker serves, and the whole fleet's split (`name=workers`, space separated). `groups` is `""` in a single-model fleet, which is itself the answer. One probe therefore says both "what did I reach" and "what else is there" |
 | `process.pinned`, `cpu_mask` | read BACK from the kernel (`sched_getaffinity`), never the mask that was requested. `false`/`unpinned` on macOS, which has no affinity API this server uses |
 | `process.build/blas/simd/int8_kernel` | the same values `--dispatch-map` prints, from the same predicates (`src/qmat.c`) |
 | `refused` | refusals **this worker** issued, by the `code` in the error body. The prefork router counts its own separately (`/metrics`, and its final table) |
@@ -336,7 +476,11 @@ model, so it exports `mynah_asr_worker_up` / `_inflight` / `_slots` /
 `_assigned_total` / `_completed_total` / `_over_service_cap_total` per worker,
 its own `mynah_asr_refused_total{code}` and the admission-queue gauges — and
 **not** sessions, steps, deltas, audio seconds or emission lag, because it does
-not have them. A worker's own scheduler counters are exported by that worker
+not have them. In a **multi-model** fleet those per-worker series carry a second
+label, `model`, naming the group that worker serves, so a scrape separates "the
+parakeet group is saturated" from "the fleet is busy". It is added only there and
+only then, because its value set is exactly the configured groups — bounded by
+the CLI before the first request, which is what the cardinality rule asks. A worker's own scheduler counters are exported by that worker
 only if it is given a metrics port of its own. Per-worker series are never
 summed here: a fleet total hides the one worker that stopped.
 
@@ -346,7 +490,11 @@ process does not own, and a server that reports them is reporting a guess. They
 belong to the benchmark harness (`tools/bench/`), which is the only thing that
 may quote them. **Cardinality** is a contract: the only labels are `worker`,
 `reason`, `code` and `le`, each from a fixed compile-time set. Never a language,
-never a model path, never text, never anything a client can choose.
+never a model path, never text, never anything a client can choose. `model` is
+the one addition and it is not an exception to that: its values are the
+`--model` names the operator typed, fixed at start-up, and a client cannot
+invent one — a request naming a group that does not exist is refused before it
+is ever counted under a label.
 
 ## `SIGUSR1` — one dump, to stderr
 
@@ -486,10 +634,23 @@ knob: there the budget is only bookkeeping, reported in `/v1/health`.
   `idle_timeout` and a stream cut off at `--max-audio-seconds` with
   `audio_limit`; the server's own pings observed; `SIGTERM` on a live stream
   answered with `shutting_down`, exit 0, no survivors. Model-gated.
+- `make test-server-models` — several models in one fleet (S2-6): ONE server with
+  two `--model` groups and `--prefork 2`. `/v1/models` lists exactly the two
+  names; a REST transcription to each group (query and multipart field both) is
+  byte-identical to THAT model's own CLI answer — the two packs disagree about
+  the clip, which is what makes a mis-route impossible to pass; a WebSocket to
+  the streaming group is byte-identical to `mynah-asr stream`; a WebSocket to the
+  offline group is `400 model_not_streaming`; an unknown name is `404
+  model_not_found` with the accepted set and no `Retry-After`; filling one
+  group's slots refuses `server_at_capacity` while the other group still serves;
+  `SIGTERM` leaves no worker. Needs BOTH a streaming and an offline model, and
+  skips (77) without either.
 
 ## Operational notes
 
-- One model per process (`/v1/models` lists one).
+- One model per process, and several models are several worker groups
+  (`--model`, above). `/v1/models` lists the groups; a worker holds exactly one
+  of them and closes the rest at start-up.
 - Timeouts/limits: body ≤ 200 MB, headers ≤ 64 KB, queue ≤ 128 connections,
   plus the per-stream caps in the table above.
 - Threads, as `top -H` / `htop` / `ps -L` name them (verified, not intended):

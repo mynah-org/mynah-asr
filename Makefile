@@ -144,6 +144,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_models.sh $(MODEL_DIR) $(MULTI_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-models: needs BOTH $(MODEL_DIR) and $(MULTI_MODEL_DIR)"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
 	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
 	@$(MAKE) --no-print-directory test-stream-batch-allocs
@@ -301,6 +304,18 @@ CONC_MODEL_DIR ?= $(PARAKEET110_DIR)
 test-server-metrics: mynah-asr-server
 	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# S2-6: SEVERAL MODELS IN ONE FLEET. One server, two worker groups (the
+# streaming pack and an offline-only one), routing by model: /v1/models from the
+# table, a REST transcription to each group byte-identical to THAT model's CLI,
+# a WebSocket to the streaming group, 400 model_not_streaming on the offline
+# one, 404 model_not_found on a name nobody holds, capacity refused per group,
+# survivors=0. Needs BOTH models, so it is gated on both.
+MULTI_MODEL_DIR ?= models/parakeet-tdt_ctc-110m-gguf
+test-server-models: mynah-asr-server mynah-asr
+	@sh tests/test_server_models.sh $(MODEL_DIR) $(MULTI_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-models: needs BOTH $(MODEL_DIR) and $(MULTI_MODEL_DIR)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 test-server-concurrency: mynah-asr-server

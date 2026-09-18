@@ -41,6 +41,12 @@
 typedef struct {
     const char *model_dir;
     const char *model_name;      /* "name" from mynah.json                    */
+    /* The GROUP this worker serves: the name the fleet routes `?model=` by,
+     * which is the --model key when one was given and the pack's own name
+     * otherwise. Separate from model_name because a group may be named
+     * something shorter than the pack calls itself, and a probe has to be able
+     * to tell what to ask for from what it got. */
+    const char *group;
     const char *engine;          /* "engine" from mynah.json                  */
     const char *quant;           /* f32 | int8 | int4                         */
     const char *lid_dir;         /* --lid-model, or NULL                      */
