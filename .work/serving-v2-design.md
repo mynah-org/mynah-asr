@@ -192,8 +192,10 @@ bank with a drift gate is the only thing that promotes**; POISSON for overload;
 DIAGNOSTIC never quotes a number. The harness refuses to print cadence
 percentiles when the client could not pace at 1x.
 
-Provisional envelope (to be recalibrated by S0): TTFP p95 < 1 chunk period +
-200 ms; emission lag p95 < 1 chunk period; finalization lag p95 < 500 ms;
+Provisional envelope (recalibrated 2026-09-18 on the M1: TTFP carries the model's
+emission delay, measured ~950 ms at lookahead 3 with an explicit language on a
+clip that speaks from t=0, so TTFP p95 < 3 chunk periods + 200 ms and the
+server's own cost is the emission-lag line); emission lag p95 < 1 chunk period; finalization lag p95 < 500 ms;
 backlog max < 2 chunks; zero rejects at the operating point; a new arrival
 raises no established stream's emission lag p95 above the gate; a stopped
 reader affects only its own stream.

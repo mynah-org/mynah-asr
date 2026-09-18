@@ -350,7 +350,12 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
 
 def default_thresholds(chunk_ms):
     return {
-        "ttfp_p95_ms": chunk_ms + 200.0,
+        # TTFP carries the MODEL's emission delay, not only the server's: measured on
+        # the M1 with a clip that speaks from t=0, the first delta of Nemotron at
+        # lookahead 3 arrives ~950 ms after the first byte whether the language is
+        # explicit or auto (first chunk 250 ms + ~2 chunks of RNNT emission delay).
+        # The server's own cost is the emission-lag line; TTFP is gated loosely.
+        "ttfp_p95_ms": 3.0 * chunk_ms + 200.0,
         "emission_lag_p95_ms": chunk_ms,
         "finalization_p95_ms": 500.0,
         "backlog_max_s": 2.0 * chunk_ms / 1000.0,
@@ -624,16 +629,16 @@ def self_test():
     bad += not _eq(drift(win, 0.0)["max_drift_pct"], None, "a zero baseline cannot drift")
 
     print("envelope lines")
-    #  chunk 320 ms -> TTFP limit 520, lag limit 320, finalization 500, backlog 0.64 s
+    #  chunk 320 ms -> TTFP limit 1160 (3 chunks + 200), lag limit 320, finalization 500, backlog 0.64 s
     thr = default_thresholds(320.0)
-    bad += not _eq(thr["ttfp_p95_ms"], 520.0, "TTFP limit")
+    bad += not _eq(thr["ttfp_p95_ms"], 1160.0, "TTFP limit")
     bad += not _eq(thr["backlog_max_s"], 0.64, "backlog limit", 1e-9)
     #  a percentile needs two samples, so every envelope fixture is a pair of identical
     #  utterances (identical text: the identity gate must stay green while the timing moves)
-    def pair(delta_dt, consumed, done_dt):
+    def pair(delta_dt, consumed, done_dt, nframes=5):
         us = []
         for base in (10.0, 40.0):
-            snd = [[base + i * 0.1, (i + 1) * 0.1] for i in range(5)]
+            snd = [[base + i * 0.1, (i + 1) * 0.1] for i in range(nframes)]
             us.append(analyze_utterance(
                 _mk("a.wav", snd, [_ev(base + delta_dt, consumed, "x", 40.0)], base + done_dt,
                     t_start=base), frame_ms=100.0))
@@ -643,16 +648,18 @@ def self_test():
     ev = envelope_verdict(pair(0.15, 0.2, 0.5), thr)
     print(f"  {'ok  ' if ev['verdict'] == 'GOOD' else 'FAIL'} inside the envelope -> {ev['verdict']}")
     bad += ev["verdict"] != "GOOD"
-    #  TTFP 1200 ms (> 780 = 1.5 x 520) and emission lag 1100 ms: two lines FAIL
-    ev2 = envelope_verdict(pair(1.2, 0.2, 1.4), thr)
+    #  TTFP 2000 ms (> 1740 = 1.5 x 1160) and emission lag 1900 ms: two lines FAIL
+    ev2 = envelope_verdict(pair(2.0, 0.2, 2.2), thr)
     failed = [l["line"] for l in ev2["lines"] if l["status"] == "FAIL"]
     print(f"  {'ok  ' if ev2['verdict'] == 'NOT STREAMABLE' else 'FAIL'} far outside -> "
           f"{ev2['verdict']} on {failed}")
     bad += ev2["verdict"] != "NOT STREAMABLE"
     bad += "TTFP p95" not in failed
-    #  TTFP 600 ms (520 < 600 <= 780) and emission lag 400 ms (320 < 400 <= 480):
-    #  over the envelope, under the marginal factor -> MARGINAL, and nothing FAILs
-    ev3 = envelope_verdict(pair(0.6, 0.3, 0.8), thr)
+    #  12 frames (1.2 s): TTFP 1400 ms (1160 < 1400 <= 1740), emission lag 400 ms
+    #  (320 < 400 <= 480, the delta at 1.4 s covers audio sent at 1.0 s), finalization
+    #  600 ms (500 < 600 <= 750): over the envelope, under the marginal factor ->
+    #  MARGINAL, and nothing FAILs
+    ev3 = envelope_verdict(pair(1.4, 1.1, 1.7, nframes=12), thr)
     print(f"  {'ok  ' if ev3['verdict'] == 'MARGINAL' else 'FAIL'} just outside -> {ev3['verdict']} "
           f"on {[l['line'] for l in ev3['lines'] if l['status'] == 'MARGINAL']}")
     bad += ev3["verdict"] != "MARGINAL"

@@ -113,7 +113,7 @@ Every line is a CLI flag; the defaults are these.
 
 | line | limit | flag |
 |---|---|---|
-| TTFP p95 | 1 chunk + 200 ms (520 ms) | `--ttfp-p95-ms` |
+| TTFP p95 | 3 chunks + 200 ms (1160 ms): TTFP includes the model's own emission delay, ~2 chunks after the first on Nemotron; the server's cost is the emission-lag line | `--ttfp-p95-ms` |
 | emission lag p95, pooled over deltas | 1 chunk (320 ms) | `--lag-p95-ms` |
 | finalization lag p95 | 500 ms | `--fin-p95-ms` |
 | backlog max | 2 chunks (0.64 s) | `--backlog-max-s` |
