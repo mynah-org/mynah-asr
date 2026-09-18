@@ -67,3 +67,57 @@ device buffers, own stream+handle (qwen_tts_cuda.c pattern).
 
 Planned evolutions (TODO, qwen-tts pattern): resident bf16 weights + `cublasGemmEx`,
 fused resident decode, CUDA Graphs on the streaming loop.
+
+## Proving which path ran: `--dispatch-map`, `--flags`, the ISA guard
+
+ENGINEERING.md §5 forbids inferring the active kernel from a flag, a build target
+or a filename, so the binary answers for itself. All three surfaces are
+model-free and cost nothing to run before a measurement.
+
+**`mynah-asr --dispatch-map [--json]`** prints one row per logical feature —
+int8 dot, int4 dot, the opt-in int8 GEMM, the f32 GEMM provider, Metal, CUDA,
+the pool width, the BLAS budget — with six columns: `feature · compiled ·
+supported · env · resolved · reason`. The rule the report is built on is that
+`resolved` is **never** derived as `compiled && supported`: it comes from a
+predicate exported by the file that owns the decision (`src/qmat.c`
+`mynah_asr_qmat_int8_kernel()` and friends), from a real runtime call
+(`mynah_asr_metal_available()`, `mynah_asr_num_threads()`), or from a pure
+compile-time gate — and `reason` says which, tagged `[predicate]`, `[runtime]`
+or `[gate]`. Anything else prints `UNKNOWN`, and the footer counts those rows:
+an UNKNOWN is a predicate somebody still has to export, not a failure. The
+`IDLE HARDWARE:` footer lists the CPU features this host has that this binary
+never issues an instruction for (ARM: dotprod, i8mm, bf16, sve, sve2 — from
+sysctl on macOS, `getauxval` on Linux; x86: avx2, avx512f, avx512vnni, avxvnni,
+amx — from CPUID), and each idle line names the kernel that would have to be
+**written** to use it. Feature probes are tri-state: a feature this process
+cannot interrogate reads `unknown`, never `absent`.
+
+**`mynah-asr --flags`** prints exactly two machine-readable lines, the same two
+that `MYNAH_ASR_VERBOSE=1` puts on stderr before a `transcribe`, `stream` or
+`bench` run:
+
+```
+[FLAGS] v=1 MYNAH_ASR_CAPS=vnni MYNAH_ASR_THREADS=999 OPENBLAS_NUM_THREADS=3
+[EFFECTIVE-CONFIG] v=1 build=<git rev> blas=accelerate simd=neon+dotprod \
+  MYNAH_ASR_CAPS=vnni->none(IGNORED:_not_an_x86_build:_...) \
+  MYNAH_ASR_THREADS=999->64(clamped) \
+  OPENBLAS_NUM_THREADS=3->none(IGNORED:_this_build_links_Accelerate;_...)
+```
+
+Every environment variable the runtime reads is one row of the single registry
+in `src/flags.c` — name, scope (`runtime|kernel|server|debug`), default,
+description, and an optional predicate that returns the reason the flag is
+**inert** in this build on this host. A flag that cannot act is reported
+`IGNORED:` with that reason instead of being echoed back as if it had been
+applied, which is the whole point: a quoted result must not rest on a variable
+that did nothing. `make check` runs `tools/check_flag_registry.py`, which fails
+when a name read through `getenv()` anywhere in `src/ cli/ server/ tests/` is
+missing from the table, or when the table names a flag nothing reads.
+
+**The ISA guard** is the first statement of `main()`. If the binary was compiled
+with an instruction set this CPU definitely lacks — `__ARM_FEATURE_DOTPROD` on a
+CPU whose auxv/sysctl says no dotprod, `__AVX2__` where CPUID says no AVX2 — it
+prints one line naming the ISA, the missing feature and the fix, and exits **78**
+(`EX_CONFIG`) instead of dying with a bare `SIGILL` three frames inside a kernel.
+It fires only on a **definite** absence: the probes are tri-state, and refusing
+to start over our own ignorance would be a worse bug than the one it prevents.

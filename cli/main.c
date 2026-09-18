@@ -8,6 +8,8 @@
 #include "mynah_asr.h"
 #include "audio.h"
 #include "backend.h"
+#include "dispatch.h"  /* --dispatch-map, mynah_asr_isa_guard */
+#include "flags.h"     /* --flags, MYNAH_ASR_VERBOSE */
 #include "qmat.h"      /* mynah_asr_set_caps (--caps) */
 
 static void usage(void) {
@@ -29,7 +31,13 @@ static void usage(void) {
     printf("             writes the pre-quantized checkpoint (instant load)\n");
     printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8] [--vad <dir>]\n");
     printf("             warm RTF (min/median over N runs) + peak RAM, one model at a time\n");
-    printf("  --version                                 prints the version\n\n");
+    printf("  --version                                 prints the version\n");
+    printf("  --dispatch-map [--json]                   which kernel/backend/pool this\n");
+    printf("                                            binary RESOLVES on this host,\n");
+    printf("                                            plus the IDLE HARDWARE footer\n");
+    printf("  --flags                                   [FLAGS] + [EFFECTIVE-CONFIG]:\n");
+    printf("                                            every env flag set, and whether\n");
+    printf("                                            it was applied, clamped or IGNORED\n\n");
     printf("  --vad <dir>                 (transcribe) cut segments on speech with the Silero\n");
     printf("                              VAD and skip the silence between them (make fetch-vad)\n");
     printf("Common options (transcribe/stream):\n");
@@ -464,6 +472,27 @@ static int cmd_bench(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    /* FIRST statement: a binary built for an ISA this CPU lacks must say so in
+     * one line, not die with a bare SIGILL three frames into a kernel. Fires
+     * only on a definite absence (S3-2). */
+    const int isa = mynah_asr_isa_guard();
+    if (isa != 0) return isa;
+
+    if (argc >= 2 && strcmp(argv[1], "--dispatch-map") == 0) {
+        const int json = argc >= 3 && strcmp(argv[2], "--json") == 0;
+        return mynah_asr_dispatch_print(stdout, json) < 0 ? 1 : 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--flags") == 0) {
+        mynah_asr_flags_print(stdout);
+        return 0;
+    }
+    /* ENGINEERING.md §5: a run that is going to be measured prints the
+     * environment it resolved, in the same process, before it starts. */
+    if (argc >= 2 && mynah_asr_flag_int("MYNAH_ASR_VERBOSE", 0) == 1 &&
+        (strcmp(argv[1], "transcribe") == 0 || strcmp(argv[1], "stream") == 0 ||
+         strcmp(argv[1], "bench") == 0))
+        mynah_asr_flags_print(stderr);
+
     if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
 #ifdef MYNAH_ASR_BUILD
         printf("%s (%s)\n", mynah_asr_version(), MYNAH_ASR_BUILD);

@@ -62,8 +62,8 @@ there; macOS is the development machine, nice to have, never the target.**
 - [ ] S2-7 Byte-identity gate: N concurrent streams == the same streams alone, also under `--prefork` → [`.work/server-scheduler.md`](.work/server-scheduler.md)
 
 ### S3 — The server proves what it runs → [`.work/observability.md`](.work/observability.md)
-- [ ] S3-1 Effective-config banner and `[TOPOLOGY]` line at start, unconditionally
-- [ ] S3-2 `--dispatch-map` from registered predicates; `IDLE HARDWARE` footer; fatal ISA guard
+- [~] S3-1 Flag registry + `[FLAGS]`/`[EFFECTIVE-CONFIG]` lines in the library and the CLI (`--flags`, `MYNAH_ASR_VERBOSE=1`); the server banner and `[TOPOLOGY]` are still open
+- [~] S3-2 `--dispatch-map [--json]` resolved from owner predicates, `IDLE HARDWARE` footer and ISA guard in `main()`; the server does not print it yet
 - [ ] S3-3 `/v1/health` as facts; `/metrics` on its own port, per-worker series, threshold counters
 - [ ] S3-4 `SIGUSR1` dump forwarded to workers; named threads
 
