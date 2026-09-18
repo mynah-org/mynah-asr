@@ -148,7 +148,11 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
  * allocates nothing. One thread at a time per mynah_asr_enc_batch. */
 typedef struct mynah_asr_enc_batch mynah_asr_enc_batch;
 
-mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int max_b, int max_q);
+/* max_left = the largest left attention context a stream of this model uses:
+ * it sizes the shared rel-pos projection buffer (S1-7), whose row count is
+ * 2*(max_left + max_q + 2) - 1. */
+mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int max_b, int max_q,
+                                         int max_left);
 void mynah_asr_enc_batch_free(mynah_asr_enc_batch *bb);
 /* Rows the scratch can hold (max_b * (max_q + 2)) — the caller checks before
  * splitting a large ready set into several passes. */
@@ -167,5 +171,23 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
  * is not contractually row-stable in M, so the answer is a MEASUREMENT of this
  * build's BLAS (see the note in encoder.c); MYNAH_ASR_BATCH_F32=0|1 overrides it. */
 int mynah_asr_enc_batch_f32_ok(void);
+
+/* ------------------------------------------- rel-pos projection sharing (S1-7)
+ * `rk = pe @ relk_wR` depends only on (layer, K) with K = cache_valid + q, so
+ * every stream of a batched pass that is at the same K computes the SAME matrix.
+ * The batched step computes it once per (layer, K-group) and lets the group read
+ * it; a stream at a different K (a slot on its first chunks, cache_valid < left)
+ * keeps its own. Bit-exact by construction: identical inputs, identical call.
+ *
+ * Which of the two actually happened is a counter, not a claim
+ * (ENGINEERING.md §6): a run that silently stopped sharing shows SHARED = 0. */
+enum {
+    MYNAH_ASR_RELPOS_PRIVATE = 0, /* attention core that computed its own rk     */
+    MYNAH_ASR_RELPOS_SHARED,      /* attention core that read a group's rk       */
+    MYNAH_ASR_RELPOS_GROUP,       /* rk computed once for a group (layer x pass) */
+    MYNAH_ASR_RELPOS__N
+};
+unsigned long long mynah_asr_enc_relpos_counter(int which);
+void mynah_asr_enc_relpos_counters_reset(void);
 
 #endif

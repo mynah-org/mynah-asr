@@ -63,6 +63,10 @@ Evidence
   its audio position).
 - S1-3 DONE 2026-09-18: see the section below.
 - S1-4 DONE 2026-09-18: see the section below.
+- S1-7 DONE 2026-09-18: see the section below. Bit-exact as predicted (0 of
+  266,240 floats differ at B = 8, both dtypes, counters proving the sharing);
+  the slope `b` measured 22.7 -> 20.3 ms on the M1 under third-party load, a
+  third of the 7.4 ms the isolated micro-benchmark had promised.
 Conclusion: the seams the scheduler needs exist.
 Next action: S2 wires the batched step into the scheduler (recipe below).
 
@@ -250,7 +254,9 @@ depend on the stream at all: at steady state every stream has the same
 the streams of a pass that have equal `K` would be bit-exact by construction
 (identical inputs, identical call) and should move B_max on this host from ≈ 7
 to ≈ 9. NOT done here — S1-4 is scoped to "attention stays per stream" —
-recorded as a new board item (S1-7).
+recorded as a new board item (S1-7). **Done in S1-7, see below: the sharing is
+bit-exact as predicted, but the saving measured end to end is 2.4 ms of the
+slope, not 7.4.**
 
 ### Allocation
 
@@ -273,6 +279,159 @@ scratch S1-3 already carved.
   bound on fixed arrays, not a capacity claim.
 - Whether threading the linears inside the step competes with the scheduler's
   other work (S1-5 pool, S5-5 pool meter).
+
+## Evidence — S1-7 (shared rel-pos projection), 2026-09-18, macOS arm64 (Accelerate)
+
+### What was built
+
+In `mynah_asr_enc_stream_step_batch` the rel-pos projection `rk = pe @ relk_w^T`
+is now computed ONCE per (layer, K) for the streams of the pass that are at the
+same `K = cache_valid + q`, instead of once per (layer, stream).
+
+- `stream_attention_core` gained a last parameter `rk_in`. NULL = compute your
+  own into `es->sa_rk`, which is exactly what the code did before and what the
+  **single-stream path always passes** — `mynah_asr_enc_stream_step` is byte for
+  byte the same computation it was.
+- The batched step records each stream's `K` in `bb->kks[]`, picks the `K` shared
+  by the most streams (ties to the lowest `K`, so the choice does not depend on
+  the order the caller passed the streams in), and, when at least two streams
+  are at it, projects once per layer into `bb->rk_sh` from the leader's `sa_pe`.
+  Every stream at that `K` reads that buffer; a stream at another `K` — a slot on
+  its first chunks, `cache_valid` still below `left` — keeps its private one.
+- `bb->rk_sh` is carved inside the existing single `malloc` of
+  `mynah_asr_enc_batch_new`, which now takes `max_left` so it can size it
+  (`2*(max_left + max_q + 2) - 1` rows × d). `mynah_asr_stream_batch_reserve`
+  passes the model's `left_ctx`. Nothing is allocated per step.
+
+Why this cannot change a float: `pe` is `mynah_asr_pos_emb(enc, K)`, a pure
+function of `K`; `relk_w` is the layer's weight. Two streams at the same `K`
+therefore feed bit-identical inputs of the same shape to the same `matmul_wt`.
+Sharing the result is not an approximation, it is common-subexpression
+elimination across streams. The gate below asserts it anyway (rule 4).
+
+### WHAT PATH RAN — the counters (`mynah_asr_enc_relpos_counter`)
+
+Three counters, one relaxed atomic per attention core: `SHARED` (a core that read
+the group's `rk`), `PRIVATE` (a core that computed its own), `GROUP` (a hoisted
+projection, i.e. layer × pass). A run that silently stopped sharing shows
+SHARED = 0, and the identity gate fails on it (ENGINEERING.md §6).
+
+Level 1, int8, `tests/test_stream_batch` (5 clips of different length, so streams
+leave the batch as they run out of audio):
+
+| B | SHARED | PRIVATE | GROUP | reading |
+|---|---|---|---|---|
+| 1 | 0 | 408 | 0 | B=1 is the single path verbatim: 17 chunks × 24 layers |
+| 2 | 624 | 120 | 312 | 13 shared passes × 2 streams; 5 steps ran with one stream left |
+| 3 | 912 | 144 | 312 | |
+| 4 | 1176 | 168 | 312 | |
+| 8 | 2496 | 192 | 384 | 16 shared passes × 8; PRIVATE = 8 tail steps × 24 |
+
+PRIVATE never drops to 0 and should not: when a group shrinks to one stream the
+library takes the single path, which is the intended behaviour. The numbers are
+identical at f32.
+
+### Gate — identity, UNCHANGED at both levels
+
+`tests/test_stream_batch <model>`, same two levels as S1-4, now also asserting
+`SHARED > 0` whenever the stacked path ran at B > 1.
+
+| quant | B | floats compared | differ | caches differ | SHARED |
+|---|---|---|---|---|---|
+| int8 | 2 | 74,240 | **0** | 0 / 6 | 624 |
+| int8 | 4 | 133,120 | **0** | 0 / 12 | 1176 |
+| int8 | 8 | 266,240 | **0** | 0 / 24 | 2496 |
+| f32 | 2 | 74,240 | **0** | 0 / 6 | 624 |
+| f32 | 4 | 133,120 | **0** | 0 / 12 | 1176 |
+| f32 | 8 | 266,240 | **0** | 0 / 24 | 2496 |
+
+Level 1 (transcripts through the public API): IDENTICAL for every stream at
+B ∈ {1,2,3,4,8}, int8 and f32, against the single-stream run and against
+`mynah_asr_transcribe`. The `DEQUANT` fallback stays 0. The pre-existing
+`test_es.wav` int8 streaming-vs-offline difference is still reported and is still
+not a batching effect.
+
+`make test` green (`MODEL_DIR` = the local Nemotron pack); the Parakeet/Canary
+e2e lines and the golden-dump stages SKIP because those models are not present
+on this box. `make test-stream-batch-allocs`: **0 allocations per step** at B = 4,
+12 steps after warm-up — the shared buffer did not add one.
+
+UBSan: `tests/test_stream_batch` rebuilt with the Makefile's `ubsan` flags
+(`-O2 -g -fsanitize=undefined -fno-omit-frame-pointer`, no `-march=native`, no
+`-ffast-math`) and run once on the full gate: **exit 0, no diagnostic**, and both
+identity levels still pass in that build — the sharing is bit-exact there too,
+not only under `-O3 -ffast-math`.
+
+### Gate B — step time (macOS dev signal, NOT a serving claim)
+
+Apple M1, 8 cores, int8, preset [56,3] (P = 320 ms of audio per step per stream),
+5 clips cycled, `tests/test_stream_batch <model> --steptime` (the table now runs
+B = 1..8, it used to run 1,2,4,8).
+
+**The box was not idle.** Another agent was building and testing in a sibling
+worktree throughout, loadavg 4–11 on 8 cores, and single `--steptime` runs
+disagreed with each other by up to 2× — far more than the effect being measured.
+So the protocol is: the two binaries (`5a6d612` and this change, same compiler
+and flags) alternate, 4 repetitions each, and the estimate per (arm, B) is the
+**minimum** over repetitions, which is the value closest to the uncontended step
+time. The sanity check that this works: the `single ms` column, which this change
+does not touch, comes out the same in both arms (109.92 vs 109.21 at B = 1,
+694.13 vs 693.90 at B = 8, ≤ 0.6 %). Everything below is still a DEV SIGNAL under
+load, never a serving number (ENGINEERING.md §8).
+
+| B | single ms | batched before | batched after | delta | ms per stream after |
+|---|---|---|---|---|---|
+| 1 | 109.9 | 107.77 | 107.69 | −0.1 % | 107.69 |
+| 2 | 194.1 | 84.34 | **80.42** | −4.6 % | 40.21 |
+| 3 | 273.6 | 107.16 | **99.47** | −7.2 % | 33.16 |
+| 4 | 347.2 | 128.67 | **117.13** | −9.0 % | 29.28 |
+| 5 | 419.4 | 150.67 | **137.17** | −9.0 % | 27.43 |
+| 6 | 526.7 | 174.35 | **150.96** | −13.4 % | 25.16 |
+| 7 | 615.0 | 198.62 | **175.09** | −11.8 % | 25.01 |
+| 8 | 694.1 | 219.87 | **207.83** | −5.5 % | 25.98 |
+
+B = 1 is the same code on both sides and moves by 0.1 %: the noise floor of the
+protocol. Fitting `T_step(B) = a + b·B` over B ∈ [2,8]:
+
+|  | a | b |
+|---|---|---|
+| before (`5a6d612`) | 38.5 ms | 22.69 ms |
+| after (S1-7) | 37.0 ms | **20.26 ms** |
+
+i.e. the per-stream slope drops by **2.4 ms (−10.7 %)**, and with ρ = 0.7 and
+P = 320 ms this host's `B_max = (ρP − a)/b` moves from **8.2 to 9.2**.
+
+### The prediction was 7.4 ms; the measurement is 2.4 ms
+
+Honest discrepancy, stated rather than smoothed. The S1-4 finding measured the
+same GEMM shape (P = 119 × 1024 × 1024, 24 layers) **in isolation** in a scratch
+micro-benchmark and got 7.4 ms. Inside the real step the same work is worth about
+a third of that. Not investigated here, so the cause is a hypothesis, not a
+result: inside the step `pe` and `relk_w` are already resident and the machine is
+already saturated by the stacked linears, so the isolated timing measured an
+idle-machine cost that the step never actually paid. Whatever the reason, the
+number to trust is the end-to-end one: **b 22.7 → 20.3 ms**. The direction of the
+S1-4 prediction (B_max ≈ 7 → ≈ 9) survives; the size of the win does not.
+
+The B = 8 point is the weakest: −5.5 % against −13 % at B = 6 and B = 7, and the
+two low-load repetitions disagreed there (one showed no gain at all). At B = 8 the
+batch saturates all 8 cores and the contention from the other worktree bites
+hardest. Do not read the B = 8 cell as a measurement.
+
+### What remains unknown
+
+- The real size of the win on an idle box, and on Linux/OpenBLAS and Axion/x86
+  (the counters and the gate are portable; they have not been run there). The
+  M1 numbers above were taken under third-party load.
+- Why the isolated 7.4 ms does not show up in the step. A DIAGNOSTIC run with
+  the projection timed in place would settle it; not done.
+- Only ONE K-group is shared per pass, the largest. A pass holding two large
+  groups at different `K` — many slots admitted in two waves — shares only the
+  bigger one; the rest fall back. Not measured, because the scheduler that would
+  produce that shape is S2. Generalising needs one buffer per group.
+- The counters are in `src/encoder.h`, so the gate can read them; they are NOT
+  surfaced in the server's `/metrics` yet. That is S3 work on `server/`, which
+  this change deliberately did not touch.
 
 ## Integration recipe for the scheduler (S2, NOT done here)
 

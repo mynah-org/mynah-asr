@@ -982,12 +982,12 @@ unsigned long long mynah_asr_stream_batch_rows_stacked(void) {
  * one scratch per model is exactly the lifetime the server wants, and it is
  * carved once instead of per step. */
 static int model_batch_ready(mynah_asr_model *m, int max_b) {
-    if (m->n_lookaheads == 0) return -1;
+    if (m->n_lookaheads == 0 || m->left_ctx < 0) return -1;
     int max_q = 1;
     for (int i = 0; i < m->n_lookaheads; i++)
         if (m->lookaheads[i] + 1 > max_q) max_q = m->lookaheads[i] + 1;
     if (m->batch && mynah_asr_enc_batch_max_b(m->batch) >= max_b) return 0;
-    mynah_asr_enc_batch *nb = mynah_asr_enc_batch_new(&m->enc, max_b, max_q);
+    mynah_asr_enc_batch *nb = mynah_asr_enc_batch_new(&m->enc, max_b, max_q, m->left_ctx);
     if (!nb) return -1;
     mynah_asr_enc_batch_free(m->batch);
     m->batch = nb;
