@@ -1,3 +1,9 @@
+/* pthread_setname_np is a GNU extension on glibc: declare it before the first
+ * include or clang-tidy (and any strict C11 compiler) sees an implicit function
+ * declaration. Harmless on macOS, where the symbol is in the default namespace. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "http_util.h"
 
 #include <pthread.h>

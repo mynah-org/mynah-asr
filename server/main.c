@@ -910,7 +910,8 @@ static void handle_conn(int fd) {
         if (r <= 0) { close(fd); return; }
         got += (size_t)r;
         hdr[got] = '\0';
-        if ((hdr_end = strstr(hdr, "\r\n\r\n")) != NULL) break;
+        hdr_end = strstr(hdr, "\r\n\r\n");
+        if (hdr_end != NULL) break;
     }
     if (!hdr_end) { close(fd); return; }
     const size_t hdr_len = (size_t)(hdr_end - hdr) + 4;
