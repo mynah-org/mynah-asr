@@ -1,6 +1,6 @@
 # S2-2 — one scheduler per worker, slots, the sink
 
-Status: IN PROGRESS (spec 2026-09-18; implementation delegated, owner reviews)
+Status: IMPLEMENTED (spec 2026-09-18; gate passed on the M1 dev host, Linux numbers pending)
 
 Task: S2-2, S2-7
 Question: replace "one blocking thread per connection" with one scheduler
@@ -171,5 +171,143 @@ upgrade; a REST request beyond `--max-pending` (default 2·threads) is refused
 6. `make leaks` clean on `test_stream_out`; `make ubsan` clean on the server
    test; TSan once on `test_stream_out` and reported.
 
-## Evidence / Conclusion / Next action
-Pending implementation.
+## Evidence
+
+Implementation landed on top of `354743c`. Host: Apple M1 (arm64, 8 cpus),
+macOS 25.5, Accelerate, `make` default flags (`-O3 -march=native`), model
+`nemotron-3.5-asr-streaming-0.6b` `--quant int8` (pre-quantised checkpoint), the
+110m `parakeet-tdt_ctc-110m-gguf` for the REST gate. **Development-machine
+numbers: signals, not a serving point** (ENGINEERING §8) — the qualifying SOAK
+belongs to S4 on the Linux box.
+
+### What was built
+
+- `server/slot.{c,h}` — the slot: float PCM ring sized by `--ring-seconds`,
+  arrival records (`{end_sample, t_monotonic}`, one per push, merged into the
+  newest when full so the oldest, which dates the audio about to be consumed, is
+  never the one lost), blocking `slot_push`, `slot_take` returning the arrival
+  of the last popped sample, request flags read at the step boundary, a
+  per-session 8 ms lag histogram, `slot_wait_done` so a teardown costs one
+  wakeup instead of a sleep loop.
+- `server/sched.{c,h}` — one thread per worker, `sched_assert_thread()` at every
+  callback and every inference call site (abort without `NDEBUG`, one line with
+  it). Step order exactly as specified: cancel → reset → ready set round-robin,
+  one chunk per slot per step → at most one batched offline call → park on a
+  condvar. No tick. Offline REST work replaced the `batch_worker` thread; a
+  batch is one kind AND one lookahead, because the batched call resolves the
+  lookahead once for the whole batch and mixing them would make a transcript
+  depend on who it travelled with (v1 took `jobs[0]->lookahead` for everyone).
+- `server/main.c` — ingest loop, slot reserved before the 101, `503` /
+  `400 model_not_streaming` before the upgrade, control messages, ping→pong
+  through the writer, `SO_RCVTIMEO` + a 200 ms poll tick, oversized frame and
+  idle caps. `g_inflight`, `inference_begin/end` and the BLAS coupling are gone:
+  `mynah_asr_blas_set_concurrency(1)` once at start.
+- The ingest reads through `dup(fd)` while the writer owns the original. The
+  writer closes as soon as it has drained, which can happen while the ingest is
+  parked in a read; reading a descriptor another thread is closing is how a
+  server ends up serving a stranger after `accept()` reissues the number.
+- s16→float conversion is byte-wise. The v1 code cast the payload to
+  `const int16_t *`, which is unaligned and undefined; ubsan is right about it.
+
+### What ran, and what it measured
+
+`make` clean, no warnings. `grep -n pthread_mutex_lock server/*.c` → `main.c`
+(the fd ring), `slot.c` (the slot rings), `sched.c` (the offline job queue, the
+scheduler's wake flag and nothing else), `stream_out.c` (the writer). Counters
+`/v1/health` reports are relaxed atomics, so a health probe never queues behind
+a step.
+
+```
+sh tests/test_server_concurrency.sh <110m-gguf> 8307        -> 0, all 8 checks OK
+sh tests/test_server.sh <nemotron> 8715                     -> 0 (ws-stream OK: v1 fields kept)
+sh tests/test_serve_repro.sh <nemotron>                     -> 0 (16 concurrent responses byte-identical)
+sh tests/test_server_stream.sh <nemotron> 8513              -> 0
+make test                                                   -> 0 (77 where model-gated)
+```
+
+`tests/test_server_stream.sh`, the S2-7 gate, on this host:
+
+| phase | result |
+|---|---|
+| 4 streams × 2 utterances, `--cap 4`, reference = `mynah-asr transcribe --quant int8 --lang auto` | MEASURED, 0 errors, 8/8, identity and reference clean. TTFP p50/p95 **1312 / 1655 ms**, emission lag p50/p95 **1152 / 2091 ms** |
+| stalled reader beside 2 streams | the 2 streams MEASURED (TTFP p50 1091 ms, lag p50/p95 **226 / 390 ms**), stalled slot cancelled and reclaimed |
+| `--prefork 2 --cap 2`, 2 streams × 2 | MEASURED, identity clean, TTFP p50/p95 **927 / 963 ms**, lag p50/p95 **140 / 159 ms**; SIGTERM leaves 0 survivors |
+
+Capacity of one scheduler on this host, from `tools/bench/stream_load.py`
+(`--repeat 2`, mixed it/en/de/fr, `--lookahead 3` = 330 ms chunks):
+
+| streams | emission lag p50 / p95 | finalization p50 | wall vs audio |
+|---|---|---|---|
+| 1 | 145 / 156 ms | 100 ms | 5.4 s for 5.2 s |
+| 2 | 261 / 728 ms | 166 ms | 10.5 s for 19.1 s |
+| 4 | 1773 / 3042 ms | 2993 ms | 15.3 s for 34.0 s |
+
+So `T_step(1) ≈ 145 ms` against a 330 ms period: **B=2 holds with margin on an
+M1, B=4 does not** — the lag grows monotonically through the run, which is
+exactly the backlog failure §3 of the design note predicts. The identity gate
+still passes at B=4 (a slow server is still a correct one), which is why it is
+the identity that gates and the cadence that is reported.
+
+ubsan: `make clean` then a `-fsanitize=undefined -O2` build of the server and
+the CLI, `tests/test_server_stream.sh` and `tests/test_server_concurrency.sh`
+both green with **0 `runtime error` lines**. Rebuilt clean afterwards.
+
+Re-run from the **committed** tree (ENGINEERING §12), `b8ff408`, clean working
+directory, `make clean && make`, `mynah-asr-server` sha256
+`4cb3e7d0d39607e0f671b4cfb1491ab3aebd0fb3ac202a2b19ec033df1dbdd2b`: the stream
+gate, `tests/test_server_concurrency.sh` and `tests/test_server.sh` all exit 0.
+The committed build's own numbers: 4 streams TTFP p50/p95 1449/1593 ms, lag
+p50/p95 1228/2194 ms; prefork 2×2 TTFP 931/936 ms, lag 126/137 ms.
+
+The control channel is not yet in a test (its gate belongs to S2-5), but it was
+exercised by hand against this build: one socket, an unknown control message
+answered with an `error` frame and the session surviving it, then three
+utterances separated by `{"type":"finalize"}` and `{"type":"reset"}`, each
+transcript byte-identical to the CLI's and `seq` continuing across them
+(15 → 27 → 37). A test for that belongs with S2-5.
+
+### What the stalled-reader phase actually proves
+
+The client sets a 2 KiB receive buffer, sends 4.4 s of audio at 1x and never
+reads. The slot is reclaimed ~3 s after it stops sending, and the server log
+carries **no** `stream aborted` line — so the cap that fired was `--idle-ms`,
+not the output ring and not `SO_SNDTIMEO`. That is the honest reading: JSON
+deltas are small, and filling a loopback socket buffer with them takes far
+longer than any test should wait. Slow-reader isolation as such (ring overflow →
+cancel) is covered by `tests/test_stream_out.c` at the module level; what this
+phase shows end to end is that a silent client is reclaimed on a bounded timer
+and that the streams beside it do not move.
+
+## Conclusion
+
+S2-2 is implemented and its gate passes, with the caveats stated: the byte
+identity holds at 4 concurrent streams and under `--prefork`, the transport
+refuses before the upgrade, and one thread owns the model with the invariant
+asserted rather than commented. Gate items 1, 2, 3, 5 pass; item 4's "a stopped
+reader is cancelled within the send timeout" is served by the idle cap here and
+is recorded as such, not as the send timeout; item 6's TSan pass was not run.
+
+## Unknowns
+
+- No Linux number at all: `a` and `b` of the cadence law, and therefore the real
+  per-worker slot cap, are S0/S4 work on the Axion. The M1 figures above must
+  not be used to size anything.
+- The per-delta frame is built with cJSON (one `cJSON_CreateObject` +
+  `cJSON_PrintUnformatted` + `free` per frame). Everything else in the step path
+  is allocation-free (ring, arrival records, chunk scratch and frame scratch are
+  carved at slot init); this one is a declared exception for this cut and is the
+  first thing S1-3 should take out.
+- `peer_gone()` polls once per slot per step, so a worker at B=32 pays 32
+  `poll()` syscalls per 330 ms. Not measured; suspected negligible, but suspected.
+- A pooled stream is re-opened when a client asks for a lookahead different from
+  the one that slot's stream holds (reset cannot resize the scratch). A
+  deployment mixing lookaheads therefore pays an open per switch. Unmeasured.
+- TSan on `test_stream_out` (gate item 6) was not run in this pass.
+- The ingest thread's `dup` doubles the descriptors per stream; the fd ceiling
+  of a many-stream worker has not been re-derived.
+
+## Next action
+
+S2-5 proper (drop the v1 frame fields, `t0` on deltas, the finalize/reset
+protocol test), S2-3's remaining rungs (server-side ping, `--max-audio-seconds`),
+and S1-4's batched stream step, for which this scheduler is the place to land.

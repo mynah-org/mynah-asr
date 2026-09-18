@@ -19,4 +19,15 @@ const uint8_t *mynah_asr_memmem(const uint8_t *hay, size_t hay_len,
  * truncated here rather than rejected there. */
 void mynah_asr_thread_set_name(const char *name);
 
+/* Builds one complete, unmasked server-to-client WebSocket frame (header +
+ * payload) into `buf` and returns its length, or 0 when it does not fit.
+ *
+ * A whole frame at a time, deliberately: the output writer concatenates the
+ * bytes it is given into one ring with no message boundaries of its own, so a
+ * frame enqueued in two pieces could be split by another thread's frame
+ * squeezing in between and the client would read garbage. One enqueue, one
+ * frame, is the invariant that keeps the ring honest. */
+size_t mynah_asr_ws_frame(unsigned char *buf, size_t cap, int opcode,
+                          const void *payload, size_t len);
+
 #endif

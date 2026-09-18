@@ -8,9 +8,13 @@
  *   GET  /v1/audio/stream           WebSocket: binary s16le 16kHz in -> JSON deltas out
  *                                   (query: ?lang=auto&lookahead=3)
  *
- * Concurrency: the model is read-only (mmap'd weights) and shared; each request
- * only owns its decode state -> a pool of worker threads, no clones.
- * Cross-request batching (B>1 kernels) is in the backlog (see TODO M4).
+ * Concurrency (serving v2, S2-2): ONE scheduler thread owns the model and drives
+ * every inference -- stream chunks and offline REST jobs alike. The HTTP threads
+ * parse, and for a WebSocket each becomes the INGEST thread of that connection
+ * for its life: it decodes PCM into the slot's bounded ring and never touches
+ * the model. Output leaves on a per-connection writer (server/stream_out.c), so
+ * a client that stops reading loses its own stream and nobody else's.
+ * See .work/server-scheduler.md for the design and the evidence behind it.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -24,16 +28,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../src/audio.h"
 #include "../src/backend.h"
 #include "../src/mynah_asr.h"
 #include "../src/qmat.h"      /* mynah_asr_set_caps (--caps) */
-#include "../src/threads.h"   /* mynah_asr_blas_set_concurrency (inflight -> BLAS) */
+#include "../src/threads.h"   /* mynah_asr_blas_set_concurrency */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
 #include "prefork.h"
+#include "sched.h"
+#include "slot.h"
+#include "stream_out.h"
 
 #define MAX_HDR (64 * 1024)
 #define MAX_BODY (200u * 1024 * 1024)
@@ -43,142 +51,19 @@ static mynah_asr_model *g_model;
 static mynah_asr_model *g_lid;       /* --lid-model: language detector for language=auto */
 static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
-
-/* Inferences computing RIGHT NOW (a batch call counts as one, however many items
- * it carries). Only the server knows this number, and BLAS needs it: N calls
- * each asking for every core thrash on the OpenBLAS lock instead of going
- * faster. Kept around the compute calls only, so an idle WebSocket stream — open
- * but between chunks — does not hold a slot down. */
-static int g_inflight;
-static pthread_mutex_t g_inflight_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static void inference_begin(void) {
-    pthread_mutex_lock(&g_inflight_mu);
-    const int n = ++g_inflight;
-    pthread_mutex_unlock(&g_inflight_mu);
-    mynah_asr_blas_set_concurrency(n);
-}
-
-static void inference_end(void) {
-    pthread_mutex_lock(&g_inflight_mu);
-    const int n = --g_inflight;
-    pthread_mutex_unlock(&g_inflight_mu);
-    mynah_asr_blas_set_concurrency(n > 0 ? n : 1);
-}
-
-static int inflight_now(void) {
-    pthread_mutex_lock(&g_inflight_mu);
-    const int n = g_inflight;
-    pthread_mutex_unlock(&g_inflight_mu);
-    return n;
-}
 static int g_quant = MYNAH_ASR_QUANT_F32;
+
+/* Per-stream service limits (S2-3, the part that lands with the scheduler). */
+static int g_idle_ms = 60000;                      /* --idle-ms */
+static int g_ring_seconds = 30;                    /* --ring-seconds */
+static size_t g_max_frame_bytes = 1024u * 1024u;   /* --max-frame-bytes */
+static int g_max_pending;                          /* --max-pending, 2*threads */
 
 /* Set by SIGINT/SIGTERM; both accept loops poll with a timeout and re-read it,
  * because closing the listening socket from a handler does not wake a blocking
  * accept(). The handler is installed without SA_RESTART on purpose. */
 static volatile sig_atomic_t g_shutdown;
 static void on_stop(int sig) { (void)sig; g_shutdown = 1; }
-
-/* --------------------------------------------------- micro-batching scheduler
- * Connections wrap their work into jobs; a dedicated thread aggregates the
- * pending jobs (a 25 ms window, or a full batch) and calls
- * mynah_asr_transcribe_batch: the weights are read once per layer for the whole
- * batch. */
-typedef struct trx_job {
-    const float *samples;
-    size_t n_samples;
-    char lang[24];
-    int lookahead;
-    char *text;                 /* result (malloc'd) */
-    char lang_out[16];
-    mynah_asr_word *words;          /* per-word timestamps (malloc'd, may be NULL) */
-    int n_words;
-    int done;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    struct trx_job *next;
-} trx_job;
-
-static trx_job *bq_head, *bq_tail;
-static int bq_len;
-static pthread_mutex_t bq_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t bq_cv = PTHREAD_COND_INITIALIZER;
-
-static void batch_submit_and_wait(trx_job *j) {
-    pthread_mutex_lock(&bq_mu);
-    if (bq_tail) bq_tail->next = j;
-    else bq_head = j;
-    bq_tail = j;
-    bq_len++;
-    pthread_cond_broadcast(&bq_cv);
-    pthread_mutex_unlock(&bq_mu);
-
-    pthread_mutex_lock(&j->mu);
-    while (!j->done) pthread_cond_wait(&j->cv, &j->mu);
-    pthread_mutex_unlock(&j->mu);
-}
-
-static void *batch_worker(void *arg) {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&bq_mu);
-        while (!bq_head) pthread_cond_wait(&bq_cv, &bq_mu);
-
-        /* aggregation window: wait up to 25 ms for more jobs to arrive */
-        struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        dl.tv_nsec += 25 * 1000000;
-        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-        while (bq_len < g_max_batch &&
-               pthread_cond_timedwait(&bq_cv, &bq_mu, &dl) == 0) {}
-
-        trx_job *jobs[64];
-        int B = 0;
-        while (bq_head && B < g_max_batch && B < 64) {
-            jobs[B++] = bq_head;
-            bq_head = bq_head->next;
-        }
-        if (!bq_head) bq_tail = NULL;
-        bq_len -= B;
-        pthread_mutex_unlock(&bq_mu);
-        if (B == 0) continue;   /* never happens with the wait on bq_head, but makes
-                                   the bound provable (GCC 13 maybe-uninitialized) */
-
-        const float *samples[64];
-        size_t ns[64];
-        const char *langs[64];
-        char *texts[64];
-        char louts[64][16];
-        mynah_asr_word *wordsv[64];
-        int nwordsv[64];
-        int lookahead = jobs[0]->lookahead;   /* batch homogeneous on the first */
-        for (int b = 0; b < B; b++) {
-            samples[b] = jobs[b]->samples;
-            ns[b] = jobs[b]->n_samples;
-            langs[b] = jobs[b]->lang;
-            texts[b] = NULL;
-        }
-        /* words are always extracted: negligible next to inference, and a batch
-         * can mix json and verbose_json requests */
-        inference_begin();
-        mynah_asr_transcribe_batch_ts(g_model, samples, ns, B, langs, lookahead,
-                                  texts, louts, wordsv, nwordsv);
-        inference_end();
-
-        for (int b = 0; b < B; b++) {
-            pthread_mutex_lock(&jobs[b]->mu);
-            jobs[b]->text = texts[b];
-            jobs[b]->words = wordsv[b];
-            jobs[b]->n_words = nwordsv[b];
-            memcpy(jobs[b]->lang_out, louts[b], sizeof(jobs[b]->lang_out));
-            jobs[b]->done = 1;
-            pthread_cond_signal(&jobs[b]->cv);
-            pthread_mutex_unlock(&jobs[b]->mu);
-        }
-    }
-    return NULL;
-}
 
 /* ------------------------------------------------------------ connection queue */
 static int q_fds[QUEUE_CAP];
@@ -375,9 +260,16 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
      * goes through with the model's default rather than failing. */
     if (g_lid && strcmp(src_lang, "auto") == 0 && !mynah_asr_can_detect_lang(g_model)) {
         char tag[16] = "", mapped[16] = "";
-        inference_begin();
-        const int got = mynah_asr_detect_lang(g_lid, samples, n_samples, tag) == 0;
-        inference_end();
+        /* The detector is a model too, so it runs where every model runs. */
+        mynah_asr_offline_job dj;
+        memset(&dj, 0, sizeof(dj));
+        dj.kind = MYNAH_ASR_JOB_DETECT_LANG;
+        dj.samples = samples;
+        dj.n_samples = n_samples;
+        const int got = mynah_asr_sched_submit(&dj) == 0 && dj.detected[0] != '\0';
+        if (got) snprintf(tag, sizeof(tag), "%s", dj.detected);
+        /* map_lang is a table lookup on the model's config, not inference: it
+         * stays on this thread rather than costing the scheduler a step. */
         if (got && mynah_asr_map_lang(g_model, tag, mapped) == 0) {
             snprintf(src_lang, sizeof(src_lang), "%s", mapped);
         } else if (got) {   /* same 400 as naming that language in the request */
@@ -397,12 +289,28 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     mynah_asr_word *words = NULL;
     int n_words = 0;
     const int want_words = strcmp(f.response_format, "verbose_json") == 0;
-    if (g_max_batch > 1) {
-        trx_job j = {.samples = samples, .n_samples = n_samples, .lookahead = f.lookahead};
+    {
+        /* One path for every offline request: the scheduler runs it, batching
+         * what is queued at the step boundary. `--batch 1` still goes through
+         * here, as a batch of one -- the code path a transcript takes must not
+         * depend on a flag. */
+        mynah_asr_offline_job j;
+        memset(&j, 0, sizeof(j));
+        j.kind = MYNAH_ASR_JOB_TRANSCRIBE;
+        j.samples = samples;
+        j.n_samples = n_samples;
+        j.lookahead = f.lookahead;
+        j.want_words = want_words;
         snprintf(j.lang, sizeof(j.lang), "%s", f.language);
-        pthread_mutex_init(&j.mu, NULL);
-        pthread_cond_init(&j.cv, NULL);
-        batch_submit_and_wait(&j);
+        const int rc = mynah_asr_sched_submit(&j);
+        if (rc == -2) {
+            free(samples);
+            char buf[1024];
+            const size_t n = mynah_asr_prefork_refusal_response(
+                MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY, buf, sizeof(buf));
+            if (n) write_all(fd, buf, n);
+            return;
+        }
         text = j.text;
         memcpy(lang_out, j.lang_out, sizeof(lang_out));
         if (want_words) {
@@ -411,13 +319,6 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         } else {
             mynah_asr_words_free(j.words, j.n_words);
         }
-        pthread_mutex_destroy(&j.mu);
-        pthread_cond_destroy(&j.cv);
-    } else {
-        inference_begin();
-        text = mynah_asr_transcribe_ts(g_model, samples, n_samples, f.language, f.lookahead,
-                                   lang_out, want_words ? &words : NULL, &n_words);
-        inference_end();
     }
     const double duration = (double)n_samples / 16000.0;
     free(samples);
@@ -451,148 +352,296 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     free(text);
 }
 
-/* ------------------------------------------------------------------ WebSocket */
-static int ws_send_frame(int fd, int opcode, const void *data, size_t len) {
-    uint8_t hdr[10];
-    size_t hl = 2;
-    hdr[0] = (uint8_t)(0x80 | opcode);
-    if (len < 126) {
-        hdr[1] = (uint8_t)len;
-    } else if (len < 65536) {
-        hdr[1] = 126;
-        hdr[2] = (uint8_t)(len >> 8);
-        hdr[3] = (uint8_t)len;
-        hl = 4;
-    } else {
-        hdr[1] = 127;
-        for (int i = 0; i < 8; i++) hdr[2 + i] = (uint8_t)((uint64_t)len >> (56 - 8 * i));
-        hl = 10;
-    }
-    if (write_all(fd, hdr, hl) != 0) return -1;
-    return write_all(fd, data, len);
-}
+/* ------------------------------------------------------------------ WebSocket
+ * The INGEST side of a stream (protocol v2, .work/ws-protocol-v2.md). This
+ * thread reads frames, converts PCM into the slot's bounded ring and posts
+ * control requests. It never calls the model -- the scheduler does -- and it
+ * never writes to the socket: once the writer is started the descriptor belongs
+ * to it, so everything going out is enqueued instead.
+ *
+ * Two descriptors for one socket, and the reason is worth stating: the writer
+ * closes the fd it owns as soon as it has drained, which can happen while this
+ * thread is parked in a read. Reading from a descriptor another thread is
+ * closing is how a server ends up serving a stranger's connection after the
+ * number is reissued by accept(). So the ingest reads through its own dup and
+ * closes it itself; the socket lives until both are gone.
+ */
+typedef struct {
+    int fd;                      /* the ingest's own dup of the client socket */
+    mynah_asr_slot *slot;
+    mynah_asr_stream_out *out;
+} ws_ingest;
 
-static int read_exact(int fd, uint8_t *buf, size_t n) {
+static int ws_read_exact(int fd, uint8_t *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
-        if (r <= 0) return -1;
+        const ssize_t r = recv(fd, buf + got, n - got, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;   /* EOF, error, or the SO_RCVTIMEO backstop */
         got += (size_t)r;
     }
     return 0;
 }
 
-typedef struct { int fd; int failed; } ws_ctx;
+static void ws_enqueue(ws_ingest *w, int opcode, const void *payload, size_t len) {
+    unsigned char buf[1024];
+    const size_t n = mynah_asr_ws_frame(buf, sizeof(buf), opcode, payload, len);
+    if (n > 0) (void)mynah_asr_stream_out_enqueue(w->out, buf, n);
+}
 
-static void ws_on_text(const mynah_asr_result *res, void *ud) {
-    ws_ctx *c = ud;
-    if (c->failed) return;
+/* A transport-level complaint: it carries no `seq`, because it is not part of
+ * the stream's sequence -- the scheduler owns that counter, and this frame is
+ * about the message the client just sent, not about the audio. */
+static void ws_transport_error(ws_ingest *w, const char *code, const char *msg) {
     cJSON *j = cJSON_CreateObject();
-    cJSON_AddStringToObject(j, "text", res->text);
-    if (res->lang) cJSON_AddStringToObject(j, "language", res->lang);
-    cJSON_AddNumberToObject(j, "audio_seconds", res->t1);
+    cJSON_AddStringToObject(j, "type", "error");
+    cJSON_AddStringToObject(j, "code", code);
+    cJSON_AddStringToObject(j, "message", msg);
     char *s = cJSON_PrintUnformatted(j);
-    if (ws_send_frame(c->fd, 0x1, s, strlen(s)) != 0) c->failed = 1;
-    free(s);
+    if (s != NULL) {
+        ws_enqueue(w, 0x1, s, strlen(s));
+        free(s);
+    }
     cJSON_Delete(j);
 }
 
-static void handle_ws_stream(int fd, const char *headers, const char *query) {
-    const char *k = strstr(headers, "Sec-WebSocket-Key:");
-    if (!k) { send_error(fd, 400, "invalid WebSocket handshake"); return; }
-    char key[64] = {0};
-    sscanf(k + 18, " %63[^\r\n]", key);
+static void ws_control(ws_ingest *w, const uint8_t *payload, size_t len) {
+    char buf[512];
+    const size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, payload, n);
+    buf[n] = '\0';
+    cJSON *j = cJSON_Parse(buf);
+    const cJSON *t = j ? cJSON_GetObjectItem(j, "type") : NULL;
+    const char *type = (t != NULL && cJSON_IsString(t)) ? t->valuestring : NULL;
 
-    char accept_src[128];
-    snprintf(accept_src, sizeof(accept_src), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
-    uint8_t sha[20];
-    mynah_asr_sha1((const uint8_t *)accept_src, strlen(accept_src), sha);
-    char accept[40];
-    mynah_asr_b64(sha, 20, accept);
+    if (type != NULL && strcmp(type, "finalize") == 0) {
+        mynah_asr_slot_request(w->slot, MYNAH_ASR_SLOT_REQ_FINALIZE, NULL,
+                               MYNAH_ASR_SLOT_CANCEL_NONE);
+    } else if (type != NULL && strcmp(type, "reset") == 0) {
+        const cJSON *l = cJSON_GetObjectItem(j, "lang");
+        mynah_asr_slot_request(w->slot, MYNAH_ASR_SLOT_REQ_RESET,
+                               (l != NULL && cJSON_IsString(l)) ? l->valuestring : NULL,
+                               MYNAH_ASR_SLOT_CANCEL_NONE);
+    } else {
+        /* An unknown message is an error frame, never a disconnect: a client
+         * that learns a newer keyword must not lose its session over it. */
+        ws_transport_error(w, "unknown_message",
+                           "expected {\"type\":\"finalize\"} or {\"type\":\"reset\"}");
+    }
+    cJSON_Delete(j);
+}
 
-    char resp[256];
-    int n = snprintf(resp, sizeof(resp),
-                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                     "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept);
-    if (write_all(fd, resp, (size_t)n) != 0) return;
+/* s16le -> float, byte by byte: the payload is not guaranteed to be aligned for
+ * an int16_t, and reading it as one is undefined behaviour that ubsan is right
+ * to complain about. Returns 0 when the session ended under us. */
+static int ws_push_pcm(ws_ingest *w, const uint8_t *payload, size_t plen, double now) {
+    const size_t ns = plen / 2;
+    float f[4096];
+    size_t off = 0;
+    while (off < ns) {
+        const size_t chunk = ns - off < 4096 ? ns - off : 4096;
+        for (size_t i = 0; i < chunk; i++) {
+            const size_t k = (off + i) * 2;
+            const int16_t v = (int16_t)((uint16_t)payload[k] |
+                                        ((uint16_t)payload[k + 1] << 8));
+            f[i] = (float)v / 32768.0f;
+        }
+        if (mynah_asr_slot_push(w->slot, f, chunk, now) != chunk) return 0;
+        off += chunk;
+    }
+    return 1;
+}
 
-    /* parameters from the query string */
-    char lang[24] = "auto";
+/* Returns 1 when the descriptor was handed to the writer (the caller must not
+ * close it), 0 when it is still the caller's. */
+static int handle_ws_stream(int fd, const char *headers, const char *query) {
+    char lang[MYNAH_ASR_SLOT_LANG_CAP] = "auto";
     int lookahead = -1;
-    if (query) {
+    if (query != NULL) {
         const char *ql = strstr(query, "lang=");
         if (ql) sscanf(ql + 5, "%23[^&\n ]", lang);
         const char *qk = strstr(query, "lookahead=");
         if (qk) lookahead = atoi(qk + 10);
     }
 
-    mynah_asr_stream *s = mynah_asr_stream_open(g_model, lang, lookahead);
-    if (!s) return;   /* the caller closes the descriptor, exactly once */
-    ws_ctx ctx = {.fd = fd};
+    /* Rung 4xx, before the upgrade: an offline-only model will never grow a
+     * stream API, so this is not a 503 and carries no Retry-After. */
+    if (!mynah_asr_sched_streaming()) {
+        cJSON *j = cJSON_CreateObject();
+        cJSON *e = cJSON_AddObjectToObject(j, "error");
+        cJSON_AddStringToObject(e, "message",
+            "this model is offline-only (no cache-aware streaming presets)");
+        cJSON_AddStringToObject(e, "type", "invalid_request_error");
+        cJSON_AddStringToObject(e, "code", "model_not_streaming");
+        send_json(fd, 400, j);
+        cJSON_Delete(j);
+        return 0;
+    }
 
-    float fbuf[65536];
-    for (;;) {
+    const char *k = strstr(headers, "Sec-WebSocket-Key:");
+    if (!k) { send_error(fd, 400, "invalid WebSocket handshake"); return 0; }
+    char key[64] = {0};
+    sscanf(k + 18, " %63[^\r\n]", key);
+
+    /* The slot is reserved BEFORE the 101: a client that is refused must read an
+     * HTTP status, not discover the refusal as a transport error after the
+     * upgrade. This is the worker's own cap; the router has its own rung. */
+    mynah_asr_slot *slot = mynah_asr_sched_claim(lang, lookahead);
+    if (slot == NULL) {
+        char buf[1024];
+        const size_t n = mynah_asr_prefork_refusal_response(
+            MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY, buf, sizeof(buf));
+        if (n) write_all(fd, buf, n);
+        return 0;
+    }
+
+    char accept_src[128];
+    snprintf(accept_src, sizeof(accept_src),
+             "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    uint8_t sha[20];
+    mynah_asr_sha1((const uint8_t *)accept_src, strlen(accept_src), sha);
+    char accept[40];
+    mynah_asr_b64(sha, 20, accept);
+    char resp[256];
+    const int rn = snprintf(resp, sizeof(resp),
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                            "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+                            accept);
+    if (write_all(fd, resp, (size_t)rn) != 0) {
+        mynah_asr_slot_release(slot);
+        return 0;
+    }
+
+    const int rfd = dup(fd);
+    if (rfd < 0) { mynah_asr_slot_release(slot); return 0; }
+    struct timeval tv = {.tv_sec = g_idle_ms / 1000,
+                         .tv_usec = (g_idle_ms % 1000) * 1000};
+    (void)setsockopt(rfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    mynah_asr_stream_out *out = mynah_asr_stream_out_start(fd, 0, 0);
+    if (out == NULL) {   /* the fd was never handed over: still the caller's */
+        close(rfd);
+        mynah_asr_slot_release(slot);
+        return 0;
+    }
+    ws_ingest w = {.fd = rfd, .slot = slot, .out = out};
+    mynah_asr_slot_arm(slot, out);
+    mynah_asr_thread_set_name("mynah-ingest");
+
+    int cancelled = 0, closed = 0;
+    double last_activity = mynah_asr_now();
+    uint8_t *payload = NULL;
+    while (!closed) {
+        if (g_shutdown) break;
+        if (mynah_asr_slot_get_state(slot) == MYNAH_ASR_SLOT_DONE) break;
+        if (mynah_asr_stream_out_failed(out)) break;
+
+        /* A short tick rather than one long blocking read: the loop has to
+         * notice a finished slot, a cancelled stream and SIGTERM, and none of
+         * those arrive on this socket. SO_RCVTIMEO above is the backstop for a
+         * frame that starts and never finishes. */
+        struct pollfd pfd = {.fd = rfd, .events = POLLIN, .revents = 0};
+        const int ready = poll(&pfd, 1, 200);
+        if (ready < 0) { if (errno == EINTR) continue; break; }
+        if (ready == 0) {
+            if ((mynah_asr_now() - last_activity) * 1000.0 >= (double)g_idle_ms) {
+                mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
+                                       MYNAH_ASR_SLOT_CANCEL_IDLE);
+                cancelled = 1;
+                break;
+            }
+            continue;
+        }
+
         uint8_t h[2];
-        if (read_exact(fd, h, 2) != 0) break;
+        if (ws_read_exact(rfd, h, 2) != 0) break;
         const int opcode = h[0] & 0x0F;
         const int masked = h[1] & 0x80;
         uint64_t plen = h[1] & 0x7F;
         if (plen == 126) {
             uint8_t e[2];
-            if (read_exact(fd, e, 2) != 0) break;
+            if (ws_read_exact(rfd, e, 2) != 0) break;
             plen = ((uint64_t)e[0] << 8) | e[1];
         } else if (plen == 127) {
             uint8_t e[8];
-            if (read_exact(fd, e, 8) != 0) break;
+            if (ws_read_exact(rfd, e, 8) != 0) break;
             plen = 0;
             for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
         }
         uint8_t mask[4] = {0};
-        if (masked && read_exact(fd, mask, 4) != 0) break;
-        if (plen > sizeof(fbuf) * 2) break;   /* unreasonable frame */
+        if (masked && ws_read_exact(rfd, mask, 4) != 0) break;
+        if (plen > (uint64_t)g_max_frame_bytes) {
+            ws_transport_error(&w, "frame_too_large",
+                               "the frame exceeds --max-frame-bytes");
+            mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
+                                   MYNAH_ASR_SLOT_CANCEL_FRAME);
+            cancelled = 1;
+            break;
+        }
 
-        uint8_t *payload = malloc(plen ? plen : 1);
-        if (!payload || read_exact(fd, payload, plen) != 0) { free(payload); break; }
+        payload = (uint8_t *)malloc((size_t)plen ? (size_t)plen : 1);
+        if (payload == NULL || ws_read_exact(rfd, payload, (size_t)plen) != 0) break;
         if (masked)
             for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
+        last_activity = mynah_asr_now();
 
-        if (opcode == 0x8) { free(payload); break; }             /* close */
-        if (opcode == 0x9) {                                     /* ping -> pong */
-            ws_send_frame(fd, 0xA, payload, plen);
-            free(payload);
-            continue;
-        }
-        if (opcode == 0x2 && plen >= 2) {                        /* PCM s16le */
-            const size_t ns = plen / 2;
-            const int16_t *pcm = (const int16_t *)payload;
-            size_t off = 0;
-            /* one frame = one compute burst: counted as a whole, not per 64k
-             * chunk, so a busy stream does not churn the BLAS knob */
-            inference_begin();
-            while (off < ns) {
-                const size_t chunk = ns - off < 65536 ? ns - off : 65536;
-                for (size_t i = 0; i < chunk; i++) fbuf[i] = (float)pcm[off + i] / 32768.0f;
-                mynah_asr_stream_feed(s, fbuf, chunk, ws_on_text, &ctx);
-                off += chunk;
-            }
-            inference_end();
+        switch (opcode) {
+            case 0x8:   /* close: flush the tail, answer `done`, then go */
+                mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
+                                             MYNAH_ASR_SLOT_REQ_CLOSE, NULL,
+                                       MYNAH_ASR_SLOT_CANCEL_NONE);
+                closed = 1;
+                break;
+            case 0x9:   /* ping -> pong, through the writer like everything else */
+                ws_enqueue(&w, 0xA, payload, (size_t)plen);
+                break;
+            case 0xA:
+                break;  /* pong: liveness, nothing to do */
+            case 0x1:
+                ws_control(&w, payload, (size_t)plen);
+                break;
+            case 0x0:   /* a continuation of a binary frame; the only kind any
+                         * client here sends, and PCM concatenates */
+            case 0x2:
+                if (plen >= 2 && !ws_push_pcm(&w, payload, (size_t)plen, last_activity))
+                    closed = 1;
+                break;
+            default:
+                ws_transport_error(&w, "unsupported_opcode",
+                                   "only text, binary, ping, pong and close are served");
+                break;
         }
         free(payload);
-        if (ctx.failed) break;
+        payload = NULL;
     }
+    free(payload);
 
-    inference_begin();
-    mynah_asr_stream_finish(s, ws_on_text, &ctx);
-    inference_end();
-    cJSON *done = cJSON_CreateObject();
-    cJSON_AddBoolToObject(done, "done", 1);
-    if (mynah_asr_stream_lang(s)[0]) cJSON_AddStringToObject(done, "language", mynah_asr_stream_lang(s));
-    char *ds = cJSON_PrintUnformatted(done);
-    ws_send_frame(fd, 0x1, ds, strlen(ds));
-    free(ds);
-    cJSON_Delete(done);
-    ws_send_frame(fd, 0x8, "", 0);
-    mynah_asr_stream_close(s);
+    /* However the loop ended, the session must end explicitly: without a
+     * finalize the tail is never flushed and the client never sees `done`. */
+    if (!cancelled)
+        mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
+                                     MYNAH_ASR_SLOT_REQ_CLOSE, NULL,
+                               MYNAH_ASR_SLOT_CANCEL_NONE);
+    mynah_asr_sched_wake();
+
+    int done = mynah_asr_slot_wait_done(slot, 60000);
+    if (!done) {
+        mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
+                               MYNAH_ASR_SLOT_CANCEL_PEER);
+        done = mynah_asr_slot_wait_done(slot, 5000);
+    }
+    close(rfd);
+    mynah_asr_thread_set_name("mynah-http");
+    if (done) {
+        mynah_asr_slot_release(slot);
+        mynah_asr_stream_out_release(out);
+    } else {
+        /* The scheduler still owns both. Letting go here would hand it a freed
+         * writer; the slot stays charged instead, which /v1/health shows. */
+        fprintf(stderr, "mynah-asr-server: slot %d did not finish; "
+                        "leaving it to the scheduler\n", slot->id);
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------- routing */
@@ -618,16 +667,19 @@ static void handle_conn(int fd) {
     if (strcmp(method, "OPTIONS") == 0) {
         send_response(fd, 204, "No Content", "text/plain", "", 0);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/health") == 0) {
-        /* inflight/blas_budget are the adaptive BLAS state: useful to see under
-         * load, and what lets a test assert the accounting returns to rest */
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "status", "ok");
-        cJSON_AddNumberToObject(j, "inflight", inflight_now());
+        /* `inflight` is now what it says: slots this worker is holding. With one
+         * inference in flight by construction, `blas_budget` no longer moves --
+         * it is reported because a budget that is not the thread count means
+         * something in the process is still driving the knob. */
+        cJSON_AddNumberToObject(j, "inflight", mynah_asr_sched_active());
         cJSON_AddNumberToObject(j, "blas_budget", mynah_asr_blas_budget());
         cJSON_AddNumberToObject(j, "threads", mynah_asr_num_threads());
         /* prefork: which worker answered, so a probe under load can tell "one
          * worker wedged" from "the server is slow" */
         cJSON_AddNumberToObject(j, "worker", mynah_asr_prefork_worker_index());
+        mynah_asr_sched_health(j);
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
@@ -640,7 +692,9 @@ static void handle_conn(int fd) {
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/audio/stream") == 0) {
-        handle_ws_stream(fd, hdr, query);
+        /* The writer owns the descriptor from the 101 on; closing it here would
+         * be a second close of a number that may already belong to someone. */
+        if (handle_ws_stream(fd, hdr, query)) return;
     } else if (strcmp(method, "POST") == 0 &&
                (strcmp(path, "/v1/audio/transcriptions") == 0 ||
                 strcmp(path, "/v1/audio/translations") == 0)) {
@@ -703,9 +757,13 @@ static void usage(void) {
         "                            cannot detect it themselves (Canary)\n"
         "       [--prefork W] [--prefork-threads T] [--cap C]\n"
         "                            W pinned worker processes (Linux: core-major cpu slices),\n"
-        "                            T threads each (default: cpus/W), C connections per\n"
-        "                            worker before the router refuses (default: --threads)\n"
+        "                            T threads each (default: cpus/W), C stream slots per\n"
+        "                            worker before it refuses 503 (default: --threads)\n"
         "       --prefork-plan       print the machine's topology and the W/T sweep, exit\n"
+        "       [--idle-ms 60000]    a stream with no audio for this long is cancelled\n"
+        "       [--ring-seconds 30]  PCM buffered per stream before the client is throttled\n"
+        "       [--max-frame-bytes 1048576]  a larger WebSocket frame ends the stream\n"
+        "       [--max-pending N]    offline requests queued (default 2*--threads), 503 beyond\n"
         "  env: MYNAH_ASR_PREFORK_QUEUE (queued per worker, default 1; 0 = refuse at once),\n"
         "       MYNAH_ASR_PREFORK_QUEUE_MS (queue deadline, default 2000),\n"
         "       MYNAH_ASR_PREFORK_SERVICE_MS (service cap, default 30000)\n");
@@ -731,13 +789,22 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prefork") == 0 && i + 1 < argc) prefork_workers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) prefork_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cap") == 0 && i + 1 < argc) cap = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--idle-ms") == 0 && i + 1 < argc) g_idle_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ring-seconds") == 0 && i + 1 < argc) g_ring_seconds = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-frame-bytes") == 0 && i + 1 < argc)
+            g_max_frame_bytes = (size_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--max-pending") == 0 && i + 1 < argc) g_max_pending = atoi(argv[++i]);
         else if (strcmp(argv[i], "--prefork-plan") == 0) plan_only = 1;
         else { usage(); return 2; }
     }
     if (g_max_batch < 1) g_max_batch = 1;
     if (g_max_batch > 64) g_max_batch = 64;
     if (n_threads < 1) n_threads = 1;
-    if (cap <= 0) cap = n_threads;   /* one connection per HTTP thread: a WS stream holds one */
+    if (cap <= 0) cap = n_threads;   /* one slot per HTTP thread: a WS stream holds one */
+    if (g_idle_ms < 1000) g_idle_ms = 1000;
+    if (g_ring_seconds < 1) g_ring_seconds = 1;
+    if (g_max_frame_bytes < 4096) g_max_frame_bytes = 4096;
+    if (g_max_pending <= 0) g_max_pending = 2 * n_threads;
 
     /* A plan is about the machine, not the model: it must work before anyone
      * has downloaded the weights. */
@@ -809,23 +876,42 @@ int main(int argc, char **argv) {
     }
     mynah_asr_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
 
+    /* One inference in flight, always: the scheduler. Nothing in the server
+     * moves this knob again -- the adaptive policy existed because N request
+     * threads entered the model at once, and now none do. */
+    mynah_asr_blas_set_concurrency(1);
+
+    /* After the fork, so the thread lives in the worker and not in the router. */
+    mynah_asr_sched_config sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.model = g_model;
+    sc.lid = g_lid;
+    sc.slots = cap;
+    sc.ring_seconds = g_ring_seconds;
+    sc.max_batch = g_max_batch;
+    sc.max_pending = g_max_pending;
+    if (mynah_asr_sched_start(&sc) != 0) {
+        fprintf(stderr, "mynah-asr-server: the scheduler failed to start\n");
+        return 1;
+    }
+
     for (int i = 0; i < n_threads; i++) {
         pthread_t t;
         pthread_create(&t, NULL, worker, NULL);
         pthread_detach(t);
     }
-    if (g_max_batch > 1) {
-        pthread_t t;
-        pthread_create(&t, NULL, batch_worker, NULL);
-        pthread_detach(t);
-    }
     if (chan_fd >= 0)
-        fprintf(stderr, "mynah-asr-server %s: prefork worker %d ready (%d http threads, cap %d, batch %d)\n",
-                mynah_asr_version(), mynah_asr_prefork_worker_index(), n_threads, cap, g_max_batch);
+        fprintf(stderr, "mynah-asr-server %s: prefork worker %d ready (%d http threads, "
+                        "%d stream slots, batch %d, streaming %s)\n",
+                mynah_asr_version(), mynah_asr_prefork_worker_index(), n_threads, cap,
+                g_max_batch, mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
     else
-        fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, batch %d)\n"
+        fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, "
+                        "%d stream slots, batch %d, streaming %s)\n"
+                        "  one scheduler thread owns the model; offline jobs share its steps\n"
                         "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
-                mynah_asr_version(), port, n_threads, g_max_batch);
+                mynah_asr_version(), port, n_threads, cap, g_max_batch,
+                mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
 
     /* Where a connection comes from is the ONLY difference between the single
      * process server and a prefork worker: a worker has no listening socket,
@@ -833,8 +919,9 @@ int main(int argc, char **argv) {
      * socketpair. Everything after this loop is the same code in both shapes. */
     while (!g_shutdown) {
         if (mynah_asr_prefork_take_dump_request())
-            fprintf(stderr, "[stats] worker %d inflight %d blas_budget %d\n",
-                    mynah_asr_prefork_worker_index(), inflight_now(), mynah_asr_blas_budget());
+            fprintf(stderr, "[stats] worker %d slots %d/%d blas_budget %d\n",
+                    mynah_asr_prefork_worker_index(), mynah_asr_sched_active(), cap,
+                    mynah_asr_blas_budget());
         int fd;
         if (chan_fd >= 0) {
             fd = mynah_asr_prefork_recv_conn(chan_fd, 200);
@@ -858,11 +945,17 @@ int main(int argc, char **argv) {
         prepare_client_fd(fd);
         q_push(fd);
     }
-    /* Shutdown: stop taking connections. In-flight requests finish on their
-     * detached threads; draining them and answering 503 to what was never
-     * served is S2-3 (.work/server-admission.md). */
+    /* Graceful shutdown, in the order the siblings settled on: stop accepting,
+     * cancel the live streams with an `error` frame the client can read, let the
+     * scheduler finish the step it is in, join, and only then let go of the
+     * weights. The writers are detached, so a short grace gives them time to put
+     * those last frames on the wire. */
     if (srv >= 0) close(srv);
     if (chan_fd >= 0) close(chan_fd);
+    mynah_asr_sched_stop();
+    { struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000000L}; nanosleep(&ts, NULL); }
+    mynah_asr_free(g_lid);
+    mynah_asr_free(g_model);
     fprintf(stderr, "mynah-asr-server: worker %d stopped\n", mynah_asr_prefork_worker_index());
     return 0;
 }
