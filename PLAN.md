@@ -32,6 +32,7 @@ Production is Linux x86-64 and ARM64; macOS is the development machine.
 - [x] The v2 serving design, what it borrows, what is ASR-specific, and the
       ideas the siblings already falsified → [`.work/serving-v2-design.md`](.work/serving-v2-design.md)
 - [x] The method → [`.work/engineering-method.md`](.work/engineering-method.md)
+- [x] What the siblings measured as wins and losses, their flag machinery, kernel state per ISA → [`.work/sibling-wins-and-flags.md`](.work/sibling-wins-and-flags.md)
 - [x] v1 history (Italian, closed, local only): the old plan and TODO under `.work/private/` (untracked archive)
 
 ### S0 — Baseline (trimmed 2026-09-18: the v1 server is not worth measuring; S1/S2 start now)

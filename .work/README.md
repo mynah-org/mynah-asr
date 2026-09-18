@@ -38,6 +38,7 @@ applied to one task at a time.
 | Note | What it covers |
 |---|---|
 | [engineering-method.md](engineering-method.md) | The method behind `ENGINEERING.md`: cost model before code, every tool declares a refusal, the completion rule |
+| [sibling-wins-and-flags.md](sibling-wins-and-flags.md) | What qwen-tts and mynah-tts measured as wins and losses, their feature-flag machinery, kernel state per ISA, and ten recommendations for this server |
 | [serving-v2-design.md](serving-v2-design.md) | **The v2 concurrent streaming server design**, what it borrows from qwen-tts and mynah-tts, what is ASR-specific, and the ideas already falsified there |
 | [baseline-streaming-concurrency.md](baseline-streaming-concurrency.md) | S0 — measure the current server under N concurrent streams before changing anything |
 | [stream-api-v2.md](stream-api-v2.md) | S1 — library changes the server needs: reset, sink contract, partial/final/EOU exposure, allocation-free chunk, batched stream step |

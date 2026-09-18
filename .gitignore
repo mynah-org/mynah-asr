@@ -66,3 +66,6 @@ package-lock.json
 
 # local converted models for tests (models/ points at a shared volume)
 models_local/
+
+# agent worktrees
+.claude/worktrees/
