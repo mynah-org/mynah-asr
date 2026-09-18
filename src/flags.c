@@ -84,6 +84,16 @@ static const mynah_asr_flag g_flags[] = {
      "x86 SIMD level for the int8/int4 dot kernels: auto|scalar|avx2|vnni",
      inert_caps, eff_caps},
 
+    {"MYNAH_ASR_BATCH_F32", MYNAH_ASR_FLAG_KERNEL, "auto (1 on Accelerate, 0 elsewhere)",
+     "1/0 forces the f32 stream step to stack B streams' rows into one sgemm or to step them one by one;"
+     " the default is on only where sgemm is proven row-stable (Accelerate), off where it is unverified (OpenBLAS);"
+     " int8 never consults it, its per-row dot is exact by construction",
+     NULL, NULL},
+
+    {"MYNAH_ASR_STEP_TIME", MYNAH_ASR_FLAG_DEBUG, "unset",
+     "tests/test_stream_batch: print per-step wall time of single vs batched steps (a dev signal)",
+     NULL, NULL},
+
     {"MYNAH_ASR_QGEMM", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
      "1 enables the threaded int8xint8 GEMM for T>16 instead of dequant+sgemm",
      inert_qgemm, NULL},
