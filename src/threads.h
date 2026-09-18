@@ -33,4 +33,15 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
 void mynah_asr_blas_set_concurrency(int n_inflight);
 int mynah_asr_blas_budget(void);
 
+/* Called in a forked CHILD before its first dispatch (server/prefork.c). The
+ * pool's worker threads do not survive fork(); this forgets them and re-arms the
+ * one-time init so the first parallel_for in the child builds a fresh pool of
+ * mynah_asr_num_threads() workers, which prefork has just set through
+ * MYNAH_ASR_THREADS. The mutexes are re-initialised rather than trusted, because a
+ * fork taken while another thread held one would inherit it locked. Also resets
+ * the cached BLAS thread count so the next apply really reaches the library.
+ * Must be called from the only thread in the child. */
+void mynah_asr_threadpool_after_fork(void);
+void mynah_asr_blas_after_fork(void);
+
 #endif

@@ -62,7 +62,8 @@ def main() -> None:
                          "supporting a subset of the languages; implies strict tier")
     args = ap.parse_args()
 
-    manifest_path = ROOT / "tests/audio/langs/manifest.json"
+    # produced by `make fetch-lang-samples` (Tatoeba clips, mixed licences, never committed)
+    manifest_path = ROOT / "tests/audio/langs/manifest.json"  # check_repo_integrity: generated
     if not manifest_path.exists() or not Path(args.model, "mynah.json").exists():
         print("SKIP: samples (tools/fetch_lang_samples.py) or model missing")
         sys.exit(77)

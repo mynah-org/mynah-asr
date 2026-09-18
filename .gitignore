@@ -15,10 +15,11 @@ models
 __pycache__/
 *.pyc
 
-# Local planning notes and agent instructions (not part of the public repo)
-PLAN.md
-TODO.md
-CLAUDE.md
+# The control plane (PLAN.md, CLAUDE.md, ENGINEERING.md, the reviewed .work/*.md
+# notes) is TRACKED, as in the sibling repos: an untracked plan diverges between
+# worktrees. Raw evidence and private archives are not.
+.work/private/
+.work/evidence/
 
 # OS
 .DS_Store
@@ -44,6 +45,7 @@ libmynah_asr.a
 tests/test_qmat
 tests/test_gguf
 tests/test_threads
+tests/test_flags
 tests/test_features
 tests/test_subsampling
 tests/test_encoder
@@ -52,6 +54,8 @@ tests/test_batch
 tests/test_align
 tests/test_vadseg
 tests/test_tokenize
+tests/test_stream_out
+tests/test_stream_batch
 tests/test_vad
 tests/bench_throughput
 examples/minimal
@@ -61,3 +65,9 @@ libmynah_asr.dylib
 *.so
 node_modules/
 package-lock.json
+
+# local converted models for tests (models/ points at a shared volume)
+models_local/
+
+# agent worktrees
+.claude/worktrees/

@@ -270,3 +270,18 @@ int mynah_asr_mel_stream_finish(mynah_asr_mel_stream *ms, float *out, int cap_fr
     ms->finished = 1;
     return emitted;
 }
+
+void mynah_asr_mel_stream_reset(mynah_asr_mel_stream *ms) {
+    ms->buf_len = 0;
+    ms->base = 0;
+    ms->total = 0;
+    ms->last_raw = 0.0f;
+    ms->next_frame = 0;
+    ms->finished = 0;
+}
+
+size_t mynah_asr_mel_stream_samples_until(const mynah_asr_mel_stream *ms, long frame) {
+    /* frame t is emitted once total >= t*hop + n_fft/2 (see mel_stream_feed) */
+    const size_t need = (size_t)frame * (size_t)ms->cfg->hop_length + (size_t)ms->cfg->n_fft / 2;
+    return need > ms->total ? need - ms->total : 0;
+}

@@ -55,7 +55,9 @@ all: mynah-asr mynah-asr-server
 mynah-asr: $(OBJ) build/cli/main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o
+mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o \
+                  build/server/stream_out.o build/server/slot.o build/server/sched.o \
+                  build/server/metrics.o build/server/obs.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
 # objects in build/ (never next to the sources: the variant builds — ubsan, cuda
@@ -68,7 +70,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_threads tests/test_align tests/test_vadseg tests/test_tokenize tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch
+TESTS := tests/test_qmat tests/test_threads tests/test_flags tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib
@@ -78,15 +80,32 @@ $(OBJ): | $(INGOT_LIB)
 tests/%: build/tests/%.o build/tests/npy.o build/tests/testcfg.o $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
+# The output writer is server-side and knows nothing about the model: its test
+# links that one object and pthreads, nothing else. Explicit rule, so it does
+# not drag in libmynah_asr through the pattern rule above.
+tests/test_stream_out: build/tests/test_stream_out.o build/server/stream_out.o
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+
+# Allocation counter for the S1-3 gate: a shared library inserted into the CLI's
+# process (DYLD_INSERT_LIBRARIES / LD_PRELOAD). Nothing in src/ links it.
+ifeq ($(UNAME_S),Darwin)
+  MALLOC_COUNT_LIB := tests/libmalloc_count.dylib
+else
+  MALLOC_COUNT_LIB := tests/libmalloc_count.so
+endif
+$(MALLOC_COUNT_LIB): tests/malloc_count.c
+	$(CC) -std=c11 -O2 -Wall -Wextra -fPIC -shared -o $@ $< $(if $(filter Darwin,$(UNAME_S)),,-ldl)
+
 # C vs oracle parity (Nemotron streaming + Parakeet TDT offline).
 # Skipped (exit 77) when the model or the golden dumps are missing. Regenerate
 # with: make golden-dump
 PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tests/test_batch
 # tests driven by a shell script (their own arguments): built here, run below
 SCRIPTED_TESTS := tests/test_vad
-test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
+test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@for t in $(TESTS); do \
-	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ]; then $$t; rc=$$?; \
+	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_flags ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
+	  elif [ $$t = tests/test_stream_batch ]; then $$t $(MODEL_DIR); rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -116,6 +135,47 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: $(VAD_DIR)/silero_vad.onnx or uv missing (see tests/test_vad.sh)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_protocol.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@$(MAKE) --no-print-directory test-stream-allocs
+	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
+	@$(MAKE) --no-print-directory test-stream-batch-allocs
+
+# S1-4: the BATCHED step allocates nothing per step either. Same counter, but
+# sampled in-process (the batched API has no CLI entry to difference two runs of).
+# Under a sanitizer the counter cannot be preloaded (ASan must be the first
+# library in the process), so the gate is skipped there rather than failing
+# before the test can say 77.
+ifneq (,$(findstring sanitize,$(CFLAGS)))
+test-stream-batch-allocs: tests/test_stream_batch
+	@echo "SKIP stream-batch-allocs: sanitized build, the malloc counter cannot be preloaded"
+test-stream-allocs: mynah-asr
+	@echo "SKIP stream-allocs: sanitized build, the malloc counter cannot be preloaded"
+else
+test-stream-batch-allocs: tests/test_stream_batch $(MALLOC_COUNT_LIB)
+	@if [ "$(UNAME_S)" = "Darwin" ]; then \
+	  DYLD_INSERT_LIBRARIES=$(MALLOC_COUNT_LIB) DYLD_FORCE_FLAT_NAMESPACE=1 \
+	  MALLOC_COUNT_OUT=/dev/null tests/test_stream_batch $(MODEL_DIR) --allocs; rc=$$?; \
+	else \
+	  LD_PRELOAD=$(MALLOC_COUNT_LIB) MALLOC_COUNT_OUT=/dev/null \
+	  tests/test_stream_batch $(MODEL_DIR) --allocs; rc=$$?; \
+	fi; \
+	if [ $$rc -eq 77 ]; then echo "SKIP stream-batch-allocs: model missing or interposition unavailable"; \
+	elif [ $$rc -ne 0 ]; then exit $$rc; fi
+# S1-3: zero allocations per streaming chunk after warm-up (model-gated).
+test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
+	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP stream-allocs: model missing or interposition unavailable"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+endif
 
 golden-dump:
 	cd tools && uv run python -m oracle.transcribe ../$(MODEL_DIR) ../tests/audio/test_it.wav \
@@ -189,6 +249,18 @@ bench: mynah-asr
 bench-throughput: tests/bench_throughput
 	@echo "usage: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
 
+# S4-2 streaming load against a RUNNING server (see docs/serving.md for the order of work).
+# WAVE screens and may disqualify; only a SOAK with a drift gate promotes.
+# Override: make bench-stream-soak STREAM_N=8 STREAM_PORT=8090 STREAM_DURATION=900
+STREAM_CLIPS ?= samples/*/fleurs_*.wav tests/audio/test_*.wav
+STREAM_PORT ?= 8090
+STREAM_N ?= 4
+STREAM_DURATION ?= 600
+bench-stream-wave:
+	@python3 tools/bench/stream_load.py --mode wave --streams $(STREAM_N) --repeat 2 --port $(STREAM_PORT) --clips $(STREAM_CLIPS) --json wave-$(STREAM_N).json
+bench-stream-soak:
+	@python3 tools/bench/stream_load.py --mode soak --streams $(STREAM_N) --duration $(STREAM_DURATION) --warmup 30 --window 60 --bank short,medium,long --seed 42 --port $(STREAM_PORT) --clips $(STREAM_CLIPS) --json soak-$(STREAM_N).json
+
 # End-to-end server test (REST + concurrency + WebSocket)
 test-server: mynah-asr-server
 	@sh tests/test_server.sh $(MODEL_DIR); rc=$$?; \
@@ -201,11 +273,36 @@ test-server: mynah-asr-server
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# Concurrent WebSocket streaming: identity against the CLI under 4 real-time
+# streams, slow-reader isolation, the same identity under --prefork. Needs a
+# streaming model (Nemotron), so it is gated like test-server.
+test-server-stream: mynah-asr-server mynah-asr
+	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# WebSocket protocol v2 and the per-worker admission ladder (S2-3 / S2-5):
+# three utterances on one socket byte-identical to the CLI, unknown control and
+# unserved language survived, the pre-upgrade 400/503, idle, pings, SIGTERM.
+# Needs a streaming model, so it is gated like test-server-stream.
+test-server-protocol: mynah-asr-server mynah-asr
+	@sh tests/test_server_protocol.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 # Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
 # test-server it asserts nothing about the transcript, so it runs with ANY
 # converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
 # the server finally gets exercised there at all.
 CONC_MODEL_DIR ?= $(PARAKEET110_DIR)
+# S3-3/S3-4: the banner, /v1/health as facts, /metrics on its own port (the
+# token bucket, the double bind, the router's fleet view) and the SIGUSR1 dump.
+# Model-agnostic and REST-only, so it runs wherever test-server-concurrency does.
+test-server-metrics: mynah-asr-server
+	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 test-server-concurrency: mynah-asr-server
 	@sh tests/test_server_concurrency.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
@@ -253,16 +350,25 @@ test-samples: mynah-asr
 
 # fast leak check on macOS (the native `leaks` tool, no rebuild — ASan is very
 # slow on a Mac: use it only in Linux CI. Same pattern as qwen-tts).
-leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align
+leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align tests/test_stream_out
 	leaks --atExit -- tests/test_align 2>&1 | tail -2
+	leaks --atExit -- tests/test_stream_out 2>&1 | tail -2
 	leaks --atExit -- ./mynah-asr transcribe -m $(MODEL_DIR) -i tests/audio/test_it.wav \
 	  --lang it-IT 2>&1 | tail -3
 	leaks --atExit -- tests/test_streaming $(MODEL_DIR) tests/audio/test_it.wav \
 	  tests/golden/test_it 2>&1 | tail -3
 	@WRAP="leaks --atExit --" sh tests/test_vad.sh $(VAD_DIR) 2>&1 | tail -4
 
+# plan + repository integrity (ENGINEERING.md §1, §12): no dangling board links,
+# no tracked script depending on an untracked file
+check:
+	@python3 tools/check_plan.py
+	@python3 tools/check_repo_integrity.py
+	@python3 tools/check_flag_registry.py
+
 clean:
-	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist
+	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist \
+	       tests/libmalloc_count.dylib tests/libmalloc_count.so
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -303,4 +409,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics

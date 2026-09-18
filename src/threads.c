@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define PF_MAX_THREADS 64
@@ -174,4 +175,25 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     pthread_mutex_unlock(&g_job_mu);
     pthread_mutex_unlock(&g_pool_mu);
     blas_apply(budget);
+}
+
+void mynah_asr_blas_after_fork(void) {
+    pthread_mutex_init(&g_blas_mu, NULL);
+    g_blas_applied = 0;
+}
+
+void mynah_asr_threadpool_after_fork(void) {
+    pthread_mutex_init(&g_pool_mu, NULL);
+    pthread_mutex_init(&g_job_mu, NULL);
+    pthread_cond_init(&g_job_cv, NULL);
+    pthread_cond_init(&g_done_cv, NULL);
+    g_job = NULL;
+    g_gen = 0;
+    g_pending = 0;
+    g_workers = 0;
+    {
+        static const pthread_once_t fresh = PTHREAD_ONCE_INIT;
+        memcpy(&g_pool_once, &fresh, sizeof(g_pool_once));
+    }
+    mynah_asr_blas_after_fork();
 }

@@ -49,6 +49,11 @@ typedef struct {
 
 int mynah_asr_mel_stream_init(mynah_asr_mel_stream *ms, const mynah_asr_feat_cfg *cfg);
 void mynah_asr_mel_stream_free(mynah_asr_mel_stream *ms);
+/* Back to the state right after init, keeping the buffers: a new utterance on
+ * the same stream object. */
+void mynah_asr_mel_stream_reset(mynah_asr_mel_stream *ms);
+/* Samples still missing before frame `frame` can be emitted (0 when ready). */
+size_t mynah_asr_mel_stream_samples_until(const mynah_asr_mel_stream *ms, long frame);
 
 /* Push samples; writes into *out (capacity cap_frames rows of n_mels) the mel
  * frames that became ready. Returns the number of frames written. */

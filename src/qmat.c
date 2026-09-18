@@ -1,8 +1,10 @@
 #include "qmat.h"
 
 #include "backend.h"
+#include "threads.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,6 +181,23 @@ void mynah_asr_qmat_dequant(const mynah_asr_qmat *m, float *wd) {
 /* row threshold: below -> direct dot (bandwidth-bound), above -> dequant+GEMM */
 #define QMAT_SMALL_T 16
 #define QMAT_K_MAX 8192
+
+/* ------------------------------------------------------------- path counters
+ * One relaxed atomic increment per product: negligible next to a GEMM, and it
+ * is the only way a test can PROVE which kernel a run took (ENGINEERING.md §5).
+ * Process-wide, like the caps cache. */
+static _Atomic unsigned long long g_qc[MYNAH_ASR_QC__N];
+static inline void qc(int which) {
+    atomic_fetch_add_explicit(&g_qc[which], 1ull, memory_order_relaxed);
+}
+unsigned long long mynah_asr_qmat_counter(int which) {
+    if (which < 0 || which >= MYNAH_ASR_QC__N) return 0;
+    return atomic_load_explicit(&g_qc[which], memory_order_relaxed);
+}
+void mynah_asr_qmat_counters_reset(void) {
+    for (int i = 0; i < MYNAH_ASR_QC__N; i++)
+        atomic_store_explicit(&g_qc[i], 0ull, memory_order_relaxed);
+}
 
 /* -------------------------------------------------- activation quantization
  * Per-row absmax -> int8 (qwen-tts recipe, quality verified in production):
@@ -500,8 +519,96 @@ static void qgemm_block(void *ctx, int blk) {
 }
 #endif
 
+/* ------------------------------------------------- dispatch predicates (S3-2)
+ * The dispatch report NEVER re-derives which kernel runs from "compiled &&
+ * supported": it asks the owner of the decision, and the owner is this file.
+ * Everything below is a read of the same macros and the same cached x86 level
+ * that mynah_asr_qmat_mul() branches on a few lines further down, so the answer
+ * cannot drift from the code that produces the numbers. No behaviour change:
+ * these are pure readers. */
+
+/* The MYNAH_ASR_QGEMM gate, hoisted out of mynah_asr_qmat_mul so the report and
+ * the hot path read ONE definition (and one cached value). */
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+static int qmat_qgemm_env(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_QGEMM");
+        v = e && e[0] == '1';
+    }
+    return v;
+}
+#endif
+
+/* 1 = the threaded int8xint8 GEMM may run, 0 = off by default or by the env,
+ * -1 = this build has no native int8 kernel to run it with. */
+int mynah_asr_qmat_qgemm(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    return qmat_qgemm_env();
+#else
+    return -1;
+#endif
+}
+
+const char *mynah_asr_caps_name(int level) {
+    switch (level) {
+        case 0: return "scalar";
+        case 1: return "avx2";
+        case 2: return "vnni";
+        default: return "n/a";
+    }
+}
+
+int mynah_asr_caps_detected(void) {
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_detect_caps();
+#else
+    return -1;   /* not an x86 build: there is no runtime SIMD level to pick */
+#endif
+}
+
+int mynah_asr_caps_effective(void) {
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_caps();   /* reads MYNAH_ASR_CAPS once, exactly as the kernels do */
+#else
+    return -1;
+#endif
+}
+
+/* The int8 dot that mynah_asr_qmat_mul() will use for T <= QMAT_SMALL_T with
+ * k <= QMAT_K_MAX — i.e. every streaming/decode projection. */
+const char *mynah_asr_qmat_int8_kernel(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT)
+    return "neon-sdot";
+#elif defined(MYNAH_ASR_HAVE_X86)
+    const int c = x86_caps();
+    if (c >= MYNAH_ASR_CAPS_VNNI) return "avx512vnni";
+    if (c >= MYNAH_ASR_CAPS_AVX2) return "avx2";
+    return "scalar";
+#elif defined(MYNAH_ASR_HAVE_NEON)
+    return "neon-f32";      /* widen + FMA: vectorized, but no integer unit */
+#else
+    return "scalar";
+#endif
+}
+
+const char *mynah_asr_qmat_int4_kernel(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT)
+    return "neon-sdot-q4";
+#elif defined(MYNAH_ASR_HAVE_X86)
+    const int c = x86_caps();
+    if (c >= MYNAH_ASR_CAPS_AVX2) return "avx2-q4";   /* no VNNI q4 kernel exists */
+    return "scalar";
+#elif defined(MYNAH_ASR_HAVE_NEON)
+    return "neon-f32-q4";
+#else
+    return "scalar";
+#endif
+}
+
 void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int T) {
     if (m->qtype == MYNAH_ASR_Q_F32) {
+        qc(MYNAH_ASR_QC_F32);
         mynah_asr_gemm_wt(x, m->f32, out, T, m->n, m->k);
         return;
     }
@@ -517,6 +624,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
         const int native = m->k <= QMAT_K_MAX;
 #endif
         if (native) {
+            qc(MYNAH_ASR_QC_DOT);
             int8_t qx[QMAT_K_MAX];
             for (int t = 0; t < T; t++) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
@@ -551,6 +659,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
             return;
         }
 #endif
+        qc(MYNAH_ASR_QC_GENERIC);
         if (m->qtype == MYNAH_ASR_Q_INT8) {
             for (int t = 0; t < T; t++) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
@@ -604,11 +713,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
      * -> default OFF. The expected upside is on x86 VNNI (no AMX): validate
      * there before considering a per-platform default. */
 #if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
-    static int g_qgemm = -1;
-    if (g_qgemm < 0) {
-        const char *e = getenv("MYNAH_ASR_QGEMM");
-        g_qgemm = e && e[0] == '1';
-    }
+    const int g_qgemm = qmat_qgemm_env();
 #ifdef MYNAH_ASR_HAVE_X86
     const int gnative = g_qgemm && x86_caps() >= MYNAH_ASR_CAPS_AVX2 && m->k <= QMAT_K_MAX;
 #else
@@ -631,6 +736,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
                 }
             }
 #endif
+            qc(MYNAH_ASR_QC_QGEMM);
             qgemm_ctx c = {.m = m, .qx = qx, .sx = sx, .out = out, .T = T};
             mynah_asr_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
             free(qx);
@@ -642,12 +748,62 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
     }
 #endif
     /* per-call dequant + GEMM: fallback (no native kernels available) */
+    qc(MYNAH_ASR_QC_DEQUANT);
     float *wd = malloc((size_t)m->n * (size_t)m->k * sizeof(float));
     if (!wd) return;
     for (int i = 0; i < m->n; i++) dequant_row(m, i, wd + (size_t)i * (size_t)m->k);
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, m->n, m->k,
                 1.0f, x, m->k, wd, m->k, 0.0f, out, m->n);
     free(wd);
+}
+
+/* ----------------------------------------------- row-stable stacked product
+ * See qmat.h for the contract. The point of this entry is that it is the ONLY
+ * one the batched stream step calls: mynah_asr_qmat_mul above keeps its own
+ * dispatch (and therefore the offline numerics) untouched. */
+int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out, int T,
+                        int8_t *qx, float *sx) {
+    if (T <= 0) return MYNAH_ASR_QC_DOT_ROWS;
+    if (m->qtype == MYNAH_ASR_Q_F32) {
+        qc(MYNAH_ASR_QC_F32);
+        mynah_asr_gemm_wt(x, m->f32, out, T, m->n, m->k);
+        return MYNAH_ASR_QC_F32;
+    }
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    int native = m->k <= QMAT_K_MAX && qx != NULL && sx != NULL;
+#ifdef MYNAH_ASR_HAVE_X86
+    native = native && x86_caps() >= MYNAH_ASR_CAPS_AVX2;
+#endif
+    if (native) {
+        qc(MYNAH_ASR_QC_DOT_ROWS);
+        /* exactly the activation quantization of the small-T path, per row */
+        for (int t = 0; t < T; t++)
+            sx[t] = quantize_act_int8(qx + (size_t)t * (size_t)m->k,
+                                      x + (size_t)t * (size_t)m->k, m->k);
+#if defined(MYNAH_ASR_HAVE_X86) && !defined(MYNAH_ASR_HAVE_SDOT)
+        if (m->qtype == MYNAH_ASR_Q_INT4) {
+            /* the q4 AVX2 kernel wants the activations pre-permuted */
+            for (int t = 0; t < T; t++) {
+                int8_t xp[QMAT_K_MAX];
+                q4_permute_act(qx + (size_t)t * (size_t)m->k, xp, m->k);
+                memcpy(qx + (size_t)t * (size_t)m->k, xp, (size_t)m->k);
+            }
+        }
+#endif
+        qgemm_ctx c = {.m = m, .qx = qx, .sx = sx, .out = out, .T = T};
+        mynah_asr_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
+        return MYNAH_ASR_QC_DOT_ROWS;
+    }
+#else
+    (void)qx; (void)sx;
+#endif
+    /* No native kernel (or k > QMAT_K_MAX): T products of ONE row each. Bit-exact
+     * against the single path by construction — it IS the single path, T times —
+     * and it still never reaches the dequant+malloc fallback. */
+    for (int t = 0; t < T; t++)
+        mynah_asr_qmat_mul(m, x + (size_t)t * (size_t)m->k,
+                           out + (size_t)t * (size_t)m->n, 1);
+    return MYNAH_ASR_QC_GENERIC;
 }
 
 /* ---------------------------------------------------------- fused helpers */

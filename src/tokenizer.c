@@ -223,6 +223,138 @@ char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int
     return out;
 }
 
+/* ------------------------------------------------- incremental detokenisation
+ * Invariant: dt->buf holds the transcript BEFORE the leading/trailing space
+ * strip, with the ▁ already expanded and the inline <xx-XX> tags already
+ * removed. The strip is applied as a view over that buffer (an offset for the
+ * leading spaces, a NUL for the trailing ones) and undone before the next
+ * append, so appending cannot see a string the strip has already shortened —
+ * which is what makes the result equal to mynah_asr_detokenize on the whole
+ * history rather than a concatenation of independently stripped pieces. */
+
+int mynah_asr_detok_init(mynah_asr_detok *dt, size_t reserve) {
+    memset(dt, 0, sizeof(*dt));
+    if (reserve < MYNAH_ASR_DETOK_MIN_CAP) reserve = MYNAH_ASR_DETOK_MIN_CAP;
+    dt->buf = malloc(reserve);
+    if (!dt->buf) return -1;
+    dt->cap = reserve;
+    dt->buf[0] = '\0';
+    return 0;
+}
+
+void mynah_asr_detok_free(mynah_asr_detok *dt) {
+    free(dt->buf);
+    memset(dt, 0, sizeof(*dt));
+}
+
+void mynah_asr_detok_reset(mynah_asr_detok *dt) {
+    dt->len = dt->scan = dt->trim = dt->collapse = 0;
+    dt->trimmed = dt->collapse_pending = 0;
+    dt->lang1[0] = dt->lang2[0] = '\0';
+    if (dt->buf) dt->buf[0] = '\0';
+}
+
+/* room for `need` bytes plus the NUL */
+static int detok_reserve(mynah_asr_detok *dt, size_t need) {
+    if (need + 1 <= dt->cap) return 0;
+    size_t cap = dt->cap ? dt->cap : MYNAH_ASR_DETOK_MIN_CAP;
+    while (cap < need + 1) cap *= 2;
+    char *nb = realloc(dt->buf, cap);
+    if (!nb) return -1;
+    dt->buf = nb;
+    dt->cap = cap;
+    return 0;
+}
+
+const char *mynah_asr_detok_append(mynah_asr_detok *dt, const mynah_asr_tokenizer *tk,
+                               const int *tokens, int n, char *lang_out) {
+    if (!dt->buf && detok_reserve(dt, 0) != 0) return NULL;
+    /* undo the previous call's trailing-space strip: those bytes were spaces */
+    if (dt->trimmed) { dt->buf[dt->trim] = ' '; dt->trimmed = 0; }
+
+    for (int i = 0; i < n; i++) {
+        if (tokens[i] < 0 || tokens[i] >= tk->n_pieces) continue;
+        const char *p = tk->pieces[tokens[i]];
+        const size_t pl = strlen(p);
+
+        /* special token <...>: language tag (contains '-') or marker -> stripped */
+        if (pl >= 2 && p[0] == '<' && p[pl - 1] == '>') {
+            if (memchr(p, '-', pl) && pl - 2 < 16) {
+                memset(dt->lang1, 0, sizeof(dt->lang1));
+                memcpy(dt->lang1, p + 1, pl - 2);
+            }
+            continue;
+        }
+        if (detok_reserve(dt, dt->len + pl) != 0) return NULL;
+        /* copy, replacing ▁ (U+2581, e2 96 81) with a space */
+        for (size_t j = 0; j < pl; ) {
+            if (j + 2 < pl && (unsigned char)p[j] == 0xE2 && (unsigned char)p[j + 1] == 0x96 &&
+                (unsigned char)p[j + 2] == 0x81) {
+                dt->buf[dt->len++] = ' ';
+                j += 3;
+            } else {
+                dt->buf[dt->len++] = p[j++];
+            }
+        }
+    }
+    dt->buf[dt->len] = '\0';
+
+    /* A tag stripped at the very end of the previous buffer left a space whose
+     * fate the whole-history pass decides by looking at the character AFTER the
+     * strip — which had not arrived yet. Decide it now, exactly as that pass
+     * would: collapse only when a space turned up there. */
+    if (dt->collapse_pending && dt->buf[dt->collapse] != '\0') {
+        if (dt->buf[dt->collapse] == ' ')
+            memmove(dt->buf + dt->collapse, dt->buf + dt->collapse + 1,
+                    strlen(dt->buf + dt->collapse + 1) + 1);
+        dt->collapse_pending = 0;
+        dt->len = strlen(dt->buf);
+    }
+
+    /* Inline <xx-XX> spelled out as ordinary BPE pieces. Restarted at dt->scan:
+     * everything before it has no '<' left, and a '<' whose '>' had not arrived
+     * yet is exactly where a later chunk can complete a tag. */
+    int unresolved = 0;
+    for (char *p = dt->buf + dt->scan; (p = strchr(p, '<')) != NULL;) {
+        char *close = strchr(p, '>');
+        if (!close) { dt->scan = (size_t)(p - dt->buf); unresolved = 1; break; }
+        if ((size_t)(close - p) > 12 || !memchr(p, '-', (size_t)(close - p))) {
+            p++;
+            continue;
+        }
+        if (!dt->lang2[0] && (size_t)(close - p - 1) < 16) {
+            memset(dt->lang2, 0, sizeof(dt->lang2));
+            memcpy(dt->lang2, p + 1, (size_t)(close - p - 1));
+        }
+        memmove(p, close + 1, strlen(close + 1) + 1);
+        /* collapse any resulting double space */
+        if (p > dt->buf && p[-1] == ' ') {
+            if (p[0] == ' ') memmove(p, p + 1, strlen(p + 1) + 1);
+            else if (p[0] == '\0') {          /* undecidable until the next chunk */
+                dt->collapse = (size_t)(p - dt->buf);
+                dt->collapse_pending = 1;
+            }
+        }
+    }
+    dt->len = strlen(dt->buf);
+    if (!unresolved) dt->scan = dt->len;   /* every '<' left is permanently skipped */
+
+    if (lang_out) {
+        if (dt->lang1[0]) memcpy(lang_out, dt->lang1, sizeof(dt->lang1));
+        else if (dt->lang2[0]) memcpy(lang_out, dt->lang2, sizeof(dt->lang2));
+        else memset(lang_out, 0, sizeof(dt->lang1));
+    }
+
+    /* leading spaces (lstrip, like the oracle) as an offset, trailing ones as a
+     * NUL restored on the next append */
+    size_t skip = 0;
+    while (skip < dt->len && dt->buf[skip] == ' ') skip++;
+    dt->trim = dt->len;
+    while (dt->trim > skip && dt->buf[dt->trim - 1] == ' ') dt->trim--;
+    if (dt->trim < dt->len) { dt->buf[dt->trim] = '\0'; dt->trimmed = 1; }
+    return dt->buf + skip;
+}
+
 int mynah_asr_tok_find(const mynah_asr_tokenizer *tk, const char *piece) {
     for (int i = 0; i < tk->n_pieces; i++)
         if (strcmp(tk->pieces[i], piece) == 0) return i;

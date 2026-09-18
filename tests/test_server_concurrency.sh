@@ -11,6 +11,12 @@
 # its inference_end() leaves BLAS capped for the whole process life — same
 # output, just slower.
 #
+# Then the same requests through `--prefork 2`: every response must be
+# byte-identical to the single-process one (a request never depends on which
+# worker served it), and with one slot and no queue the third of three
+# concurrent requests must be refused with a 503 the client can actually read
+# (error.code server_at_capacity, Retry-After), never a reset.
+#
 # Usage: test_server_concurrency.sh [model_dir] [port] [n_concurrent]
 # Exit: 0 ok, 1 fail, 77 skip (model missing).
 MODEL_DIR="${1:-models/nemotron-3.5-asr-streaming-0.6b}"
@@ -86,5 +92,82 @@ if [ -n "$nth" ] && [ "$nth" = "$bud2" ]; then
 else
     echo "server-concurrency budget-restored FAIL: budget='$bud2' threads='$nth'"; fail=1
 fi
+
+kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
+i=1; while [ "$i" -le "$N" ]; do mv "$TMP/r$i.json" "$TMP/single$i.json"; i=$((i + 1)); done
+
+# ---- the same requests through the prefork router -------------------------
+PORT2=$((PORT + 1))
+./mynah-asr-server -m "$MODEL_DIR" -p "$PORT2" --threads 2 --batch 1 --prefork 2 --cap 2 2>"$TMP/prefork.log" &
+SRV_PID=$!
+trap 'kill $SRV_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+ready=0
+for i in $(seq 1 100); do
+    if curl -sf "http://localhost:$PORT2/v1/health" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 0.2
+done
+[ $ready -eq 1 ] || { echo "server-concurrency prefork FAIL: fleet never became ready"; cat "$TMP/prefork.log"; exit 1; }
+PIDS=""
+i=1
+while [ "$i" -le "$N" ]; do
+    curl -s -F file=@"$WAV" -F language=auto \
+        "http://localhost:$PORT2/v1/audio/transcriptions" -o "$TMP/pf$i.json" &
+    PIDS="$PIDS $!"
+    i=$((i + 1))
+done
+wait $PIDS
+i=1
+same=1
+while [ "$i" -le "$N" ]; do
+    cmp -s "$TMP/single$i.json" "$TMP/pf$i.json" || { same=0; echo "  request $i differs under prefork: $(cat "$TMP/pf$i.json")"; }
+    i=$((i + 1))
+done
+[ $same -eq 1 ] && echo "server-concurrency prefork byte-identical OK ($N requests)" \
+                || { echo "server-concurrency prefork byte-identical FAIL"; fail=1; }
+health=$(curl -s "http://localhost:$PORT2/v1/health")
+case "$health" in
+    *'"worker":'[0-9]*) echo "server-concurrency prefork health names its worker OK" ;;
+    *) echo "server-concurrency prefork health FAIL: $health"; fail=1 ;;
+esac
+kill -TERM $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
+sleep 0.3
+left=$(pgrep -f "mynah-asr-server -m $MODEL_DIR -p $PORT2" | wc -l | tr -d ' ')
+[ "$left" = "0" ] && echo "server-concurrency prefork shutdown leaves no worker OK" \
+                  || { echo "server-concurrency prefork shutdown FAIL: $left survivors"; pkill -9 -f "mynah-asr-server -m $MODEL_DIR -p $PORT2"; fail=1; }
+
+# ---- refusal is a status, not a reset: 1 slot, no queue, 3 at once --------
+PORT3=$((PORT + 2))
+MYNAH_ASR_PREFORK_QUEUE=0 ./mynah-asr-server -m "$MODEL_DIR" -p "$PORT3" --threads 1 --batch 1 --prefork 1 --cap 1 2>"$TMP/refuse.log" &
+SRV_PID=$!
+trap 'kill $SRV_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+ready=0
+for i in $(seq 1 100); do
+    if curl -sf "http://localhost:$PORT3/v1/health" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 0.2
+done
+[ $ready -eq 1 ] || { echo "server-concurrency refusal FAIL: server never became ready"; exit 1; }
+PIDS=""
+for i in 1 2 3; do
+    curl -s -o "$TMP/rf$i.body" -w '%{http_code}' -D "$TMP/rf$i.hdr" -F file=@"$WAV" -F language=auto \
+        "http://localhost:$PORT3/v1/audio/transcriptions" > "$TMP/rf$i.code" &
+    PIDS="$PIDS $!"
+done
+wait $PIDS
+n503=0; n200=0; readable=1
+for i in 1 2 3; do
+    code=$(cat "$TMP/rf$i.code")
+    if [ "$code" = "503" ]; then
+        n503=$((n503 + 1))
+        grep -q '"code":"server_at_capacity"' "$TMP/rf$i.body" || readable=0
+        grep -qi 'retry-after' "$TMP/rf$i.hdr" || readable=0
+    elif [ "$code" = "200" ]; then n200=$((n200 + 1)); fi
+done
+if [ $n200 -ge 1 ] && [ $n503 -ge 1 ] && [ $readable -eq 1 ]; then
+    echo "server-concurrency refusal OK ($n200 served, $n503 refused with a readable 503 + Retry-After)"
+else
+    echo "server-concurrency refusal FAIL: served=$n200 refused=$n503 readable=$readable"; fail=1
+    for i in 1 2 3; do echo "  $i: $(cat "$TMP/rf$i.code") $(head -c 100 "$TMP/rf$i.body")"; done
+fi
+kill -TERM $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
 
 exit $fail

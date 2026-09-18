@@ -2,7 +2,7 @@
 """Generate a GGUF K-quant fixture plus reference dequants from llama.cpp's own code.
 
 Why: our C dequant for Q4_K/Q5_K/Q6_K (src/gguf.c) and the synthetic fixtures in
-tests/test_gguf.c were written from the same reading of the spec, so a shared
+tests/test_gguf.sh were written from the same reading of the spec, so a shared
 misunderstanding of the layout would pass unnoticed. This script builds the
 fixture with the `gguf` package (the reference implementation shipped with
 llama.cpp): it WRITES the file with GGUFWriter and dequantizes with

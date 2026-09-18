@@ -1,4 +1,13 @@
+/* pthread_setname_np is a GNU extension on glibc: declare it before the first
+ * include or clang-tidy (and any strict C11 compiler) sees an implicit function
+ * declaration. Harmless on macOS, where the symbol is in the default namespace. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "http_util.h"
+
+#include <pthread.h>
+#include <stdio.h>
 
 #include <string.h>
 
@@ -77,4 +86,38 @@ const uint8_t *mynah_asr_memmem(const uint8_t *hay, size_t hay_len,
         if (hay[i] == needle[0] && memcmp(hay + i, needle, needle_len) == 0)
             return hay + i;
     return NULL;
+}
+
+size_t mynah_asr_ws_frame(unsigned char *buf, size_t cap, int opcode,
+                          const void *payload, size_t len) {
+    size_t hl = 2;
+    if (len >= 126) hl = len < 65536 ? 4 : 10;
+    if (cap < hl + len) return 0;
+    buf[0] = (unsigned char)(0x80 | (opcode & 0x0F));
+    if (len < 126) {
+        buf[1] = (unsigned char)len;
+    } else if (len < 65536) {
+        buf[1] = 126;
+        buf[2] = (unsigned char)(len >> 8);
+        buf[3] = (unsigned char)len;
+    } else {
+        buf[1] = 127;
+        for (int i = 0; i < 8; i++)
+            buf[2 + i] = (unsigned char)((uint64_t)len >> (56 - 8 * i));
+    }
+    if (len) memcpy(buf + hl, payload, len);
+    return hl + len;
+}
+
+void mynah_asr_thread_set_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s", name);
+#if defined(__APPLE__)
+    (void)pthread_setname_np(buf);
+#elif defined(__linux__)
+    (void)pthread_setname_np(pthread_self(), buf);
+#else
+    (void)buf;
+#endif
 }

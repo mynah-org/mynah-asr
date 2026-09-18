@@ -51,6 +51,12 @@ jobs:
       - name: Build
         run: make
 
+      # Board, repository and flag-registry integrity (ENGINEERING.md §1, §12, §6):
+      # no dangling plan link, no tracked script depending on an untracked file,
+      # every environment flag the tree reads declared once.
+      - name: Repository checks (make check)
+        run: make check
+
       - name: Kernel self-test (no model needed)
         run: make tests/test_qmat && tests/test_qmat
         # the forced aligner is model-free too, and it runs again inside `make

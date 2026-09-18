@@ -85,10 +85,14 @@ void mynah_asr_gemm_wt(const float *x, const float *w, float *out, int T, int n,
  * 87 avoids inf (the -ffast-math lesson: inf = UB, see mynah_asr_sigmoid);
  * exp(-x) with the clamp can never overflow in f32. The scalar fallback is
  * unchanged. */
-void mynah_asr_silu(float *x, size_t n) {
+void mynah_asr_silu_scratch(float *x, size_t n, float *scratch) {
 #ifdef MYNAH_ASR_BLAS_ACCELERATE
     if (n >= 256) {
-        float *t = malloc(n * sizeof(float));
+        /* caller scratch (>= n floats) keeps the streaming step allocation-free;
+         * NULL = allocate here, as before */
+        float *t = scratch;
+        const int owned = t == NULL;
+        if (owned) t = malloc(n * sizeof(float));
         if (t) {
             for (size_t i = 0; i < n; i++) {
                 const float v = -x[i];
@@ -99,13 +103,17 @@ void mynah_asr_silu(float *x, size_t n) {
                 vvexpf(t + off, t + off, &chunk);
             }
             for (size_t i = 0; i < n; i++) x[i] = x[i] / (1.0f + t[i]);
-            free(t);
+            if (owned) free(t);
             return;
         }
     }
+#else
+    (void)scratch;
 #endif
     for (size_t i = 0; i < n; i++) x[i] = x[i] * mynah_asr_sigmoid(x[i]);
 }
+
+void mynah_asr_silu(float *x, size_t n) { mynah_asr_silu_scratch(x, n, NULL); }
 
 void mynah_asr_ffn_wt(const float *x, const float *w1, int n1, const float *w2, int n2,
                   float *out, int T, int k, float *scratch) {

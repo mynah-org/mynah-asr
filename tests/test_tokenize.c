@@ -140,5 +140,59 @@ int main(void) {
         unlink(path);
     }
 
+    /* ---- 6. incremental detokenisation == whole-history detokenisation ----
+     * The streaming path emits deltas from mynah_asr_detok_append instead of
+     * re-decoding the history every chunk (S1-3). The property that makes the
+     * transcript byte-identical is checked exactly: after every prefix, and for
+     * every chunking of that prefix, the incremental text and language must
+     * equal what mynah_asr_detokenize produces from the same tokens. The cases
+     * that make it non-trivial are all in the vocabulary below: a leading ▁, a
+     * piece that is only ▁ (trailing space), a <xx-XX> SPECIAL token, and an
+     * inline tag spelled out across three ordinary pieces. */
+    {
+        static const char *const pieces[] = {
+            WM "ciao", WM "il", "gatto", WM, "<it-IT>", "<blank>",
+            "<sl", "-SI", ">", WM "fine",
+        };
+        static const int seq[] = {0, 4, 1, 2, 3, 6, 7, 8, 9, 5, 0, 3};
+        const int nseq = (int)(sizeof(seq) / sizeof(seq[0]));
+        mynah_asr_tokenizer tk;
+        CHECK(load_vocab(&tk, pieces, 10, path) == 0, "incremental vocabulary loaded");
+
+        int bad_text = 0, bad_lang = 0, checked = 0;
+        for (int step = 1; step <= 4; step++) {      /* chunks of 1..4 tokens */
+            mynah_asr_detok dt;
+            if (mynah_asr_detok_init(&dt, 8) != 0) { CHECK(0, "detok_init"); break; }
+            for (int i = 0; i < nseq; i += step) {
+                const int take = (nseq - i) < step ? (nseq - i) : step;
+                char ilang[16] = "", wlang[16] = "";
+                const char *inc = mynah_asr_detok_append(&dt, &tk, seq + i, take, ilang);
+                char *whole = mynah_asr_detokenize(&tk, seq, i + take, wlang);
+                if (!inc || !whole || strcmp(inc, whole) != 0) bad_text = 1;
+                if (strcmp(ilang, wlang) != 0) bad_lang = 1;
+                checked++;
+                free(whole);
+            }
+            mynah_asr_detok_free(&dt);
+        }
+        snprintf(msg, sizeof(msg), "incremental text == whole-history (%d prefixes)", checked);
+        CHECK(!bad_text, msg);
+        CHECK(!bad_lang, "incremental language == whole-history");
+
+        /* reset returns it to the empty transcript */
+        mynah_asr_detok dt;
+        if (mynah_asr_detok_init(&dt, 8) == 0) {
+            mynah_asr_detok_append(&dt, &tk, seq, nseq, NULL);
+            mynah_asr_detok_reset(&dt);
+            const char *after = mynah_asr_detok_append(&dt, &tk, seq, 1, NULL);
+            char *whole = mynah_asr_detokenize(&tk, seq, 1, NULL);
+            CHECK(after && whole && strcmp(after, whole) == 0, "detok_reset clears the history");
+            free(whole);
+            mynah_asr_detok_free(&dt);
+        }
+        mynah_asr_tokenizer_free(&tk);
+        unlink(path);
+    }
+
     return failures;
 }

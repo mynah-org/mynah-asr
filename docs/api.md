@@ -160,8 +160,20 @@ int  mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                        mynah_asr_result_cb cb, void *userdata);
 int  mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *userdata);
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
+int    mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang);   /* new utterance, same object */
+size_t mynah_asr_stream_need_samples(const mynah_asr_stream *s);        /* samples until the next chunk */
+double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s);
 void mynah_asr_stream_close(mynah_asr_stream *s);
 ```
+- **Pooling**: `reset` takes the stream back to what `open` returned without
+  freeing or allocating anything (caches, decoder state, VAD state, emitted
+  text); `lang = NULL` keeps the prompt, the lookahead cannot change. A server
+  keeps one stream per slot and resets it between sessions. Gate: reset+feed is
+  byte-identical to close+open+feed (`tests/test_streaming.c`).
+- **Pacing**: `need_samples` is how much audio completes the next encoder chunk
+  (first chunk `1 + 8·lookahead` mel frames, then `8·(lookahead+1)`); a scheduler
+  that feeds exactly this much per step gives every stream one chunk per step.
+  After warm-up a chunk allocates nothing (`make test-stream-allocs`).
 - The callback receives `mynah_asr_result`: `text` = text **delta** (final,
   `is_final = true` always with Nemotron greedy), `t1` = seconds of audio consumed,
   `lang` = detected language (or NULL).
@@ -172,6 +184,39 @@ void mynah_asr_stream_close(mynah_asr_stream *s);
   feed chunk (measured: 160 ms with 32 ms feeds, 312-376 ms with 250 ms feeds).
 - `feed` returns 0/-1; accepts any input size.
 - Memory per stream: ~12 MB of cache, independent of duration.
+
+### Batched step (several streams, one encoder pass)
+
+```c
+int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
+                            const float *const *samples, const size_t *n_samples,
+                            mynah_asr_result_cb cb, void *const *userdata);
+int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b);
+unsigned long long mynah_asr_stream_batch_rows_stacked(void);
+```
+Feeds B streams and runs **one** encoder pass over every chunk that completed:
+the rows are stacked as a single `[Σq, d]` activation, so each conformer layer's
+linears read the weights once instead of B times. Attention (per-stream K/V
+cache and relative positions), the conv cache, the subsampling, the greedy
+decode and the callbacks stay per stream. Typically `n_samples[i] =
+mynah_asr_stream_need_samples(streams[i])`, which gives each stream exactly one
+chunk per call; a stream whose chunk does not complete is simply fed.
+- **Identity**: every stream's text is byte-identical to the same clip fed alone,
+  whatever B is and whoever it was batched with — the encoder output matches
+  float for float, caches included (`tests/test_stream_batch`). Streams may mix
+  languages, clips and lookahead presets (grouped internally). `B == 1` is the
+  single path. All streams must belong to the same model.
+- **Threading**: one thread at a time per model; the batch scratch lives on the
+  model. Call `mynah_asr_stream_batch_reserve(m, cap)` once at start-up and the
+  step allocates nothing (`make test-stream-batch-allocs`).
+- **Dtype**: int8/int4 always stack (per-row integer accumulation is
+  order-independent). f32 stacks where `cblas_sgemm` has been *measured*
+  row-stable in M — on by default with Accelerate, off with OpenBLAS until its
+  own gate runs, and then the call degrades to per-stream steps through the same
+  API. `MYNAH_ASR_BATCH_F32=0|1` forces it; `stream_batch_rows_stacked()` says
+  what actually happened (0 = nothing was stacked).
+- **Finalizing** a stream is not part of this call: use `mynah_asr_stream_finish`
+  per stream for the tail.
 
 ## Audio helpers
 
