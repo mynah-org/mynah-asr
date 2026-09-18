@@ -152,20 +152,29 @@ static int sweep_child(void) {
     float *a = malloc(na * sizeof(float));
     float *b = malloc(nb * sizeof(float));
     float *c = malloc(nc * sizeof(float));
-    if (!a || !b || !c) return 4;
-    fill(a, na, 77u); fill(b, nb, 88u); fill(c, nc, 99u);
-    /* trans_b: the stacked stream-step shape, the one the batched encoder
-     * relies on being row-stable. */
-    mynah_asr_sgemm_f32(0, 1, SWEEP_M, SWEEP_N, SWEEP_K, 1.0f, a, SWEEP_K, b,
-                        SWEEP_K, 0.5f, c, SWEEP_N);
-    const char *p = (const char *)c;
-    size_t left = nc * sizeof(float);
-    while (left > 0) {
-        const ssize_t n = write(STDOUT_FILENO, p, left);
-        if (n <= 0) return 5;
-        p += n; left -= (size_t)n;
+    int rc = 0;
+    if (!a || !b || !c) {
+        rc = 4;
+    } else {
+        fill(a, na, 77u); fill(b, nb, 88u); fill(c, nc, 99u);
+        /* trans_b: the stacked stream-step shape, the one the batched encoder
+         * relies on being row-stable. */
+        mynah_asr_sgemm_f32(0, 1, SWEEP_M, SWEEP_N, SWEEP_K, 1.0f, a, SWEEP_K, b,
+                            SWEEP_K, 0.5f, c, SWEEP_N);
+        const char *p = (const char *)c;
+        size_t left = nc * sizeof(float);
+        while (left > 0) {
+            const ssize_t n = write(STDOUT_FILENO, p, left);
+            if (n <= 0) { rc = 5; break; }
+            p += n; left -= (size_t)n;
+        }
     }
-    return 0;
+    /* The child must free before it exits, even though the process is about to
+     * die: under ASan the leak check runs at exit and turns a harmless leak into
+     * a non-zero status, which the parent reads as "the sweep failed at this
+     * width". A test that leaks cannot be run by the leak checker. */
+    free(a); free(b); free(c);
+    return rc;
 }
 
 static int run_width(const char *self, int width, float *out) {
