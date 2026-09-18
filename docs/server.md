@@ -218,6 +218,11 @@ health endpoint that reports both is one that will be quoted for the wrong one.
  "audio_seconds":5.229,
  "lag_ms":{"p50":144,"p95":312,"max":358.6,"count":270,"bucket_ms":8},
  "streaming":true,
+ "batch":{"batched_steps_total":312,"rows_stacked_total":1248,"ready_sum":884,
+          "ready_mean":2.83,"reserved_slots":8,
+          "step_wall_ms":{"sum":79560.0,"count":312,"mean":255.0},
+          "by_b":{"1":{"steps":80,"wall_ms_sum":14984.0,"wall_ms_mean":187.3},
+                  "4":{"steps":132,"wall_ms_sum":45672.0,"wall_ms_mean":346.0}}},
  "model":{"name":"nemotron-3.5-asr-streaming-0.6b","engine":"nemotron-streaming",
           "quant":"f32","lookahead_default":3},
  "groups":"",
@@ -238,6 +243,7 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 | `offline` | REST jobs `queued` now, `done` since start, and `--max-pending` |
 | `audio_seconds` | seconds of audio fed to the model, streams and REST alike |
 | `lag_ms` | emission lag since start, from the 8 ms histogram (`bucket_ms`); `p50`/`p95` are therefore quantised to 8 ms, which is a measurement — a percentile computed from a mean is not |
+| `batch` | what the batched stream step did (S2-2b). `batched_steps_total` counts the calls, one per step that had a ready set; `rows_stacked_total` is the library's own count of encoder rows that went through the STACKED path, so **0 next to a non-zero `batched_steps_total` means every step degraded to per-stream steps** rather than a silent fallback; `ready_mean` is `ready_sum / batched_steps_total`; `step_wall_ms` is time spent inside the call (model only: building the set and the frames are outside it); `by_b` is the same sum/count split by ready-set size, which is what the cadence law `T_step(B) = a + b·B` is fitted from |
 | `model`, `groups` | what this process holds, read from the model's own `mynah.json`; `groups` is the fleet's language split, `""` when there is one |
 | `process.pinned`, `cpu_mask` | read BACK from the kernel (`sched_getaffinity`), never the mask that was requested. `false`/`unpinned` on macOS, which has no affinity API this server uses |
 | `process.build/blas/simd/int8_kernel` | the same values `--dispatch-map` prints, from the same predicates (`src/qmat.c`) |
@@ -318,6 +324,8 @@ server):
 | `mynah_asr_refused_total{code}` | this worker's own refusals, by the code in the error body |
 | `mynah_asr_emission_lag_ms_sum` / `_count` / `_max` | a sum-and-count pair, not a histogram |
 | `mynah_asr_emission_lag_over_ms_total{le}` | **exact** counts of deltas whose lag was **at least** the labelled ms. The thresholds are one and two chunk periods plus 1000 ms, rounded up to an 8 ms bucket edge — so on the v1 target they are `320`, `640`, `1000`, and the count is exact rather than interpolated |
+| `mynah_asr_batched_steps_total` · `mynah_asr_batch_rows_stacked_total` · `mynah_asr_batch_ready_size_sum` | the batched step: calls, encoder rows actually stacked, and the summed ready-set size (÷ calls = the mean). `rows_stacked` at 0 with a non-zero call count is the visible fallback, not a healthy run |
+| `mynah_asr_step_wall_ms_sum` / `_count` | milliseconds inside the batched step call. The per-`B` split is in `/v1/health` and deliberately not here: a `B` label would grow the label set with `--cap` |
 | `mynah_asr_slots_active` · `mynah_asr_slots_cap` | gauges |
 | `mynah_asr_build_info{build,blas,simd,int8_kernel}` | always 1; the labels are the point |
 | `mynah_asr_uptime_seconds` | gauge |
@@ -353,6 +361,7 @@ view.
 [DUMP] worker=0 seq=1 build=... blas=accelerate simd=neon+dotprod int8_kernel=neon-sdot int8_gemm=off
 [DUMP] worker=0 seq=1 model=... engine=... quant=f32 streaming=yes lookahead_default=3 chunk_ms=320
 [DUMP] worker=0 seq=1 slots active=0 cap=2 sessions=1 steps=17 deltas=15 eous=0 audio_s=5.2
+[DUMP] worker=0 seq=1 batch steps=17 rows_stacked=0 ready_mean=1.00 step_wall_ms_mean=187.3
 [DUMP] worker=0 seq=1 offline queued=0 done=4 max_pending=4
 [DUMP] worker=0 seq=1 cancelled=0 idle_timeout=0 peer_gone=0 ... other=0
 [DUMP] worker=0 seq=1 refused none

@@ -9,8 +9,9 @@
  * serial path: socket writes went to `stream_out`, and here the model has one
  * owner, so a step is a step and never a queue behind another step.
  *
- * What runs on this thread: stream chunks (one per ready slot per step,
- * round-robin) and the offline REST jobs (at most one batched call per step).
+ * What runs on this thread: stream chunks (one per ready slot per step, and the
+ * whole ready set in ONE mynah_asr_stream_step_batch call -- S2-2b) and the
+ * offline REST jobs (at most one batched call per step).
  * What does NOT: reading sockets, writing sockets, parsing HTTP, JSON of the
  * REST responses. `mynah_asr_sched_assert_thread` is called at the top of every
  * callback and at every inference call site, so the invariant is checked by the
@@ -120,6 +121,12 @@ typedef enum {
 
 const char *mynah_asr_sched_cancel_bucket_name(int bucket);
 
+/* Step-wall accounting is kept per ready-set size B, because the cadence law
+ * T_step(B) = a + b*B (.work/serving-v2-design.md §3) cannot be fitted from a
+ * single mean: two sizes in one run give a and b, and a mean over a run whose
+ * B moved gives neither. Index = B, the last bucket is "that many or more". */
+#define MYNAH_ASR_SCHED_B_BUCKETS 33
+
 typedef struct {
     int  slots_active, slots_cap, streaming;
     unsigned long steps, deltas, eous, sessions, cancelled;
@@ -130,6 +137,19 @@ typedef struct {
     unsigned long lag_count;       /* = deltas, but read in the same snapshot  */
     double lag_sum_ms, lag_max_ms;
     unsigned long lag_hist[MYNAH_ASR_LAG_BUCKETS];
+
+    /* S2-2b: what the batched step actually did. `batched_steps` counts calls
+     * to mynah_asr_stream_step_batch, `ready_sum` sums the B of those calls (so
+     * the mean ready-set size is a division and not a third counter), and
+     * `rows_stacked` accumulates the library's own rows-stacked deltas -- 0 on
+     * a run with traffic means every step degraded to the single path, which is
+     * the visible-fallback rule of ENGINEERING.md §6. */
+    unsigned long batched_steps, ready_sum;
+    unsigned long long rows_stacked;
+    double step_wall_ms_sum;
+    unsigned long step_wall_count;          /* = batched_steps */
+    unsigned long step_b_count[MYNAH_ASR_SCHED_B_BUCKETS];
+    double step_b_wall_ms[MYNAH_ASR_SCHED_B_BUCKETS];
 } mynah_asr_sched_stats;
 
 void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out);

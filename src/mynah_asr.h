@@ -271,6 +271,12 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
                             const float *const *samples, const size_t *n_samples,
                             mynah_asr_result_cb cb, void *const *userdata);
 
+/* Largest B one call accepts; a larger ready set is split into calls of this
+ * size by the caller. A bound on the fixed per-call arrays, not a serving
+ * policy: the per-worker slot cap comes from a measured T_step(B)
+ * (.work/serving-v2-design.md §3). */
+#define MYNAH_ASR_STREAM_BATCH_MAX 256
+
 /* Pre-carve the batched-step scratch for up to max_b streams (sized for the
  * model's largest lookahead preset). 0 = ok, -1 = not a streaming model / OOM. */
 int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b);

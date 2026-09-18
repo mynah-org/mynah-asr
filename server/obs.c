@@ -318,6 +318,38 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
             "mynah_asr_emission_lag_over_ms_total{worker=\"%s\",le=\"%d\"} %lu\n",
             wl, th[i], mynah_asr_sched_lag_over(st.lag_hist, th[i]));
 
+    /* S2-2b: the batched step, as facts. A run can be asked whether it batched
+     * at all (rows_stacked > 0), how large its ready set was on average
+     * (ready_size_sum / batched_steps_total) and how long a step took
+     * (step_wall_ms_sum / _count) -- the three numbers the cadence law
+     * T_step(B) = a + b*B is fitted from. The per-B breakdown is in /v1/health
+     * and NOT here: a `b` label would grow the label set with the slot cap. */
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_batched_steps_total calls to the batched stream step, one\n"
+        "# per scheduler step that had a ready set (B=1 included: that is the\n"
+        "# library's single path, reached through the same call).\n"
+        "# TYPE mynah_asr_batched_steps_total counter\n"
+        "mynah_asr_batched_steps_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_batch_rows_stacked_total encoder rows (one row = one encoder\n"
+        "# frame of one stream) pushed through the STACKED encoder path. 0 next to a\n"
+        "# non-zero batched_steps_total means every step degraded to single steps.\n"
+        "# TYPE mynah_asr_batch_rows_stacked_total counter\n"
+        "mynah_asr_batch_rows_stacked_total{worker=\"%s\"} %llu\n"
+        "# HELP mynah_asr_batch_ready_size_sum streams in the ready set, summed over\n"
+        "# batched steps; divided by batched_steps_total it is the mean ready set.\n"
+        "# TYPE mynah_asr_batch_ready_size_sum counter\n"
+        "mynah_asr_batch_ready_size_sum{worker=\"%s\"} %lu\n",
+        wl, st.batched_steps, wl, st.rows_stacked, wl, st.ready_sum);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_step_wall_ms_sum milliseconds spent inside the batched step\n"
+        "# call. Model time only: building the ready set and the frames are outside it.\n"
+        "# TYPE mynah_asr_step_wall_ms_sum counter\n"
+        "mynah_asr_step_wall_ms_sum{worker=\"%s\"} %.3f\n"
+        "# HELP mynah_asr_step_wall_ms_count steps that contributed to the sum.\n"
+        "# TYPE mynah_asr_step_wall_ms_count counter\n"
+        "mynah_asr_step_wall_ms_count{worker=\"%s\"} %lu\n",
+        wl, st.step_wall_ms_sum, wl, st.step_wall_count);
+
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_slots_active stream slots this worker is holding now.\n"
         "# TYPE mynah_asr_slots_active gauge\n"
@@ -378,6 +410,11 @@ void mynah_asr_obs_dump(void) {
             "steps=%lu deltas=%lu eous=%lu audio_s=%.1f\n",
             widx, n, st.slots_active, st.slots_cap, st.sessions, st.steps,
             st.deltas, st.eous, st.audio_seconds);
+    OBS_ADD("[DUMP] worker=%d seq=%lu batch steps=%lu rows_stacked=%llu "
+            "ready_mean=%.2f step_wall_ms_mean=%.1f\n",
+            widx, n, st.batched_steps, st.rows_stacked,
+            st.batched_steps ? (double)st.ready_sum / (double)st.batched_steps : 0.0,
+            st.step_wall_count ? st.step_wall_ms_sum / (double)st.step_wall_count : 0.0);
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
     OBS_ADD("[DUMP] worker=%d seq=%lu cancelled=%lu", widx, n, st.cancelled);

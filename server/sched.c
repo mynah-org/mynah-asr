@@ -13,6 +13,15 @@
 
 #define SCHED_MAX_OFFLINE_BATCH 64
 
+/* What a delta produced by one row of a step needs to know: whose session it
+ * belongs to, and when the last sample it consumed arrived. The batched call
+ * gets one of these per row as its userdata, so lag is charged per SLOT and is
+ * the same number a per-slot feed would have charged. */
+typedef struct {
+    mynah_asr_slot *slot;
+    double arrival;    /* when the last sample consumed by this feed landed */
+} emit_ctx;
+
 static struct {
     mynah_asr_sched_config cfg;
     mynah_asr_slot *slots;
@@ -33,6 +42,21 @@ static struct {
     mynah_asr_stream_out **req_out;
     size_t *req_avail;
     int *req_live;
+
+    /* The ready set of ONE step, as mynah_asr_stream_step_batch wants it
+     * (S2-2b). Carved with the slot table so building the set is n_slots
+     * pointer stores and never a malloc; `b_slot` keeps the owner of each row
+     * so a failed pass can cancel exactly the sessions that were in it, and
+     * `fin` lists the slots whose turn is the per-slot finalize path. */
+    emit_ctx *b_ctx;
+    mynah_asr_stream **b_stream;
+    const float **b_samples;
+    size_t *b_n;
+    void **b_ud;
+    mynah_asr_slot **b_slot;
+    int *fin;
+    int batch_reserved;            /* the scratch the library pre-carved, or 0 */
+    unsigned long long rows_seen;  /* last mynah_asr_stream_batch_rows_stacked() */
 
     /* The one mutex in this module: offline job queue + the wake flag. */
     pthread_mutex_t mu;
@@ -56,6 +80,13 @@ static struct {
     _Atomic unsigned long audio_samples;
     _Atomic unsigned long lag_sum_us;
     _Atomic unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];
+    /* S2-2b. What the batched step did, and how long it took: four relaxed adds
+     * per step (not per slot), plus one pair indexed by the ready-set size so
+     * T_step(B) = a + b*B can be FITTED from a run instead of asserted. */
+    _Atomic unsigned long batched_steps, ready_sum, step_wall_us;
+    _Atomic unsigned long long rows_stacked;
+    _Atomic unsigned long step_b_count[MYNAH_ASR_SCHED_B_BUCKETS];
+    _Atomic unsigned long step_b_wall_us[MYNAH_ASR_SCHED_B_BUCKETS];
 } g;
 
 /* ------------------------------------------------------- cancel buckets */
@@ -175,11 +206,6 @@ static void sched_error_frame(mynah_asr_slot *s, const char *code, const char *m
 
 /* ------------------------------------------------------- the model callback */
 
-typedef struct {
-    mynah_asr_slot *slot;
-    double arrival;    /* when the last sample consumed by this feed landed */
-} emit_ctx;
-
 static void sched_on_result(const mynah_asr_result *res, void *ud) {
     mynah_asr_sched_assert_thread("the stream result callback");
     emit_ctx *c = (emit_ctx *)ud;
@@ -286,52 +312,101 @@ static void sched_emit_done(mynah_asr_slot *s) {
 
 /* --------------------------------------------------------------- one step */
 
-/* Feeds exactly what the stream needs for its next chunk, or the tail on a
- * finalize. Returns 1 when it did work. */
-static int sched_feed(mynah_asr_slot *s, size_t avail, int finalize) {
-    mynah_asr_sched_assert_thread("mynah_asr_stream_feed");
+/* Takes the samples this slot's next chunk needs and files it as one ROW of the
+ * step's batch. Nothing is fed here: the whole ready set goes to the model in
+ * one call below, which is what makes the 24 conformer layers read their
+ * weights once for B streams instead of B times. Returns 1 when a row was
+ * filed; `B` is the number of rows already in the set.
+ *
+ * The accounting is per SLOT and identical to the per-slot feed it replaces:
+ * the slot's own arrival record dates the audio, and the delta callback of that
+ * row gets that slot's emit_ctx. A transcript, and its lag, never depend on who
+ * the chunk travelled with (ENGINEERING.md §9). */
+static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     size_t need = mynah_asr_stream_need_samples(s->stream);
     if (need == 0) need = 1;
+    if (avail < need) return 0;
 
-    if (avail >= need) {
-        size_t want = need > s->take_cap ? s->take_cap : need;
-        emit_ctx ctx = {.slot = s, .arrival = 0.0};
-        const size_t got = mynah_asr_slot_take(s, s->take, want, &ctx.arrival);
-        if (got == 0) return 0;
-        if (ctx.arrival > 0.0) s->last_arrival = ctx.arrival;
-        else ctx.arrival = s->last_arrival;
-        s->steps++;
-        atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
+    const size_t want = need > s->take_cap ? s->take_cap : need;
+    emit_ctx *c = &g.b_ctx[B];
+    c->slot = s;
+    c->arrival = 0.0;
+    const size_t got = mynah_asr_slot_take(s, s->take, want, &c->arrival);
+    if (got == 0) return 0;
+    if (c->arrival > 0.0) s->last_arrival = c->arrival;
+    else c->arrival = s->last_arrival;
+
+    s->steps++;
+    atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
+                              memory_order_relaxed);
+    g.b_stream[B] = s->stream;
+    g.b_samples[B] = s->take;
+    g.b_n[B] = got;
+    g.b_ud[B] = c;
+    g.b_slot[B] = s;
+    return 1;
+}
+
+/* ONE call for the whole ready set. B == 1 takes the library's single path
+ * verbatim, so a lone stream runs exactly the code it ran before S2-2b.
+ *
+ * A -1 is a failure of the pass, not of one row: every session in the set is
+ * cancelled with `decode_failed`, which is what the per-slot feed did for its
+ * one slot. */
+static void sched_step_batch(int B) {
+    mynah_asr_sched_assert_thread("mynah_asr_stream_step_batch");
+    const double t0 = mynah_asr_now();
+    const int rc = mynah_asr_stream_step_batch(g.b_stream, B, g.b_samples, g.b_n,
+                                               sched_on_result, g.b_ud);
+    const unsigned long us = (unsigned long)((mynah_asr_now() - t0) * 1e6 + 0.5);
+
+    /* What the library ACTUALLY stacked, taken as a delta so this worker
+     * reports its own steps and not a process-wide total. 0 over a run with
+     * traffic means every step degraded to the single path (ENGINEERING.md §6). */
+    const unsigned long long rows = mynah_asr_stream_batch_rows_stacked();
+    if (rows > g.rows_seen)
+        atomic_fetch_add_explicit(&g.rows_stacked, rows - g.rows_seen,
                                   memory_order_relaxed);
-        if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
-            sched_cancel(s, "decode_failed", "the stream step failed");
-            return 1;
-        }
+    g.rows_seen = rows;
+
+    atomic_fetch_add_explicit(&g.batched_steps, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.ready_sum, (unsigned long)B, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.step_wall_us, us, memory_order_relaxed);
+    const int bb = B < MYNAH_ASR_SCHED_B_BUCKETS ? B : MYNAH_ASR_SCHED_B_BUCKETS - 1;
+    atomic_fetch_add_explicit(&g.step_b_count[bb], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.step_b_wall_us[bb], us, memory_order_relaxed);
+
+    if (rc == 0) return;
+    for (int j = 0; j < B; j++) {
+        mynah_asr_slot *s = g.b_slot[j];
+        g.req_live[s->id] = 0;
+        sched_cancel(s, "decode_failed", "the stream step failed");
+    }
+}
+
+/* The last piece of a finalizing stream, shorter than a chunk. It does NOT go
+ * through the batched call: that call takes whole chunks only, and what follows
+ * this piece is the tail, which needs the causal right pad only
+ * mynah_asr_stream_finish applies. Returns 1 when it fed something. */
+static int sched_feed_tail(mynah_asr_slot *s, size_t avail) {
+    mynah_asr_sched_assert_thread("mynah_asr_stream_feed");
+    if (avail == 0) return 0;
+    const size_t want = avail > s->take_cap ? s->take_cap : avail;
+    emit_ctx ctx = {.slot = s, .arrival = 0.0};
+    const size_t got = mynah_asr_slot_take(s, s->take, want, &ctx.arrival);
+    if (got == 0) return 0;
+    if (ctx.arrival > 0.0) s->last_arrival = ctx.arrival;
+    else ctx.arrival = s->last_arrival;
+    s->steps++;
+    atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
+                              memory_order_relaxed);
+    if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
+        sched_cancel(s, "decode_failed", "the stream step failed");
         return 1;
     }
-    if (!finalize) return 0;
-
-    if (avail > 0) {
-        /* A last piece shorter than a chunk: hand it over now, the finalize
-         * flag survives and the next pass runs the tail through finish(). */
-        size_t want = avail > s->take_cap ? s->take_cap : avail;
-        emit_ctx ctx = {.slot = s, .arrival = 0.0};
-        const size_t got = mynah_asr_slot_take(s, s->take, want, &ctx.arrival);
-        if (got == 0) return 0;
-        if (ctx.arrival > 0.0) s->last_arrival = ctx.arrival;
-        else ctx.arrival = s->last_arrival;
-        s->steps++;
-        atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
-                                  memory_order_relaxed);
-        if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
-            sched_cancel(s, "decode_failed", "the stream step failed");
-            return 1;
-        }
-        return 1;
-    }
-    return 0;
+    return 1;
 }
 
 static void sched_finalize(mynah_asr_slot *s, int close_after) {
@@ -515,15 +590,19 @@ static void *sched_main(void *arg) {
             did = 1;
         }
 
-        /* (3)+(4) The ready set, one chunk per ready slot, round-robin so a
-         * stream that arrived first does not keep the head of the queue. */
+        /* (3) The ready set. Round-robin so a stream that arrived first does
+         * not keep the head of the queue, one chunk per ready slot, and every
+         * chunk STAGED rather than fed: the whole set goes to the model in one
+         * call below. A slot that is finalizing with less than a chunk left is
+         * put aside for the per-slot tail path, which runs after the batch so
+         * the order of a slot's own deltas is unchanged. */
+        int B = 0, n_fin = 0;
         for (int k = 0; k < g.n_slots; k++) {
             const int i = (rr + k) % g.n_slots;
             if (!g.req_live[i]) continue;
             mynah_asr_slot *s = &g.slots[i];
             const int finalize = (g.req[i] & (MYNAH_ASR_SLOT_REQ_FINALIZE |
                                               MYNAH_ASR_SLOT_REQ_CLOSE)) != 0;
-            const int close_after = (g.req[i] & MYNAH_ASR_SLOT_REQ_CLOSE) != 0;
             size_t avail = g.req_avail[i];
             if (avail == 0 && !finalize) continue;
 
@@ -537,34 +616,57 @@ static void *sched_main(void *arg) {
                     continue;
                 }
             }
-            if (avail > 0 || !finalize) {
-                if (sched_feed(s, avail, finalize)) {
-                    did = 1;
-                    /* Keep the finalize pending: the tail runs when the ring
-                     * is empty, on a later pass. */
-                    if (finalize) mynah_asr_slot_request(s, g.req[i] &
-                        (MYNAH_ASR_SLOT_REQ_FINALIZE | MYNAH_ASR_SLOT_REQ_CLOSE),
-                        NULL, MYNAH_ASR_SLOT_CANCEL_NONE);
-                    continue;
-                }
-            }
-            if (finalize && mynah_asr_slot_available(s) == 0) {
-                sched_finalize(s, close_after);
+
+            if (sched_stage(s, avail, B)) {
+                B++;
                 did = 1;
-            } else if (finalize) {
+                /* Keep the finalize pending: the tail runs when the ring is
+                 * empty, on a later pass. */
+                if (finalize) mynah_asr_slot_request(s, g.req[i] &
+                    (MYNAH_ASR_SLOT_REQ_FINALIZE | MYNAH_ASR_SLOT_REQ_CLOSE),
+                    NULL, MYNAH_ASR_SLOT_CANCEL_NONE);
+                /* MYNAH_ASR_STREAM_BATCH_MAX rows is one call's limit; a larger
+                 * ready set is simply more calls in the same step. */
+                if (B == MYNAH_ASR_STREAM_BATCH_MAX) {
+                    sched_step_batch(B);
+                    B = 0;
+                }
+                continue;
+            }
+            if (finalize) g.fin[n_fin++] = i;
+        }
+
+        /* (4) ONE batched step over the ready set. */
+        if (B > 0) sched_step_batch(B);
+
+        /* (5) Finalize: the short last piece, then the tail through
+         * mynah_asr_stream_finish, per slot and never through the batch. */
+        for (int t = 0; t < n_fin; t++) {
+            const int i = g.fin[t];
+            if (!g.req_live[i]) continue;
+            mynah_asr_slot *s = &g.slots[i];
+            const int close_after = (g.req[i] & MYNAH_ASR_SLOT_REQ_CLOSE) != 0;
+            const size_t avail = mynah_asr_slot_available(s);
+            if (avail > 0) {
+                /* The piece goes now and the finalize stays pending: the tail
+                 * runs on a later pass, when the ring is empty. */
+                if (sched_feed_tail(s, avail)) did = 1;
                 mynah_asr_slot_request(s, g.req[i] &
                     (MYNAH_ASR_SLOT_REQ_FINALIZE | MYNAH_ASR_SLOT_REQ_CLOSE),
                     NULL, MYNAH_ASR_SLOT_CANCEL_NONE);
+                continue;
             }
+            sched_finalize(s, close_after);
+            did = 1;
         }
         rr = (rr + 1) % (g.n_slots > 0 ? g.n_slots : 1);
 
-        /* (5) Offline REST work, at most one batched call per step. It stalls
+        /* (6) Offline REST work, at most one batched call per step. It stalls
          * the streams on this worker for its duration; v2.0 accepts that and
          * says so in the banner (S2-6 splits the groups). */
         if (sched_run_jobs()) did = 1;
 
-        /* (6) Nothing ready and nothing queued: park. Never a fixed tick -- the
+        /* (7) Nothing ready and nothing queued: park. Never a fixed tick -- the
          * first chunk of a new stream runs the moment it lands. */
         pthread_mutex_lock(&g.mu);
         while (!did && !g.woken && g.q_head == NULL &&
@@ -613,8 +715,16 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     g.req_out = calloc((size_t)g.n_slots, sizeof(*g.req_out));
     g.req_avail = calloc((size_t)g.n_slots, sizeof(*g.req_avail));
     g.req_live = (int *)calloc((size_t)g.n_slots, sizeof(int));
+    g.b_ctx = calloc((size_t)g.n_slots, sizeof(*g.b_ctx));
+    g.b_stream = calloc((size_t)g.n_slots, sizeof(*g.b_stream));
+    g.b_samples = calloc((size_t)g.n_slots, sizeof(*g.b_samples));
+    g.b_n = calloc((size_t)g.n_slots, sizeof(*g.b_n));
+    g.b_ud = calloc((size_t)g.n_slots, sizeof(*g.b_ud));
+    g.b_slot = calloc((size_t)g.n_slots, sizeof(*g.b_slot));
+    g.fin = (int *)calloc((size_t)g.n_slots, sizeof(int));
     if (!g.slots || !g.req || !g.req_lang || !g.req_reason || !g.req_out ||
-        !g.req_avail || !g.req_live)
+        !g.req_avail || !g.req_live || !g.b_ctx || !g.b_stream || !g.b_samples ||
+        !g.b_n || !g.b_ud || !g.b_slot || !g.fin)
         return -1;
 
     const size_t ring = (size_t)g.cfg.ring_seconds * 16000u;
@@ -624,6 +734,21 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     const size_t take = 4u * 16000u;
     for (int i = 0; i < g.n_slots; i++)
         if (mynah_asr_slot_init(&g.slots[i], i, ring, take) != 0) return -1;
+
+    /* Pre-carve the batched step's scratch for the whole slot cap, ONCE, here:
+     * after this the step path allocates nothing of its own. Called before the
+     * scheduler thread exists, so it is still single-owner; a model with no
+     * streaming presets has no batch scratch to carve and says so. */
+    if (g.streaming) {
+        const int cap = g.n_slots > MYNAH_ASR_STREAM_BATCH_MAX
+                            ? MYNAH_ASR_STREAM_BATCH_MAX : g.n_slots;
+        g.batch_reserved = mynah_asr_stream_batch_reserve(g.cfg.model, cap) == 0
+                               ? cap : 0;
+        if (g.batch_reserved == 0)
+            fprintf(stderr, "mynah-asr-server: the batched-step scratch could not "
+                            "be reserved for %d slots; steps will carve it on "
+                            "first use\n", cap);
+    }
 
     mynah_asr_slot_set_notify(mynah_asr_sched_wake);
     if (pthread_create(&g.thread, NULL, sched_main, NULL) != 0) return -1;
@@ -696,6 +821,19 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
         (double)atomic_load_explicit(&g.lag_max_us, memory_order_relaxed) / 1000.0;
     for (int i = 0; i < MYNAH_ASR_LAG_BUCKETS; i++)
         out->lag_hist[i] = atomic_load_explicit(&g.lag_hist[i], memory_order_relaxed);
+    out->batched_steps = atomic_load_explicit(&g.batched_steps, memory_order_relaxed);
+    out->ready_sum = atomic_load_explicit(&g.ready_sum, memory_order_relaxed);
+    out->rows_stacked = atomic_load_explicit(&g.rows_stacked, memory_order_relaxed);
+    out->step_wall_ms_sum =
+        (double)atomic_load_explicit(&g.step_wall_us, memory_order_relaxed) / 1000.0;
+    out->step_wall_count = out->batched_steps;
+    for (int i = 0; i < MYNAH_ASR_SCHED_B_BUCKETS; i++) {
+        out->step_b_count[i] =
+            atomic_load_explicit(&g.step_b_count[i], memory_order_relaxed);
+        out->step_b_wall_ms[i] =
+            (double)atomic_load_explicit(&g.step_b_wall_us[i], memory_order_relaxed)
+            / 1000.0;
+    }
     pthread_mutex_lock(&g.mu);
     out->offline_pending = g.q_len;
     out->offline_max_pending = g.cfg.max_pending;
@@ -769,6 +907,36 @@ void mynah_asr_sched_health(cJSON *into) {
                             mynah_asr_sched_lag_quantile(st.lag_hist, 0.50));
     cJSON_AddNumberToObject(into, "lag_max_ms", st.lag_max_ms);
     cJSON_AddBoolToObject(into, "streaming", st.streaming ? 1 : 0);
+
+    /* S2-2b: what the STEP did. `rows_stacked_total` is the library's own
+     * count of encoder rows that went through the stacked path; 0 next to a
+     * non-zero `batched_steps_total` means every step ran as single steps --
+     * the fallback is visible, not silent (ENGINEERING.md §6). `by_b` is the
+     * raw material of the cadence law: T_step(B) = a + b*B fitted over the
+     * ready-set sizes this worker actually saw. */
+    cJSON *bt = cJSON_AddObjectToObject(into, "batch");
+    cJSON_AddNumberToObject(bt, "batched_steps_total", (double)st.batched_steps);
+    cJSON_AddNumberToObject(bt, "rows_stacked_total", (double)st.rows_stacked);
+    cJSON_AddNumberToObject(bt, "ready_sum", (double)st.ready_sum);
+    cJSON_AddNumberToObject(bt, "ready_mean",
+        st.batched_steps ? (double)st.ready_sum / (double)st.batched_steps : 0.0);
+    cJSON_AddNumberToObject(bt, "reserved_slots", g.batch_reserved);
+    cJSON *sw = cJSON_AddObjectToObject(bt, "step_wall_ms");
+    cJSON_AddNumberToObject(sw, "sum", st.step_wall_ms_sum);
+    cJSON_AddNumberToObject(sw, "count", (double)st.step_wall_count);
+    cJSON_AddNumberToObject(sw, "mean",
+        st.step_wall_count ? st.step_wall_ms_sum / (double)st.step_wall_count : 0.0);
+    cJSON *byb = cJSON_AddObjectToObject(bt, "by_b");
+    for (int i = 1; i < MYNAH_ASR_SCHED_B_BUCKETS; i++) {
+        if (st.step_b_count[i] == 0) continue;
+        char key[8];
+        snprintf(key, sizeof(key), "%d", i);
+        cJSON *e = cJSON_AddObjectToObject(byb, key);
+        cJSON_AddNumberToObject(e, "steps", (double)st.step_b_count[i]);
+        cJSON_AddNumberToObject(e, "wall_ms_sum", st.step_b_wall_ms[i]);
+        cJSON_AddNumberToObject(e, "wall_ms_mean",
+                                st.step_b_wall_ms[i] / (double)st.step_b_count[i]);
+    }
 }
 
 void mynah_asr_sched_stop(void) {
@@ -798,5 +966,9 @@ void mynah_asr_sched_stop(void) {
     free(g.req_out); free(g.req_avail); free(g.req_live);
     g.req = NULL; g.req_lang = NULL; g.req_reason = NULL;
     g.req_out = NULL; g.req_avail = NULL; g.req_live = NULL;
+    free(g.b_ctx); free(g.b_stream); free(g.b_samples); free(g.b_n);
+    free(g.b_ud); free(g.b_slot); free(g.fin);
+    g.b_ctx = NULL; g.b_stream = NULL; g.b_samples = NULL; g.b_n = NULL;
+    g.b_ud = NULL; g.b_slot = NULL; g.fin = NULL;
     g.n_slots = 0;
 }

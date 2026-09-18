@@ -24,11 +24,6 @@ const char *mynah_asr_version(void) { return MYNAH_ASR_VERSION; }
 
 #define MYNAH_ASR_AED_PROMPT_MAX 16
 
-/* Largest B one mynah_asr_stream_step_batch call accepts. A bound on the fixed
- * per-call arrays, not a serving policy: the per-worker slot cap comes from a
- * measured T_step(B) (.work/serving-v2-design.md §3). */
-#define MYNAH_ASR_STREAM_BATCH_MAX 256
-
 struct mynah_asr_model {
     cJSON *cfg;                     /* mynah.json (kept alive for the prompt dictionary) */
     mynah_asr_safetensors *weights;

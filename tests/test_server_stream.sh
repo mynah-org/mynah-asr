@@ -11,6 +11,12 @@
 #      measure, and /v1/health shows the stalled slot cancelled.
 #   3. The same identity through `--prefork 2 --cap 2`, so a transcript does not
 #      depend on which worker served it.
+#   4. BATCHED IDENTITY (S2-2b). Eight streams over five clips on ONE process
+#      with `--cap 8`, so every step feeds a ready set of several streams through
+#      one `mynah_asr_stream_step_batch` call: every text still byte-identical to
+#      the CLI, and /v1/health proving the batched path is what ran
+#      (`batched_steps_total` and `rows_stacked_total` both non-zero) rather than
+#      a silent degradation to per-stream steps.
 #
 # Usage: test_server_stream.sh [model_dir] [port]
 # Exit: 0 ok, 1 fail, 77 skip (model, binaries or python missing).
@@ -219,5 +225,90 @@ else
     pkill -9 -f "mynah-asr-server -m $MODEL_DIR -p $PORT3"
     fail=1
 fi
+
+# ---- 4. eight streams through the batched step, on one process -------------
+# The reference here is the CLI's own STREAMING answer, not `transcribe`: what
+# this phase gates is that a stream batched with seven others says exactly what
+# the same clip says alone, and the single-stream streaming path is that answer.
+# It matters for test_es.wav, whose int8 streaming transcript already differs
+# from its offline one ("a las muertes" vs "a las vuelve") -- a pre-existing
+# streaming-vs-offline numerical difference recorded in .work/stream-api-v2.md,
+# and nothing to do with batching. For the other four clips the two references
+# are the same bytes.
+CLIPS8="$CLIPS tests/audio/test_es.wav"
+[ -f tests/audio/test_es.wav ] || CLIPS8="$CLIPS"
+
+: > "$TMP/ref8.tsv"
+for c in $CLIPS8; do
+    printf '%s\t' "$c" >> "$TMP/ref8.tsv"
+    ./mynah-asr stream -m "$MODEL_DIR" -i "$c" --quant int8 --lang auto 2>/dev/null \
+        | tr -d '\n' >> "$TMP/ref8.tsv"
+    printf '\n' >> "$TMP/ref8.tsv"
+done
+python3 - "$TMP/ref8.tsv" "$TMP/ref8.json" <<'PY'
+import json, sys
+ref = {}
+for line in open(sys.argv[1]):
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    k, _, v = line.partition("\t")
+    ref[k] = v
+if not all(ref.values()):
+    sys.exit("the CLI produced an empty streaming reference for " +
+             ", ".join(k for k, v in ref.items() if not v))
+json.dump(ref, open(sys.argv[2], "w"), ensure_ascii=False)
+PY
+if [ $? -ne 0 ]; then echo "server-stream batched reference FAIL"; exit 1; fi
+
+PORT4=$((PORT + 3))
+./mynah-asr-server -m "$MODEL_DIR" -p "$PORT4" --threads 4 --batch 4 \
+    --quant int8 --cap 8 > "$TMP/srv4.log" 2>&1 &
+SRV_PID=$!
+wait_ready "$PORT4" || { echo "server-stream batched FAIL: server never became ready"; cat "$TMP/srv4.log"; exit 1; }
+
+n8=0
+for c in $CLIPS8; do n8=$((n8 + 1)); done
+python3 tools/bench/stream_load.py --host localhost --port "$PORT4" \
+    --streams 8 --repeat 1 --clips $CLIPS8 \
+    --reference "$TMP/ref8.json" --json "$TMP/load8.json" > "$TMP/load8.txt" 2>&1
+if python3 "$TMP/verdict.py" "$TMP/load8.json" 8; then
+    echo "server-stream batched-identity OK (8 streams, $n8 clips, --cap 8)"
+else
+    echo "server-stream batched-identity FAIL"; sed -n '1,20p' "$TMP/load8.txt"; fail=1
+fi
+
+# The counters are the point: a run that fell back to per-stream steps would
+# still be correct and would still pass the identity check above, so the gate
+# asks the server what path it ran (ENGINEERING.md §5, §6).
+curl -s "http://localhost:$PORT4/v1/health" > "$TMP/health8.json"
+if python3 - "$TMP/health8.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+b = h.get("batch") or {}
+steps = b.get("batched_steps_total", 0)
+rows = b.get("rows_stacked_total", 0)
+print("    batched_steps_total %d   rows_stacked_total %d   ready_mean %.2f   "
+      "step_wall_ms mean %.1f" % (steps, rows, b.get("ready_mean", 0.0),
+                                  (b.get("step_wall_ms") or {}).get("mean", 0.0)))
+by_b = b.get("by_b") or {}
+for k in sorted(by_b, key=int):
+    e = by_b[k]
+    print("      B=%s  steps %d  wall mean %.1f ms" % (k, e["steps"], e["wall_ms_mean"]))
+bad = []
+if not steps:
+    bad.append("batched_steps_total is 0: no step went through the batched call")
+if not rows:
+    bad.append("rows_stacked_total is 0: every step degraded to the single path")
+if bad:
+    print("    " + "; ".join(bad))
+    sys.exit(1)
+PY
+then
+    echo "server-stream batched-path-proven OK (/v1/health counted stacked rows)"
+else
+    echo "server-stream batched-path-proven FAIL"; fail=1
+fi
+kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null; SRV_PID=""
 
 exit $fail
