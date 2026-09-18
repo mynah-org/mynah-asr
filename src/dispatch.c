@@ -110,7 +110,10 @@ static const char *tri_name(int t) {
  * kernels use (src/qmat.c x86_detect_caps) rather than of a second cpuid here:
  * on x86 the highest SIMD level detected, on ARM whether dotprod is there. */
 static const char *quant_supported(void) {
-#if MYNAH_ASR_DISPATCH_HAS_X86
+#if MYNAH_ASR_DISPATCH_HAS_X86 || MYNAH_ASR_DISPATCH_HAS_DOTPROD
+    /* Since S5-1 the ARM side has a ladder too (scalar < sdot < smmla), fed by
+     * the same mynah_asr_cpu_has("i8mm") this file exports, so both
+     * architectures answer from the SAME detector the kernels branch on. */
     return mynah_asr_caps_name(mynah_asr_caps_detected());
 #else
     return tri_name(mynah_asr_cpu_has("dotprod"));
@@ -153,17 +156,33 @@ int mynah_asr_dispatch_collect(mynah_asr_dispatch_row *rows, int capacity) {
     if (rows == NULL || capacity < 8) return -1;
     int n = 0;
 
-    /* --- int8 dot: the kernel every streaming projection runs (T <= 16) ---
+    /* --- int8 dot: the kernel a ONE-ROW projection runs (T <= 16) ---------
      * Owner: src/qmat.c. We ASK it; we do not rebuild its branch here. */
     row_set(&rows[n++], "kernel.int8_dot",
             MYNAH_ASR_DISPATCH_HAS_DOTPROD ? "neon-sdot"
               : MYNAH_ASR_DISPATCH_HAS_X86 ? "avx512vnni+avx2"
               : MYNAH_ASR_DISPATCH_HAS_NEON ? "neon-f32" : "scalar",
             quant_supported(),
+            "MYNAH_ASR_CAPS", mynah_asr_qmat_int8_dot_kernel(),
+            MYNAH_ASR_DISPATCH_SRC_PREDICATE,
+            "src/qmat.c mynah_asr_qmat_int8_dot_kernel(); the T<=16 branch of "
+            "mynah_asr_qmat_mul and every weight-stationary T remainder, k<=8192");
+
+    /* --- int8 weight-stationary: the kernel the BATCHED server step runs --
+     * Different question, different predicate (S5-1): this is the one that can
+     * be SMMLA or a VPDPBUSD, because it is the only path that holds several
+     * activation rows against one weight row. */
+    row_set(&rows[n++], "kernel.int8_rows",
+            MYNAH_ASR_DISPATCH_HAS_I8MM_KERNEL ? "neon-smmla+sdot"
+              : MYNAH_ASR_DISPATCH_HAS_DOTPROD ? "neon-sdot"
+              : MYNAH_ASR_DISPATCH_HAS_AVXVNNI_KERNEL ? "avx512vnni+avxvnni+avx2"
+              : MYNAH_ASR_DISPATCH_HAS_X86 ? "avx512vnni+avx2"
+              : MYNAH_ASR_DISPATCH_HAS_NEON ? "neon-f32" : "scalar",
+            quant_supported(),
             "MYNAH_ASR_CAPS", mynah_asr_qmat_int8_kernel(),
             MYNAH_ASR_DISPATCH_SRC_PREDICATE,
-            "src/qmat.c mynah_asr_qmat_int8_kernel(); the T<=16 branch of "
-            "mynah_asr_qmat_mul, k<=8192");
+            "src/qmat.c mynah_asr_qmat_int8_kernel(); mynah_asr_qmat_mul_rows, "
+            "the stacked [T,k]x[n,k]T of the batched stream step");
 
     row_set(&rows[n++], "kernel.int4_dot",
             MYNAH_ASR_DISPATCH_HAS_DOTPROD ? "neon-sdot"
@@ -267,9 +286,9 @@ static const idle_feature *idle_table(int *count) {
     static const idle_feature arm[] = {
         {"dotprod", MYNAH_ASR_DISPATCH_HAS_DOTPROD,
          "SDOT int8/int4 dots in src/qmat.c (dot_q8_sdot, dot_q4_sdot)"},
-        {"i8mm", 0,
-         "an SMMLA int8 GEMM in src/qmat.c: 2x2 tiles for the T>16 path, the "
-         "one kernel that would make MYNAH_ASR_QGEMM worth defaulting to"},
+        {"i8mm", MYNAH_ASR_DISPATCH_HAS_I8MM_KERNEL,
+         "SMMLA 2x2 tiles in src/qmat.c (dots_q8_smmla_2x2), issued by the "
+         "weight-stationary batched step; the one-row dot stays SDOT"},
         {"bf16", 0,
          "a BFDOT/BFMMLA f32 GEMM in src/backend.c, or bf16 weights in "
          "src/weights.c"},
@@ -285,10 +304,10 @@ static const idle_feature *idle_table(int *count) {
         {"avx512f", 0,
          "an AVX-512 f32 kernel; today only the int8 dot is AVX-512 (VNNI)"},
         {"avx512vnni", MYNAH_ASR_DISPATCH_HAS_VNNI_KERNEL,
-         "dot_q8_vnni in src/qmat.c (VPDPBUSD)"},
-        {"avxvnni", 0,
-         "a VEX-encoded VPDPBUSD twin of dot_q8_vnni for the AVX-512-less "
-         "client parts"},
+         "dot_q8_vnni and dots_q8_avx512vnni_x4 in src/qmat.c (EVEX VPDPBUSD)"},
+        {"avxvnni", MYNAH_ASR_DISPATCH_HAS_AVXVNNI_KERNEL,
+         "dots_q8_avxvnni_x4 in src/qmat.c: the VEX VPDPBUSD twin for the "
+         "AVX-512-less client parts, in the weight-stationary step"},
         {"amx", 0,
          "a tile-based int8 GEMM in src/qmat.c: no tile op exists anywhere in "
          "this runtime"},

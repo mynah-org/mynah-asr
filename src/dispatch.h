@@ -68,14 +68,25 @@
 #define MYNAH_ASR_DISPATCH_HAS_DOTPROD 0
 #endif
 
-/* Compiled for i8mm is NOT the same as "there is an i8mm kernel": src/qmat.c
- * has no SMMLA path at all, so this macro exists only for the ISA guard, and
- * the IDLE HARDWARE footer says so in words rather than leaving a blank the
- * reader fills in optimistically. */
+/* Compiled for i8mm is NOT the same as "there is an i8mm kernel", and the two
+ * are deliberately separate macros. BUILT_I8MM says the COMPILER was allowed to
+ * emit SMMLA anywhere (a -march that implies it), which is only the ISA
+ * guard's business. HAS_I8MM_KERNEL says src/qmat.c carries the SMMLA kernel
+ * behind a target attribute and picks it by a runtime probe — true in every
+ * aarch64 build since S5-1, whatever -march says. Reading a -march flag as a
+ * kernel claim is the mistake this whole file exists to prevent. */
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 #define MYNAH_ASR_DISPATCH_BUILT_I8MM 1
 #else
 #define MYNAH_ASR_DISPATCH_BUILT_I8MM 0
+#endif
+
+/* mirrors, expression for expression, src/qmat.c MYNAH_ASR_HAVE_I8MM */
+#if MYNAH_ASR_DISPATCH_HAS_DOTPROD && defined(__aarch64__) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))
+#define MYNAH_ASR_DISPATCH_HAS_I8MM_KERNEL 1
+#else
+#define MYNAH_ASR_DISPATCH_HAS_I8MM_KERNEL 0
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -91,9 +102,17 @@
 #if MYNAH_ASR_DISPATCH_HAS_X86
 #define MYNAH_ASR_DISPATCH_HAS_VNNI_KERNEL 1
 #define MYNAH_ASR_DISPATCH_HAS_AVX2_KERNEL 1
+/* the VEX VPDPBUSD twin (src/qmat.c MYNAH_ASR_HAVE_AVXVNNI_KERNEL): the
+ * intrinsic is spelled _mm256_dpbusd_avx_epi32 and arrived in GCC 11 */
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11)
+#define MYNAH_ASR_DISPATCH_HAS_AVXVNNI_KERNEL 1
+#else
+#define MYNAH_ASR_DISPATCH_HAS_AVXVNNI_KERNEL 0
+#endif
 #else
 #define MYNAH_ASR_DISPATCH_HAS_VNNI_KERNEL 0
 #define MYNAH_ASR_DISPATCH_HAS_AVX2_KERNEL 0
+#define MYNAH_ASR_DISPATCH_HAS_AVXVNNI_KERNEL 0
 #endif
 
 /* What the COMPILER was allowed to emit everywhere (-march=native by default

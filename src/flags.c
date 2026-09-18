@@ -18,11 +18,13 @@
  * sentence an operator can act on, not a restatement of the name. */
 
 static const char *inert_caps(void) {
-#if MYNAH_ASR_DISPATCH_HAS_X86
+#if MYNAH_ASR_DISPATCH_HAS_X86 || MYNAH_ASR_DISPATCH_HAS_DOTPROD
+    /* S5-1 gave ARM a ladder of its own (scalar < sdot < smmla), so the flag
+     * acts on both architectures now; it used to be inert off x86. */
     return NULL;
 #else
-    return "not an x86 build: NEON/SDOT are chosen at compile time, there is no "
-           "runtime SIMD level to pick";
+    return "this build has no native int8 kernel (neither ARM dotprod nor x86), "
+           "so there is no runtime SIMD level to pick";
 #endif
 }
 
@@ -80,8 +82,10 @@ static int eff_caps(const char *requested, char *out, size_t cap) {
  * Order: what steers a measurement first, then the process, then the server,
  * then the diagnostics. */
 static const mynah_asr_flag g_flags[] = {
-    {"MYNAH_ASR_CAPS", MYNAH_ASR_FLAG_KERNEL, "auto (cpuid)",
-     "x86 SIMD level for the int8/int4 dot kernels: auto|scalar|avx2|vnni",
+    {"MYNAH_ASR_CAPS", MYNAH_ASR_FLAG_KERNEL, "auto (from the CPU)",
+     "SIMD level for the int8/int4 kernels, and the opt-out for every one of them:"
+     " x86 auto|scalar|avx2|vnni (vnni = either VPDPBUSD encoding),"
+     " ARM auto|scalar|sdot|smmla; a level above what the CPU has is downgraded with a note",
      inert_caps, eff_caps},
 
     {"MYNAH_ASR_BATCH_F32", MYNAH_ASR_FLAG_KERNEL, "auto (1 on Accelerate, 0 elsewhere)",

@@ -16,8 +16,11 @@
  * shrinks while it runs. Each stream's final text must equal a single-stream
  * mynah_asr_stream_feed run of the same clip, and mynah_asr_transcribe of it
  * wherever streaming and offline already agree at that quant. The qmat counters
- * say which kernel actually ran (ENGINEERING.md §5-6): the T > 16
- * dequant+sgemm fallback must never be reached.
+ * say which PATH ran and the S5-1 kernel counters say which MICRO-KERNEL did
+ * the arithmetic inside it (ENGINEERING.md §5-6): the T > 16 dequant+sgemm
+ * fallback must never be reached, and the kernel --dispatch-map names must be
+ * the one that actually executed, or an identical transcript would be proving
+ * nothing about a kernel that quietly fell back.
  *
  * Gate B, `--steptime` (dev signal, NOT a serving claim). Wall per step for
  * B = 1,2,4,8, single-stream vs batched, printed as a table.
@@ -466,6 +469,7 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
         char texts[MAX_B][TEXT_CAP];
 
         mynah_asr_qmat_counters_reset();
+        mynah_asr_qmat_kernel_counters_reset();
         mynah_asr_enc_relpos_counters_reset();
         const unsigned long long rows0 = mynah_asr_stream_batch_rows_stacked();
         long steps = 0;
@@ -517,6 +521,23 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
             printf("  [%s] B=%d: nothing went through the stacked path FAIL\n",
                    quant_name(quant), B);
             fail = 1;
+        }
+        /* S5-1: WHICH micro-kernel did the arithmetic. A transcript that is
+         * identical while the kernel silently fell back to the pre-S5-1 loop
+         * would be a green gate over a dead kernel (ENGINEERING.md §5). */
+        if (quant == MYNAH_ASR_QUANT_INT8) {
+            printf("  [%s] B=%d: int8 kernels", quant_name(quant), B);
+            for (int ki = 0; ki < MYNAH_ASR_QK__N; ki++) {
+                const unsigned long long c = mynah_asr_qmat_kernel_counter(ki);
+                if (c) printf("  %s %llu", mynah_asr_qmat_kernel_name(ki), c);
+            }
+            printf("  | resolved %s\n", mynah_asr_qmat_int8_kernel());
+            const int want = mynah_asr_qmat_kernel_resolved();
+            if (B > 1 && rows > 0 && mynah_asr_qmat_kernel_counter(want) == 0) {
+                printf("  [%s] B=%d: the resolved kernel %s never ran FAIL\n",
+                       quant_name(quant), B, mynah_asr_qmat_kernel_name(want));
+                fail = 1;
+            }
         }
     }
     mynah_asr_free(m);
