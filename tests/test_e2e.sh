@@ -39,11 +39,18 @@ elif [ "$NAME" = "parakeet-tdt_ctc-110m" ]; then
     Q_SUB="speech recognition test"
     SEG_TAIL="today"
     check tests/audio/test_en.wav auto "Hello, this is a speech recognition test. The weather is nice today."
-    out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i tests/audio/test_en.wav --decoder ctc 2>/dev/null)
-    case "$out" in
-        *"This is a speech recognition test. The weather is nice today."*)
-            echo "e2e decoder-ctc OK: $out" ;;
-        *) echo "e2e decoder-ctc FAIL: $out"; fail=1 ;;
+    # the community GGUF of the 110m ships without the CTC head: the CLI says so
+    # on stderr, and that is a skip, not a wrong transcript
+    err=$(./mynah-asr transcribe -m "$MODEL_DIR" -i tests/audio/test_en.wav --decoder ctc 2>&1 >/dev/null)
+    case "$err" in
+        *"no CTC head"*) echo "e2e decoder-ctc SKIP (this checkpoint has no CTC head)" ;;
+        *)
+            out=$(./mynah-asr transcribe -m "$MODEL_DIR" -i tests/audio/test_en.wav --decoder ctc 2>/dev/null)
+            case "$out" in
+                *"This is a speech recognition test. The weather is nice today."*)
+                    echo "e2e decoder-ctc OK: $out" ;;
+                *) echo "e2e decoder-ctc FAIL: $out"; fail=1 ;;
+            esac ;;
     esac
 elif [ "$ENGINE" = "parakeet-tdt" ]; then
     check tests/audio/test_it.wav auto "Ciao, questo è un test di riconoscimento vocale in italiano: il gatto dorme sul divano."
