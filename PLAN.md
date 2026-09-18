@@ -56,7 +56,7 @@ there; macOS is the development machine, nice to have, never the target.**
 - [~] S2-1 Prefork parent, core-major pinned workers, SCM_RIGHTS handoff, `--prefork-plan` (landed; Linux pinned run pending) → [`.work/server-prefork.md`](.work/server-prefork.md)
 - [~] S2-2 One scheduler thread per worker owns the model; slots; ingest threads; one path for WS and REST (landed and gated on the M1 dev host: identity at 4 streams and under `--prefork`, ubsan clean; TSan and the Linux cadence numbers pending) → [`.work/server-scheduler.md`](.work/server-scheduler.md)
 - [ ] S2-3 Admission ladder with per-reason statuses, timeouts, pings, lingering close, graceful shutdown → [`.work/server-admission.md`](.work/server-admission.md)
-- [ ] S2-4 Asynchronous bounded output writer; backpressure is cancel → [`.work/server-stream-out.md`](.work/server-stream-out.md)
+- [x] S2-4 Asynchronous bounded output writer; backpressure is cancel (module landed with a model-free self-test, TSan and leaks clean; the scheduler writes every frame through it) → [`.work/server-stream-out.md`](.work/server-stream-out.md)
 - [ ] S2-5 WebSocket protocol v2: control messages, `seq`/`lag_ms`, refusals before the upgrade → [`.work/ws-protocol-v2.md`](.work/ws-protocol-v2.md)
 - [ ] S2-6 Several models in one fleet: `--model name=dir:workers=:cpus=:cap=`, router by model, `/v1/models` from the table → [`.work/multi-model-serving.md`](.work/multi-model-serving.md)
 - [ ] S2-7 Byte-identity gate: N concurrent streams == the same streams alone, also under `--prefork` → [`.work/server-scheduler.md`](.work/server-scheduler.md)
