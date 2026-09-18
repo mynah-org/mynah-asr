@@ -41,6 +41,10 @@ def main():
         except OSError:
             continue
         for line in txt.splitlines():
+            # a reference the script itself declares as a generated artefact (produced by
+            # a documented make target, never tracked) is not a dependency on a local file
+            if "check_repo_integrity: generated" in line:
+                continue
             for ref in REF_RE.findall(line):
                 if "$" in ref or "*" in ref or "%" in ref:
                     continue
