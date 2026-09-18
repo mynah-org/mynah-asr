@@ -1171,29 +1171,52 @@ static int linger_step(pf_linger *L, double now) {
     return 1;
 }
 
-void mynah_asr_prefork_refuse_and_close(int fd, mynah_asr_prefork_refusal reason) {
-    if (fd < 0) return;
-    /* No globals are touched here: this is callable from any thread, which
-     * matters because server/main.c's shed path runs on an HTTP worker. It is
-     * bounded-blocking rather than non-blocking -- a worker thread can afford
-     * half a second on a connection it is refusing, and the router cannot,
-     * which is why the router uses refuse_park() below instead. */
-    pf_linger L;
-    linger_begin(&L, fd, reason, mono_seconds());
+/* Drives one lingering close to completion on the CALLING thread, bounded by
+ * PF_LINGER_MS. No globals are touched, so it is callable from any thread --
+ * which matters because server/main.c refuses on an HTTP worker. It is
+ * bounded-blocking rather than non-blocking: a worker thread can afford half a
+ * second on a connection it is refusing, and the router cannot, which is why
+ * the router uses refuse_park() below instead. */
+static void linger_run(pf_linger *L) {
     for (;;) {
         const double now = mono_seconds();
-        if (linger_step(&L, now)) return;
-        const double left_ms = (L.deadline - now) * 1000.0;
+        if (linger_step(L, now)) return;
+        const double left_ms = (L->deadline - now) * 1000.0;
         if (left_ms <= 0.0) break;
         struct pollfd pfd;
-        pfd.fd = L.fd;
-        pfd.events = linger_events(&L);
+        pfd.fd = L->fd;
+        pfd.events = linger_events(L);
         pfd.revents = 0;
         const int r = poll(&pfd, 1, (int)left_ms);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
     }
-    if (L.fd >= 0) close(L.fd);
+    if (L->fd >= 0) close(L->fd);
+}
+
+void mynah_asr_prefork_refuse_and_close(int fd, mynah_asr_prefork_refusal reason) {
+    if (fd < 0) return;
+    pf_linger L;
+    linger_begin(&L, fd, reason, mono_seconds());
+    linger_run(&L);
+}
+
+int mynah_asr_prefork_linger_close(int fd, const char *response, size_t len) {
+    if (fd < 0) return -1;
+    pf_linger L;
+    memset(&L, 0, sizeof(L));
+    L.fd = fd;
+    L.deadline = mono_seconds() + PF_LINGER_MS / 1000.0;
+    const int fits = response != NULL && len > 0 &&
+                     len <= (size_t)MYNAH_ASR_PREFORK_LINGER_MAX &&
+                     len < sizeof(L.msg);
+    if (fits) {
+        memcpy(L.msg, response, len);
+        L.msg_len = len;
+    }
+    set_nonblock(fd);
+    linger_run(&L);   /* with msg_len 0 this is shutdown -> drain -> close */
+    return fits ? 0 : -1;
 }
 
 int mynah_asr_prefork_service_cap_ms(void) { return g_service_cap_ms; }

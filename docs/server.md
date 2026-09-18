@@ -104,7 +104,29 @@ Ignored (with a note) on a model that already detects by itself.
 
 ### GET /v1/audio/stream — WebSocket streaming (protocol v2)
 
-Query: `?lang=auto&lookahead=3`.
+**Query parameters.** Every key is validated **before** the upgrade; an unknown
+key, or a value this server cannot honour, is an HTTP status naming the accepted
+set — never a stream that silently runs with a default the client did not ask
+for.
+
+| key | default | accepted | refusal |
+|---|---|---|---|
+| `model` | the served model | what `/v1/models` lists | `404 model_not_found` |
+| `lang` | `auto` | any tag in the model's prompt dictionary | `400 language_not_served` |
+| `lookahead` | model default | the model's presets (Nemotron: 0, 3, 6, 13) | `400 lookahead_not_available` |
+| `format` | `s16le` | `s16le`, `f32le` | `400 unsupported_format` |
+| `rate` | `16000` | `16000` | `400 unsupported_rate` |
+
+Anything else is `400 unknown_query_parameter` with the list above in the
+message.
+
+**`rate=` is not resampled, and that is a decision, not an omission.** The
+library's resampler (`mynah_asr_resample`) is a whole-buffer, stateless windowed
+sinc: it keeps no filter history between calls, so running it per WebSocket
+frame would inject a discontinuity at every frame boundary and change the
+transcript in a way no identity gate would catch. The REST path resamples
+because it has the whole file. Until a streaming resampler exists with its own
+parity gate, a stream at another rate is refused and the client resamples.
 
 **Client → server**
 
@@ -116,8 +138,19 @@ Query: `?lang=auto&lookahead=3`.
 | ping | answered with a pong |
 | close | finalize, emit `done`, close |
 
-An unknown text message is answered with an `error` frame and does **not** end
-the session. A binary frame larger than `--max-frame-bytes` does.
+An unknown control `type` is answered with an `error` frame carrying
+`unknown_control` and does **not** end the session; neither does a `reset`
+naming a language this model does not hold (`language_not_served`) — a typo must
+not cost a session. A binary frame larger than `--max-frame-bytes` does end it.
+`finalize` followed by more audio is simply the next utterance on the same
+socket: the stream is reset for you and `seq` keeps counting.
+
+**The server pings** every `--ping-ms` (default 20000). A pong is not required —
+`--idle-ms` is the rule and the ping is only there to keep middleboxes from
+dropping an idle socket. Note the consequence, since it is measured rather than
+assumed: idle is "no frame of ANY kind", and a pong is a frame, so a client that
+answers the pings is never idle. `--idle-ms` reclaims a client that has stopped
+answering altogether, which is the case it exists for.
 
 **Server → client** — every frame carries `seq` (per session, counting every
 frame), `audio_s` (audio consumed when it was produced) and `lag_ms` (wall time
@@ -142,16 +175,27 @@ a median's name. An `error` frame raised by the transport (a bad control
 message, an oversized frame) carries no `seq`: it is about the message the
 client just sent, not about the audio.
 
-**Error codes**: `idle_timeout` · `frame_too_large` · `peer_gone` ·
-`shutting_down` · `decode_failed` · `reset_failed` · `unknown_message` ·
-`unsupported_opcode` · `model_not_streaming`.
+**Error codes**: `idle_timeout` · `audio_limit` · `frame_too_large` ·
+`peer_gone` · `shutting_down` · `decode_failed` · `unknown_control` ·
+`language_not_served` · `unsupported_opcode` · `model_not_streaming`.
+`audio_limit` is announced and then **finalised**: the audio already accepted is
+still owed a transcript, so the cap flushes the tail, emits `done` and closes.
 
 **Refusals happen before the upgrade**, as HTTP statuses, so a client reads a
-status and not a transport error: `503` with `error.code`
-`server_at_capacity` and `Retry-After` when every slot of this worker is taken,
-`400` with `error.code` `model_not_streaming` on an offline-only model
-(Parakeet, Canary — they have no cache-aware streaming presets and never will,
-so there is no `Retry-After`).
+status and not a transport error: `503` with `error.code` `server_at_capacity`
+and `Retry-After` when every slot of this worker is taken, `400` with
+`model_not_streaming` on an offline-only model (Parakeet, Canary — they have no
+cache-aware streaming presets and never will, so there is no `Retry-After`), and
+the query refusals in the table above.
+
+Every refusal, on the WebSocket path and on the REST one, leaves through a
+**lingering close**: the response is written, the socket is half-closed, whatever
+the client still had in flight is drained, and only then is the descriptor
+closed. A `close()` with unread bytes in the receive queue makes the kernel send
+an RST, and the RST discards the response along with it — which is how a
+documented 400 reaches a client as `ECONNRESET`. One implementation serves both
+(`mynah_asr_prefork_linger_close`), so the worker refuses the way the router
+does.
 
 Reference client (Python stdlib): `tools/eval/ws_client.py`. Load harness:
 `tools/bench/stream_load.py`.
@@ -214,7 +258,9 @@ deployments get their own worker group (S2-6).
 |---|---|---|
 | `--cap C` | `--threads` | stream slots per worker; beyond it, `503 server_at_capacity` **before** the 101 |
 | `--ring-seconds S` | 30 | PCM buffered per slot; beyond it the ingest stops reading and TCP throttles the client |
-| `--idle-ms N` | 60000 | no audio for this long → the slot is cancelled with `idle_timeout` |
+| `--idle-ms N` | 60000 | no frame of any kind for this long → the slot is cancelled with `idle_timeout` |
+| `--ping-ms N` | 20000 | server-side WebSocket ping period; `0` never pings |
+| `--max-audio-seconds S` | 14400 | audio one stream may send; beyond it, `error audio_limit`, then finalize and close. `0` = no cap |
 | `--max-frame-bytes N` | 1048576 | a larger WebSocket frame ends the stream with `frame_too_large` |
 | `--max-pending N` | `2 × --threads` | offline requests queued for the scheduler; beyond it, `503 server_at_capacity` |
 
@@ -266,6 +312,14 @@ knob: there the budget is only bookkeeping, reported in `/v1/health`.
   whose text is byte-identical to `mynah-asr transcribe` of the same clip, a
   stalled reader taking only its own slot down, and the same identity under
   `--prefork 2 --cap 2`. Needs a streaming model, so it is skipped without one.
+- `make test-server-protocol` — protocol v2 and the per-worker admission ladder:
+  three utterances on ONE socket separated by `finalize`/`reset`, each
+  byte-identical to the CLI with `seq` continuing; an unknown control message and
+  an unserved `reset` language survived; the pre-upgrade `400` and `503` read as
+  HTTP with their bodies and `Retry-After`; an idle client cancelled with
+  `idle_timeout` and a stream cut off at `--max-audio-seconds` with
+  `audio_limit`; the server's own pings observed; `SIGTERM` on a live stream
+  answered with `shutting_down`, exit 0, no survivors. Model-gated.
 
 ## Operational notes
 

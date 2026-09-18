@@ -136,6 +136,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_protocol.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
 	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
 
@@ -249,6 +252,15 @@ test-server-stream: mynah-asr-server mynah-asr
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# WebSocket protocol v2 and the per-worker admission ladder (S2-3 / S2-5):
+# three utterances on one socket byte-identical to the CLI, unknown control and
+# unserved language survived, the pre-upgrade 400/503, idle, pings, SIGTERM.
+# Needs a streaming model, so it is gated like test-server-stream.
+test-server-protocol: mynah-asr-server mynah-asr
+	@sh tests/test_server_protocol.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 # Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
 # test-server it asserts nothing about the transcript, so it runs with ANY
 # converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
@@ -360,4 +372,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot
