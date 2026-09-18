@@ -1,6 +1,6 @@
 # Campaign — first build and baseline on the 32-core Neoverse-V2 box
 
-Status: IN PROGRESS (started 2026-09-18)
+Status: IN PROGRESS (started 2026-09-18; paused — box shared with mynah-tts soaks, resume only on the owner's go)
 
 Task: S0-1
 Question: does the tree build and pass its gates on the production-class ARM
@@ -42,7 +42,32 @@ Evidence (2026-09-18, tree 5f0f802 via `git archive`, gcc 15.2, `-O3 -march=nati
   argument for S1-6 (BLAS leaves the worker) measured so far. int8 at four
   threads is 2.6x faster than f32 at the same pin; the per-core speed is well
   below the M1 (f32 RTF 0.055 there), as expected for a server core.
-Conclusion: build and gates hold on Linux ARM; the model is in place; the
-thread matrix and the server baseline are running as phase 2 (see
-`baseline-streaming-concurrency.md` for the S0-3 table when it lands).
-Next action: S0-3.
+- **DIAGNOSTIC, NOT QUALIFYING** — offline `bench` on `samples/en/fleurs_long.wav`
+  (94.6 s), taken while a mynah-tts soak was running on the same host (loadavg
+  20–28 at start; the script printed it and did not refuse, which is the
+  contradiction rule 7 forbids). Kept only as an order of magnitude:
+
+  | T (pinned) | f32 RTF | int8 RTF |
+  |---|---|---|
+  | 1 | 0.238 | 0.226 |
+  | 2 | — | 0.119 |
+  | 4 | 0.127 | 0.066 |
+  | 8 | — | 0.038 |
+  | 16 | 0.033 | 0.025 |
+  | 32 | 0.018 | 0.018 |
+  | unpinned default | 0.018 | 0.020 |
+
+  Two readings that survive the contamination: on long offline audio (big
+  GEMMs) OpenBLAS at 32 threads is fine and int8 barely helps at high T, so
+  the 4x pathology of the 4.3 s clip is specific to short/streaming shapes,
+  exactly the shapes a streaming server runs; and int8 scales near-linearly to
+  8 threads then flattens, consistent with narrow workers. Peak RAM 2.8 GB f32
+  / 1.2 GB int8.
+- Process lesson recorded: both phases were started with another load on the
+  box. Every box script now begins with a `loadavg` gate that refuses above 2.0
+  (as the sibling `bench-suite` does), and nothing runs on a shared box without
+  the owner's explicit go.
+Conclusion: build and gates hold on Linux ARM; the model is in place. The one
+measurement still owed is the pinned single-stream step cost at Q=4 int8,
+T=1..4, on an idle box.
+Next action: paused. Implementation starts (S1-1).

@@ -1,6 +1,6 @@
 # S0 — baseline: the current server under N real-time streams
 
-Status: OPEN
+Status: S0-3 DROPPED 2026-09-18; S0-4 OPEN
 
 Task: S0-3
 Question: what does the v1 server (blocking pool, one worker per stream, BLAS
@@ -49,6 +49,13 @@ backlog max / STREAM_RTF for each N and thread setting, the `a + b·B` fit with
 R², the allocation count, and a one-paragraph reading of where the time goes.
 Only then does S1 start.
 
-Evidence: (none yet)
-Conclusion: (pending)
-Next action: S0-1 (box build) then S0-2 (tool).
+Evidence: none for S0-3; the run was started with another load on the box
+(loadavg 28 at start) and killed before the server section ran.
+Conclusion (decision by the owner, 2026-09-18): measuring the v1 server under
+N streams is not worth box time. Its ceiling is the thread count by
+construction and nothing it does survives into v2; the sibling repos already
+supply the design evidence. What v2 needs from a baseline is model-level: the
+pinned single-stream step cost at Q=4 (S0-1, two minutes on an idle box) and
+the allocation count per chunk (S0-4, any Linux). `tools/bench/stream_load.py`
+stays: it is the S4 harness seed and the byte-identity gate for S2-7.
+Next action: none here; S1-1 starts.
