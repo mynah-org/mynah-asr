@@ -85,8 +85,15 @@ def main() -> None:
             return False
         if opcode == 0x1:
             msg = json.loads(payload)
-            if msg.get("done"):
-                print(f"\n[done, language={msg.get('language')}]")
+            kind = msg.get("type")          # v2 frames carry a type; v1 frames do not
+            if msg.get("done") or kind == "done":
+                print(f"\n[done, language={msg.get('language') or msg.get('lang')}]")
+                return False
+            if kind == "eou":
+                print(f"\n[end of utterance at {msg.get('t')} s]")
+                return True
+            if kind == "error":
+                print(f"\n[error {msg.get('code')}: {msg.get('message')}]")
                 return False
             print(msg.get("text", ""), end="", flush=True)
         return True

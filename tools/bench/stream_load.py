@@ -133,10 +133,23 @@ def run_utterance(a, clip: str, pcm: bytes) -> dict:
                     break
                 if op == 0x1:
                     msg = json.loads(payload)
-                    if msg.get("done"):
+                    kind = msg.get("type")
+                    # v1 frames: {"text","language","audio_seconds"} and {"done":true};
+                    # v2 frames: {"type":"delta"|"eou"|"done"|"error", "seq","audio_s","lag_ms",...}
+                    if msg.get("done") or kind == "done":
                         done_at.append(now)
-                        out["lang"] = msg.get("language")
+                        out["lang"] = msg.get("language") or msg.get("lang")
                         break
+                    if kind == "error":
+                        out["error"] = out["error"] or f"server error: {msg.get('code')} {msg.get('message')}"
+                        break
+                    if kind == "eou":
+                        out["empty_deltas"] += 1
+                        continue
+                    if kind == "delta" and "audio_seconds" not in msg:
+                        msg["audio_seconds"] = msg.get("audio_s")
+                    if "lag_ms" in msg:
+                        out.setdefault("server_lags_ms", []).append(float(msg["lag_ms"]))
                     events.append((now, msg))
         except Exception as e:  # noqa: BLE001 — recorded, not raised, in a client thread
             if not stop.is_set():
@@ -268,6 +281,7 @@ def main() -> int:
     refused = [r for r in errors if r["error"].startswith("refused")]
     ttfp = [r["ttfp_ms"] for r in ok if r["ttfp_ms"] is not None]
     lag_pooled = [x for r in ok for x in r["lags_ms"]]
+    srv_lag = [x for r in ok for x in r.get("server_lags_ms", [])]
     lag_utt_p95 = [pct(r["lags_ms"], 95) for r in ok if len(r["lags_ms"]) >= 2]
     fin = [r["fin_ms"] for r in ok if r["fin_ms"] is not None]
     max_late = max([r["max_late_ms"] for r in results], default=0.0)
@@ -304,6 +318,8 @@ def main() -> int:
     print(f"  TTFP            p50 / p95 ms : {fmt_pct(ttfp)}")
     print(f"  emission lag    p50 / p95 ms : {fmt_pct(lag_pooled)}   [pooled over deltas]")
     print(f"  emission lag    per-utt p95  : {fmt_pct(lag_utt_p95)}   [p50/p95 of per-utterance p95]")
+    if srv_lag:
+        print(f"  server lag_ms   p50 / p95 ms : {fmt_pct(srv_lag)}   [server-side, chunk arrival -> frame written]")
     print(f"  finalization    p50 / p95 ms : {fmt_pct(fin)}")
     if identity_fail:
         print(f"  TEXT IDENTITY FAIL: {len(identity_fail)} clip(s) produced different texts across streams")
@@ -326,6 +342,7 @@ def main() -> int:
                         "ttfp_ms": {"p50": pct(ttfp, 50), "p95": pct(ttfp, 95)} if len(ttfp) >= 2 else None,
                         "lag_ms": {"p50": pct(lag_pooled, 50), "p95": pct(lag_pooled, 95)} if len(lag_pooled) >= 2 else None,
                         "fin_ms": {"p50": pct(fin, 50), "p95": pct(fin, 95)} if len(fin) >= 2 else None,
+                        "server_lag_ms": {"p50": pct(srv_lag, 50), "p95": pct(srv_lag, 95)} if len(srv_lag) >= 2 else None,
                         "identity_fail": identity_fail, "reference_fail": ref_fail, "verdict": verdict},
             "utterances": results,
         }
