@@ -1,8 +1,9 @@
 # S2-2 — one scheduler per worker, slots, the sink
 
-Status: IMPLEMENTED (spec 2026-09-18; gate passed on the M1 dev host, Linux numbers pending)
+Status: IMPLEMENTED (spec 2026-09-18; S2-2b landed the batched step 2026-09-18;
+gates passed on the M1 dev host, Linux numbers pending)
 
-Task: S2-2, S2-7
+Task: S2-2, S2-2b, S2-7
 Question: replace "one blocking thread per connection" with one scheduler
 thread that owns the model and drives B stream slots, with ingest threads that
 never touch the model, so that admission, fairness, cancellation and lag
@@ -31,6 +32,12 @@ land.
   timestamps exist only on the offline API, not on streams.
 
 ## Design (v2.0: per-slot feed, no cross-stream batching yet)
+
+**Superseded in part by S2-2b** (see the Evidence section of that name): step
+(4) below fed each ready slot with its own `mynah_asr_stream_feed`; it now
+stages the ready set and makes ONE `mynah_asr_stream_step_batch` call. The
+order of the step, the fairness rule, the lag accounting and the finalize path
+are unchanged, which is why the rest of this section still reads true.
 
 Threads in a worker: `mynah-recv`/`mynah-accept` (main: takes descriptors, ring
 of fds) · `mynah-http` × `--threads` (parse; for WebSocket they become the
@@ -278,6 +285,206 @@ cancel) is covered by `tests/test_stream_out.c` at the module level; what this
 phase shows end to end is that a silent client is reclaimed on a bounded timer
 and that the streams beside it do not move.
 
+## Evidence — S2-2b (the step is one batched call), 2026-09-18, macOS arm64
+
+Implementation on top of `5a6d612`, committed as `e605278`. Same host as the
+S2-2 evidence above: Apple M1 (arm64, 8 cpus), macOS 25.5, Accelerate, `make`
+default flags, `nemotron-3.5-asr-streaming-0.6b --quant int8`, binary
+`mynah-asr-server` sha256 `a27160ab1cb7...`, `--threads 4 --batch 4`.
+**Development-machine numbers: signals, not a serving point** (ENGINEERING §8).
+
+### What changed
+
+`sched_feed` is gone. The step now has three parts instead of one:
+
+- `sched_stage(slot, avail, B)` takes exactly `need_samples` from the slot's ring
+  (round-robin start, one chunk per ready slot, unchanged) and files the chunk as
+  row `B` of the step's batch: `streams[]`, `samples[]` (the slot's own `take`
+  scratch), `n_samples[]`, `userdata[]` = that slot's `emit_ctx`. Nothing is fed.
+- `sched_step_batch(B)` makes ONE `mynah_asr_stream_step_batch` call for the whole
+  set, under `sched_assert_thread`. A `-1` cancels every session in that set with
+  `decode_failed`, which is what the per-slot feed did for its one slot.
+- `sched_feed_tail` + `sched_finalize` keep the per-slot path for a finalizing
+  stream: a last piece shorter than a chunk through `stream_feed`, the tail
+  through `stream_finish` (the batched call takes whole chunks only and does not
+  accept `is_last`). They run AFTER the batch, so a slot's own deltas keep their
+  order.
+
+Cancellation still runs before any other policy, resets still run before the
+ready set is built, lag is still charged from the slot's own arrival record (the
+callback of each row gets that slot's `emit_ctx`), and every frame still leaves
+through that slot's `stream_out`. `mynah_asr_stream_batch_reserve(model, cap)` is
+called once in `mynah_asr_sched_start`, before the scheduler thread exists, so
+the step path allocates nothing; the per-step arrays are carved with the slot
+table. A ready set larger than `MYNAH_ASR_STREAM_BATCH_MAX` becomes several calls
+in the same step (the constant moved to the public header rather than being
+copied here).
+
+### Gate 1 — the same gate, visibly better lag
+
+`tests/test_server_stream.sh` unchanged in its first three phases, both commits
+built clean and run back to back on a QUIET host (loadavg ~2.5; an earlier pair
+taken while a sibling process held a core is discarded, and that is why these
+numbers differ from the ones in the S2-2 section above).
+
+| phase | before `5a6d612` (per-slot feed) | after `e605278` (batched step) |
+|---|---|---|
+| 4 streams × 2, `--cap 4`: TTFP p50/p95 | 1367 / 1707 ms | **1026 / 1074 ms** |
+| 4 streams × 2, `--cap 4`: emission lag p50/p95 | 1219 / **2193** ms | 145 / **253** ms |
+| 4 streams: envelope | NOT STREAMABLE | **GOOD** |
+| stalled reader beside 2 streams: lag p50/p95 | 252 / 444 ms | 112 / 194 ms |
+| `--prefork 2 --cap 2`, 2 × 2: lag p50/p95 | 143 / 162 ms | 137 / 159 ms |
+
+Identity, isolation and the prefork shutdown pass in both: a slow server is still
+a correct one, which is why identity is the gate and cadence is the report.
+
+### Gate 2 — the new "batched-identity" phase
+
+Eight streams over five clips on ONE `--cap 8` process, `--repeat 1`, every text
+byte-identical to the CLI's own streaming answer, 8/8 utterances, 0 errors. The
+reference is `mynah-asr stream`, not `transcribe`: `test_es.wav`'s int8 streaming
+transcript already differs from its offline one ("a las muertes" vs "a las
+vuelve"), a pre-existing numerical difference recorded in `.work/stream-api-v2.md`
+and nothing to do with batching; for the other four clips the two references are
+the same bytes.
+
+The phase then reads `/v1/health` and REQUIRES `batched_steps_total > 0` and
+`rows_stacked_total > 0`, because an identity gate alone cannot tell the batched
+path from the fallback — both are correct. On the quiet host:
+
+```
+    TTFP p50/p95 963/1323 ms   emission lag p50/p95 155/268 ms   envelope MARGINAL
+    batched_steps_total 63   rows_stacked_total 256   ready_mean 1.57   step_wall_ms mean 108.9
+      B=1  steps 35  wall mean 119.3 ms
+      B=2  steps 20  wall mean  87.0 ms
+      B=3  steps  8  wall mean 117.8 ms
+```
+
+### Gate 3 — WAVE, 8 streams × 2 utterances, `--cap 8`, one process
+
+`python3 tools/bench/stream_load.py --mode wave --streams 8 --repeat 2 --clips
+tests/audio/test_{it,en,de,fr,es}.wav --port 8901` against
+`mynah-asr-server --threads 4 --batch 4 --quant int8 --cap 8`.
+**macOS dev host, not a serving number** (WAVE screens, only a SOAK promotes).
+
+| | before `5a6d612` | after `e605278` |
+|---|---|---|
+| utterances | 16/16 ok, 0 errors | 16/16 ok, 0 errors |
+| TTFP p50/p95 | 1372 / 2053 ms | **944 / 1394 ms** |
+| emission lag p50/p95 (client) | 1104 / **1952** ms | 143 / **258** ms |
+| server `lag_ms` p50/p95 | 1104 / 1952 ms | 142 / 258 ms |
+| finalization lag p95 | 2371 ms | 398 ms |
+| backlog max p95 | 1.664 s | 0.284 s |
+| wall | 24.5 s | 19.0 s |
+| verdict | **NOT STREAMABLE** (4 of 4 limits failed) | **MARGINAL** (only TTFP p95 1394 vs 1160) |
+
+`/v1/health` after the run:
+
+```
+batched_steps_total 134   rows_stacked_total 480   ready_sum 201   ready_mean 1.50
+reserved_slots 8          step_wall_ms sum 14793.7 count 134 mean 110.4
+by_b  B=1: 81 steps, 118.7 ms mean | B=2: 39 steps, 88.5 ms | B=3: 14 steps, 123.2 ms
+```
+
+480 stacked rows out of the ~868 encoder rows the run produced (a chunk is q = 4
+rows at preset [56,3]): 39 × 2 × 4 + 14 × 3 × 4 = 480, i.e. **55 % of the work
+went through the stacked path** although the mean ready set was only 1.5.
+
+### Fitting `a` and `b`
+
+Two fits, and they do not measure the same thing.
+
+**In situ, from `by_b`** (the WAVE run plus the gate-2 phase, weighted): B = 2 →
+88.0 ms over 59 steps, B = 3 → 121.3 ms over 22 steps, so **a ≈ 21 ms, b ≈ 33 ms**
+and `B_max = (0.7·320 − a)/b ≈ 6`. B = 1 is deliberately excluded: it is the
+library's single path, whose small-`T` int8 kernel is serial, so it costs MORE
+(118.7 ms) than a batched B = 2 (88.0 ms) and a line through it has a negative
+slope. This fit is weak and says so: B is not an independent variable here (the
+scheduler batches whatever happens to be ready), and only 22 steps reached B = 3.
+
+**Controlled, same host and binary**, `tests/test_stream_batch <model> --steptime`
+(B is fixed, 5 clips cycled):
+
+| B | single ms | batched ms | ratio | ms per stream |
+|---|---|---|---|---|
+| 1 | 109.86 | 106.40 | 0.97 | 106.40 |
+| 2 | 192.85 | **84.20** | 0.44 | 42.10 |
+| 4 | 342.87 | **128.29** | 0.37 | 32.07 |
+| 8 | 689.04 | **221.05** | 0.32 | 27.63 |
+
+Least squares over B ∈ [2,8]: **a ≈ 37.8 ms, b ≈ 22.9 ms**, so `B_max ≈ 8` with
+ρ = 0.7 and P = 320 ms. That reproduces S1-4's own fit (a ≈ 37, b ≈ 23.7) on this
+host, which is the point of quoting it: the server's step is the library's step
+plus the server's own per-delta work, and the difference between the two fits
+(b 33 vs 23 ms) is charged to what the server does INSIDE the call — the per-delta
+cJSON build and enqueue run in the result callback, once per stream per step.
+That is the allocation exception S2-2 already declared, and it is now measured
+rather than suspected.
+
+### Why the win is so large when the mean ready set is only 1.5
+
+Because B is not a setting, it is a symptom. A worker that keeps up sees its
+slots become ready one at a time (clients send 100 ms frames, chunks are 320 ms,
+arrivals are staggered) and steps at B = 1. A worker that falls behind has
+several slots ready at once and steps at B = 2, 3, …, which is exactly when the
+stacked pass is 2–3× cheaper per stream. The batching therefore acts as a brake
+on the backlog: it is strongest where the old code compounded. Before, 8 streams
+drove the worker into a backlog it never recovered from (backlog max 1.66 s, lag
+p95 1.95 s, and the run needed 24.5 s of wall to serve what it would have served
+in ~19); after, the same run stays inside one chunk period.
+
+### What ran, not what was configured
+
+Every measurement above comes from a clean committed tree, binary
+sha256 `a27160ab1cb7…` (`make clean && make` reproduces the same hash), with the
+`[FLAGS]` / `[EFFECTIVE-CONFIG]` / `[SERVER-CONFIG]` / `[TOPOLOGY]` banner in the
+run's own log: `build=v0.9.1-48-ge605278 blas=accelerate simd=neon+dotprod`,
+`quant=int8 lookahead_default=3 chunk_ms=320 cap=8 http_threads=4 pool_threads=8`.
+
+### The other gates
+
+```
+sh tests/test_server_stream.sh <nemotron> 8833        -> 0 (4 phases, batched-identity included)
+sh tests/test_server_protocol.sh <nemotron> 8323      -> 0
+sh tests/test_server_metrics.sh <110m-gguf> 8327      -> 0
+sh tests/test_server_concurrency.sh <110m-gguf> 8331  -> 0
+make test (PARAKEET110_DIR=<110m-gguf>)               -> 0 (21 skips, all model/uv-gated)
+make check                                            -> 0 (plan, repo integrity, flag registry)
+```
+
+`make test` includes `make test-stream-batch-allocs` (0 allocations per batched
+step) and `test-stream-allocs` (0 per chunk): the step path is still
+allocation-free with the batch scratch reserved at start-up.
+
+UBSAN: `make clean`, then an `-fsanitize=undefined -O2` build of the CLI and the
+server (Makefile `ubsan` flags, no `-ffast-math`), all four phases of
+`tests/test_server_stream.sh` green with **0 `runtime error` lines**, collected
+with `UBSAN_OPTIONS=log_path=…` because the test deletes the directory it
+redirects each server's stderr into — a diagnostic printed there would have gone
+with it. Rebuilt clean afterwards (`make clean && make` returns the same binary
+hash).
+
+That run is also the cleanest evidence for the paragraph above: a sanitized
+server is roughly three times slower per step, and its ready set rose from 1.6 to
+**3.3** on the same 8-stream phase (17 of its 30 steps at B = 4), with 388 rows
+stacked. The scheduler batches more exactly when a step costs more.
+
+### What S2-2b does NOT answer
+
+- **No Linux number.** `a`, `b`, and therefore the per-worker cap, are still S0/S4
+  work on the Axion. Nothing above may be used to size a deployment.
+- **The ready set is small by construction on a healthy worker** (mean 1.5 at 8
+  streams). Coalescing — waiting a few milliseconds at the top of a step for more
+  slots to become ready — would raise B and the stacked share, at the cost of
+  adding latency on purpose. NOT done here (it changes the cadence policy, which
+  is its own decision); recorded as a candidate for S2/S5.
+- The in-situ `by_b` fit is too weak to size anything on its own; the controlled
+  step table is the one to quote until a run holds a fixed B for long enough.
+- `rows_stacked_total` is 0 on an f32 build with a BLAS that is not row-stable
+  (OpenBLAS today): the counters make that visible, but the Linux side of it is
+  S1-8.
+- TSan was not run in this pass either (S2-2 gate item 6 is still open).
+
 ## Conclusion
 
 S2-2 is implemented and its gate passes, with the caveats stated: the byte
@@ -286,6 +493,13 @@ refuses before the upgrade, and one thread owns the model with the invariant
 asserted rather than commented. Gate items 1, 2, 3, 5 pass; item 4's "a stopped
 reader is cancelled within the send timeout" is served by the idle cap here and
 is recorded as such, not as the send timeout; item 6's TSan pass was not run.
+
+S2-2b closes the cadence half of it on this host. The scheduler's step is one
+batched library call over the ready set; the transcripts did not move (the gate
+that proves it now runs at 8 streams over 5 clips as well as at 4), the worker
+holds 4 streams inside one chunk period where it used to run a 2.2 s backlog, and
+the process says which path it took rather than being believed. What is still
+missing is a Linux number and a TSan pass, not a mechanism.
 
 ## Unknowns
 
@@ -308,6 +522,8 @@ is recorded as such, not as the send timeout; item 6's TSan pass was not run.
 
 ## Next action
 
-S2-5 proper (drop the v1 frame fields, `t0` on deltas, the finalize/reset
-protocol test), S2-3's remaining rungs (server-side ping, `--max-audio-seconds`),
-and S1-4's batched stream step, for which this scheduler is the place to land.
+S2-5 proper (drop the v1 frame fields, `t0` on deltas), S2-3's remaining rungs,
+and the two things S2-2b measured rather than fixed: the per-delta cJSON build
+inside the step (it is what makes the server's per-stream slope larger than the
+library's) and the question of whether a worker should wait a few milliseconds
+for a larger ready set. The Linux `a`/`b` and the TSan pass stay with S0/S4.
