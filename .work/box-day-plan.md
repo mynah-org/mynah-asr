@@ -58,6 +58,17 @@ make test-stream-allocs MODEL_DIR=models/nemotron-3.5-asr-streaming-0.6b   # S0-
   there too, the batched f32 default turns on for Linux; if it is not, it stays
   off and the note records the exact shapes that moved. int8 is exact either way
   and is the production path regardless.
+- **S1-6a, the A/B that owns the Linux default.** `src/sgemm.c` is complete,
+  deterministic across thread counts and gated, but it has never been compared
+  with OpenBLAS on Linux, so the Linux default is still `BLAS=openblas`. Build
+  both (`make BLAS=openblas` and `make BLAS=none`, each proving its provider with
+  `./mynah-asr --dispatch-map`), then run the same WAVE and the same
+  `tests/test_server_stream.sh` on each. On the M1 Accelerate beat `own` by
+  enough to break four real-time streams; if OpenBLAS beats `own` by anything
+  like that on Neoverse, ownership costs capacity and the answer is to keep
+  OpenBLAS until the kernels close the gap. If they are close, flip the default
+  in the Makefile (the comment there says exactly where) and OpenBLAS leaves the
+  worker for good.
 - **S1-6a, the 2T-threads hazard.** Inside a prefork worker pinned to T cpus the
   pool builds T threads and OpenBLAS builds T more. Measure, do not guess:
   `OPENBLAS_NUM_THREADS=1` against the default, same topology, same bank, and

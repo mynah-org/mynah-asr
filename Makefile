@@ -21,10 +21,23 @@ LDFLAGS ?=
 CFLAGS += -fPIC
 
 UNAME_S := $(shell uname -s)
+# The f32 GEMM provider. `own` (BLAS=none) is the OWNERSHIP answer -- one thread
+# pool in the address space, a result that does not depend on the thread count,
+# nothing to set through the environment -- and it is complete, gated and
+# deterministic (tests/test_sgemm, S1-6).
+#
+# It is NOT yet the Linux default, and the reason is a measurement that does not
+# exist: nobody has run `own` against OpenBLAS on Linux ARM or x86. The only
+# comparison taken anywhere is on an Apple M1, where Accelerate wins by enough
+# that four real-time streams stop being streamable under `own` -- an AMX-versus-
+# portable-NEON result that says nothing about Neoverse or Zen, but does say that
+# the gap can be large enough to matter. ENGINEERING.md §12: a production default
+# changes by explicit decision, and the decision needs the A/B in
+# `.work/box-day-plan.md` step 4 (S1-6a). Flip the line below the moment it is run.
 ifeq ($(UNAME_S),Darwin)
   BLAS ?= accelerate
 else
-  BLAS ?= none
+  BLAS ?= openblas
 endif
 
 # Accelerate the FRAMEWORK is linked on every macOS build: Metal needs it and
