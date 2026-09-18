@@ -160,8 +160,20 @@ int  mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                        mynah_asr_result_cb cb, void *userdata);
 int  mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *userdata);
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
+int    mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang);   /* new utterance, same object */
+size_t mynah_asr_stream_need_samples(const mynah_asr_stream *s);        /* samples until the next chunk */
+double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s);
 void mynah_asr_stream_close(mynah_asr_stream *s);
 ```
+- **Pooling**: `reset` takes the stream back to what `open` returned without
+  freeing or allocating anything (caches, decoder state, VAD state, emitted
+  text); `lang = NULL` keeps the prompt, the lookahead cannot change. A server
+  keeps one stream per slot and resets it between sessions. Gate: reset+feed is
+  byte-identical to close+open+feed (`tests/test_streaming.c`).
+- **Pacing**: `need_samples` is how much audio completes the next encoder chunk
+  (first chunk `1 + 8·lookahead` mel frames, then `8·(lookahead+1)`); a scheduler
+  that feeds exactly this much per step gives every stream one chunk per step.
+  After warm-up a chunk allocates nothing (`make test-stream-allocs`).
 - The callback receives `mynah_asr_result`: `text` = text **delta** (final,
   `is_final = true` always with Nemotron greedy), `t1` = seconds of audio consumed,
   `lang` = detected language (or NULL).
