@@ -69,6 +69,20 @@ jobs:
         run: |
           MYNAH_ASR_CAPS=scalar tests/test_qmat
           MYNAH_ASR_CAPS=avx2   tests/test_qmat   # downgrades with a note if unsupported
+          MYNAH_ASR_CAPS=vnni   tests/test_qmat   # EVEX or VEX VPDPBUSD, whichever this runner has
+
+      # S5-1: the ARM ladder is scalar < sdot < smmla. `sdot` takes SMMLA out of
+      # the run without a rebuild, which is what makes the two arms comparable.
+      # The identity gate prints the kernels it exercised and the ones it
+      # skipped, so this log is the evidence that the i8mm path really ran —
+      # the macOS dev box has dotprod but no FEAT_I8MM and can only compile it.
+      - name: Kernel self-test — explicit SIMD levels (ARM)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          MYNAH_ASR_CAPS=scalar tests/test_qmat
+          MYNAH_ASR_CAPS=sdot   tests/test_qmat
+          MYNAH_ASR_CAPS=smmla  tests/test_qmat   # downgrades with a note if unsupported
+          ./mynah-asr --dispatch-map
 
       - name: Restore converted model (cache warmed by prepare-model)
         uses: ./.github/actions/prepare-model

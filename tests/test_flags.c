@@ -93,11 +93,15 @@ int main(void) {
     }
 
     /* An inert flag must be named IGNORED with its reason. Pick one that is
-     * inert on THIS build: MYNAH_ASR_CAPS off x86, OPENBLAS_NUM_THREADS against
-     * Accelerate, MYNAH_ASR_METAL_PROF without Metal, MYNAH_ASR_CUDA_TF32
-     * without CUDA. At least one of those is always inert somewhere, and the
-     * test only asserts about the ones that really are. */
-    setenv("MYNAH_ASR_CAPS", "vnni", 1);
+     * inert on THIS build: OPENBLAS_NUM_THREADS against Accelerate,
+     * MYNAH_ASR_METAL_PROF without Metal, MYNAH_ASR_CUDA_TF32 without CUDA. At
+     * least one of those is always inert somewhere, and the test only asserts
+     * about the ones that really are. MYNAH_ASR_CAPS is in the list as a
+     * control that must NOT be called ignored: since S5-1 it acts on ARM too
+     * (the scalar<sdot<smmla ladder), so it is set to `auto` — a level name
+     * only valid on one architecture would print a downgrade warning into the
+     * test log and prove nothing. */
+    setenv("MYNAH_ASR_CAPS", "auto", 1);
     setenv("OPENBLAS_NUM_THREADS", "3", 1);
     setenv("MYNAH_ASR_METAL_PROF", "1", 1);
     setenv("MYNAH_ASR_CUDA_TF32", "1", 1);

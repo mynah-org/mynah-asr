@@ -99,6 +99,48 @@ enum {
 unsigned long long mynah_asr_qmat_counter(int which);
 void mynah_asr_qmat_counters_reset(void);
 
+/* ------------------------------------------------ which int8 MICRO-KERNEL ran
+ * MYNAH_ASR_QC_* says which PATH was taken; this says which instruction set
+ * actually did the multiply-accumulate inside it (S5-1). The two are
+ * independent: the weight-stationary path can resolve to SMMLA, to SDOT, to
+ * VPDPBUSD in either encoding, or to the plain AVX2 pair, and a report that
+ * cannot tell them apart is exactly the unearned ISA attribution
+ * ENGINEERING.md §5 exists to prevent.
+ *
+ * Counted once per weight-row BLOCK (not per row: a block is ~32 rows of real
+ * arithmetic, so one relaxed atomic per block is free), plus once per serial
+ * small-T call. Process-wide, like the path counters. */
+enum {
+    MYNAH_ASR_QK_SCALAR = 0,     /* no native int8 kernel: the f32xint8 loop   */
+    MYNAH_ASR_QK_AVX2,           /* maddubs+madd sign trick                    */
+    MYNAH_ASR_QK_AVXVNNI,        /* VEX VPDPBUSD (_mm256_dpbusd_avx_epi32)     */
+    MYNAH_ASR_QK_AVX512VNNI,     /* EVEX VPDPBUSD (_mm512_dpbusd_epi32)        */
+    MYNAH_ASR_QK_NEON_SDOT,      /* SDOT                                       */
+    MYNAH_ASR_QK_NEON_SMMLA,     /* SMMLA (i8mm), the 2x2 tile                 */
+    MYNAH_ASR_QK_DOT_PER_ROW,    /* the pre-S5-1 per-row dot loop              */
+    MYNAH_ASR_QK__N
+};
+unsigned long long mynah_asr_qmat_kernel_counter(int which);
+void        mynah_asr_qmat_kernel_counters_reset(void);
+const char *mynah_asr_qmat_kernel_name(int which);   /* "neon-smmla", ...      */
+
+/* Is this micro-kernel usable in THIS binary on THIS host?
+ *   1  compiled and the CPU has it
+ *   0  compiled, but the CPU does not have it (or the caps level forbids it)
+ *  -1  not compiled into this build (wrong architecture, or too old a compiler)
+ * `reason` (optional, may be NULL) receives a short static sentence for 0/-1 so
+ * a test log can say WHY it skipped a kernel instead of passing silently. */
+int mynah_asr_qmat_kernel_available(int which, const char **reason);
+
+/* TEST HOOK, not a runtime knob (qwen-tts `force()` pattern). Pins the int8
+ * weight-stationary leaf for the whole process so one binary can run the same
+ * comparison through every compiled kernel and require the results to be
+ * bit-identical. `which` is a MYNAH_ASR_QK_* id, or -1 to go back to auto.
+ * Returns the id now in force, or -1 when that kernel is not available here
+ * (the pin is then left untouched). Set it from ONE thread, before the call. */
+int mynah_asr_qmat_kernel_force(int which);
+int mynah_asr_qmat_kernel_resolved(void);   /* what auto/force resolves to now */
+
 /* FFN: out = SiLU(x @ W1^T) @ W2^T. scratch >= T*w1->n floats.
  * When both are F32 it uses the backend's fused path (Metal: a single GPU sync). */
 void mynah_asr_qmat_ffn(const mynah_asr_qmat *w1, const mynah_asr_qmat *w2, const float *x,
@@ -113,24 +155,40 @@ void mynah_asr_qmat_qkv(const mynah_asr_qmat *wq, const mynah_asr_qmat *wk, cons
  * per-call dequant (e.g. the joint head in blocked greedy decoding). */
 void mynah_asr_qmat_dequant(const mynah_asr_qmat *m, float *wd);
 
-/* Runtime x86 SIMD caps (qwen-tts --caps pattern): "auto" (default, cpuid),
- * "scalar", "avx2", "vnni"; env MYNAH_ASR_CAPS as an alternative to the flag. A
- * level above what the CPU supports is downgraded with a note. Returns the
- * effective level (0 scalar, 1 avx2, 2 vnni). On ARM it is a no-op: NEON/SDOT
- * are compile-time (Apple Silicon always has dotprod). */
+/* Runtime SIMD caps (qwen-tts --caps pattern): "auto" (default, from the CPU),
+ * then a per-architecture ladder; env MYNAH_ASR_CAPS as an alternative to the
+ * flag. A level above what the CPU supports is downgraded with a note.
+ *
+ *   x86: "scalar" (0) | "avx2" (1) | "vnni" (2, either VPDPBUSD encoding)
+ *   ARM: "scalar" (0) | "sdot"  (1) | "smmla" (2, i8mm)
+ *
+ * It is the opt-OUT for every int8 kernel: `sdot` forbids SMMLA, `avx2`
+ * forbids both VNNI encodings, `scalar` forbids the native int8 dot entirely.
+ * Returns the effective level. */
 int mynah_asr_set_caps(const char *name);
 
 /* Dispatch predicates OWNED by src/qmat.c (S3-2). src/dispatch.c calls these
  * instead of re-deriving "compiled && supported", which is the guess that lets
  * a report and a README agree and both be wrong. Pure readers, no side effect
  * beyond the same one-time cpuid the first kernel call would do anyway.
- *   mynah_asr_qmat_int8_kernel  "neon-sdot" | "avx512vnni" | "avx2" |
- *                               "neon-f32" | "scalar"
+ *   mynah_asr_qmat_int8_kernel  "neon-smmla" | "neon-sdot" | "avx512vnni" |
+ *                               "avxvnni" | "avx2" | "neon-f32" | "scalar"
+ *                               — the micro-kernel the int8 product resolves
+ *                               to here. On a host with i8mm that is SMMLA,
+ *                               which is issued by the weight-stationary
+ *                               batched pass only: a single activation row
+ *                               would leave half the tile empty, so the
+ *                               one-row dot stays SDOT (see src/qmat.c).
  *   mynah_asr_qmat_int4_kernel  "neon-sdot-q4" | "avx2-q4" | "neon-f32-q4" |
  *                               "scalar"
  *   mynah_asr_qmat_qgemm        1 on, 0 off, -1 no native int8 kernel compiled
  *   mynah_asr_caps_detected/_effective  x86 SIMD level, -1 on a non-x86 build */
 const char *mynah_asr_qmat_int8_kernel(void);
+/* The ONE-ROW int8 dot, which is a different question: a single activation row
+ * leaves half an SMMLA tile empty, so a host whose batched pass is neon-smmla
+ * still answers "neon-sdot" here. Two questions, two predicates, so a reader
+ * of --dispatch-map cannot conflate them. */
+const char *mynah_asr_qmat_int8_dot_kernel(void);
 const char *mynah_asr_qmat_int4_kernel(void);
 int         mynah_asr_qmat_qgemm(void);
 int         mynah_asr_caps_detected(void);
