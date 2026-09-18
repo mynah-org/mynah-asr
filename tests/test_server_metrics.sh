@@ -204,14 +204,30 @@ else
 fi
 grep -q '^mynah_asr_refused_total{code=' "$TMP/m2.txt" \
     || { echo "server-metrics prefork FAIL: the router does not export its refusals by code"; fail=1; }
-# every worker in a prefork fleet printed its own TOPOLOGY line
-t=$(grep -cE '^\[TOPOLOGY\] v=1 worker=[01] ' "$TMP/pf.log")
+# Every worker in a prefork fleet printed its own TOPOLOGY line.
+#
+# Polled, not read once: readiness means the FIRST worker answered /v1/health,
+# which says nothing about the second, and a worker prints this line after it
+# pins itself. On a sanitized build everything is several times slower and the
+# second line lands well after the first request is served. Waiting for a line
+# the server does print is not the same as loosening the assertion: the count
+# must still reach 2, and a fleet that only ever starts one worker still fails.
+wait_lines() {  # pattern file count timeout_tenths
+    j=0
+    while [ $j -lt "$4" ]; do
+        n=$(grep -cE "$1" "$2" 2>/dev/null || echo 0)
+        [ "$n" -ge "$3" ] && { echo "$n"; return 0; }
+        sleep 0.1
+        j=$((j + 1))
+    done
+    grep -cE "$1" "$2" 2>/dev/null || echo 0
+}
+t=$(wait_lines '^\[TOPOLOGY\] v=1 worker=[01] ' "$TMP/pf.log" 2 300)
 [ "$t" = "2" ] || { echo "server-metrics prefork FAIL: $t [TOPOLOGY] lines, expected 2"; fail=1; }
 
 # SIGUSR1 on the parent reaches both workers, and nobody dies
 kill -USR1 "$SRV_PID" 2>/dev/null
-sleep 1
-b=$(grep -cE '^\[DUMP\] v=1 worker=[01] seq=[0-9]+ begin' "$TMP/pf.log")
+b=$(wait_lines '^\[DUMP\] v=1 worker=[01] seq=[0-9]+ begin' "$TMP/pf.log" 2 300)
 alive=$(pgrep -f "mynah-asr-server -m $MODEL_DIR -p $PORT2" | wc -l | tr -d ' ')
 if [ "$b" = "2" ] && [ "$alive" = "3" ]; then
     echo "server-metrics prefork sigusr1 OK (both workers dumped, all 3 processes alive)"
