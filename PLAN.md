@@ -42,7 +42,7 @@ Production is Linux x86-64 and ARM64; macOS is the development machine.
 - [ ] S0-4 Allocation count per chunk on Linux, measured not assumed (needs no box: any Linux) → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
 
 ### S1 — Library seams the server needs → [`.work/stream-api-v2.md`](.work/stream-api-v2.md)
-- [ ] S1-1 `mynah_asr_stream_reset`; slots are pooled, not reopened
+- [x] S1-1 `mynah_asr_stream_reset` + `need_samples`; slots are pooled, not reopened (gate green 2026-09-18)
 - [ ] S1-2 Deltas carry `t0`, `is_final`, `is_eou` and a chunk-arrival passthrough for `lag_ms`
 - [ ] S1-3 Allocation-free chunk: per-stream scratch, incremental detokenisation
 - [ ] S1-4 Batched stream step for B slots, byte-identical to B single steps

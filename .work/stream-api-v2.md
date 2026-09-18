@@ -50,4 +50,17 @@ Plan
 Acceptance gate: `make test` and `make test-server-concurrency` green; the
 new tests above green; `docs/api.md` updated; no transcript in `tests/` changed.
 
-Evidence / Conclusion / Next action: pending S0.
+Evidence
+- S1-1 DONE 2026-09-18 (commit 794f1c7): `mynah_asr_stream_reset(s, lang)`,
+  `mynah_asr_stream_need_samples(s)`, `mynah_asr_stream_audio_seconds(s)`;
+  mel/subsampling/encoder stream resets added underneath. Gate in
+  tests/test_streaming.c with the local Nemotron f32: a stream polluted with
+  the second half of the clip, reset, then fed exactly `need_samples` per call
+  produced text byte-identical to the offline path (17 feeds, 14 of them with
+  a delta, i.e. one encoder chunk per feed); a bad language is refused and the
+  stream stays usable. S1-2 turned out to need no library change for the
+  server (the scheduler knows when each sample arrived; `t1` maps a delta to
+  its audio position).
+- S1-3, S1-4: in progress / pending (see below).
+Conclusion: the seams the scheduler needs exist.
+Next action: S1-3 (allocation-free chunk) and S1-4 after the scheduler lands.
