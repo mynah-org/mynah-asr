@@ -53,9 +53,15 @@ static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
-/* Per-stream service limits (S2-3, the part that lands with the scheduler). */
+/* Per-stream service limits (S2-3). Every one of them bounds what ONE connection
+ * can cost this worker: time without saying anything, audio, frame size,
+ * buffered PCM. A cap that fires is always announced -- an `error` frame with a
+ * code, then a close -- because a stream that simply stops is indistinguishable
+ * from a bug in the client. */
 static int g_idle_ms = 60000;                      /* --idle-ms */
+static int g_ping_ms = 20000;                      /* --ping-ms, 0 = no ping */
 static int g_ring_seconds = 30;                    /* --ring-seconds */
+static double g_max_audio_seconds = 14400.0;       /* --max-audio-seconds */
 static size_t g_max_frame_bytes = 1024u * 1024u;   /* --max-frame-bytes */
 static int g_max_pending;                          /* --max-pending, 2*threads */
 
@@ -143,6 +149,56 @@ static void send_error(int fd, int code, const char *msg) {
     cJSON_Delete(j);
 }
 
+/* ---------------------------------------------------------------- refusing
+ * A refusal is a response the client must be able to READ. Writing it and
+ * closing is not enough: with the request body (or the next pipelined request)
+ * still unread in the receive queue, close() makes the kernel send an RST, and
+ * the RST discards the response along with it -- which is how a documented 400
+ * reaches a client as ECONNRESET. So every refusal leaves through the same
+ * lingering close the router uses: write, shutdown(SHUT_WR), bounded
+ * non-blocking drain, close. Takes ownership of `fd`.
+ *
+ * `msg` is built here and never echoes a client string verbatim: what came from
+ * the query goes through refuse_token() first. */
+static void refuse_json(int fd, int code, const char *status, const char *type,
+                        const char *errcode, const char *msg) {
+    char body[288], resp[MYNAH_ASR_PREFORK_LINGER_MAX];
+    const int blen = snprintf(body, sizeof(body),
+        "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"code\":\"%s\"}}",
+        msg, type, errcode);
+    if (blen <= 0 || (size_t)blen >= sizeof(body)) {
+        mynah_asr_prefork_linger_close(fd, NULL, 0);
+        return;
+    }
+    const int n = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n%s",
+        code, status, blen, body);
+    if (n <= 0 || (size_t)n >= sizeof(resp)) {
+        mynah_asr_prefork_linger_close(fd, NULL, 0);
+        return;
+    }
+    mynah_asr_prefork_linger_close(fd, resp, (size_t)n);
+}
+
+/* A client-supplied token on its way into a JSON error message. Only what a
+ * query key or a language tag can legitimately contain survives, and the result
+ * is short: a message that quoted the raw bytes would let the client choose
+ * where the JSON string ends. */
+static void refuse_token(const char *src, char *dst, size_t cap) {
+    size_t k = 0;
+    for (size_t i = 0; src != NULL && src[i] != '\0' && k + 1 < cap; i++) {
+        const char c = src[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '>')
+            dst[k++] = c;
+    }
+    dst[k] = '\0';
+}
+
 /* ------------------------------------------------------------------ multipart */
 typedef struct {
     const uint8_t *file;
@@ -209,9 +265,12 @@ static void parse_multipart(const uint8_t *body, size_t len, const char *boundar
 /* -------------------------------------- POST /transcriptions and /translations
  * translate = 1: the /v1/audio/translations endpoint (AED models only) — the
  * output language is target_language (default "en", OpenAI/Whisper style); the
- * per-request translation travels inside lang as "src>tgt" (thread-safe). */
-static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
-                              size_t body_len, int translate) {
+ * per-request translation travels inside lang as "src>tgt" (thread-safe).
+ *
+ * Returns 1 when it took ownership of `fd` (a refusal closed it), 0 when the
+ * descriptor is still the caller's. */
+static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
+                             size_t body_len, int translate) {
     form_data f = {.lookahead = -1, .language = "auto", .response_format = "json"};
 
     const char *ct = strstr(headers, "Content-Type:");
@@ -227,7 +286,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         f.file = body;           /* raw body: direct audio/wav */
         f.file_len = body_len;
     }
-    if (!f.file || f.file_len < 44) { send_error(fd, 400, "missing audio file (multipart 'file' or raw WAV body)"); return; }
+    if (!f.file || f.file_len < 44) { send_error(fd, 400, "missing audio file (multipart 'file' or raw WAV body)"); return 0; }
 
     char src_lang[24];
     snprintf(src_lang, sizeof(src_lang), "%s", f.language);
@@ -235,7 +294,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     if (translate || f.target_language[0]) {
         if (!mynah_asr_can_translate(g_model)) {
             send_error(fd, 400, "this model does not support translation (an AED engine is required, e.g. Canary)");
-            return;
+            return 0;
         }
         tgt = f.target_language[0] ? f.target_language : "en";
     }
@@ -243,12 +302,12 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     size_t n_samples;
     int sr;
     float *samples = mynah_asr_wav_parse(f.file, f.file_len, &n_samples, &sr);
-    if (!samples) { send_error(fd, 400, "invalid WAV (PCM16 required)"); return; }
+    if (!samples) { send_error(fd, 400, "invalid WAV (PCM16 required)"); return 0; }
     if (sr != 16000) {
         size_t n2;
         float *rs = mynah_asr_resample(samples, n_samples, sr, 16000, &n2);
         free(samples);
-        if (!rs) { send_error(fd, 500, "resampling failed"); return; }
+        if (!rs) { send_error(fd, 500, "resampling failed"); return 0; }
         samples = rs;
         n_samples = n2;
     }
@@ -278,7 +337,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
                                        "not support", tag);
             free(samples);
             send_error(fd, 400, msg);
-            return;
+            return 0;
         }
     }
     if (tgt) snprintf(f.language, sizeof(f.language), "%s>%s", src_lang, tgt);
@@ -304,12 +363,14 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
         snprintf(j.lang, sizeof(j.lang), "%s", f.language);
         const int rc = mynah_asr_sched_submit(&j);
         if (rc == -2) {
+            /* --max-pending, and the same discipline as every other refusal:
+             * writing a 503 and closing on a socket that may still hold a
+             * pipelined request sends an RST, and the client reads the reset
+             * instead of the status it was told to back off on. */
             free(samples);
-            char buf[1024];
-            const size_t n = mynah_asr_prefork_refusal_response(
-                MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY, buf, sizeof(buf));
-            if (n) write_all(fd, buf, n);
-            return;
+            mynah_asr_prefork_refuse_and_close(
+                fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
+            return 1;
         }
         text = j.text;
         memcpy(lang_out, j.lang_out, sizeof(lang_out));
@@ -322,7 +383,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     }
     const double duration = (double)n_samples / 16000.0;
     free(samples);
-    if (!text) { send_error(fd, 400, "transcription failed (unsupported language?)"); return; }
+    if (!text) { send_error(fd, 400, "transcription failed (unsupported language?)"); return 0; }
 
     if (strcmp(f.response_format, "text") == 0) {
         send_response(fd, 200, "OK", "text/plain; charset=utf-8", text, strlen(text));
@@ -350,6 +411,7 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
     }
     mynah_asr_words_free(words, n_words);
     free(text);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ WebSocket
@@ -366,8 +428,142 @@ static void handle_transcribe(int fd, const char *headers, const uint8_t *body,
  * number is reissued by accept(). So the ingest reads through its own dup and
  * closes it itself; the socket lives until both are gone.
  */
+/* The accepted query keys in ONE place, so the 400 that refuses an unknown one
+ * names exactly what the server will read. */
+#define WS_QUERY_ACCEPTED "model, lang, lookahead, format, rate"
+
+typedef struct {
+    char lang[MYNAH_ASR_SLOT_LANG_CAP];
+    int lookahead;               /* -1 = the model's default preset */
+    int f32;                     /* format=f32le; the default is s16le */
+} ws_params;
+
+/* Parses and VALIDATES the query of GET /v1/audio/stream. Returns 0, or the HTTP
+ * status to refuse with, filling `*code` and `msg` (both go into the body).
+ * Everything here happens BEFORE the 101: a client that misspells a parameter
+ * reads a status naming the accepted set, instead of getting a stream that
+ * silently runs with a default it never asked for.
+ *
+ * `rate=`: only 16000 is accepted, and the refusal says so rather than
+ * resampling. The library's resampler (src/audio.h, mynah_asr_resample) is a
+ * WHOLE-BUFFER stateless windowed sinc: it keeps no filter history across calls,
+ * so running it per WebSocket frame would inject a discontinuity at every frame
+ * boundary and change the transcript in a way no identity gate would catch. A
+ * streaming resampler is separate work with its own parity gate; until it
+ * exists the honest answer is a 400 that names what is served.
+ *
+ * The lookups are reads of the model's config -- the prompt dictionary and the
+ * preset table -- not inference, so they stay on this thread rather than
+ * costing the scheduler a step (handle_transcribe resolves map_lang the same
+ * way, for the same reason). */
+static int ws_parse_query(const char *query, ws_params *p, const char **code,
+                          char *msg, size_t msgcap) {
+    snprintf(p->lang, sizeof(p->lang), "auto");
+    p->lookahead = -1;
+    p->f32 = 0;
+    if (query == NULL || query[0] == '\0') return 0;
+
+    const char *q = query;
+    while (*q != '\0') {
+        const char *amp = strchr(q, '&');
+        const size_t seg = amp != NULL ? (size_t)(amp - q) : strlen(q);
+        const char *eq = (const char *)memchr(q, '=', seg);
+        const size_t klen = eq != NULL ? (size_t)(eq - q) : seg;
+        const size_t vlen = eq != NULL ? seg - klen - 1 : 0;
+        char key[40], val[64], tok[48];
+        snprintf(key, sizeof(key), "%.*s",
+                 (int)(klen < sizeof(key) ? klen : sizeof(key) - 1), q);
+        snprintf(val, sizeof(val), "%.*s",
+                 (int)(vlen < sizeof(val) ? vlen : sizeof(val) - 1),
+                 eq != NULL ? eq + 1 : "");
+
+        if (klen == 0) {
+            /* an empty segment ("a=1&&b=2"): nothing to read, nothing to refuse */
+        } else if (strcmp(key, "model") == 0) {
+            /* What /v1/models lists is what this accepts; there is one model per
+             * process, so naming another one is a 404 and never a wait. */
+            if (val[0] != '\0' && strcmp(val, g_model_name) != 0) {
+                refuse_token(val, tok, sizeof(tok));
+                snprintf(msg, msgcap, "no model '%s' here; this server serves '%s'",
+                         tok, g_model_name);
+                *code = "model_not_found";
+                return 404;
+            }
+        } else if (strcmp(key, "lang") == 0) {
+            if (val[0] == '\0') {
+                snprintf(p->lang, sizeof(p->lang), "auto");
+            } else if (mynah_asr_lang_id(g_model, val) < 0) {
+                refuse_token(val, tok, sizeof(tok));
+                snprintf(msg, msgcap, "this model does not serve the language '%s'", tok);
+                *code = "language_not_served";
+                return 400;
+            } else {
+                snprintf(p->lang, sizeof(p->lang), "%s", val);
+            }
+        } else if (strcmp(key, "lookahead") == 0) {
+            if (val[0] != '\0') {
+                char *end = NULL;
+                const long want = strtol(val, &end, 10);
+                int la[8];
+                const int n = mynah_asr_lookaheads(g_model, la);
+                int ok = end != NULL && *end == '\0';
+                if (ok) {
+                    ok = 0;
+                    for (int i = 0; i < n; i++)
+                        if ((long)la[i] == want) ok = 1;
+                }
+                if (!ok) {
+                    char set[64];
+                    size_t w = 0;
+                    set[0] = '\0';
+                    for (int i = 0; i < n && w + 8 < sizeof(set); i++)
+                        w += (size_t)snprintf(set + w, sizeof(set) - w, "%s%d",
+                                              i > 0 ? ", " : "", la[i]);
+                    refuse_token(val, tok, sizeof(tok));
+                    snprintf(msg, msgcap,
+                             "lookahead '%s' is not a preset of this model; accepted: %s",
+                             tok, set[0] != '\0' ? set : "none");
+                    *code = "lookahead_not_available";
+                    return 400;
+                }
+                p->lookahead = (int)want;
+            }
+        } else if (strcmp(key, "format") == 0) {
+            if (strcmp(val, "f32le") == 0) {
+                p->f32 = 1;
+            } else if (val[0] != '\0' && strcmp(val, "s16le") != 0) {
+                refuse_token(val, tok, sizeof(tok));
+                snprintf(msg, msgcap, "format '%s' is not served; accepted: s16le, f32le",
+                         tok);
+                *code = "unsupported_format";
+                return 400;
+            }
+        } else if (strcmp(key, "rate") == 0) {
+            if (val[0] != '\0' && strcmp(val, "16000") != 0) {
+                refuse_token(val, tok, sizeof(tok));
+                snprintf(msg, msgcap,
+                         "rate '%s' is not served; accepted: 16000 (resample client-side)",
+                         tok);
+                *code = "unsupported_rate";
+                return 400;
+            }
+        } else {
+            refuse_token(key, tok, sizeof(tok));
+            snprintf(msg, msgcap, "unknown query parameter '%s'; accepted: %s",
+                     tok, WS_QUERY_ACCEPTED);
+            *code = "unknown_query_parameter";
+            return 400;
+        }
+
+        if (amp == NULL) break;
+        q = amp + 1;
+    }
+    return 0;
+}
+
 typedef struct {
     int fd;                      /* the ingest's own dup of the client socket */
+    int f32;                     /* the session's binary format (format=f32le) */
     mynah_asr_slot *slot;
     mynah_asr_stream_out *out;
 } ws_ingest;
@@ -419,32 +615,53 @@ static void ws_control(ws_ingest *w, const uint8_t *payload, size_t len) {
                                MYNAH_ASR_SLOT_CANCEL_NONE);
     } else if (type != NULL && strcmp(type, "reset") == 0) {
         const cJSON *l = cJSON_GetObjectItem(j, "lang");
-        mynah_asr_slot_request(w->slot, MYNAH_ASR_SLOT_REQ_RESET,
-                               (l != NULL && cJSON_IsString(l)) ? l->valuestring : NULL,
-                               MYNAH_ASR_SLOT_CANCEL_NONE);
+        const char *lang = (l != NULL && cJSON_IsString(l)) ? l->valuestring : NULL;
+        /* A language this model does not hold is refused HERE, from the model's
+         * own prompt dictionary (a table lookup, not inference). Letting it
+         * reach the scheduler would fail mynah_asr_stream_reset and take the
+         * session down with it, and a typo must not cost a session. */
+        if (lang != NULL && lang[0] != '\0' && mynah_asr_lang_id(g_model, lang) < 0) {
+            char tok[48], m[160];
+            refuse_token(lang, tok, sizeof(tok));
+            snprintf(m, sizeof(m), "this model does not serve the language '%s'", tok);
+            ws_transport_error(w, "language_not_served", m);
+        } else {
+            mynah_asr_slot_request(w->slot, MYNAH_ASR_SLOT_REQ_RESET, lang,
+                                   MYNAH_ASR_SLOT_CANCEL_NONE);
+        }
     } else {
-        /* An unknown message is an error frame, never a disconnect: a client
-         * that learns a newer keyword must not lose its session over it. */
-        ws_transport_error(w, "unknown_message",
+        /* An unknown control message is an error frame, never a disconnect: a
+         * client that learns a newer keyword must not lose its session over it. */
+        ws_transport_error(w, "unknown_control",
                            "expected {\"type\":\"finalize\"} or {\"type\":\"reset\"}");
     }
     cJSON_Delete(j);
 }
 
-/* s16le -> float, byte by byte: the payload is not guaranteed to be aligned for
- * an int16_t, and reading it as one is undefined behaviour that ubsan is right
- * to complain about. Returns 0 when the session ended under us. */
+/* The wire format -> float, byte by byte in both cases: the payload sits at
+ * whatever offset the WebSocket header left it at, and reading it through an
+ * int16_t or a float pointer is an unaligned access -- undefined behaviour that
+ * ubsan is right to complain about. Returns 0 when the session ended under us. */
 static int ws_push_pcm(ws_ingest *w, const uint8_t *payload, size_t plen, double now) {
-    const size_t ns = plen / 2;
+    const size_t width = w->f32 ? 4u : 2u;
+    const size_t ns = plen / width;
     float f[4096];
     size_t off = 0;
     while (off < ns) {
         const size_t chunk = ns - off < 4096 ? ns - off : 4096;
         for (size_t i = 0; i < chunk; i++) {
-            const size_t k = (off + i) * 2;
-            const int16_t v = (int16_t)((uint16_t)payload[k] |
-                                        ((uint16_t)payload[k + 1] << 8));
-            f[i] = (float)v / 32768.0f;
+            const size_t k = (off + i) * width;
+            if (width == 2) {
+                const int16_t v = (int16_t)((uint16_t)payload[k] |
+                                            ((uint16_t)payload[k + 1] << 8));
+                f[i] = (float)v / 32768.0f;
+            } else {
+                const uint32_t u = (uint32_t)payload[k] |
+                                   ((uint32_t)payload[k + 1] << 8) |
+                                   ((uint32_t)payload[k + 2] << 16) |
+                                   ((uint32_t)payload[k + 3] << 24);
+                memcpy(&f[i], &u, sizeof(f[i]));
+            }
         }
         if (mynah_asr_slot_push(w->slot, f, chunk, now) != chunk) return 0;
         off += chunk;
@@ -452,47 +669,50 @@ static int ws_push_pcm(ws_ingest *w, const uint8_t *payload, size_t plen, double
     return 1;
 }
 
-/* Returns 1 when the descriptor was handed to the writer (the caller must not
- * close it), 0 when it is still the caller's. */
+/* Returns 1 when the descriptor is no longer the caller's -- handed to the
+ * writer, or consumed by a lingering refusal -- and 0 when it is still theirs. */
 static int handle_ws_stream(int fd, const char *headers, const char *query) {
-    char lang[MYNAH_ASR_SLOT_LANG_CAP] = "auto";
-    int lookahead = -1;
-    if (query != NULL) {
-        const char *ql = strstr(query, "lang=");
-        if (ql) sscanf(ql + 5, "%23[^&\n ]", lang);
-        const char *qk = strstr(query, "lookahead=");
-        if (qk) lookahead = atoi(qk + 10);
+    /* Rung 4xx, before the upgrade: an offline-only model will never grow a
+     * stream API, so this is not a 503 and carries no Retry-After. Asked first
+     * because on such a model there is no preset table to validate against. */
+    if (!mynah_asr_sched_streaming()) {
+        refuse_json(fd, 400, "Bad Request", "invalid_request_error",
+                    "model_not_streaming",
+                    "this model is offline-only (no cache-aware streaming presets)");
+        return 1;
     }
 
-    /* Rung 4xx, before the upgrade: an offline-only model will never grow a
-     * stream API, so this is not a 503 and carries no Retry-After. */
-    if (!mynah_asr_sched_streaming()) {
-        cJSON *j = cJSON_CreateObject();
-        cJSON *e = cJSON_AddObjectToObject(j, "error");
-        cJSON_AddStringToObject(e, "message",
-            "this model is offline-only (no cache-aware streaming presets)");
-        cJSON_AddStringToObject(e, "type", "invalid_request_error");
-        cJSON_AddStringToObject(e, "code", "model_not_streaming");
-        send_json(fd, 400, j);
-        cJSON_Delete(j);
-        return 0;
+    ws_params params;
+    const char *qcode = "invalid_request";
+    char qmsg[192];
+    qmsg[0] = '\0';
+    const int qstatus = ws_parse_query(query, &params, &qcode, qmsg, sizeof(qmsg));
+    if (qstatus != 0) {
+        refuse_json(fd, qstatus, qstatus == 404 ? "Not Found" : "Bad Request",
+                    "invalid_request_error", qcode, qmsg);
+        return 1;
     }
 
     const char *k = strstr(headers, "Sec-WebSocket-Key:");
-    if (!k) { send_error(fd, 400, "invalid WebSocket handshake"); return 0; }
+    if (!k) {
+        refuse_json(fd, 400, "Bad Request", "invalid_request_error",
+                    "invalid_handshake",
+                    "a WebSocket upgrade needs a Sec-WebSocket-Key header");
+        return 1;
+    }
     char key[64] = {0};
     sscanf(k + 18, " %63[^\r\n]", key);
 
     /* The slot is reserved BEFORE the 101: a client that is refused must read an
      * HTTP status, not discover the refusal as a transport error after the
-     * upgrade. This is the worker's own cap; the router has its own rung. */
-    mynah_asr_slot *slot = mynah_asr_sched_claim(lang, lookahead);
+     * upgrade. This is the worker's own cap; the router has its own rung. The
+     * refusal leaves through the lingering close for the same reason the body
+     * and the Retry-After exist at all -- they are worthless if the client
+     * reads ECONNRESET instead. */
+    mynah_asr_slot *slot = mynah_asr_sched_claim(params.lang, params.lookahead);
     if (slot == NULL) {
-        char buf[1024];
-        const size_t n = mynah_asr_prefork_refusal_response(
-            MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY, buf, sizeof(buf));
-        if (n) write_all(fd, buf, n);
-        return 0;
+        mynah_asr_prefork_refuse_and_close(fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
+        return 1;
     }
 
     char accept_src[128];
@@ -524,17 +744,29 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
         mynah_asr_slot_release(slot);
         return 0;
     }
-    ws_ingest w = {.fd = rfd, .slot = slot, .out = out};
+    ws_ingest w = {.fd = rfd, .f32 = params.f32, .slot = slot, .out = out};
     mynah_asr_slot_arm(slot, out);
     mynah_asr_thread_set_name("mynah-ingest");
 
-    int cancelled = 0, closed = 0;
-    double last_activity = mynah_asr_now();
+    int cancelled = 0, closed = 0, shutting = 0;
+    size_t audio_samples = 0;
+    const double t_start = mynah_asr_now();
+    double last_activity = t_start, last_ping = t_start;
     uint8_t *payload = NULL;
     while (!closed) {
-        if (g_shutdown) break;
+        if (g_shutdown) { shutting = 1; break; }
         if (mynah_asr_slot_get_state(slot) == MYNAH_ASR_SLOT_DONE) break;
         if (mynah_asr_stream_out_failed(out)) break;
+
+        /* The server's own liveness probe, on this thread's tick rather than on
+         * a timer thread. It goes out through the writer like every other frame,
+         * so it can never block the ingest, and no pong is required: a pong is a
+         * courtesy, `--idle-ms` is the rule. */
+        const double tick = mynah_asr_now();
+        if (g_ping_ms > 0 && (tick - last_ping) * 1000.0 >= (double)g_ping_ms) {
+            ws_enqueue(&w, 0x9, "", 0);
+            last_ping = tick;
+        }
 
         /* A short tick rather than one long blocking read: the loop has to
          * notice a finished slot, a cancelled stream and SIGTERM, and none of
@@ -544,6 +776,9 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
         const int ready = poll(&pfd, 1, 200);
         if (ready < 0) { if (errno == EINTR) continue; break; }
         if (ready == 0) {
+            /* Idle is measured against ANY frame, not just audio: a client that
+             * keeps the socket open and says nothing at all is the one holding
+             * a slot for free, whatever it intended to send. */
             if ((mynah_asr_now() - last_activity) * 1000.0 >= (double)g_idle_ms) {
                 mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
                                        MYNAH_ASR_SLOT_CANCEL_IDLE);
@@ -602,10 +837,28 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                 break;
             case 0x0:   /* a continuation of a binary frame; the only kind any
                          * client here sends, and PCM concatenates */
-            case 0x2:
-                if (plen >= 2 && !ws_push_pcm(&w, payload, (size_t)plen, last_activity))
+            case 0x2: {
+                const size_t width = w.f32 ? 4u : 2u;
+                if (plen < width) break;
+                if (!ws_push_pcm(&w, payload, (size_t)plen, last_activity)) {
                     closed = 1;
+                    break;
+                }
+                audio_samples += (size_t)plen / width;
+                if (g_max_audio_seconds > 0.0 &&
+                    (double)audio_samples / 16000.0 > g_max_audio_seconds) {
+                    /* Announced, then finalised rather than dropped: the audio
+                     * already accepted is still owed a transcript, so the cap
+                     * flushes the tail, emits `done` and closes. */
+                    ws_transport_error(&w, "audio_limit",
+                                       "the stream reached --max-audio-seconds");
+                    mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
+                                                 MYNAH_ASR_SLOT_REQ_CLOSE, NULL,
+                                           MYNAH_ASR_SLOT_CANCEL_NONE);
+                    closed = 1;
+                }
                 break;
+            }
             default:
                 ws_transport_error(&w, "unsupported_opcode",
                                    "only text, binary, ping, pong and close are served");
@@ -617,8 +870,11 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     free(payload);
 
     /* However the loop ended, the session must end explicitly: without a
-     * finalize the tail is never flushed and the client never sees `done`. */
-    if (!cancelled)
+     * finalize the tail is never flushed and the client never sees `done`.
+     * SIGTERM is the exception -- the scheduler's drain owes that client an
+     * `error shutting_down`, and a finalize racing it would answer `done`
+     * instead, which tells the client the opposite of what happened. */
+    if (!cancelled && !shutting)
         mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
                                      MYNAH_ASR_SLOT_REQ_CLOSE, NULL,
                                MYNAH_ASR_SLOT_CANCEL_NONE);
@@ -704,12 +960,19 @@ static void handle_conn(int fd) {
         if (!cl) cl = strstr(hdr, "content-length:");
         if (cl) content_len = strtoull(cl + 15, NULL, 10);
         if (content_len == 0 || content_len > MAX_BODY) {
-            send_error(fd, 400, "missing or oversized Content-Length");
-            close(fd);
+            /* The body is still in the socket: a plain close here would RST it
+             * away together with the 400 the client is waiting to read. */
+            refuse_json(fd, 400, "Bad Request", "invalid_request_error",
+                        "invalid_content_length",
+                        "missing or oversized Content-Length");
             return;
         }
         uint8_t *body = malloc(content_len);
-        if (!body) { send_error(fd, 500, "out of memory"); close(fd); return; }
+        if (!body) {
+            refuse_json(fd, 500, "Internal Server Error", "server_error",
+                        "out_of_memory", "out of memory");
+            return;
+        }
         size_t have = got - hdr_len;
         if (have > content_len) have = content_len;
         memcpy(body, hdr + hdr_len, have);
@@ -718,11 +981,20 @@ static void handle_conn(int fd) {
             if (r <= 0) break;
             have += (size_t)r;
         }
-        if (have == content_len) handle_transcribe(fd, hdr, body, content_len, translate);
-        else send_error(fd, 400, "incomplete body");
-        free(body);
+        if (have == content_len) {
+            const int taken = handle_transcribe(fd, hdr, body, content_len, translate);
+            free(body);
+            if (taken) return;
+        } else {
+            free(body);
+            refuse_json(fd, 400, "Bad Request", "invalid_request_error",
+                        "incomplete_body", "the body was shorter than Content-Length");
+            return;
+        }
     } else {
-        send_error(fd, 404, "not found");
+        refuse_json(fd, 404, "Not Found", "invalid_request_error", "not_found",
+                    "no such endpoint");
+        return;
     }
     close(fd);
 }
@@ -760,7 +1032,9 @@ static void usage(void) {
         "                            T threads each (default: cpus/W), C stream slots per\n"
         "                            worker before it refuses 503 (default: --threads)\n"
         "       --prefork-plan       print the machine's topology and the W/T sweep, exit\n"
-        "       [--idle-ms 60000]    a stream with no audio for this long is cancelled\n"
+        "       [--idle-ms 60000]    a stream silent for this long is cancelled (idle_timeout)\n"
+        "       [--ping-ms 20000]    server-side WebSocket ping period (0 = never)\n"
+        "       [--max-audio-seconds 14400]  audio one stream may send (0 = no cap)\n"
         "       [--ring-seconds 30]  PCM buffered per stream before the client is throttled\n"
         "       [--max-frame-bytes 1048576]  a larger WebSocket frame ends the stream\n"
         "       [--max-pending N]    offline requests queued (default 2*--threads), 503 beyond\n"
@@ -790,6 +1064,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) prefork_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cap") == 0 && i + 1 < argc) cap = atoi(argv[++i]);
         else if (strcmp(argv[i], "--idle-ms") == 0 && i + 1 < argc) g_idle_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ping-ms") == 0 && i + 1 < argc) g_ping_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-audio-seconds") == 0 && i + 1 < argc)
+            g_max_audio_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--ring-seconds") == 0 && i + 1 < argc) g_ring_seconds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--max-frame-bytes") == 0 && i + 1 < argc)
             g_max_frame_bytes = (size_t)strtoull(argv[++i], NULL, 10);
@@ -802,6 +1079,9 @@ int main(int argc, char **argv) {
     if (n_threads < 1) n_threads = 1;
     if (cap <= 0) cap = n_threads;   /* one slot per HTTP thread: a WS stream holds one */
     if (g_idle_ms < 1000) g_idle_ms = 1000;
+    if (g_ping_ms < 0) g_ping_ms = 0;              /* 0 = never ping */
+    if (g_ping_ms > 0 && g_ping_ms < 100) g_ping_ms = 100;
+    if (g_max_audio_seconds < 0.0) g_max_audio_seconds = 0.0;   /* 0 = no cap */
     if (g_ring_seconds < 1) g_ring_seconds = 1;
     if (g_max_frame_bytes < 4096) g_max_frame_bytes = 4096;
     if (g_max_pending <= 0) g_max_pending = 2 * n_threads;

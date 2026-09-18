@@ -490,6 +490,22 @@ int mynah_asr_prefork_take_dump_request(void);
  * Takes ownership of `fd`: the caller must not close or use it afterwards. */
 void mynah_asr_prefork_refuse_and_close(int fd, mynah_asr_prefork_refusal reason);
 
+/* The same discipline for a response the ladder does not name. A worker refuses
+ * for reasons of its own -- an unknown query parameter, a model that cannot
+ * stream, a language it does not hold -- and those answers deserve to reach the
+ * client just as much as a 503 does. Rather than a second copy of
+ * write/shutdown/drain/close in server/main.c, the bytes come in already built
+ * and leave the same way.
+ *
+ * `len` must be at most MYNAH_ASR_PREFORK_LINGER_MAX. Returns 0 when the
+ * response was sent; -1 when it was too long, and then NOTHING is written --
+ * the descriptor is still half-closed, drained and closed, because a truncated
+ * body with an honest Content-Length is worse than no body at all.
+ *
+ * Takes ownership of `fd`. */
+#define MYNAH_ASR_PREFORK_LINGER_MAX 512
+int mynah_asr_prefork_linger_close(int fd, const char *response, size_t len);
+
 /* The stable, machine-readable token for a reason -- "server_at_capacity",
  * "queued_too_long", "service_cap_exceeded", "handoff_failed". It appears as
  * `error.code` in the JSON body and as the counter name in the stats line, so
