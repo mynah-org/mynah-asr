@@ -41,7 +41,7 @@ there; macOS is the development machine, nice to have, never the target.**
 - [~] S0-2 Streaming load tool v0: N WebSocket clients paced at 1x, stdlib only → [`.work/bench-harness-streaming.md`](.work/bench-harness-streaming.md)
 - [-] S0-3 The v1 server under N streams — dropped: it is broken by construction and the number would not size v2 → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
 - [ ] S0-4 Allocation count per chunk on Linux, measured not assumed (needs no box: any Linux) → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
-- [ ] S0-5 **Linux functional gates on every server change** (glibc, OpenBLAS, `sched_setaffinity`, `POLLRDHUP`, `LD_PRELOAD` count): the GitHub CI on a pushed `serving-v2` branch, or the ARM box — both need the owner's go; until then every macOS-only result is labelled as such → [`.work/axion-first-run.md`](.work/axion-first-run.md)
+- [~] S0-5 **Linux functional gates on every server change**: PR #2 (`serving-v2`) runs the GitHub CI on ubuntu x86, ubuntu ARM and macOS, green 2026-09-18 including the prefork phases, ASan+UBSan and clang-tidy; still owed: masks read back on the ARM box → [`.work/axion-first-run.md`](.work/axion-first-run.md)
 
 ### S1 — Library seams the server needs → [`.work/stream-api-v2.md`](.work/stream-api-v2.md)
 - [x] S1-1 `mynah_asr_stream_reset` + `need_samples`; slots are pooled, not reopened (gate green 2026-09-18)
