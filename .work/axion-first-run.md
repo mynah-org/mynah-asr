@@ -70,4 +70,22 @@ Evidence (2026-09-18, tree 5f0f802 via `git archive`, gcc 15.2, `-O3 -march=nati
 Conclusion: build and gates hold on Linux ARM; the model is in place. The one
 measurement still owed is the pinned single-stream step cost at Q=4 int8,
 T=1..4, on an idle box.
-Next action: paused. Implementation starts (S1-1).
+Next action: paused for the implementation; when the box is free the run is ONE
+command, `tools/bench/box_qualify.sh` (S4-3):
+
+```
+tools/bench/box_qualify.sh -m models/nemotron-3.5-asr-streaming-0.6b \
+    -W 8 -T 4 -C 4 --wave "1 4 8 16 32" --soak 8 --soak-seconds 600
+```
+
+It refuses rather than produce a number it cannot support: a `loadavg` at or above
+2.0 (another load owns the box), a dispatch row that resolved UNKNOWN, prefork
+workers that are not pinned to disjoint slices on Linux. A dirty tree does not
+stop it but labels the whole run NON-QUALIFYING, and `--allow-load` does the same
+for a deliberately diagnostic run on a busy host. It writes one directory per run
+holding the manifest (commit, binary sha256, masks, topology, loadavg), the
+banner, the dispatch map, the per-concurrency WAVE JSONs, the SOAK JSON with its
+drift windows, and the server's own `/v1/health` and `/metrics` at the end.
+Smoke-tested on the dev host end to end (the load gate, the dirty-tree label, the
+WAVE phase and the teardown all behaved); the mask assertion is Linux-only and has
+therefore never fired here.
