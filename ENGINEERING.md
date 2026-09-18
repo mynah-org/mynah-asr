@@ -28,12 +28,11 @@ A `.work/` note opens with: Task · Question · Known facts · Unknowns ·
 Files/functions inspected · Evidence · Conclusion · Next action, and states an
 acceptance gate before the work starts. A note never becomes a second plan.
 
-Tracked and public-safe: `ENGINEERING.md`, `AGENTS.md`, the reviewed
-`.work/*.md` notes, `docs/`, code. Local by standing decision (gitignored):
-`PLAN.md` and `CLAUDE.md`; the board is therefore checked locally, and a
-`.work/` note must stand on its own for a reader without the board. Untracked
-and private: the raw evidence the notes summarise (`.work/evidence/`,
-`.work/private/`), profiler dumps, benchmark artefact trees. Never `git add .work/` wholesale; before
+Tracked and public-safe: `ENGINEERING.md`, `CLAUDE.md`, `AGENTS.md`,
+`PLAN.md`, the reviewed `.work/*.md` notes, `docs/`, code (decision of
+2026-09-18, aligning with the sibling repos: an untracked plan diverges between
+worktrees). Untracked and private: the raw evidence the notes summarise
+(`.work/evidence/`, `.work/private/`), profiler dumps, benchmark artefact trees. Never `git add .work/` wholesale; before
 staging a note read the staged content and reject credentials, private
 hostnames or addresses, SSH commands and key paths, absolute personal paths,
 raw dumps. A tracked note summarises private evidence; it never reproduces it.

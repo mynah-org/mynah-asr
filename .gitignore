@@ -15,11 +15,9 @@ models
 __pycache__/
 *.pyc
 
-# Local planning notes and agent instructions (not part of the public repo).
-# The reviewed .work/*.md notes ARE tracked; raw evidence and private archives are not.
-PLAN.md
-TODO.md
-CLAUDE.md
+# The control plane (PLAN.md, CLAUDE.md, ENGINEERING.md, the reviewed .work/*.md
+# notes) is TRACKED, as in the sibling repos: an untracked plan diverges between
+# worktrees. Raw evidence and private archives are not.
 .work/private/
 .work/evidence/
 
