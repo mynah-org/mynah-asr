@@ -33,11 +33,15 @@
 
 #include "../src/audio.h"
 #include "../src/backend.h"
+#include "../src/dispatch.h"  /* --dispatch-map, mynah_asr_isa_guard */
+#include "../src/flags.h"     /* the [FLAGS]/[EFFECTIVE-CONFIG] banner lines */
 #include "../src/mynah_asr.h"
 #include "../src/qmat.h"      /* mynah_asr_set_caps (--caps) */
 #include "../src/threads.h"   /* mynah_asr_blas_set_concurrency */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
+#include "metrics.h"
+#include "obs.h"
 #include "prefork.h"
 #include "sched.h"
 #include "slot.h"
@@ -49,7 +53,13 @@
 
 static mynah_asr_model *g_model;
 static mynah_asr_model *g_lid;       /* --lid-model: language detector for language=auto */
-static const char *g_model_name = "nemotron-3.5-asr-streaming-0.6b";
+/* Read from the model's own mynah.json at start: a server that names a model
+ * it is not serving is a server whose /v1/models and whose banner are both
+ * wrong. The literal below is only the answer for a directory with no name. */
+static char g_model_name[96] = "unknown";
+static char g_model_engine[64] = "unknown";
+static double g_encoder_frame_ms;      /* streaming.encoder_frame_ms, 0 if none */
+static int    g_default_preset_index;
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
 static int g_quant = MYNAH_ASR_QUANT_F32;
 
@@ -71,6 +81,13 @@ static int g_max_pending;                          /* --max-pending, 2*threads *
 static volatile sig_atomic_t g_shutdown;
 static void on_stop(int sig) { (void)sig; g_shutdown = 1; }
 
+/* SIGUSR1 = "print what you know, once" (S3-4). The handler only raises a
+ * flag; the dump itself is written by the accept loop, where fprintf is
+ * allowed. Installed BEFORE the fork on purpose: a worker inherits it, and
+ * without a handler the default action for SIGUSR1 would kill the worker the
+ * first time anyone asked the fleet for statistics. */
+static void on_usr1(int sig) { (void)sig; mynah_asr_prefork_request_dump(); }
+
 /* ------------------------------------------------------------ connection queue */
 static int q_fds[QUEUE_CAP];
 static int q_head, q_tail, q_len;
@@ -86,6 +103,8 @@ static void q_push(int fd) {
          * refuse_and_close does shutdown -> bounded drain -> close and emits the
          * same error.code as the parent's ladder. It takes the descriptor; the
          * slot the router charged for it is given back separately. */
+        mynah_asr_obs_refused(mynah_asr_prefork_refusal_code(
+                                  MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY));
         mynah_asr_prefork_refuse_and_close(fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
         mynah_asr_prefork_conn_done();
         return;
@@ -162,6 +181,10 @@ static void send_error(int fd, int code, const char *msg) {
  * the query goes through refuse_token() first. */
 static void refuse_json(int fd, int code, const char *status, const char *type,
                         const char *errcode, const char *msg) {
+    /* Counted HERE, at the one funnel every refusal this worker issues passes
+     * through, so a counted refusal and a delivered refusal are the same event.
+     * `errcode` is a compile-time literal at every call site. */
+    mynah_asr_obs_refused(errcode);
     char body[288], resp[MYNAH_ASR_PREFORK_LINGER_MAX];
     const int blen = snprintf(body, sizeof(body),
         "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"code\":\"%s\"}}",
@@ -368,6 +391,8 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
              * pipelined request sends an RST, and the client reads the reset
              * instead of the status it was told to back off on. */
             free(samples);
+            mynah_asr_obs_refused(mynah_asr_prefork_refusal_code(
+                                      MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY));
             mynah_asr_prefork_refuse_and_close(
                 fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
             return 1;
@@ -711,6 +736,8 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
      * reads ECONNRESET instead. */
     mynah_asr_slot *slot = mynah_asr_sched_claim(params.lang, params.lookahead);
     if (slot == NULL) {
+        mynah_asr_obs_refused(mynah_asr_prefork_refusal_code(
+                                  MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY));
         mynah_asr_prefork_refuse_and_close(fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
         return 1;
     }
@@ -850,6 +877,10 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                     /* Announced, then finalised rather than dropped: the audio
                      * already accepted is still owed a transcript, so the cap
                      * flushes the tail, emits `done` and closes. */
+                    /* Ended by the INGEST, so the scheduler never sees a
+                     * cancel for it: counted here, in the same buckets, under
+                     * the same code the client was just given. */
+                    mynah_asr_sched_note_cancel("audio_limit");
                     ws_transport_error(&w, "audio_limit",
                                        "the stream reached --max-audio-seconds");
                     mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
@@ -936,6 +967,7 @@ static void handle_conn(int fd) {
          * worker wedged" from "the server is slow" */
         cJSON_AddNumberToObject(j, "worker", mynah_asr_prefork_worker_index());
         mynah_asr_sched_health(j);
+        mynah_asr_obs_health(j);
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
@@ -1021,6 +1053,42 @@ static void prepare_client_fd(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 }
 
+/* The model's own mynah.json: its name, its engine, and the streaming shape
+ * the lag thresholds are derived from. Read directly rather than through the
+ * library, because the server needs it before it needs anything else and
+ * because these three fields are description, not weights. A directory without
+ * them still serves; it just cannot name itself. */
+static void read_model_meta(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/mynah.json", model_dir);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > 8 * 1024 * 1024) { fclose(f); return; }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (buf == NULL) { fclose(f); return; }
+    const size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    cJSON *j = cJSON_Parse(buf);
+    free(buf);
+    if (j == NULL) return;
+    const cJSON *v = cJSON_GetObjectItem(j, "name");
+    if (cJSON_IsString(v)) snprintf(g_model_name, sizeof(g_model_name), "%s", v->valuestring);
+    v = cJSON_GetObjectItem(j, "engine");
+    if (cJSON_IsString(v)) snprintf(g_model_engine, sizeof(g_model_engine), "%s", v->valuestring);
+    const cJSON *st = cJSON_GetObjectItem(j, "streaming");
+    if (cJSON_IsObject(st)) {
+        v = cJSON_GetObjectItem(st, "encoder_frame_ms");
+        if (cJSON_IsNumber(v)) g_encoder_frame_ms = v->valuedouble;
+        v = cJSON_GetObjectItem(st, "default_preset_index");
+        if (cJSON_IsNumber(v)) g_default_preset_index = v->valueint;
+    }
+    cJSON_Delete(j);
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8] [--quant int8|int4]\n"
@@ -1038,15 +1106,34 @@ static void usage(void) {
         "       [--ring-seconds 30]  PCM buffered per stream before the client is throttled\n"
         "       [--max-frame-bytes 1048576]  a larger WebSocket frame ends the stream\n"
         "       [--max-pending N]    offline requests queued (default 2*--threads), 503 beyond\n"
+        "       [--metrics-port N]   Prometheus text on its OWN port (off by default)\n"
+        "       [--metrics-bind ADDR]  where that port listens (default 127.0.0.1)\n"
+        "       --dispatch-map [--json]  which kernel/backend/pool this binary resolved, exit\n"
         "  env: MYNAH_ASR_PREFORK_QUEUE (queued per worker, default 1; 0 = refuse at once),\n"
         "       MYNAH_ASR_PREFORK_QUEUE_MS (queue deadline, default 2000),\n"
         "       MYNAH_ASR_PREFORK_SERVICE_MS (service cap, default 30000)\n");
 }
 
 int main(int argc, char **argv) {
+    /* FIRST statement, exactly as in cli/main.c: a binary built for an ISA this
+     * CPU lacks says so in one line instead of dying with a bare SIGILL inside
+     * a kernel three frames down. Fires only on a DEFINITE absence (S3-2). */
+    const int isa = mynah_asr_isa_guard();
+    if (isa != 0) return isa;
+
+    /* The same dispatch report the CLI prints, from the same code: a server
+     * benchmark that cannot state its kernels is not a measurement
+     * (ENGINEERING.md §5). */
+    if (argc >= 2 && strcmp(argv[1], "--dispatch-map") == 0) {
+        const int json = argc >= 3 && strcmp(argv[2], "--json") == 0;
+        return mynah_asr_dispatch_print(stdout, json) < 0 ? 1 : 0;
+    }
+
     const char *model_dir = NULL, *lid_dir = NULL;
     int port = 8090, n_threads = 4;
     int prefork_workers = 0, prefork_threads = 0, cap = 0, plan_only = 0;
+    int metrics_port = 0;
+    const char *metrics_bind = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "--lid-model") == 0 && i + 1 < argc) lid_dir = argv[++i];
@@ -1071,6 +1158,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--max-frame-bytes") == 0 && i + 1 < argc)
             g_max_frame_bytes = (size_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--max-pending") == 0 && i + 1 < argc) g_max_pending = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--metrics-port") == 0 && i + 1 < argc) metrics_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--metrics-bind") == 0 && i + 1 < argc) metrics_bind = argv[++i];
         else if (strcmp(argv[i], "--prefork-plan") == 0) plan_only = 1;
         else { usage(); return 2; }
     }
@@ -1094,6 +1183,8 @@ int main(int argc, char **argv) {
     pf.workers = prefork_workers;
     pf.threads_per = prefork_threads;
     pf.slots_per = cap;
+    pf.metrics_port = metrics_port;
+    pf.metrics_bind = metrics_bind;
     if (plan_only) {
         mynah_asr_prefork_print_plan(&pf, stdout);
         return 0;
@@ -1114,7 +1205,14 @@ int main(int argc, char **argv) {
         sa.sa_handler = on_stop;        /* no SA_RESTART: accept/poll must return EINTR */
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
+        /* Restartable: a dump request must not turn a read() in an ingest
+         * thread into an EINTR the stream then has to recover from. */
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGUSR1, &sa, NULL);
     }
+    read_model_meta(model_dir);
     g_model = mynah_asr_load_quant(model_dir, g_quant);
     if (!g_model) return 1;
     if (lid_dir) {
@@ -1175,6 +1273,66 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* ENGINEERING.md §5: unconditionally, in the same process, before anything
+     * is served -- what the environment asked for, what this build does with
+     * it, the whole server configuration, and the cpu mask actually in force. */
+    {
+        mynah_asr_obs_config oc;
+        memset(&oc, 0, sizeof(oc));
+        oc.model_dir = model_dir;
+        oc.model_name = g_model_name;
+        oc.engine = g_model_engine;
+        oc.quant = g_quant == MYNAH_ASR_QUANT_INT8 ? "int8"
+                 : g_quant == MYNAH_ASR_QUANT_INT4 ? "int4" : "f32";
+        oc.lid_dir = lid_dir;
+        oc.streaming = mynah_asr_sched_streaming();
+        oc.n_lookaheads = mynah_asr_lookaheads(g_model, oc.lookaheads);
+        if (oc.n_lookaheads > 0) {
+            const int d = g_default_preset_index >= 0 &&
+                          g_default_preset_index < oc.n_lookaheads
+                              ? g_default_preset_index : 0;
+            oc.lookahead_default = oc.lookaheads[d];
+            /* One chunk is (lookahead + 1) encoder frames. That is the cadence
+             * the emission-lag thresholds are multiples of, so it is computed
+             * from the model rather than assumed. */
+            if (g_encoder_frame_ms > 0.0)
+                oc.chunk_ms = (double)(oc.lookahead_default + 1) * g_encoder_frame_ms;
+        }
+        oc.port = port;
+        oc.cap = cap;
+        oc.ring_seconds = g_ring_seconds;
+        oc.idle_ms = g_idle_ms;
+        oc.ping_ms = g_ping_ms;
+        oc.max_audio_seconds = g_max_audio_seconds;
+        oc.max_frame_bytes = g_max_frame_bytes;
+        oc.max_pending = g_max_pending;
+        oc.http_threads = n_threads;
+        oc.batch = g_max_batch;
+        oc.prefork_workers = prefork_workers;
+        oc.prefork_threads = mynah_asr_prefork_worker_threads();
+        oc.metrics_port = metrics_port;
+        oc.metrics_bind = metrics_bind;
+        mynah_asr_obs_init(&oc);
+        mynah_asr_obs_banner();
+    }
+
+    /* /metrics, in a SINGLE-PROCESS server only: with --prefork the parent owns
+     * the port and answers for the fleet (see prefork.h), and it bound the
+     * listener before the fork. A bind that fails is fatal here -- an
+     * observability port that silently did not open is worse than none. */
+    int metrics_fd = -1;
+    if (metrics_port > 0 && prefork_workers == 0) {
+        metrics_fd = mynah_asr_metrics_listen(metrics_bind, metrics_port);
+        if (metrics_fd < 0) {
+            mynah_asr_sched_stop();
+            mynah_asr_free(g_lid);
+            mynah_asr_free(g_model);
+            return 1;
+        }
+        fprintf(stderr, "mynah-asr-server: /metrics on %s:%d\n",
+                metrics_bind, metrics_port);
+    }
+
     for (int i = 0; i < n_threads; i++) {
         pthread_t t;
         pthread_create(&t, NULL, worker, NULL);
@@ -1198,10 +1356,10 @@ int main(int argc, char **argv) {
      * the router accepted, chose it and passed the descriptor down a
      * socketpair. Everything after this loop is the same code in both shapes. */
     while (!g_shutdown) {
-        if (mynah_asr_prefork_take_dump_request())
-            fprintf(stderr, "[stats] worker %d slots %d/%d blas_budget %d\n",
-                    mynah_asr_prefork_worker_index(), mynah_asr_sched_active(), cap,
-                    mynah_asr_blas_budget());
+        /* SIGUSR1 (S3-4). The parent forwards it to every worker, so one
+         * `kill -USR1 <parent>` produces the routing table from the router and
+         * this block from each worker. */
+        if (mynah_asr_prefork_take_dump_request()) mynah_asr_obs_dump();
         int fd;
         if (chan_fd >= 0) {
             fd = mynah_asr_prefork_recv_conn(chan_fd, 200);
@@ -1212,10 +1370,19 @@ int main(int argc, char **argv) {
                 break;
             }
         } else {
-            struct pollfd pfd = {.fd = srv, .events = POLLIN};
-            const int ready = poll(&pfd, 1, 200);
+            /* The service listener and, when it exists, the metrics listener in
+             * ONE poll: a scrape is then a bounded slice of this loop rather
+             * than a thread reading counters the loop is writing. */
+            struct pollfd pfd[2];
+            pfd[0].fd = srv; pfd[0].events = POLLIN; pfd[0].revents = 0;
+            pfd[1].fd = metrics_fd; pfd[1].events = POLLIN; pfd[1].revents = 0;
+            const int nfd = metrics_fd >= 0 ? 2 : 1;
+            const int ready = poll(pfd, (nfds_t)nfd, 200);
             if (ready < 0) { if (errno == EINTR) continue; break; }
             if (ready == 0) continue;
+            if (nfd == 2 && (pfd[1].revents & POLLIN) != 0)
+                mynah_asr_metrics_service(metrics_fd, mynah_asr_obs_render_metrics, NULL);
+            if ((pfd[0].revents & POLLIN) == 0) continue;
             fd = accept(srv, NULL, NULL);
             if (fd < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) continue;
@@ -1232,6 +1399,7 @@ int main(int argc, char **argv) {
      * those last frames on the wire. */
     if (srv >= 0) close(srv);
     if (chan_fd >= 0) close(chan_fd);
+    if (metrics_fd >= 0) close(metrics_fd);
     mynah_asr_sched_stop();
     { struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000000L}; nanosleep(&ts, NULL); }
     mynah_asr_free(g_lid);

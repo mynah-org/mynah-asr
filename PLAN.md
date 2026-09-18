@@ -62,10 +62,10 @@ there; macOS is the development machine, nice to have, never the target.**
 - [x] S2-7 Byte-identity gate: N concurrent streams == the same streams alone, also under `--prefork` (`tests/test_server_stream.sh`: 4 real-time streams x 2 utterances and `--prefork 2 --cap 2`, each text byte-identical to `mynah-asr transcribe` of the same clip; `tests/test_server_protocol.sh` adds three utterances on ONE socket) → [`.work/server-scheduler.md`](.work/server-scheduler.md)
 
 ### S3 — The server proves what it runs → [`.work/observability.md`](.work/observability.md)
-- [~] S3-1 Flag registry + `[FLAGS]`/`[EFFECTIVE-CONFIG]` lines in the library and the CLI (`--flags`, `MYNAH_ASR_VERBOSE=1`); the server banner and `[TOPOLOGY]` are still open
-- [~] S3-2 `--dispatch-map [--json]` resolved from owner predicates, `IDLE HARDWARE` footer and ISA guard in `main()`; the server does not print it yet
-- [ ] S3-3 `/v1/health` as facts; `/metrics` on its own port, per-worker series, threshold counters
-- [ ] S3-4 `SIGUSR1` dump forwarded to workers; named threads
+- [x] S3-1 Flag registry + `[FLAGS]`/`[EFFECTIVE-CONFIG]` in library, CLI and server, `[SERVER-CONFIG] v=1` and a per-worker `[TOPOLOGY] v=1` with the mask read back from the kernel
+- [x] S3-2 `--dispatch-map [--json]` resolved from owner predicates, `IDLE HARDWARE` footer, ISA guard first in both `main()`s; `mynah-asr-server --dispatch-map` prints the same table
+- [x] S3-3 `/v1/health` as facts (cancels by reason, lag p50/p95, resolved kernels, actual mask); `/metrics` on its own port, token bucket, per-worker series, exact threshold counters, the router answering for the fleet
+- [x] S3-4 `SIGUSR1` one-shot `[DUMP]` bracketed per worker, forwarded by the parent, handler installed before the fork; thread names verified and documented
 
 ### S4 — Measure, then qualify → [`.work/bench-harness-streaming.md`](.work/bench-harness-streaming.md)
 - [x] S4-1 Streaming metrics module: every metric defined once, known-answer self-test in `make test` ([`tools/bench/streaming_metrics.py`](tools/bench/streaming_metrics.py))

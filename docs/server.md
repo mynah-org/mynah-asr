@@ -202,24 +202,175 @@ Reference client (Python stdlib): `tools/eval/ws_client.py`. Load harness:
 
 ### GET /v1/models · GET /v1/health · OPTIONS (CORS)
 
-`/v1/health` reports what the scheduler actually did, not what it was configured
-to do:
+`/v1/health` reports **facts**: what this process actually did. The
+configuration it was given is on the `[SERVER-CONFIG]` banner line, printed once
+at start — a number that is configuration has no business in a counter, and a
+health endpoint that reports both is one that will be quoted for the wrong one.
 
 ```json
 {"status":"ok","inflight":2,"blas_budget":8,"threads":8,"worker":-1,
  "slots":{"active":2,"cap":4},"steps":312,"deltas":270,"eous":0,"sessions":9,
- "cancelled":1,"offline_jobs":4,"offline_pending":0,
- "lag_p50_ms":144,"lag_max_ms":358.6,"streaming":true}
+ "cancelled":1,
+ "cancelled_by":{"idle_timeout":1,"peer_gone":0,"frame_too_large":0,
+                 "protocol_error":0,"shutting_down":0,"audio_limit":0,
+                 "decode_failed":0,"other":0},
+ "offline":{"queued":0,"done":4,"max_pending":8},
+ "audio_seconds":5.229,
+ "lag_ms":{"p50":144,"p95":312,"max":358.6,"count":270,"bucket_ms":8},
+ "streaming":true,
+ "model":{"name":"nemotron-3.5-asr-streaming-0.6b","engine":"nemotron-streaming",
+          "quant":"f32","lookahead_default":3},
+ "groups":"",
+ "process":{"worker":-1,"pid":6392,"uptime_s":30.2,"pool_threads":8,
+            "prefork_threads":0,"http_threads":4,"pinned":false,
+            "cpu_mask":"unpinned","build":"v0.9.1-38-gd480467",
+            "blas":"accelerate","simd":"neon+dotprod","int8_kernel":"neon-sdot",
+            "int4_kernel":"neon-sdot-q4","int8_gemm":"off"},
+ "refused":{"server_at_capacity":2,"unknown_query_parameter":1}}
 ```
 
-`inflight` = stream slots this worker is holding (a slot is held from the 101
-until the ingest thread lets go) · `slots.cap` = `--cap` · `steps` = scheduler
-steps that fed a chunk · `deltas`/`eous` = frames emitted · `sessions` = slots
-claimed since start · `cancelled` = sessions ended by a cap or a dead peer ·
-`offline_pending` = REST jobs waiting for a step · `lag_*` = emission lag since
-start, from the same 8 ms histogram the `done` frame uses · `threads` =
-`mynah_asr_num_threads()` · `blas_budget` = threads one inference may ask of
-BLAS, now a constant (see below).
+| field | what it is |
+|---|---|
+| `inflight`, `slots` | stream slots this worker holds now; `cap` is `--cap` |
+| `steps`, `deltas`, `eous` | scheduler steps that fed a chunk, frames emitted |
+| `sessions` | slots claimed since start |
+| `cancelled`, `cancelled_by` | sessions ended early, bucketed **by the `code` the client was sent** — the counter and the error frame can never name two different things |
+| `offline` | REST jobs `queued` now, `done` since start, and `--max-pending` |
+| `audio_seconds` | seconds of audio fed to the model, streams and REST alike |
+| `lag_ms` | emission lag since start, from the 8 ms histogram (`bucket_ms`); `p50`/`p95` are therefore quantised to 8 ms, which is a measurement — a percentile computed from a mean is not |
+| `model`, `groups` | what this process holds, read from the model's own `mynah.json`; `groups` is the fleet's language split, `""` when there is one |
+| `process.pinned`, `cpu_mask` | read BACK from the kernel (`sched_getaffinity`), never the mask that was requested. `false`/`unpinned` on macOS, which has no affinity API this server uses |
+| `process.build/blas/simd/int8_kernel` | the same values `--dispatch-map` prints, from the same predicates (`src/qmat.c`) |
+| `refused` | refusals **this worker** issued, by the `code` in the error body. The prefork router counts its own separately (`/metrics`, and its final table) |
+
+## The start-up banner
+
+Every server process prints four machine-readable lines to **stderr** before it
+serves anything, unconditionally — there is no flag that turns them off, because
+the one run whose banner is missing is the run that will be quoted
+(`ENGINEERING.md` §5).
+
+```
+[FLAGS] v=1 MYNAH_ASR_THREADS=8
+[EFFECTIVE-CONFIG] v=1 build=v0.9.1-38-gd480467 blas=accelerate simd=neon+dotprod MYNAH_ASR_THREADS=8->8(applied)
+[SERVER-CONFIG] v=1 model_dir=... model=nemotron-3.5-asr-streaming-0.6b engine=nemotron-streaming
+    quant=f32 lid_model=none streaming=yes lookahead_default=3 lookahead_presets=3,0,6,13
+    chunk_ms=320 port=8397 cap=4 ring_s=30 idle_ms=60000 ping_ms=20000 max_audio_s=14400
+    max_frame_bytes=1048576 max_pending=8 batch=8 http_threads=4 pool_threads=8
+    blas_budget=8 prefork=single-process worker=-1 metrics=on
+[TOPOLOGY] v=1 worker=-1 pid=6392 configured_mask=inherited actual_mask=unpinned threads=8 pinned=no
+```
+
+- `[FLAGS]` / `[EFFECTIVE-CONFIG]` come from `src/flags.c`, the same two lines
+  the CLI prints: every registered environment variable that is **set**, and
+  what this build on this host actually does with it (`applied`, `clamped`,
+  `IGNORED: <why>`).
+- `[SERVER-CONFIG]` is one token per field, whitespace inside a value replaced
+  by `_`. `chunk_ms` is `(lookahead_default + 1) × encoder_frame_ms`, taken from
+  the model's `mynah.json` — it is the cadence the emission-lag thresholds below
+  are multiples of.
+- `[TOPOLOGY]` is printed **per worker**, by the worker, right after it pins
+  itself, and `configured_mask` vs `actual_mask` is the point: the second is read
+  back from the kernel, so a cgroup, an inherited `taskset` or a failed
+  `sched_setaffinity` shows up as a difference instead of as a slow server.
+- `mynah-asr-server --dispatch-map [--json]` prints the same dispatch table the
+  CLI does, resolved from the owners' predicates, and exits. A serving benchmark
+  that cannot state its kernels is not a measurement.
+
+## `/metrics` — Prometheus text, on its own port
+
+Off by default. `--metrics-port N` turns it on; `--metrics-bind ADDR` (default
+`127.0.0.1`) says where.
+
+```
+mynah-asr-server -m models/nemotron-3.5-asr-streaming-0.6b --metrics-port 9090
+curl -s localhost:9090/metrics
+```
+
+**Never the service port.** A scrape must not queue behind a 200 MB upload, and
+an observability surface should not be reachable from wherever the audio clients
+are. **Never `SO_REUSEPORT`**: two processes silently sharing the port would
+answer half the scrapes with the other one's counters under the same labels, so
+a second bind on a live metrics port fails, loudly, with the port named.
+`SO_REUSEADDR` *is* set, and only that — it lets a restart re-bind over the
+`TIME_WAIT` of the scrapes the previous run answered.
+
+**No thread, no background collection.** The page is rendered on request from
+counters the process already keeps; the accept loop that owns the listener
+serves it in a bounded slice (2 ms for the request bytes, 200 ms for the write,
+the FIN and the drain). Nothing was added to the per-step path beyond two
+relaxed atomic adds next to adds that were already there (audio samples and the
+lag sum).
+
+**Rate limit**: a token bucket, 5 scrapes/s with a burst of 10. Over that the
+answer is `429` and the page is *not* rendered — rendering is the cost the limit
+exists to bound.
+
+What a worker exports (all series carry `worker`, `-1` = a single-process
+server):
+
+| series | |
+|---|---|
+| `mynah_asr_sessions_total` · `mynah_asr_steps_total` · `mynah_asr_deltas_total` · `mynah_asr_eou_total` | counters |
+| `mynah_asr_audio_seconds_total` | **the throughput unit**: any RTF claim about this server has this as its denominator |
+| `mynah_asr_offline_jobs_total` · `mynah_asr_offline_queued` | REST jobs done, and waiting now |
+| `mynah_asr_cancelled_total{reason}` | `idle_timeout` `peer_gone` `frame_too_large` `protocol_error` `shutting_down` `audio_limit` `decode_failed` `other` |
+| `mynah_asr_refused_total{code}` | this worker's own refusals, by the code in the error body |
+| `mynah_asr_emission_lag_ms_sum` / `_count` / `_max` | a sum-and-count pair, not a histogram |
+| `mynah_asr_emission_lag_over_ms_total{le}` | **exact** counts of deltas whose lag was **at least** the labelled ms. The thresholds are one and two chunk periods plus 1000 ms, rounded up to an 8 ms bucket edge — so on the v1 target they are `320`, `640`, `1000`, and the count is exact rather than interpolated |
+| `mynah_asr_slots_active` · `mynah_asr_slots_cap` | gauges |
+| `mynah_asr_build_info{build,blas,simd,int8_kernel}` | always 1; the labels are the point |
+| `mynah_asr_uptime_seconds` | gauge |
+
+**Under `--prefork` the PARENT answers**, and it says so in a comment line at
+the top of the page. The router holds the routing table and never enters the
+model, so it exports `mynah_asr_worker_up` / `_inflight` / `_slots` /
+`_assigned_total` / `_completed_total` / `_over_service_cap_total` per worker,
+its own `mynah_asr_refused_total{code}` and the admission-queue gauges — and
+**not** sessions, steps, deltas, audio seconds or emission lag, because it does
+not have them. A worker's own scheduler counters are exported by that worker
+only if it is given a metrics port of its own. Per-worker series are never
+summed here: a fleet total hides the one worker that stopped.
+
+**What is deliberately NOT exported.** No client-side latency: no TTFP, no stall
+rate, no "safe play start". Those are measured at the far end of a socket this
+process does not own, and a server that reports them is reporting a guess. They
+belong to the benchmark harness (`tools/bench/`), which is the only thing that
+may quote them. **Cardinality** is a contract: the only labels are `worker`,
+`reason`, `code` and `le`, each from a fixed compile-time set. Never a language,
+never a model path, never text, never anything a client can choose.
+
+## `SIGUSR1` — one dump, to stderr
+
+`kill -USR1 <pid>` makes a server print everything above once, bracketed, and
+keep running. Sent to a prefork **parent** it prints the routing table and
+forwards the signal to every worker, so one signal produces the whole machine's
+view.
+
+```
+[DUMP] v=1 worker=0 seq=1 begin
+[DUMP] worker=0 seq=1 process pid=1720 uptime_s=41.3 pool_threads=4 blas_budget=4 pinned=no mask=unpinned
+[DUMP] worker=0 seq=1 build=... blas=accelerate simd=neon+dotprod int8_kernel=neon-sdot int8_gemm=off
+[DUMP] worker=0 seq=1 model=... engine=... quant=f32 streaming=yes lookahead_default=3 chunk_ms=320
+[DUMP] worker=0 seq=1 slots active=0 cap=2 sessions=1 steps=17 deltas=15 eous=0 audio_s=5.2
+[DUMP] worker=0 seq=1 offline queued=0 done=4 max_pending=4
+[DUMP] worker=0 seq=1 cancelled=0 idle_timeout=0 peer_gone=0 ... other=0
+[DUMP] worker=0 seq=1 refused none
+[DUMP] worker=0 seq=1 lag_ms p50=144 p95=312 max=358.6 count=15 sum=2160 bucket_ms=8 over_320ms=0 over_640ms=0 over_1000ms=0
+[DUMP] v=1 worker=0 seq=1 end
+```
+
+The whole dump is composed into one buffer and written once: W workers write to
+the same stderr at the same moment, and a dump built out of a dozen `fprintf`
+calls comes back with worker 0's line spliced into the middle of worker 1's —
+which is what the first run of this actually produced. `seq` increments per
+dump, so two dumps can never be read as one.
+
+The handler is installed by `server/main.c` **before** the fork, and workers
+inherit it. That is load-bearing rather than tidy: the default action for
+`SIGUSR1` is to *terminate*, so a fleet without a handler loses every worker the
+first time anyone asks it for statistics — which is exactly what happened the
+first time this was exercised.
 
 ## Concurrency: one scheduler thread owns the model
 
@@ -312,6 +463,12 @@ knob: there the budget is only bookkeeping, reported in `/v1/health`.
   whose text is byte-identical to `mynah-asr transcribe` of the same clip, a
   stalled reader taking only its own slot down, and the same identity under
   `--prefork 2 --cap 2`. Needs a streaming model, so it is skipped without one.
+- `make test-server-metrics` — the observability surface, model-agnostic and
+  REST-only: the four banner lines; `/metrics` and `/v1/health` agreeing on the
+  same counters; `audio_seconds_total` equal to 4 x the clip; a second bind on
+  the metrics port refused; a burst of 20 scrapes answered with 429s; a
+  bracketed `[DUMP]` that does not kill the process; and, under `--prefork 2`,
+  the router answering for both workers.
 - `make test-server-protocol` — protocol v2 and the per-worker admission ladder:
   three utterances on ONE socket separated by `finalize`/`reset`, each
   byte-identical to the CLI with `seq` continuing; an unknown control message and
@@ -326,7 +483,11 @@ knob: there the budget is only bookkeeping, reported in `/v1/health`.
 - One model per process (`/v1/models` lists one).
 - Timeouts/limits: body ≤ 200 MB, headers ≤ 64 KB, queue ≤ 128 connections,
   plus the per-stream caps in the table above.
-- Threads, as `top -H` names them: `mynah-accept`/`mynah-recv` (the connection
-  source) · `mynah-http` ×`--threads`, renamed `mynah-ingest` while one drives a
-  stream · `mynah-sched` ×1 · `mynah-out<fd>` per streaming connection.
+- Threads, as `top -H` / `htop` / `ps -L` name them (verified, not intended):
+  `mynah-accept` (single process) or `mynah-recv` (a prefork worker) — the
+  connection source, one per process · `mynah-http` ×`--threads`, each renamed
+  `mynah-ingest` for the life of a WebSocket it is driving and back afterwards ·
+  `mynah-sched` ×1, the only thread that enters the model · `mynah-out<fd>`, one
+  per streaming connection, named with its own descriptor so a stuck writer can
+  be tied to a socket.
 - TLS/auth out of scope: put behind a reverse proxy (nginx/caddy) in production.

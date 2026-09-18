@@ -345,6 +345,22 @@ typedef struct {
      * runtime is detected independently -- but a caller that does set it gets
      * the refusal on every backend rather than only the detectable ones. */
     int gpu_backend_open;
+
+    /* ---- /metrics (S3-3). 0 = off, and off is the default. ----
+     *
+     * THE PARENT ANSWERS FOR THE FLEET. A worker holds its own scheduler
+     * counters and the parent holds the routing table, and no process holds
+     * both -- so rather than invent a collection protocol, the parent serves
+     * what it KNOWS (per-worker in-flight, assigned, completed, and the
+     * router's refusals by reason) and says so on a comment line in the page
+     * itself. A worker's own scheduler counters are exported by that worker
+     * only if it is given a metrics port of its own.
+     *
+     * The listener is bound BEFORE the fork, so a port that is already taken
+     * fails before any child exists, and closed in every child, so a worker
+     * can never answer a scrape the parent is supposed to answer. */
+    int metrics_port;
+    const char *metrics_bind;   /* NULL -> 127.0.0.1 */
 } mynah_asr_prefork_config;
 
 #define MYNAH_ASR_PREFORK_QUEUE_DEFAULT        1
@@ -459,6 +475,33 @@ int mynah_asr_prefork_recv_conn(int chan_fd, int timeout_ms);
 /* Non-zero once since the last call if SIGUSR1 asked for a statistics dump.
  * Both the parent's router loop and a worker's accept loop poll this. */
 int mynah_asr_prefork_take_dump_request(void);
+
+/* Raises that flag. Async-signal-safe (one store to a volatile sig_atomic_t),
+ * so it is what a caller's SIGUSR1 handler calls.
+ *
+ * The caller MUST install that handler before mynah_asr_prefork_run(): a worker
+ * inherits it across the fork, and the default action for SIGUSR1 is to
+ * TERMINATE, so a fleet without one loses every worker the first time anyone
+ * asks for statistics. This module refuses to install a handler in a child for
+ * the reason given at that call site -- two handlers mean whichever ran last
+ * silently wins -- and instead ignores the signal where it finds none. */
+void mynah_asr_prefork_request_dump(void);
+
+/* THE MASK THIS PROCESS IS ACTUALLY RUNNING ON, read back from the kernel --
+ * never the one that was requested. Writes a cpu list ("0,1,2,3") into `out`,
+ * or "unpinned" where the platform has no affinity API (macOS) or the call
+ * failed, and returns 1 only when the mask is a STRICT subset of the cpus
+ * online, i.e. when this process really is pinned.
+ *
+ * `configured` and `actual` being two different claims is the entire reason
+ * the topology is printed at all: a cgroup, an inherited taskset or a failed
+ * sched_setaffinity all produce a worker that is not where the plan says. */
+int mynah_asr_prefork_actual_mask(char *out, size_t cap);
+
+/* `[TOPOLOGY] v=1 worker= pid= configured_mask= actual_mask= threads= pinned=`
+ * -- the machine-readable twin of the human worker line. A worker prints it
+ * for itself; a single-process server prints it for the one process it is. */
+void mynah_asr_prefork_print_topology(FILE *out, int threads);
 
 /* ------------------------------------------------------- the refusal itself
  *
