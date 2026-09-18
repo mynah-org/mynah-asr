@@ -4,6 +4,8 @@
 #ifndef MYNAH_ASR_TOKENIZER_H
 #define MYNAH_ASR_TOKENIZER_H
 
+#include <stddef.h>
+
 typedef struct {
     char **pieces;
     int n_pieces;
@@ -36,6 +38,47 @@ int mynah_asr_tokenize(const mynah_asr_tokenizer *tk, const char *text, int *ids
  * leading space dropped. */
 char *mynah_asr_detokenize(const mynah_asr_tokenizer *tk, const int *tokens, int n,
                        char *lang_out);
+
+/* ------------------------------------------------- incremental detokenisation
+ * Same output as mynah_asr_detokenize over the whole token history, produced by
+ * appending only the tokens of the current chunk to a per-stream buffer: a
+ * streaming caller no longer re-decodes (and re-allocates) the transcript on
+ * every chunk. The buffer grows geometrically, so it reallocates only when the
+ * transcript outgrows the reserve taken at init — never once per chunk.
+ *
+ * Exactness: the raw transcript is kept unstripped, so the ▁ -> space expansion,
+ * the inline <xx-XX> stripping (rescanned from the first '<' left unresolved,
+ * which is why a tag split across chunks still works) and the leading/trailing
+ * space strip produce, at every step, the bytes mynah_asr_detokenize would
+ * produce from the whole history. */
+#define MYNAH_ASR_DETOK_MIN_CAP 256
+
+typedef struct {
+    char *buf;              /* raw transcript, NUL-terminated at len */
+    size_t len, cap;
+    size_t scan;            /* first '<' the inline-tag pass could not resolve */
+    size_t trim;            /* where the trailing-space strip put its NUL */
+    int trimmed;            /* buf[trim] currently holds that NUL, not a space */
+    size_t collapse;        /* a tag was stripped here, at the end of the buffer: */
+    int collapse_pending;   /* whether the space that follows it collapses is not
+                               decidable until the next chunk arrives */
+    char lang1[16];         /* last <xx-XX> SPECIAL token seen */
+    char lang2[16];         /* first inline <xx-XX> spelled out in the text */
+} mynah_asr_detok;
+
+/* reserve: bytes to allocate up front (clamped to MYNAH_ASR_DETOK_MIN_CAP).
+ * 0 on success, -1 on allocation failure. */
+int mynah_asr_detok_init(mynah_asr_detok *dt, size_t reserve);
+void mynah_asr_detok_free(mynah_asr_detok *dt);
+/* Back to the empty transcript, keeping the buffer. */
+void mynah_asr_detok_reset(mynah_asr_detok *dt);
+
+/* Append the n tokens of this chunk. Returns the WHOLE transcript so far (owned
+ * by dt, valid until the next append/reset/free), NULL on allocation failure.
+ * lang_out, when non-NULL, receives 16 bytes exactly as mynah_asr_detokenize
+ * would have written them for the whole history. */
+const char *mynah_asr_detok_append(mynah_asr_detok *dt, const mynah_asr_tokenizer *tk,
+                               const int *tokens, int n, char *lang_out);
 
 #include "mynah_asr.h"  /* mynah_asr_word */
 
