@@ -1,0 +1,405 @@
+/* The worker's view of itself. See obs.h for the four renderings and the
+ * honest-metric boundary. */
+#include "obs.h"
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "../src/dispatch.h"
+#include "../src/flags.h"
+#include "../src/mynah_asr.h"
+#include "../src/qmat.h"
+#include "../src/threads.h"
+#include "prefork.h"
+#include "sched.h"
+#include "slot.h"
+
+static mynah_asr_obs_config g_cfg;
+static double g_t0;
+
+/* --------------------------------------------------------- refusal counters
+ *
+ * A worker refuses for reasons the ROUTER never sees (a bad Content-Length, an
+ * unknown endpoint, a lookahead that is not a preset, its own connection queue
+ * full), so the router's table cannot answer "why did this worker say no".
+ * A small fixed table, filled on first use with the compile-time literals the
+ * refusal sites pass; anything beyond its capacity is `other`, because the one
+ * thing a label set may never do is grow with traffic. */
+#define OBS_REFUSAL_MAX 24
+static struct {
+    pthread_mutex_t mu;
+    const char *code[OBS_REFUSAL_MAX];
+    unsigned long n[OBS_REFUSAL_MAX];
+    int used;
+    unsigned long other;
+} g_ref = {PTHREAD_MUTEX_INITIALIZER, {NULL}, {0}, 0, 0};
+
+void mynah_asr_obs_refused(const char *code) {
+    if (code == NULL || code[0] == '\0') code = "other";
+    pthread_mutex_lock(&g_ref.mu);
+    for (int i = 0; i < g_ref.used; i++) {
+        if (strcmp(g_ref.code[i], code) == 0) {
+            g_ref.n[i]++;
+            pthread_mutex_unlock(&g_ref.mu);
+            return;
+        }
+    }
+    if (g_ref.used < OBS_REFUSAL_MAX) {
+        g_ref.code[g_ref.used] = code;   /* borrowed: every caller passes a literal */
+        g_ref.n[g_ref.used] = 1;
+        g_ref.used++;
+    } else {
+        g_ref.other++;
+    }
+    pthread_mutex_unlock(&g_ref.mu);
+}
+
+static double now_s(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+void mynah_asr_obs_init(const mynah_asr_obs_config *cfg) {
+    g_cfg = *cfg;
+    g_t0 = now_s();
+}
+
+/* ----------------------------------------------------------- the thresholds
+ *
+ * Chunk-period multiples, because a lag of one chunk period is the cadence
+ * working and a lag of two is the cadence slipping -- an absolute millisecond
+ * ladder would mean something different on every preset. Rounded UP to a
+ * histogram bucket edge so the counter is EXACT (the histogram quantises to
+ * MYNAH_ASR_LAG_BUCKET_MS), and the rounded value is what the label says: a
+ * label that names a threshold the counter does not use is a lie with a
+ * number in it. */
+#define OBS_LAG_THRESHOLDS 3
+static void lag_thresholds(int out[OBS_LAG_THRESHOLDS]) {
+    double chunk = g_cfg.chunk_ms;
+    if (!(chunk > 0.0)) chunk = 320.0;   /* an offline-only model has no cadence */
+    int t[OBS_LAG_THRESHOLDS] = {(int)(chunk + 0.5), (int)(2.0 * chunk + 0.5), 1000};
+    for (int i = 0; i < OBS_LAG_THRESHOLDS; i++) {
+        int v = t[i];
+        if (v % MYNAH_ASR_LAG_BUCKET_MS != 0)
+            v += MYNAH_ASR_LAG_BUCKET_MS - (v % MYNAH_ASR_LAG_BUCKET_MS);
+        out[i] = v;
+    }
+}
+
+/* ---------------------------------------------------------------- the banner */
+
+static void print_server_config(FILE *out) {
+    char pres[64] = "none";
+    if (g_cfg.n_lookaheads > 0) {
+        size_t k = 0;
+        pres[0] = '\0';
+        for (int i = 0; i < g_cfg.n_lookaheads && k + 8 < sizeof(pres); i++)
+            k += (size_t)snprintf(pres + k, sizeof(pres) - k, "%s%d",
+                                  i ? "," : "", g_cfg.lookaheads[i]);
+    }
+    fprintf(out,
+        "[SERVER-CONFIG] v=1 model_dir=%s model=%s engine=%s quant=%s "
+        "lid_model=%s streaming=%s lookahead_default=%d lookahead_presets=%s "
+        "chunk_ms=%.0f port=%d cap=%d ring_s=%d idle_ms=%d ping_ms=%d "
+        "max_audio_s=%.0f max_frame_bytes=%zu max_pending=%d batch=%d "
+        "http_threads=%d pool_threads=%d blas_budget=%d prefork=%s worker=%d "
+        "metrics=%s\n",
+        g_cfg.model_dir ? g_cfg.model_dir : "-",
+        g_cfg.model_name ? g_cfg.model_name : "-",
+        g_cfg.engine ? g_cfg.engine : "-",
+        g_cfg.quant ? g_cfg.quant : "-",
+        g_cfg.lid_dir ? g_cfg.lid_dir : "none",
+        g_cfg.streaming ? "yes" : "no",
+        g_cfg.lookahead_default, pres, g_cfg.chunk_ms,
+        g_cfg.port, g_cfg.cap, g_cfg.ring_seconds, g_cfg.idle_ms, g_cfg.ping_ms,
+        g_cfg.max_audio_seconds, g_cfg.max_frame_bytes, g_cfg.max_pending,
+        g_cfg.batch, g_cfg.http_threads, mynah_asr_num_threads(),
+        mynah_asr_blas_budget(),
+        g_cfg.prefork_workers > 0 ? "yes" : "single-process",
+        mynah_asr_prefork_worker_index(),
+        /* A WORKER never answers a scrape: the router bound the port before the
+         * fork and closed this process's copy of it. Saying "on" here would
+         * point an operator at a port this pid does not hold. */
+        g_cfg.metrics_port <= 0 ? "off"
+            : mynah_asr_prefork_worker_index() >= 0 ? "served-by-router" : "on");
+    if (g_cfg.prefork_workers > 0)
+        fprintf(out, "[SERVER-CONFIG] v=1 prefork_workers=%d prefork_threads=%d\n",
+                g_cfg.prefork_workers, g_cfg.prefork_threads);
+    if (g_cfg.metrics_port > 0)
+        fprintf(out, "[SERVER-CONFIG] v=1 metrics_bind=%s metrics_port=%d\n",
+                g_cfg.metrics_bind ? g_cfg.metrics_bind : "127.0.0.1",
+                g_cfg.metrics_port);
+    fflush(out);
+}
+
+void mynah_asr_obs_banner(void) {
+    /* The two lines src/flags.c owns: what the environment asked for and what
+     * this build on this host can actually do with it. */
+    mynah_asr_flags_print(stderr);
+    print_server_config(stderr);
+    /* A prefork worker already printed its own [TOPOLOGY] from inside the fork,
+     * where the mask had just been set. A single process prints its own here. */
+    if (mynah_asr_prefork_worker_index() < 0)
+        mynah_asr_prefork_print_topology(stderr, mynah_asr_num_threads());
+}
+
+/* ---------------------------------------------------------------- /v1/health */
+
+void mynah_asr_obs_health(cJSON *into) {
+    char mask[256];
+    const int pinned = mynah_asr_prefork_actual_mask(mask, sizeof(mask));
+
+    cJSON *m = cJSON_AddObjectToObject(into, "model");
+    cJSON_AddStringToObject(m, "name", g_cfg.model_name ? g_cfg.model_name : "-");
+    cJSON_AddStringToObject(m, "engine", g_cfg.engine ? g_cfg.engine : "-");
+    cJSON_AddStringToObject(m, "quant", g_cfg.quant ? g_cfg.quant : "-");
+    cJSON_AddNumberToObject(m, "lookahead_default", g_cfg.lookahead_default);
+    /* The fleet's shape, so a probe on one worker can say what the whole
+     * server holds. "" in a single-language fleet. */
+    cJSON_AddStringToObject(into, "groups", mynah_asr_prefork_language_plan());
+
+    cJSON *p = cJSON_AddObjectToObject(into, "process");
+    cJSON_AddNumberToObject(p, "worker", mynah_asr_prefork_worker_index());
+    cJSON_AddNumberToObject(p, "pid", (double)getpid());
+    cJSON_AddNumberToObject(p, "uptime_s", now_s() - g_t0);
+    cJSON_AddNumberToObject(p, "pool_threads", mynah_asr_num_threads());
+    cJSON_AddNumberToObject(p, "prefork_threads", mynah_asr_prefork_worker_threads());
+    cJSON_AddNumberToObject(p, "http_threads", g_cfg.http_threads);
+    cJSON_AddBoolToObject(p, "pinned", pinned ? 1 : 0);
+    cJSON_AddStringToObject(p, "cpu_mask", mask);
+    cJSON_AddStringToObject(p, "build", mynah_asr_build_id());
+    cJSON_AddStringToObject(p, "blas", mynah_asr_blas_provider());
+    cJSON_AddStringToObject(p, "simd", mynah_asr_simd_profile());
+    /* Resolved by the owner's predicate (src/qmat.c), never re-derived here:
+     * ENGINEERING.md §5. */
+    cJSON_AddStringToObject(p, "int8_kernel", mynah_asr_qmat_int8_kernel());
+    cJSON_AddStringToObject(p, "int4_kernel", mynah_asr_qmat_int4_kernel());
+    cJSON_AddStringToObject(p, "int8_gemm",
+        mynah_asr_qmat_qgemm() > 0 ? "on"
+        : mynah_asr_qmat_qgemm() == 0 ? "off" : "not-compiled");
+
+    cJSON *r = cJSON_AddObjectToObject(into, "refused");
+    pthread_mutex_lock(&g_ref.mu);
+    for (int i = 0; i < g_ref.used; i++)
+        cJSON_AddNumberToObject(r, g_ref.code[i], (double)g_ref.n[i]);
+    if (g_ref.other > 0) cJSON_AddNumberToObject(r, "other", (double)g_ref.other);
+    pthread_mutex_unlock(&g_ref.mu);
+}
+
+/* ------------------------------------------------------------------ /metrics */
+
+void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
+    (void)unused;
+    mynah_asr_sched_stats st;
+    mynah_asr_sched_stats_read(&st);
+
+    char wl[16];
+    const int widx = mynah_asr_prefork_worker_index();
+    snprintf(wl, sizeof(wl), "%d", widx);
+
+    char build[128], blas[64], simd[64], k8[64];
+    mynah_asr_metrics_label(mynah_asr_build_id(), build, sizeof(build));
+    mynah_asr_metrics_label(mynah_asr_blas_provider(), blas, sizeof(blas));
+    mynah_asr_metrics_label(mynah_asr_simd_profile(), simd, sizeof(simd));
+    mynah_asr_metrics_label(mynah_asr_qmat_int8_kernel(), k8, sizeof(k8));
+
+    mynah_asr_metrics_addf(b,
+        "# This process's OWN counters, labelled with its worker index (-1 = a\n"
+        "# single-process server). Per-worker series are never summed here: a\n"
+        "# fleet total hides the one worker that stopped.\n"
+        "# No client-side latency is exported -- no TTFP, no stall rate. Those are\n"
+        "# measured at the far end of a socket this process does not own, and they\n"
+        "# belong to the benchmark harness.\n");
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_build_info build, BLAS provider, compiled SIMD profile and\n"
+        "# the int8 kernel src/qmat.c's own predicate resolved.\n"
+        "# TYPE mynah_asr_build_info gauge\n"
+        "mynah_asr_build_info{build=\"%s\",blas=\"%s\",simd=\"%s\",int8_kernel=\"%s\"} 1\n",
+        build, blas, simd, k8);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_uptime_seconds seconds since this process started serving.\n"
+        "# TYPE mynah_asr_uptime_seconds gauge\n"
+        "mynah_asr_uptime_seconds %.3f\n", now_s() - g_t0);
+
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_sessions_total stream slots claimed since start.\n"
+        "# TYPE mynah_asr_sessions_total counter\n"
+        "mynah_asr_sessions_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_steps_total scheduler steps that fed a chunk to the model.\n"
+        "# TYPE mynah_asr_steps_total counter\n"
+        "mynah_asr_steps_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_deltas_total transcript deltas emitted.\n"
+        "# TYPE mynah_asr_deltas_total counter\n"
+        "mynah_asr_deltas_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_eou_total end-of-utterance frames emitted.\n"
+        "# TYPE mynah_asr_eou_total counter\n"
+        "mynah_asr_eou_total{worker=\"%s\"} %lu\n",
+        wl, st.sessions, wl, st.steps, wl, st.deltas, wl, st.eous);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_audio_seconds_total seconds of audio fed to the model,\n"
+        "# streams and offline jobs alike. THE throughput unit: any RTF claim about\n"
+        "# this server has this as its denominator.\n"
+        "# TYPE mynah_asr_audio_seconds_total counter\n"
+        "mynah_asr_audio_seconds_total{worker=\"%s\"} %.3f\n", wl, st.audio_seconds);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_offline_jobs_total offline (REST) jobs completed.\n"
+        "# TYPE mynah_asr_offline_jobs_total counter\n"
+        "mynah_asr_offline_jobs_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_offline_queued offline jobs waiting for a step right now.\n"
+        "# TYPE mynah_asr_offline_queued gauge\n"
+        "mynah_asr_offline_queued{worker=\"%s\"} %d\n",
+        wl, st.offline_done, wl, st.offline_pending);
+
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_cancelled_total sessions ended by a cap, a dead peer or a\n"
+        "# shutdown, bucketed by the code the client was given.\n"
+        "# TYPE mynah_asr_cancelled_total counter\n");
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_cancelled_total{worker=\"%s\",reason=\"%s\"} %lu\n",
+            wl, mynah_asr_sched_cancel_bucket_name(i), st.cancel_by[i]);
+
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_refused_total requests this worker refused, by the code in\n"
+        "# the error body. Its own refusals only: the prefork router counts its own.\n"
+        "# TYPE mynah_asr_refused_total counter\n");
+    pthread_mutex_lock(&g_ref.mu);
+    for (int i = 0; i < g_ref.used; i++) {
+        char code[64];
+        mynah_asr_metrics_label(g_ref.code[i], code, sizeof(code));
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_refused_total{worker=\"%s\",code=\"%s\"} %lu\n",
+            wl, code, g_ref.n[i]);
+    }
+    const unsigned long other = g_ref.other;
+    pthread_mutex_unlock(&g_ref.mu);
+    if (other > 0)
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_refused_total{worker=\"%s\",code=\"other\"} %lu\n", wl, other);
+
+    /* Emission lag: a _sum/_count pair and EXACT threshold counters, not a
+     * histogram. A Prometheus histogram of a quantity we already keep as a
+     * fixed 8 ms histogram would be a second quantisation of the same numbers,
+     * and the three thresholds below are the ones an operator acts on. */
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_emission_lag_ms_sum total milliseconds between a sample\n"
+        "# arriving in a slot's ring and the delta that answered it. Server-side by\n"
+        "# construction: both ends of the interval are timestamps this process took.\n"
+        "# TYPE mynah_asr_emission_lag_ms_sum counter\n"
+        "mynah_asr_emission_lag_ms_sum{worker=\"%s\"} %.3f\n"
+        "# HELP mynah_asr_emission_lag_ms_count deltas that contributed to the sum.\n"
+        "# TYPE mynah_asr_emission_lag_ms_count counter\n"
+        "mynah_asr_emission_lag_ms_count{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_emission_lag_ms_max the worst single emission lag so far.\n"
+        "# TYPE mynah_asr_emission_lag_ms_max gauge\n"
+        "mynah_asr_emission_lag_ms_max{worker=\"%s\"} %.3f\n",
+        wl, st.lag_sum_ms, wl, st.lag_count, wl, st.lag_max_ms);
+
+    int th[OBS_LAG_THRESHOLDS];
+    lag_thresholds(th);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_emission_lag_over_ms_total deltas whose emission lag was AT\n"
+        "# LEAST the labelled number of milliseconds. Exact, not interpolated: the\n"
+        "# thresholds are bucket edges of the %d ms histogram, and the first two are\n"
+        "# chunk-period multiples of this model's default preset.\n"
+        "# TYPE mynah_asr_emission_lag_over_ms_total counter\n",
+        MYNAH_ASR_LAG_BUCKET_MS);
+    for (int i = 0; i < OBS_LAG_THRESHOLDS; i++)
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_emission_lag_over_ms_total{worker=\"%s\",le=\"%d\"} %lu\n",
+            wl, th[i], mynah_asr_sched_lag_over(st.lag_hist, th[i]));
+
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_slots_active stream slots this worker is holding now.\n"
+        "# TYPE mynah_asr_slots_active gauge\n"
+        "mynah_asr_slots_active{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_slots_cap stream slots this worker will hold (--cap).\n"
+        "# TYPE mynah_asr_slots_cap gauge\n"
+        "mynah_asr_slots_cap{worker=\"%s\"} %d\n",
+        wl, st.slots_active, wl, st.slots_cap);
+}
+
+/* ------------------------------------------------------------------- SIGUSR1 */
+
+void mynah_asr_obs_dump(void) {
+    static _Atomic unsigned long seq;
+    const unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    const int widx = mynah_asr_prefork_worker_index();
+
+    mynah_asr_sched_stats st;
+    mynah_asr_sched_stats_read(&st);
+    char mask[256];
+    const int pinned = mynah_asr_prefork_actual_mask(mask, sizeof(mask));
+    int th[OBS_LAG_THRESHOLDS];
+    lag_thresholds(th);
+
+    /* COMPOSED FIRST, WRITTEN ONCE. The parent forwards SIGUSR1 to every
+     * worker, so W processes write this at the same moment onto the same
+     * stderr; a dump built out of a dozen fprintf() calls comes back with
+     * worker 0's line spliced into the middle of worker 1's, which is exactly
+     * what the first run of this produced. One buffer, one write: on a regular
+     * file that is atomic, and on a pipe the ordering within a dump still
+     * holds. Bracketed begin/end with the same seq so two dumps can never be
+     * read as one. */
+    char b[4096];
+    size_t k = 0;
+#define OBS_ADD(...) do { \
+        if (k < sizeof(b)) \
+            k += (size_t)snprintf(b + k, sizeof(b) - k, __VA_ARGS__); \
+        if (k >= sizeof(b)) k = sizeof(b) - 1; \
+    } while (0)
+
+    OBS_ADD("[DUMP] v=1 worker=%d seq=%lu begin\n", widx, n);
+    OBS_ADD("[DUMP] worker=%d seq=%lu process pid=%d uptime_s=%.1f "
+            "pool_threads=%d blas_budget=%d pinned=%s mask=%s\n",
+            widx, n, (int)getpid(), now_s() - g_t0, mynah_asr_num_threads(),
+            mynah_asr_blas_budget(), pinned ? "yes" : "no", mask);
+    OBS_ADD("[DUMP] worker=%d seq=%lu build=%s blas=%s simd=%s "
+            "int8_kernel=%s int8_gemm=%s\n",
+            widx, n, mynah_asr_build_id(), mynah_asr_blas_provider(),
+            mynah_asr_simd_profile(), mynah_asr_qmat_int8_kernel(),
+            mynah_asr_qmat_qgemm() > 0 ? "on"
+                : mynah_asr_qmat_qgemm() == 0 ? "off" : "not-compiled");
+    OBS_ADD("[DUMP] worker=%d seq=%lu model=%s engine=%s quant=%s streaming=%s "
+            "lookahead_default=%d chunk_ms=%.0f\n",
+            widx, n, g_cfg.model_name ? g_cfg.model_name : "-",
+            g_cfg.engine ? g_cfg.engine : "-", g_cfg.quant ? g_cfg.quant : "-",
+            g_cfg.streaming ? "yes" : "no", g_cfg.lookahead_default, g_cfg.chunk_ms);
+    OBS_ADD("[DUMP] worker=%d seq=%lu slots active=%d cap=%d sessions=%lu "
+            "steps=%lu deltas=%lu eous=%lu audio_s=%.1f\n",
+            widx, n, st.slots_active, st.slots_cap, st.sessions, st.steps,
+            st.deltas, st.eous, st.audio_seconds);
+    OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
+            widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
+    OBS_ADD("[DUMP] worker=%d seq=%lu cancelled=%lu", widx, n, st.cancelled);
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
+        OBS_ADD(" %s=%lu", mynah_asr_sched_cancel_bucket_name(i), st.cancel_by[i]);
+    OBS_ADD("\n[DUMP] worker=%d seq=%lu refused", widx, n);
+    pthread_mutex_lock(&g_ref.mu);
+    if (g_ref.used == 0 && g_ref.other == 0) OBS_ADD(" none");
+    for (int i = 0; i < g_ref.used; i++) OBS_ADD(" %s=%lu", g_ref.code[i], g_ref.n[i]);
+    if (g_ref.other > 0) OBS_ADD(" other=%lu", g_ref.other);
+    pthread_mutex_unlock(&g_ref.mu);
+    OBS_ADD("\n[DUMP] worker=%d seq=%lu lag_ms p50=%.0f p95=%.0f max=%.1f "
+            "count=%lu sum=%.0f bucket_ms=%d",
+            widx, n, mynah_asr_sched_lag_quantile(st.lag_hist, 0.50),
+            mynah_asr_sched_lag_quantile(st.lag_hist, 0.95), st.lag_max_ms,
+            st.lag_count, st.lag_sum_ms, MYNAH_ASR_LAG_BUCKET_MS);
+    for (int i = 0; i < OBS_LAG_THRESHOLDS; i++)
+        OBS_ADD(" over_%dms=%lu", th[i],
+                mynah_asr_sched_lag_over(st.lag_hist, th[i]));
+    OBS_ADD("\n[DUMP] v=1 worker=%d seq=%lu end\n", widx, n);
+#undef OBS_ADD
+
+    fwrite(b, 1, k, stderr);
+    fflush(stderr);
+}

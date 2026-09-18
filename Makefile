@@ -56,7 +56,8 @@ mynah-asr: $(OBJ) build/cli/main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o \
-                  build/server/stream_out.o build/server/slot.o build/server/sched.o
+                  build/server/stream_out.o build/server/slot.o build/server/sched.o \
+                  build/server/metrics.o build/server/obs.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
 # objects in build/ (never next to the sources: the variant builds — ubsan, cuda
@@ -139,6 +140,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_server_protocol.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
 	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
@@ -291,6 +295,14 @@ test-server-protocol: mynah-asr-server mynah-asr
 # converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
 # the server finally gets exercised there at all.
 CONC_MODEL_DIR ?= $(PARAKEET110_DIR)
+# S3-3/S3-4: the banner, /v1/health as facts, /metrics on its own port (the
+# token bucket, the double bind, the router's fleet view) and the SIGUSR1 dump.
+# Model-agnostic and REST-only, so it runs wherever test-server-concurrency does.
+test-server-metrics: mynah-asr-server
+	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 test-server-concurrency: mynah-asr-server
 	@sh tests/test_server_concurrency.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
@@ -397,4 +409,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics

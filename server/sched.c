@@ -48,7 +48,46 @@ static struct {
     _Atomic unsigned long steps, deltas, eous, cancelled, sessions, offline_jobs;
     _Atomic unsigned long lag_hist[MYNAH_ASR_LAG_BUCKETS];
     _Atomic unsigned long lag_max_us;
+    /* S3-3. Two more adds on paths that already do one, and one array indexed
+     * by the reason the client was given. `audio_samples` is the throughput
+     * unit: seconds of audio this process actually fed to the model, streams
+     * and offline jobs alike, which is the only denominator an RTF claim about
+     * a SERVER may use. */
+    _Atomic unsigned long audio_samples;
+    _Atomic unsigned long lag_sum_us;
+    _Atomic unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];
 } g;
+
+/* ------------------------------------------------------- cancel buckets */
+
+static const char *const CANCEL_BUCKET_NAME[MYNAH_ASR_SCHED_CANCEL__COUNT] = {
+    "idle_timeout", "peer_gone", "frame_too_large", "protocol_error",
+    "shutting_down", "audio_limit", "decode_failed", "other"
+};
+
+const char *mynah_asr_sched_cancel_bucket_name(int bucket) {
+    if (bucket < 0 || bucket >= MYNAH_ASR_SCHED_CANCEL__COUNT) return "other";
+    return CANCEL_BUCKET_NAME[bucket];
+}
+
+/* The bucket is chosen from the code the CLIENT was sent, so the counter and
+ * the error frame can never name two different things. A code with no bucket
+ * of its own (`reset_failed`, `model_not_streaming`) lands in `other` rather
+ * than growing the label set: cardinality is a contract, see docs/server.md. */
+static int cancel_bucket_of(const char *code) {
+    if (code == NULL) return MYNAH_ASR_SCHED_CANCEL_OTHER;
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT - 1; i++)
+        if (strcmp(code, CANCEL_BUCKET_NAME[i]) == 0) return i;
+    return MYNAH_ASR_SCHED_CANCEL_OTHER;
+}
+
+static void count_cancel(const char *code) {
+    atomic_fetch_add_explicit(&g.cancelled, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.cancel_by[cancel_bucket_of(code)], 1,
+                              memory_order_relaxed);
+}
+
+void mynah_asr_sched_note_cancel(const char *code) { count_cancel(code); }
 
 /* ----------------------------------------------------------- the invariant */
 
@@ -176,6 +215,7 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
         atomic_fetch_add_explicit(&g.lag_hist[lag_bucket(lag_ms)], 1,
                                   memory_order_relaxed);
         const unsigned long us = (unsigned long)(lag_ms * 1000.0);
+        atomic_fetch_add_explicit(&g.lag_sum_us, us, memory_order_relaxed);
         unsigned long prev = atomic_load_explicit(&g.lag_max_us, memory_order_relaxed);
         while (us > prev &&
                !atomic_compare_exchange_weak_explicit(&g.lag_max_us, &prev, us,
@@ -222,7 +262,7 @@ static void sched_close_session(mynah_asr_slot *s) {
 
 static void sched_cancel(mynah_asr_slot *s, const char *code, const char *msg) {
     sched_error_frame(s, code, msg);
-    atomic_fetch_add_explicit(&g.cancelled, 1, memory_order_relaxed);
+    count_cancel(code);
     sched_close_session(s);
 }
 
@@ -262,6 +302,8 @@ static int sched_feed(mynah_asr_slot *s, size_t avail, int finalize) {
         else ctx.arrival = s->last_arrival;
         s->steps++;
         atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
+                                  memory_order_relaxed);
         if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
             sched_cancel(s, "decode_failed", "the stream step failed");
             return 1;
@@ -281,6 +323,8 @@ static int sched_feed(mynah_asr_slot *s, size_t avail, int finalize) {
         else ctx.arrival = s->last_arrival;
         s->steps++;
         atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
+                                  memory_order_relaxed);
         if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
             sched_cancel(s, "decode_failed", "the stream step failed");
             return 1;
@@ -372,6 +416,9 @@ static int sched_run_jobs(void) {
     pthread_mutex_lock(&g.mu);
     for (int b = 0; b < B; b++) batch[b]->done = 1;
     atomic_fetch_add_explicit(&g.offline_jobs, (unsigned long)B, memory_order_relaxed);
+    for (int b = 0; b < B; b++)
+        atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)batch[b]->n_samples,
+                                  memory_order_relaxed);
     pthread_cond_broadcast(&g.job_done);
     pthread_mutex_unlock(&g.mu);
     return 1;
@@ -438,7 +485,10 @@ static void *sched_main(void *arg) {
                         * half-closes after asking to finalize is not gone, it is
                         * waiting for `done`. */
                        (!finalizing && mynah_asr_stream_out_peer_gone(g.req_out[i]))) {
-                atomic_fetch_add_explicit(&g.cancelled, 1, memory_order_relaxed);
+                /* No frame goes out on this one -- the socket is the thing that
+                 * failed -- but the reason is still the one the client would
+                 * have been told, so it is counted in that bucket. */
+                count_cancel(mynah_asr_slot_cancel_code(MYNAH_ASR_SLOT_CANCEL_PEER));
                 sched_close_session(s);
                 g.req_live[i] = 0;
                 did = 1;
@@ -622,35 +672,103 @@ int mynah_asr_sched_active(void) {
     return n;
 }
 
-void mynah_asr_sched_health(cJSON *into) {
-    cJSON *sl = cJSON_AddObjectToObject(into, "slots");
-    cJSON_AddNumberToObject(sl, "active", mynah_asr_sched_active());
-    cJSON_AddNumberToObject(sl, "cap", g.n_slots);
-    cJSON_AddNumberToObject(into, "steps",
-        (double)atomic_load_explicit(&g.steps, memory_order_relaxed));
-    cJSON_AddNumberToObject(into, "deltas",
-        (double)atomic_load_explicit(&g.deltas, memory_order_relaxed));
-    cJSON_AddNumberToObject(into, "eous",
-        (double)atomic_load_explicit(&g.eous, memory_order_relaxed));
-    cJSON_AddNumberToObject(into, "sessions",
-        (double)atomic_load_explicit(&g.sessions, memory_order_relaxed));
-    cJSON_AddNumberToObject(into, "cancelled",
-        (double)atomic_load_explicit(&g.cancelled, memory_order_relaxed));
-    cJSON_AddNumberToObject(into, "offline_jobs",
-        (double)atomic_load_explicit(&g.offline_jobs, memory_order_relaxed));
-    pthread_mutex_lock(&g.mu);
-    const int pending = g.q_len;
-    pthread_mutex_unlock(&g.mu);
-    cJSON_AddNumberToObject(into, "offline_pending", pending);
+/* --------------------------------------------------------- the snapshot */
 
-    unsigned snapshot[MYNAH_ASR_LAG_BUCKETS];
+void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
+    memset(out, 0, sizeof(*out));
+    out->slots_active = mynah_asr_sched_active();
+    out->slots_cap = g.n_slots;
+    out->streaming = g.streaming;
+    out->steps    = atomic_load_explicit(&g.steps, memory_order_relaxed);
+    out->deltas   = atomic_load_explicit(&g.deltas, memory_order_relaxed);
+    out->eous     = atomic_load_explicit(&g.eous, memory_order_relaxed);
+    out->sessions = atomic_load_explicit(&g.sessions, memory_order_relaxed);
+    out->cancelled = atomic_load_explicit(&g.cancelled, memory_order_relaxed);
+    out->offline_done = atomic_load_explicit(&g.offline_jobs, memory_order_relaxed);
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
+        out->cancel_by[i] = atomic_load_explicit(&g.cancel_by[i], memory_order_relaxed);
+    out->audio_seconds =
+        (double)atomic_load_explicit(&g.audio_samples, memory_order_relaxed) / 16000.0;
+    out->lag_count = out->deltas;
+    out->lag_sum_ms =
+        (double)atomic_load_explicit(&g.lag_sum_us, memory_order_relaxed) / 1000.0;
+    out->lag_max_ms =
+        (double)atomic_load_explicit(&g.lag_max_us, memory_order_relaxed) / 1000.0;
     for (int i = 0; i < MYNAH_ASR_LAG_BUCKETS; i++)
-        snapshot[i] = (unsigned)atomic_load_explicit(&g.lag_hist[i],
-                                                     memory_order_relaxed);
-    cJSON_AddNumberToObject(into, "lag_p50_ms", hist_p50_u(snapshot));
-    cJSON_AddNumberToObject(into, "lag_max_ms",
-        (double)atomic_load_explicit(&g.lag_max_us, memory_order_relaxed) / 1000.0);
-    cJSON_AddBoolToObject(into, "streaming", g.streaming ? 1 : 0);
+        out->lag_hist[i] = atomic_load_explicit(&g.lag_hist[i], memory_order_relaxed);
+    pthread_mutex_lock(&g.mu);
+    out->offline_pending = g.q_len;
+    out->offline_max_pending = g.cfg.max_pending;
+    pthread_mutex_unlock(&g.mu);
+}
+
+double mynah_asr_sched_lag_quantile(const unsigned long *hist, double q) {
+    unsigned long total = 0;
+    for (int i = 0; i < MYNAH_ASR_LAG_BUCKETS; i++) total += hist[i];
+    if (total == 0) return 0.0;
+    const double want = (double)total * q;
+    unsigned long seen = 0;
+    for (int i = 0; i < MYNAH_ASR_LAG_BUCKETS; i++) {
+        seen += hist[i];
+        if ((double)seen >= want) return (double)i * MYNAH_ASR_LAG_BUCKET_MS;
+    }
+    return (double)(MYNAH_ASR_LAG_BUCKETS - 1) * MYNAH_ASR_LAG_BUCKET_MS;
+}
+
+unsigned long mynah_asr_sched_lag_over(const unsigned long *hist, int ms) {
+    if (ms <= 0) {
+        unsigned long all = 0;
+        for (int i = 0; i < MYNAH_ASR_LAG_BUCKETS; i++) all += hist[i];
+        return all;
+    }
+    int first = ms / MYNAH_ASR_LAG_BUCKET_MS;
+    if (ms % MYNAH_ASR_LAG_BUCKET_MS != 0) first++;   /* the caller rounded up */
+    if (first >= MYNAH_ASR_LAG_BUCKETS) return hist[MYNAH_ASR_LAG_BUCKETS - 1];
+    unsigned long n = 0;
+    for (int i = first; i < MYNAH_ASR_LAG_BUCKETS; i++) n += hist[i];
+    return n;
+}
+
+void mynah_asr_sched_health(cJSON *into) {
+    /* FACTS, from one snapshot: what this worker DID, not what it was
+     * configured to do. The configuration is on the [SERVER-CONFIG] banner
+     * line, which is printed once and never has to be kept in sync with a
+     * counter. */
+    mynah_asr_sched_stats st;
+    mynah_asr_sched_stats_read(&st);
+
+    cJSON *sl = cJSON_AddObjectToObject(into, "slots");
+    cJSON_AddNumberToObject(sl, "active", st.slots_active);
+    cJSON_AddNumberToObject(sl, "cap", st.slots_cap);
+    cJSON_AddNumberToObject(into, "steps", (double)st.steps);
+    cJSON_AddNumberToObject(into, "deltas", (double)st.deltas);
+    cJSON_AddNumberToObject(into, "eous", (double)st.eous);
+    cJSON_AddNumberToObject(into, "sessions", (double)st.sessions);
+    cJSON_AddNumberToObject(into, "cancelled", (double)st.cancelled);
+    cJSON *cb = cJSON_AddObjectToObject(into, "cancelled_by");
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
+        cJSON_AddNumberToObject(cb, mynah_asr_sched_cancel_bucket_name(i),
+                                (double)st.cancel_by[i]);
+    cJSON_AddNumberToObject(into, "offline_jobs", (double)st.offline_done);
+    cJSON_AddNumberToObject(into, "offline_pending", st.offline_pending);
+    cJSON *off = cJSON_AddObjectToObject(into, "offline");
+    cJSON_AddNumberToObject(off, "queued", st.offline_pending);
+    cJSON_AddNumberToObject(off, "done", (double)st.offline_done);
+    cJSON_AddNumberToObject(off, "max_pending", st.offline_max_pending);
+    cJSON_AddNumberToObject(into, "audio_seconds", st.audio_seconds);
+
+    cJSON *lag = cJSON_AddObjectToObject(into, "lag_ms");
+    cJSON_AddNumberToObject(lag, "p50", mynah_asr_sched_lag_quantile(st.lag_hist, 0.50));
+    cJSON_AddNumberToObject(lag, "p95", mynah_asr_sched_lag_quantile(st.lag_hist, 0.95));
+    cJSON_AddNumberToObject(lag, "max", st.lag_max_ms);
+    cJSON_AddNumberToObject(lag, "count", (double)st.lag_count);
+    cJSON_AddNumberToObject(lag, "bucket_ms", MYNAH_ASR_LAG_BUCKET_MS);
+    /* v1 field names, kept for one release: docs/server.md and the bench
+     * harness read them flat. */
+    cJSON_AddNumberToObject(into, "lag_p50_ms",
+                            mynah_asr_sched_lag_quantile(st.lag_hist, 0.50));
+    cJSON_AddNumberToObject(into, "lag_max_ms", st.lag_max_ms);
+    cJSON_AddBoolToObject(into, "streaming", st.streaming ? 1 : 0);
 }
 
 void mynah_asr_sched_stop(void) {

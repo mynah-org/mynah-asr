@@ -92,6 +92,63 @@ int mynah_asr_sched_submit(mynah_asr_offline_job *job);
 /* Facts for /v1/health, added to `into`. */
 void mynah_asr_sched_health(cJSON *into);
 
+/* ------------------------------------------------------ counters as FACTS
+ *
+ * Why a snapshot struct and not three readers: /v1/health, /metrics and the
+ * SIGUSR1 dump all report the same numbers, and three copies of "load the
+ * atomics" is how the three come to disagree about what `cancelled` means.
+ * One read, three renderings.
+ *
+ * Every field below is a counter the scheduler ALREADY maintains on a path it
+ * already runs; nothing here added work to a step beyond two relaxed adds
+ * (audio samples and the lag sum) next to adds that were already there. */
+
+/* Why a session ended, bucketed. The bucket is chosen from the same `code`
+ * string the client was sent, so a counter can never name a reason the client
+ * did not see. */
+typedef enum {
+    MYNAH_ASR_SCHED_CANCEL_IDLE = 0,      /* idle_timeout                     */
+    MYNAH_ASR_SCHED_CANCEL_PEER,          /* peer_gone                        */
+    MYNAH_ASR_SCHED_CANCEL_FRAME,         /* frame_too_large                  */
+    MYNAH_ASR_SCHED_CANCEL_PROTOCOL,      /* protocol_error                   */
+    MYNAH_ASR_SCHED_CANCEL_SHUTDOWN,      /* shutting_down                    */
+    MYNAH_ASR_SCHED_CANCEL_AUDIO_LIMIT,   /* audio_limit (--max-audio-seconds)*/
+    MYNAH_ASR_SCHED_CANCEL_DECODE,        /* decode_failed                    */
+    MYNAH_ASR_SCHED_CANCEL_OTHER,         /* anything else, counted not lost  */
+    MYNAH_ASR_SCHED_CANCEL__COUNT
+} mynah_asr_sched_cancel_bucket;
+
+const char *mynah_asr_sched_cancel_bucket_name(int bucket);
+
+typedef struct {
+    int  slots_active, slots_cap, streaming;
+    unsigned long steps, deltas, eous, sessions, cancelled;
+    unsigned long offline_done;
+    int  offline_pending, offline_max_pending;
+    unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];
+    double audio_seconds;          /* fed to the model: streams + offline jobs */
+    unsigned long lag_count;       /* = deltas, but read in the same snapshot  */
+    double lag_sum_ms, lag_max_ms;
+    unsigned long lag_hist[MYNAH_ASR_LAG_BUCKETS];
+} mynah_asr_sched_stats;
+
+void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out);
+
+/* Quantile of the emission-lag histogram, in ms, quantised to the 8 ms bucket
+ * the histogram keeps. A p95 to the nearest 8 ms is a measurement; a p95
+ * interpolated out of a mean is not. */
+double mynah_asr_sched_lag_quantile(const unsigned long *hist, double q);
+
+/* EXACTLY how many deltas had a lag of `ms` or more. Exact, not estimated,
+ * whenever `ms` is a multiple of MYNAH_ASR_LAG_BUCKET_MS -- which is why the
+ * thresholds /metrics exports are rounded up to a bucket edge before they are
+ * named in a label. */
+unsigned long mynah_asr_sched_lag_over(const unsigned long *hist, int ms);
+
+/* Counts a session ended by the INGEST side under a code the scheduler never
+ * sees (today: `audio_limit`). Same buckets, same total, one funnel. */
+void mynah_asr_sched_note_cancel(const char *code);
+
 /* Slots not FREE right now -- what /v1/health reports as `inflight`. */
 int mynah_asr_sched_active(void);
 

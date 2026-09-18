@@ -35,6 +35,11 @@
 
 #include "prefork.h"
 
+#include "metrics.h"
+
+#include "../src/flags.h"    /* build id, BLAS provider, SIMD profile */
+#include "../src/qmat.h"     /* the int8 kernel predicate, for build_info */
+
 #include "../src/threads.h"
 
 #include <ctype.h>
@@ -627,8 +632,71 @@ static volatile sig_atomic_t g_dump_request = 0;
 static int  g_worker_language = 0;
 static char g_language_plan[512];
 
+/* The cpu list this worker was ASKED to take. Written by the child right after
+ * pin_to_slice, so `configured` and `actual` can be printed side by side. */
+static char g_configured_mask[192];
+
 int mynah_asr_prefork_worker_index(void) { return g_worker_index; }
 int mynah_asr_prefork_worker_threads(void) { return g_worker_threads; }
+int mynah_asr_prefork_actual_mask(char *out, size_t cap) {
+    if (out == NULL || cap == 0) return 0;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        size_t used = 0;
+        int n = 0;
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (!CPU_ISSET(c, &set)) continue;
+            ++n;
+            if (used + 8u < cap)
+                used += (size_t)snprintf(out + used, cap - used, "%s%d",
+                                         used > 0 ? "," : "", c);
+        }
+        if (used == 0) snprintf(out, cap, "empty");
+        long online = sysconf(_SC_NPROCESSORS_ONLN);
+        if (online < 1) online = 1;
+        return n > 0 && n < (int)online;   /* a strict subset: really pinned */
+    }
+    snprintf(out, cap, "unpinned (sched_getaffinity: %s)", strerror(errno));
+    return 0;
+#else
+    /* macOS has no affinity API this server would use (thread affinity tags are
+     * hints to the scheduler, not a mask), so there is nothing to read back and
+     * "unpinned" is the honest answer rather than a blank. */
+    snprintf(out, cap, "unpinned");
+    return 0;
+#endif
+}
+
+/* One field, one token: whitespace becomes '_' so the line stays parseable by
+ * splitting on spaces, exactly as [FLAGS] does with a value that contains one.
+ * The phrases here are real ("unpinned (no cpu affinity API on this
+ * platform)"), so this is not hypothetical tidiness. */
+static void topo_token(const char *in, char *out, size_t cap) {
+    size_t k = 0;
+    for (size_t i = 0; in != NULL && in[i] != '\0' && k + 1 < cap; i++)
+        out[k++] = (in[i] == ' ' || in[i] == '\t') ? '_' : in[i];
+    if (k == 0 && cap > 1) out[k++] = '-';
+    out[k] = '\0';
+}
+
+/* The machine-readable twin of the human "prefork: worker N pid ... cpus ..."
+ * line. One line per worker, printed by the worker itself, with the mask read
+ * BACK from the kernel next to the one that was planned: those two being
+ * different is the failure this line exists to make visible. */
+void mynah_asr_prefork_print_topology(FILE *out, int threads) {
+    char actual[256], atok[256], ctok[256];
+    const int pinned = mynah_asr_prefork_actual_mask(actual, sizeof(actual));
+    topo_token(actual, atok, sizeof(atok));
+    topo_token(g_configured_mask[0] != '\0' ? g_configured_mask : "inherited",
+               ctok, sizeof(ctok));
+    fprintf(out, "[TOPOLOGY] v=1 worker=%d pid=%d configured_mask=%s "
+                 "actual_mask=%s threads=%d pinned=%s\n",
+            g_worker_index, (int)getpid(), ctok, atok, threads,
+            pinned ? "yes" : "no");
+    fflush(out);
+}
 int mynah_asr_prefork_worker_language(void) { return g_worker_language; }
 const char *mynah_asr_prefork_language_plan(void) { return g_language_plan; }
 
@@ -678,6 +746,12 @@ static void on_usr1(int sig) {
     (void)sig;
     g_dump_request = 1;
 }
+
+/* Async-signal-safe by construction: one store to a volatile sig_atomic_t.
+ * Exported so server/main.c can install the handler BEFORE the fork -- which
+ * is what the long note in the child path below assumes, and what keeps a
+ * worker from being killed by the default SIGUSR1 action. */
+void mynah_asr_prefork_request_dump(void) { g_dump_request = 1; }
 
 int mynah_asr_prefork_take_dump_request(void) {
     if (g_dump_request == 0) return 0;
@@ -1597,6 +1671,127 @@ static void router_drain(pf_router *R, double now) {
     }
 }
 
+/* ------------------------------------------------- /metrics, the ROUTER's view
+ *
+ * What the parent can honestly say, and nothing else. It routes; it never runs
+ * inference, so it holds no scheduler counter: no sessions, no steps, no
+ * deltas, no emission lag. What it does hold is the routing table -- per worker
+ * in-flight, assigned and completed -- and its own refusals by reason, and
+ * those are exported with a `worker` label so a fleet is never summed into a
+ * single number that hides one wedged process.
+ *
+ * The page says all of this in its own comment lines. A scrape that has to be
+ * read next to a design document is a scrape that will be misread. */
+typedef struct {
+    const worker_state *w;
+    int workers;
+    int slots;
+    long long dispatched, queued_total, client_gone;
+    int queued_now, queue_peak;
+    const long long *refused;
+    const char *build, *blas, *simd, *int8_kernel;
+    double uptime;
+} pf_metrics_view;
+
+static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
+    const pf_metrics_view *v = (const pf_metrics_view *)ud;
+    char build[128], blas[64], simd[64], k8[64];
+    mynah_asr_metrics_label(v->build, build, sizeof(build));
+    mynah_asr_metrics_label(v->blas, blas, sizeof(blas));
+    mynah_asr_metrics_label(v->simd, simd, sizeof(simd));
+    mynah_asr_metrics_label(v->int8_kernel, k8, sizeof(k8));
+
+    mynah_asr_metrics_addf(b,
+        "# This is the PREFORK ROUTER's view. This process routes connections and\n"
+        "# never enters the model, so the scheduler counters -- sessions, steps,\n"
+        "# deltas, audio seconds, emission lag -- do not exist here and are NOT\n"
+        "# exported. Give a worker its own --metrics-port to scrape those.\n"
+        "# Per-worker series are never summed: a fleet total hides a wedged worker.\n");
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_build_info build, BLAS provider, compiled SIMD profile and\n"
+        "# the int8 kernel the dispatcher's own predicate resolved.\n"
+        "# TYPE mynah_asr_build_info gauge\n"
+        "mynah_asr_build_info{build=\"%s\",blas=\"%s\",simd=\"%s\",int8_kernel=\"%s\"} 1\n",
+        build, blas, simd, k8);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_uptime_seconds seconds since this process started routing.\n"
+        "# TYPE mynah_asr_uptime_seconds gauge\n"
+        "mynah_asr_uptime_seconds %.3f\n", v->uptime);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_up 1 while the router still holds this worker.\n"
+        "# TYPE mynah_asr_worker_up gauge\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_up{worker=\"%d\"} %d\n",
+                               i, v->w[i].pid > 0 ? 1 : 0);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_inflight connections dispatched to this worker and\n"
+        "# not yet reported finished. Router-view: it counts CONNECTIONS, not the\n"
+        "# worker's stream slots.\n"
+        "# TYPE mynah_asr_worker_inflight gauge\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_inflight{worker=\"%d\"} %d\n",
+                               i, v->w[i].active);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_slots the per-worker capacity the router admits\n"
+        "# against (--cap).\n"
+        "# TYPE mynah_asr_worker_slots gauge\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_slots{worker=\"%d\"} %d\n",
+                               i, v->slots);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_assigned_total connections handed to this worker.\n"
+        "# TYPE mynah_asr_worker_assigned_total counter\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_assigned_total{worker=\"%d\"} %lld\n",
+                               i, v->w[i].assigned);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_completed_total connections this worker reported\n"
+        "# finished.\n"
+        "# TYPE mynah_asr_worker_completed_total counter\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_completed_total{worker=\"%d\"} %lld\n",
+                               i, v->w[i].completed);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_over_service_cap_total outstanding connections this\n"
+        "# worker was seen holding past --service-cap.\n"
+        "# TYPE mynah_asr_worker_over_service_cap_total counter\n");
+    for (int i = 0; i < v->workers; ++i)
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_worker_over_service_cap_total{worker=\"%d\"} %lld\n",
+            i, v->w[i].over_cap);
+
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_connections_dispatched_total connections routed to a worker.\n"
+        "# TYPE mynah_asr_connections_dispatched_total counter\n"
+        "mynah_asr_connections_dispatched_total %lld\n", v->dispatched);
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_refused_total refusals by the code the client was given.\n"
+        "# Router-owned: a refusal happens before a worker is chosen, so it carries\n"
+        "# no worker label (handoff_failed excepted, and it is not broken out).\n"
+        "# TYPE mynah_asr_refused_total counter\n");
+    for (int r = 0; r < MYNAH_ASR_PREFORK_REFUSE__COUNT; ++r) {
+        char code[64];
+        mynah_asr_metrics_label(mynah_asr_prefork_refusal_code(
+                                    (mynah_asr_prefork_refusal)r), code, sizeof(code));
+        mynah_asr_metrics_addf(b, "mynah_asr_refused_total{code=\"%s\"} %lld\n",
+                               code, v->refused[r]);
+    }
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_admission_queue_depth connections waiting for a slot now.\n"
+        "# TYPE mynah_asr_admission_queue_depth gauge\n"
+        "mynah_asr_admission_queue_depth %d\n"
+        "# HELP mynah_asr_admission_queue_peak the deepest the queue has been.\n"
+        "# TYPE mynah_asr_admission_queue_peak gauge\n"
+        "mynah_asr_admission_queue_peak %d\n"
+        "# HELP mynah_asr_admission_queued_total connections that had to wait.\n"
+        "# TYPE mynah_asr_admission_queued_total counter\n"
+        "mynah_asr_admission_queued_total %lld\n"
+        "# HELP mynah_asr_client_gone_total queued clients that hung up before a slot.\n"
+        "# TYPE mynah_asr_client_gone_total counter\n"
+        "mynah_asr_client_gone_total %lld\n",
+        v->queued_now, v->queue_peak, v->queued_total, v->client_gone);
+}
+
 static void dump_table(const worker_state *w, int workers, long long dispatched,
                        const long long *refused, int queued, double window) {
     fprintf(stderr, "[prefork] dispatched=%lld queued=%d", dispatched, queued);
@@ -1730,6 +1925,20 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
      * to a topology we cannot undo. */
     if (check_fork_preconditions(&local) != 0) return MYNAH_ASR_PREFORK_ERROR;
 
+    /* /metrics, bound HERE and not in the child: a port that is already taken
+     * must fail before there are W processes to clean up, and the descriptor
+     * must exist before the fork so every child can close its copy. */
+    int metrics_fd = -1;
+    if (local.metrics_port > 0) {
+        metrics_fd = mynah_asr_metrics_listen(local.metrics_bind, local.metrics_port);
+        if (metrics_fd < 0) return MYNAH_ASR_PREFORK_ERROR;
+        fprintf(stderr, "prefork: /metrics on %s:%d, answered by the ROUTER for the "
+                        "whole fleet\n",
+                local.metrics_bind != NULL && local.metrics_bind[0] != '\0'
+                    ? local.metrics_bind : "127.0.0.1", local.metrics_port);
+        fflush(stderr);
+    }
+
     worker_state *w = (worker_state *)calloc((size_t)workers, sizeof(*w));
     if (w == NULL) return MYNAH_ASR_PREFORK_ERROR;
     for (int i = 0; i < workers; ++i) { w[i].pid = -1; w[i].chan = -1; }
@@ -1765,6 +1974,10 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             }
             free(w);
             close(local.listen_fd);  /* a worker must never accept: the parent routes */
+            /* And never answers a scrape the router is answering: two
+             * processes on one metrics port would hand a scraper whichever of
+             * them the kernel picked. */
+            if (metrics_fd >= 0) close(metrics_fd);
 
             g_worker_index = i;
             g_worker_chan = sp[1];
@@ -1780,6 +1993,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
                 (i + 1) * per <= ncpu ? per : ncpu - i * per;
             const int pinned = pin_to_slice(cpus, i * per, slice_cpus,
                                             slice, sizeof(slice));
+            snprintf(g_configured_mask, sizeof(g_configured_mask), "%s", slice);
 
             /* Belt and braces on the pool. src/threads.c registers a
              * pthread_atfork child handler, so this is already done; calling it
@@ -1858,6 +2072,9 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             if (local.lane_cpus > 0) {
                 fprintf(stderr, "prefork: worker %d %s\n", i, lane_why);
             }
+            /* The same facts, machine-readable, with the mask read back from
+             * the kernel rather than the one we asked for (S3-1). */
+            mynah_asr_prefork_print_topology(stderr, g_worker_threads);
             fflush(stderr);
             return MYNAH_ASR_PREFORK_CHILD;
         }
@@ -1871,6 +2088,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
 
     if (live == 0) {
         fprintf(stderr, "prefork: no worker could be started\n");
+        if (metrics_fd >= 0) close(metrics_fd);
         free(w);
         return MYNAH_ASR_PREFORK_ERROR;
     }
@@ -1892,12 +2110,13 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     pf_queued *q = (pf_queued *)calloc((size_t)q_alloc, sizeof(*q));
     int q_n = 0;
 
-    const size_t pfd_cap = (size_t)workers + 1u + PF_QPOLL_MAX + PF_LINGER_MAX +
-                           (size_t)PF_PENDING_MAX;
+    const size_t pfd_cap = (size_t)workers + 2u + PF_QPOLL_MAX + PF_LINGER_MAX +
+                           (size_t)PF_PENDING_MAX;   /* +1: the metrics listener */
     struct pollfd *pfd = (struct pollfd *)calloc(pfd_cap, sizeof(*pfd));
     if (pfd == NULL || q == NULL) {
         for (int i = 0; i < workers; ++i) if (w[i].pid > 0) kill(w[i].pid, SIGTERM);
         for (int i = 0; i < workers; ++i) free(w[i].disp);
+        if (metrics_fd >= 0) close(metrics_fd);
         free(pfd); free(q); free(w);
         return MYNAH_ASR_PREFORK_ERROR;
     }
@@ -1945,8 +2164,9 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
     R.linger_n = &linger_n;
     R.linger_forced = &linger_forced;
 
+    const double router_start = mono_seconds();
     while (*stop == 0 && live > 0) {
-        int nf = 0, listen_slot = -1;
+        int nf = 0, listen_slot = -1, metrics_slot = -1;
         int map[PREFORK_MAX_WORKERS];
         for (int i = 0; i < workers; ++i) {
             if (w[i].pid <= 0) continue;
@@ -1973,6 +2193,17 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
         pfd[nf].events = POLLIN;
         pfd[nf].revents = 0;
         ++nf;
+
+        /* The metrics listener, in the SAME poll set: a scrape is then a
+         * bounded slice of this loop rather than a thread with its own view of
+         * a table this loop is writing. */
+        if (metrics_fd >= 0) {
+            metrics_slot = nf;
+            pfd[nf].fd = metrics_fd;
+            pfd[nf].events = POLLIN;
+            pfd[nf].revents = 0;
+            ++nf;
+        }
 
         /* Queued clients, watched for a HANGUP ONLY. events is deliberately 0:
          * a queued client has already sent its request, so asking for POLLIN
@@ -2192,6 +2423,27 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
         /* ---- RUNG 3, then RUNG 1: drain the queue ---- */
         router_drain(&R, now);
 
+        if (metrics_slot >= 0 && metrics_slot < nf &&
+            (pfd[metrics_slot].revents & POLLIN) != 0) {
+            pf_metrics_view view;
+            memset(&view, 0, sizeof(view));
+            view.w = w;
+            view.workers = workers;
+            view.slots = slots;
+            view.dispatched = dispatched;
+            view.queued_total = queued_total;
+            view.client_gone = client_gone;
+            view.queued_now = q_n;
+            view.queue_peak = queue_peak;
+            view.refused = refused;
+            view.build = mynah_asr_build_id();
+            view.blas = mynah_asr_blas_provider();
+            view.simd = mynah_asr_simd_profile();
+            view.int8_kernel = mynah_asr_qmat_int8_kernel();
+            view.uptime = mono_seconds() - router_start;
+            mynah_asr_metrics_service(metrics_fd, pf_render_metrics, &view);
+        }
+
         if (listen_slot < 0 || listen_slot >= nf ||
             (pfd[listen_slot].revents & POLLIN) == 0) continue;
 
@@ -2342,6 +2594,7 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
         free(w[i].disp);
     }
     close(local.listen_fd);
+    if (metrics_fd >= 0) close(metrics_fd);
     free(pfd);
     free(q);
     free(w);
