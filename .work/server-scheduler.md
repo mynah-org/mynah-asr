@@ -252,6 +252,20 @@ ubsan: `make clean` then a `-fsanitize=undefined -O2` build of the server and
 the CLI, `tests/test_server_stream.sh` and `tests/test_server_concurrency.sh`
 both green with **0 `runtime error` lines**. Rebuilt clean afterwards.
 
+Re-run from the **committed** tree (ENGINEERING §12), `b8ff408`, clean working
+directory, `make clean && make`, `mynah-asr-server` sha256
+`4cb3e7d0d39607e0f671b4cfb1491ab3aebd0fb3ac202a2b19ec033df1dbdd2b`: the stream
+gate, `tests/test_server_concurrency.sh` and `tests/test_server.sh` all exit 0.
+The committed build's own numbers: 4 streams TTFP p50/p95 1449/1593 ms, lag
+p50/p95 1228/2194 ms; prefork 2×2 TTFP 931/936 ms, lag 126/137 ms.
+
+The control channel is not yet in a test (its gate belongs to S2-5), but it was
+exercised by hand against this build: one socket, an unknown control message
+answered with an `error` frame and the session surviving it, then three
+utterances separated by `{"type":"finalize"}` and `{"type":"reset"}`, each
+transcript byte-identical to the CLI's and `seq` continuing across them
+(15 → 27 → 37). A test for that belongs with S2-5.
+
 ### What the stalled-reader phase actually proves
 
 The client sets a 2 KiB receive buffer, sends 4.4 s of audio at 1x and never
