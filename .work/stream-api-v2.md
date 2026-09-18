@@ -51,3 +51,59 @@ Acceptance gate: `make test` and `make test-server-concurrency` green; the
 new tests above green; `docs/api.md` updated; no transcript in `tests/` changed.
 
 Evidence / Conclusion / Next action: pending S0.
+
+## Evidence — S1-3 (allocation-free chunk), 2026-09-18, macOS arm64 (Accelerate)
+
+Measurement (`tests/malloc_count.c` inserted with `DYLD_INSERT_LIBRARIES` +
+`DYLD_FORCE_FLAT_NAMESPACE`, `tests/test_stream_allocs.sh`): the counter is a
+whole-process total, so the per-chunk number is the DIFFERENCE between two runs
+of the same command on the same model with inputs of different length — model
+load, stream open, WAV load and the final flush are identical in both, so the
+difference is exactly what the extra chunks cost. Command in both runs:
+`./mynah-asr stream -m <nemotron-3.5-asr-streaming-0.6b> -i <wav> --quant int8`,
+preset [56,3] (q = 4 encoder frames = 320 ms per chunk), `tests/audio/test_it.wav`
+(5.229 s) against its first half (2.615 s), i.e. 8 steady-state chunks.
+
+| tree | 2.615 s | 5.229 s | second half | per chunk |
+|---|---|---|---|---|
+| `354743c` (before) | 45975 | 46671 | 696 | **87** |
+| this change (after) | 45171 | 45171 | 0 | **0** |
+
+The 87 are exactly the audited sites: SiLU on Accelerate 24 × (2 FFN + 1 conv
+module) = 72 · subsampling 9 (`a`, `bbuf`, `flat`, `xp` × 3 stages, the stage-0
+im2col `P`, the depthwise pad × 2 stages — the audit listed 6, the im2col and
+the two pads were inside `conv2d_s2`) · `mynah_asr_encoder_post` 3 (`cat`,
+`mid`, `fused`) · `mynah_asr_greedy_decode` 2 (`jin`, `logits`) ·
+`mynah_asr_detokenize` 1 (the whole transcript, re-decoded every chunk).
+
+What was done: every one of those buffers is now carved at stream open —
+`mynah_asr_ss_stream` grew its own `scr` (sized from `max_n_mel = 8*(right+1)+1`,
+`sflat` aliasing `sb`), `mynah_asr_enc_stream` grew `ssilu` and `spost`,
+`mynah_asr_stream` grew `dec_scr` and a `mynah_asr_detok`. The offline entry
+points (`mynah_asr_silu`, `mynah_asr_encoder_post`, `mynah_asr_greedy_decode`,
+`mynah_asr_subsampling_forward`) keep allocating: they call the same code with a
+NULL scratch, so their arithmetic and their outputs are untouched.
+
+Detokenisation is now incremental (`mynah_asr_detok_append`): the raw transcript
+is kept UNSTRIPPED in a per-stream buffer and the ▁-expansion, the inline
+`<xx-XX>` strip and the leading/trailing space strip are reproduced as a view
+over it, so at every chunk the bytes equal `mynah_asr_detokenize` over the whole
+history. Two cases needed care and both are covered by a model-free test
+(`tests/test_tokenize.c` §6, every prefix × chunkings of 1..4 tokens):
+a language tag spelled out across several tokens (the pass restarts at the first
+`'<'` it could not resolve) and the double-space collapse after a tag stripped at
+the very end of the buffer (undecidable until the next chunk arrives, so it is
+deferred rather than skipped — this was a real divergence the test caught).
+There is NO fallback to the whole-history path: no case needed one.
+
+What remains: the transcript buffer (reserved 8192 B) and the token array
+(4096 ids) still realloc geometrically if a stream outgrows them, as does the mel
+stream's own sample buffer — amortised, not per chunk, and the measurement above
+shows none of them fires on a 5 s clip. `mynah_asr_greedy_decode` still
+dequantizes the head into a temporary when T > 16; no Nemotron preset reaches
+that (the largest, [56,13], gives q = 14), but a model with a larger lookahead
+would allocate 1 per chunk there. `MYNAH_ASR_QGEMM=1` (off by default) allocates
+inside `mynah_asr_qmat_mul`. Linux is NOT measured here: the counter has an
+`LD_PRELOAD`/`dlsym(RTLD_NEXT)` arm and the test skips (77) where interposition
+does not work, but the numbers above are macOS/Accelerate only — S0-4 is the
+Linux count.

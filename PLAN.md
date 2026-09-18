@@ -44,7 +44,7 @@ Production is Linux x86-64 and ARM64; macOS is the development machine.
 ### S1 — Library seams the server needs → [`.work/stream-api-v2.md`](.work/stream-api-v2.md)
 - [ ] S1-1 `mynah_asr_stream_reset`; slots are pooled, not reopened
 - [ ] S1-2 Deltas carry `t0`, `is_final`, `is_eou` and a chunk-arrival passthrough for `lag_ms`
-- [ ] S1-3 Allocation-free chunk: per-stream scratch, incremental detokenisation
+- [x] S1-3 Allocation-free chunk: per-stream scratch, incremental detokenisation — 87 -> 0 allocations per chunk on macOS/Accelerate, gated by `make test-stream-allocs`; the Linux count stays S0-4
 - [ ] S1-4 Batched stream step for B slots, byte-identical to B single steps
 - [ ] S1-5 Lift the mynah-tts pool: spin-then-park, meter, after_fork, lane redirect → [`.work/threadpool-and-lane.md`](.work/threadpool-and-lane.md)
 - [ ] S1-6 BLAS leaves the Linux worker: own sgemm, `BLAS=none` default, `openblas` as the comparison build → [`.work/threadpool-and-lane.md`](.work/threadpool-and-lane.md)
