@@ -90,6 +90,10 @@ static const mynah_asr_flag g_flags[] = {
      " int8 never consults it, its per-row dot is exact by construction",
      NULL, NULL},
 
+    {"MYNAH_ASR_BATCH_ALLOCS", MYNAH_ASR_FLAG_DEBUG, "unset",
+     "tests/test_stream_batch: run only the zero-allocation gate of the batched step (same as --allocs)",
+     NULL, NULL},
+
     {"MYNAH_ASR_STEP_TIME", MYNAH_ASR_FLAG_DEBUG, "unset",
      "tests/test_stream_batch: print per-step wall time of single vs batched steps (a dev signal)",
      NULL, NULL},
