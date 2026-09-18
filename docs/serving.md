@@ -101,6 +101,10 @@ python3 tools/bench/stream_load.py --mode soak --streams 8 --duration 600 \
 Minimum for a promotion: **≥ 10 minutes**, a mixed bank, a clean committed tree (§12;
 a dirty-tree binary is NON-QUALIFYING and serves WAVE and DIAGNOSTIC only).
 
+Both invocations have a Makefile shortcut against an already running server:
+`make bench-stream-wave STREAM_N=4 STREAM_PORT=8090` and
+`make bench-stream-soak STREAM_N=8 STREAM_DURATION=900`.
+
 ## 6. The envelope
 
 Provisional (`.work/serving-v2-design.md` §6), to be recalibrated by S0. One chunk period
