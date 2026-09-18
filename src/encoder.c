@@ -4,6 +4,7 @@
 #include "threads.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -733,6 +734,23 @@ int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
                                                 : sub * (es->right + 1);
 }
 
+/* ------------------------------------------- rel-pos projection counters (S1-7)
+ * One relaxed atomic per attention core (24 per stream per step): negligible
+ * next to the GEMMs, and it is the only way a run can PROVE that the sharing
+ * below actually happened instead of quietly degrading (ENGINEERING.md §6). */
+static _Atomic unsigned long long g_relpos[MYNAH_ASR_RELPOS__N];
+static void relpos_count(int which) {
+    atomic_fetch_add_explicit(&g_relpos[which], 1ull, memory_order_relaxed);
+}
+unsigned long long mynah_asr_enc_relpos_counter(int which) {
+    if (which < 0 || which >= MYNAH_ASR_RELPOS__N) return 0;
+    return atomic_load_explicit(&g_relpos[which], memory_order_relaxed);
+}
+void mynah_asr_enc_relpos_counters_reset(void) {
+    for (int i = 0; i < MYNAH_ASR_RELPOS__N; i++)
+        atomic_store_explicit(&g_relpos[i], 0ull, memory_order_relaxed);
+}
+
 /* Streaming attention, WITHOUT the q and o projections: they are plain per-row
  * linears, so the batched step hoists them out and runs them over every stream's
  * rows at once (S1-4). Everything left here is per stream: the K/V cache, the
@@ -740,17 +758,26 @@ int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
  * q [Q,d] is the already-projected query; ctx [Q,d] receives the context, which
  * the caller multiplies by o_w.
  * pe [2K-1, d] is computed by the caller (once per chunk, not per layer);
- * scratch preallocated in es (zero mallocs in the hot path). */
+ * scratch preallocated in es (zero mallocs in the hot path).
+ *
+ * rk_in (S1-7): rk = pe @ relk_w^T for THIS layer and THIS K, already computed
+ * by the caller because several streams of the pass share the same K. NULL = the
+ * core computes its own into es->sa_rk, which is what the single-stream path
+ * always does. Passing a shared buffer cannot change a single float: pe is a
+ * pure function of K, relk_w is the layer's, so the two matmul_wt calls have
+ * bit-identical inputs and the same shape. */
 static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L,
                                   const float *q, const float *kn, const float *vn,
                                   const float *pe, float *ctx, int Q,
-                                  const float *k_cache, const float *v_cache, int valid) {
+                                  const float *k_cache, const float *v_cache, int valid,
+                                  const float *rk_in) {
     const mynah_asr_encoder *enc = es->enc;
     const int d = enc->d_model, H = enc->n_heads, dk = enc->d_head;
     const int K = valid + Q, P = 2 * K - 1;
     const float scaling = 1.0f / sqrtf((float)dk);
 
-    float *rk = es->sa_rk, *scores = es->sa_sc, *bd = es->sa_bd;
+    const float *rk = rk_in ? rk_in : es->sa_rk;
+    float *scores = es->sa_sc, *bd = es->sa_bd;
     float *qb = es->sa_qb;
 
     {
@@ -762,7 +789,12 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
         memcpy(vv, v_cache, (size_t)valid * (size_t)d * sizeof(float));
         memcpy(vv + (size_t)valid * (size_t)d, vn, (size_t)Q * (size_t)d * sizeof(float));
 
-        matmul_wt(pe, L->relk_w, rk, P, d, d);
+        if (rk_in) {
+            relpos_count(MYNAH_ASR_RELPOS_SHARED);
+        } else {
+            matmul_wt(pe, L->relk_w, es->sa_rk, P, d, d);
+            relpos_count(MYNAH_ASR_RELPOS_PRIVATE);
+        }
 
         for (int h = 0; h < H; h++) {
             const size_t ho = (size_t)h * (size_t)dk;
@@ -812,8 +844,9 @@ static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer
                              const float *pe, float *out, int Q,
                              const float *k_cache, const float *v_cache, int valid) {
     mynah_asr_qmat_mul(&L->q_w, x, es->sa_q, Q);
+    /* NULL: the single path always computes its own rk — unchanged by S1-7 */
     stream_attention_core(es, L, es->sa_q, kn, vn, pe, es->sa_ctx, Q,
-                          k_cache, v_cache, valid);
+                          k_cache, v_cache, valid, NULL);
     mynah_asr_qmat_mul(&L->o_w, es->sa_ctx, out, Q);
 }
 
@@ -954,20 +987,27 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
 struct mynah_asr_enc_batch {
     const mynah_asr_encoder *enc;
     int max_b, max_q, max_rows, kmax;
+    int max_p;                                      /* rows the shared rk holds */
     float *buf;                                     /* one allocation */
     float *xs, *tmp, *tmp2, *xn, *kn, *qs, *ctxs, *cin;
+    float *rk_sh;                                   /* [max_p, d] shared rel-pos (S1-7) */
     int8_t *qx;                                     /* [max_rows, kmax] */
     float *sx;                                      /* [max_rows] */
-    int *offs, *qq;                                 /* [max_b] */
+    int *offs, *qq, *kks;                           /* [max_b]; kks = K per stream */
 };
 
-mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int max_b, int max_q) {
-    if (!enc || max_b < 1 || max_b > MYNAH_ASR_BATCH_MAX_B || max_q < 1) return NULL;
+mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int max_b, int max_q,
+                                         int max_left) {
+    if (!enc || max_b < 1 || max_b > MYNAH_ASR_BATCH_MAX_B || max_q < 1 || max_left < 0)
+        return NULL;
     mynah_asr_enc_batch *bb = calloc(1, sizeof(*bb));
     if (!bb) return NULL;
     bb->enc = enc;
     bb->max_b = max_b;
     bb->max_q = max_q;
+    /* the shared rel-pos projection is [2K-1, d] with K = cache_valid + q, so
+     * the largest it can be is the same Kmax mynah_asr_enc_stream_init uses */
+    bb->max_p = 2 * (max_left + max_q + 2) - 1;
     /* +2 per stream: the same slack mynah_asr_enc_stream_init carves (Qm = q+2),
      * so a chunk that subsamples to one or two extra frames still fits */
     bb->max_rows = max_b * (max_q + 2);
@@ -984,12 +1024,17 @@ mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int m
                     + R * d          /* qs   */
                     + R * d          /* ctxs */
                     + R * d          /* cin  */
+                    + (size_t)bb->max_p * d /* rk_sh */
                     + R;             /* sx   */
     bb->buf = malloc(nf * sizeof(float));
     bb->qx = malloc(R * (size_t)bb->kmax);
     bb->offs = malloc((size_t)max_b * sizeof(int));
     bb->qq = malloc((size_t)max_b * sizeof(int));
-    if (!bb->buf || !bb->qx || !bb->offs || !bb->qq) { mynah_asr_enc_batch_free(bb); return NULL; }
+    bb->kks = malloc((size_t)max_b * sizeof(int));
+    if (!bb->buf || !bb->qx || !bb->offs || !bb->qq || !bb->kks) {
+        mynah_asr_enc_batch_free(bb);
+        return NULL;
+    }
     float *p = bb->buf;
     #define BCARVE(f, n) bb->f = p; p += (n)
     BCARVE(xs, R * d);
@@ -1000,6 +1045,7 @@ mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int m
     BCARVE(qs, R * d);
     BCARVE(ctxs, R * d);
     BCARVE(cin, R * d);
+    BCARVE(rk_sh, (size_t)bb->max_p * d);
     BCARVE(sx, R);
     #undef BCARVE
     return bb;
@@ -1007,7 +1053,7 @@ mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int m
 
 void mynah_asr_enc_batch_free(mynah_asr_enc_batch *bb) {
     if (!bb) return;
-    free(bb->buf); free(bb->qx); free(bb->offs); free(bb->qq);
+    free(bb->buf); free(bb->qx); free(bb->offs); free(bb->qq); free(bb->kks);
     free(bb);
 }
 
@@ -1069,7 +1115,27 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             mynah_asr_pos_emb(enc, pe_K, es->sa_pe);
             es->sa_pe_K = pe_K;
         }
+        bb->kks[i] = pe_K;
     }
+
+    /* S1-7: the K shared by the most streams of this pass. `rk = pe @ relk_w^T`
+     * depends on nothing else, so that group computes it ONCE per layer and the
+     * rest of the group reads it. Ties go to the lowest K so the choice does not
+     * depend on the order the caller passed the streams in. A stream at another
+     * K — a slot on its first chunks, cache_valid still below left — keeps the
+     * private projection, exactly as before. */
+    int k_sh = 0, k_sh_n = 0, lead = 0;
+    for (int i = 0; i < B; i++) {
+        int n = 0;
+        for (int j = 0; j < B; j++) if (bb->kks[j] == bb->kks[i]) n++;
+        if (n > k_sh_n || (n == k_sh_n && bb->kks[i] < k_sh)) { k_sh = bb->kks[i]; k_sh_n = n; }
+    }
+    for (int i = 0; i < B; i++) if (bb->kks[i] == k_sh) { lead = i; break; }
+    /* sharing pays from two streams up, and only if the scratch really holds it
+     * (it is sized for max_left + max_q + 2 — a defensive check, not a policy) */
+    const int P_sh = 2 * k_sh - 1;
+    const int share = k_sh_n >= 2 && P_sh <= bb->max_p;
+
     const size_t nd = (size_t)R * (size_t)d;
     float *xs = bb->xs, *tmp = bb->tmp, *tmp2 = bb->tmp2, *xn = bb->xn;
     float *kn = bb->kn, *vn = bb->kn + nd;
@@ -1094,6 +1160,15 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         mynah_asr_qmat_mul_rows(&L->k_w, xn, kn, R, qx, sx);
         mynah_asr_qmat_mul_rows(&L->v_w, xn, vn, R, qx, sx);
         mynah_asr_qmat_mul_rows(&L->q_w, xn, bb->qs, R, qx, sx);
+        /* the group's rel-pos projection, once for this layer (S1-7). ess[lead]
+         * is at K = k_sh, so its sa_pe holds pos_emb(k_sh) — the same bytes every
+         * other member of the group would have fed to the same matmul_wt. */
+        const float *rk_sh = NULL;
+        if (share) {
+            matmul_wt(ess[lead]->sa_pe, L->relk_w, bb->rk_sh, P_sh, d, d);
+            relpos_count(MYNAH_ASR_RELPOS_GROUP);
+            rk_sh = bb->rk_sh;
+        }
         for (int i = 0; i < B; i++) {
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
@@ -1101,7 +1176,8 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             float *kc = es->k_cache + (size_t)li * (size_t)es->left * (size_t)d;
             float *vc = es->v_cache + (size_t)li * (size_t)es->left * (size_t)d;
             stream_attention_core(es, L, bb->qs + off, kn + off, vn + off, es->sa_pe,
-                                  bb->ctxs + off, Q, kc, vc, es->cache_valid);
+                                  bb->ctxs + off, Q, kc, vc, es->cache_valid,
+                                  bb->kks[i] == k_sh ? rk_sh : NULL);
             update_kv_cache(kc, kn + off, es->cache_valid, Q, es->left, d);
             update_kv_cache(vc, vn + off, es->cache_valid, Q, es->left, d);
         }

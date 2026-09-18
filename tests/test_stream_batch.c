@@ -288,8 +288,9 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
     }
 
     /* pass 2: the same chunks, batched */
-    mynah_asr_enc_batch *bb = mynah_asr_enc_batch_new(&e.enc, B, q);
+    mynah_asr_enc_batch *bb = mynah_asr_enc_batch_new(&e.enc, B, q, e.left);
     if (!bb) return -1;
+    mynah_asr_enc_relpos_counters_reset();       /* S1-7: shared vs private rk */
     for (int i = 0; i < B; i++) { mynah_asr_enc_stream_reset(&es[i]); pos[i] = 0; }
     int used_batched = 0;
     for (int step = 0; step < nsteps; step++) {
@@ -341,11 +342,19 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
         if (memcmp(c, es[i].conv_cache, ccache_floats(&e) * sizeof(float)) != 0) cdiff++;
     }
 
-    const int ok = !qdiff && diff_floats == 0 && cdiff == 0 && used_batched;
+    /* S1-7: the sharing must have happened, and it must not have changed a
+     * single float above — the two assertions belong to the same line. */
+    const unsigned long long rp_sh = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_SHARED);
+    const unsigned long long rp_pv = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_PRIVATE);
+    const unsigned long long rp_gr = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_GROUP);
+    const int shared_ok = rp_sh > 0;
+
+    const int ok = !qdiff && diff_floats == 0 && cdiff == 0 && used_batched && shared_ok;
     printf("  [%s] encoder bit-exact B=%d: %d steps, %zu floats compared, %zu differ, "
-           "%zu/%d caches differ%s | %s\n",
+           "%zu/%d caches differ%s | rel-pos shared %llu private %llu group %llu%s | %s\n",
            quantize ? "int8" : "f32", B, nsteps, cmp_floats, diff_floats, cdiff, 3 * B,
-           qdiff ? ", FRAME COUNT DIFFERS" : "", ok ? "EXACT OK" : "FAIL");
+           qdiff ? ", FRAME COUNT DIFFERS" : "", rp_sh, rp_pv, rp_gr,
+           shared_ok ? "" : " NO SHARING", ok ? "EXACT OK" : "FAIL");
 
     mynah_asr_enc_batch_free(bb);
     for (int i = 0; i < B; i++) { mynah_asr_enc_stream_free(&es[i]); free(feats[i]); }
@@ -457,6 +466,7 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
         char texts[MAX_B][TEXT_CAP];
 
         mynah_asr_qmat_counters_reset();
+        mynah_asr_enc_relpos_counters_reset();
         const unsigned long long rows0 = mynah_asr_stream_batch_rows_stacked();
         long steps = 0;
         if (run_batched(m, use, B, texts, NULL, &steps) != 0) { mynah_asr_free(m); return -1; }
@@ -471,8 +481,12 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
                        i, use[i].lang, one[c], texts[i]);
             }
         }
+        const unsigned long long rp_sh = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_SHARED);
+        const unsigned long long rp_pv = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_PRIVATE);
+        const unsigned long long rp_gr = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_GROUP);
         printf("  [%s] B=%d: %2ld steps, %4llu stacked rows | dot %llu  dot_rows %llu  "
-               "f32 %llu  generic %llu  qgemm %llu  DEQUANT %llu | %s\n",
+               "f32 %llu  generic %llu  qgemm %llu  DEQUANT %llu | relpos sh %llu pv %llu "
+               "gr %llu | %s\n",
                quant_name(quant), B, steps, rows,
                mynah_asr_qmat_counter(MYNAH_ASR_QC_DOT),
                mynah_asr_qmat_counter(MYNAH_ASR_QC_DOT_ROWS),
@@ -480,8 +494,19 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
                mynah_asr_qmat_counter(MYNAH_ASR_QC_GENERIC),
                mynah_asr_qmat_counter(MYNAH_ASR_QC_QGEMM),
                mynah_asr_qmat_counter(MYNAH_ASR_QC_DEQUANT),
+               rp_sh, rp_pv, rp_gr,
                ok ? "IDENTICAL OK" : "DIFFERENT FAIL");
         if (!ok) fail = 1;
+        /* S1-7: at B > 1 the streams reach a common K within a few steps, so a
+         * run that took the stacked path and never shared means the sharing
+         * silently stopped working. (rows == 0 = the whole batched path
+         * degraded — an f32 build with MYNAH_ASR_BATCH_F32=0 — and the line
+         * above already reports that.) */
+        if (B > 1 && rows > 0 && rp_sh == 0) {
+            printf("  [%s] B=%d: the rel-pos projection was never shared FAIL\n",
+                   quant_name(quant), B);
+            fail = 1;
+        }
         /* the dequant+sgemm fallback mallocs per call and changes the numerics:
          * reaching it from a stream step is a failure, not a slow path */
         if (mynah_asr_qmat_counter(MYNAH_ASR_QC_DEQUANT) != 0) {
@@ -506,8 +531,8 @@ static void gate_steptime(const char *dir, clip *cs, int n_clips) {
     if (!m) return;
     printf("\n  step time, int8, macOS dev signal (NOT a serving claim)\n");
     printf("  %3s | %10s | %10s | %6s | %s\n", "B", "single ms", "batched ms", "ratio", "ms/stream");
-    const int Bs[4] = {1, 2, 4, 8};
-    for (int bi = 0; bi < 4; bi++) {
+    const int Bs[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (int bi = 0; bi < 8; bi++) {
         const int B = Bs[bi];
         clip use[MAX_B];
         for (int i = 0; i < B; i++) use[i] = cs[i % n_clips];
