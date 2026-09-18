@@ -15,10 +15,13 @@ models
 __pycache__/
 *.pyc
 
-# Local planning notes and agent instructions (not part of the public repo)
+# Local planning notes and agent instructions (not part of the public repo).
+# The reviewed .work/*.md notes ARE tracked; raw evidence and private archives are not.
 PLAN.md
 TODO.md
 CLAUDE.md
+.work/private/
+.work/evidence/
 
 # OS
 .DS_Store

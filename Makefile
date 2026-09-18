@@ -261,6 +261,12 @@ leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align
 	  tests/golden/test_it 2>&1 | tail -3
 	@WRAP="leaks --atExit --" sh tests/test_vad.sh $(VAD_DIR) 2>&1 | tail -4
 
+# plan + repository integrity (ENGINEERING.md §1, §12): no dangling board links,
+# no tracked script depending on an untracked file
+check:
+	@python3 tools/check_plan.py
+	@python3 tools/check_repo_integrity.py
+
 clean:
 	rm -rf build mynah-asr mynah-asr-server libmynah_asr.a $(TESTS) $(SCRIPTED_TESTS) examples/minimal dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
@@ -303,4 +309,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot
