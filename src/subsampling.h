@@ -40,6 +40,9 @@ typedef struct {
     int first;
 } mynah_asr_ss_stream;
 
+/* Back to the first-chunk state, keeping the buffers. */
+void mynah_asr_ss_stream_reset(mynah_asr_ss_stream *sst);
+
 int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampling *ss, int n_mels);
 void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst);
 

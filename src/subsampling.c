@@ -368,3 +368,9 @@ int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_strea
     free(a); free(bbuf); free(flat);
     return To;
 }
+
+void mynah_asr_ss_stream_reset(mynah_asr_ss_stream *sst) {
+    for (int s = 0; s < 3; s++)
+        if (sst->cache[s]) memset(sst->cache[s], 0, (size_t)sst->cin[s] * (size_t)sst->fdim[s] * sizeof(float));
+    sst->first = 1;
+}

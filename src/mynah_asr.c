@@ -780,6 +780,40 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
 
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s) { return s->lang; }
 
+int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
+    if (lang) {
+        const int prompt = resolve_prompt(s->m, lang);
+        if (prompt == -2) return -1;
+        s->prompt = prompt;
+    }
+    mynah_asr_mel_stream_reset(&s->mel);
+    mynah_asr_enc_stream_reset(&s->es);
+    mynah_asr_dec_state_reset(&s->m->dec, &s->dec);
+    s->mel_have = 0;
+    s->n_tokens = 0;
+    s->chars_emitted = 0;
+    s->lang[0] = '\0';
+    s->samples_fed = 0;
+    if (s->vad) {
+        mynah_asr_vad_reset(s->vad);
+        mynah_asr_vad_seg_reset(&s->seg);
+    }
+    s->vhave = 0;
+    s->eou_pending = 0;
+    s->eou_sec = 0.0;
+    return 0;
+}
+
+size_t mynah_asr_stream_need_samples(const mynah_asr_stream *s) {
+    const int need = mynah_asr_enc_stream_need(&s->es);
+    const long last = s->mel.next_frame + (long)(need - s->mel_have) - 1;
+    return mynah_asr_mel_stream_samples_until(&s->mel, last);
+}
+
+double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s) {
+    return (double)s->samples_fed / (double)s->m->feat.sample_rate;
+}
+
 /* Encode the current mel chunk, decode it, emit the text delta. */
 static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
                               mynah_asr_result_cb cb, void *ud) {

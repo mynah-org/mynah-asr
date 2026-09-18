@@ -50,7 +50,35 @@ int main(int argc, char **argv) {
     printf("streaming  offline : %s\n", offline);
     printf("streaming  chunked : %s\n", stream_text);
     printf("streaming parity: %s\n", same ? "IDENTICAL OK" : "DIFFERENT FAIL");
+    int fail = !same;
+
+    /* reset ≡ reopen: pollute a stream with the second half of the audio, reset
+     * it, then feed the whole file paced by need_samples (one chunk per feed) */
+    s = mynah_asr_stream_open(m, "it-IT", -1);
+    if (!s) return 2;
+    if (mynah_asr_stream_feed(s, audio + n_samples / 2, n_samples - n_samples / 2, NULL, NULL) != 0) return 2;
+    if (mynah_asr_stream_reset(s, NULL) != 0) return 2;
+    stream_text[0] = '\0';
+    size_t fed = 0, feeds = 0, flushes = 0;
+    while (fed < n_samples) {
+        size_t need = mynah_asr_stream_need_samples(s);
+        if (need == 0) { printf("streaming need_samples: 0 after a feed FAIL\n"); fail = 1; break; }
+        if (need > n_samples - fed) need = n_samples - fed;
+        const size_t before = strlen(stream_text);
+        if (mynah_asr_stream_feed(s, audio + fed, need, collect, NULL) != 0) return 2;
+        if (strlen(stream_text) != before) flushes++;
+        fed += need;
+        feeds++;
+    }
+    mynah_asr_stream_finish(s, collect, NULL);
+    const int same2 = strcmp(offline, stream_text) == 0;
+    printf("streaming reset+paced (%zu feeds, %zu with text): %s\n", feeds, flushes,
+           same2 ? "IDENTICAL OK" : "DIFFERENT FAIL");
+    if (!same2) { printf("  got: %s\n", stream_text); fail = 1; }
+    /* a wrong language is refused and leaves the stream usable */
+    if (mynah_asr_stream_reset(s, "xx-YY") != -1) { printf("streaming reset bad lang: accepted FAIL\n"); fail = 1; }
+    mynah_asr_stream_close(s);
 
     free(offline); free(audio); mynah_asr_free(m);
-    return same ? 0 : 1;
+    return fail;
 }

@@ -110,6 +110,8 @@ typedef struct {
 int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
                           int left_ctx, int right_ctx, int n_mels);
 void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es);
+/* Back to the first-chunk state (empty caches), keeping every allocation. */
+void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es);
 
 /* Mel frames required by the next chunk (first: 1+8r, then 8(r+1)). */
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es);

@@ -682,6 +682,18 @@ void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es) {
     es->k_cache = es->v_cache = es->conv_cache = es->scr = NULL;
 }
 
+void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es) {
+    const mynah_asr_encoder *enc = es->enc;
+    const size_t kv = (size_t)enc->n_layers * (size_t)es->left * (size_t)enc->d_model;
+    const size_t cv = (size_t)enc->n_layers * (size_t)(enc->conv_k - 1) * (size_t)enc->d_model;
+    mynah_asr_ss_stream_reset(&es->ss);
+    memset(es->k_cache, 0, kv * sizeof(float));
+    memset(es->v_cache, 0, kv * sizeof(float));
+    memset(es->conv_cache, 0, cv * sizeof(float));
+    es->cache_valid = 0;
+    es->sa_pe_K = 0;
+}
+
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
     const int sub = 8; /* subsampling_factor: 3 stride-2 stages */
     return es->cache_valid == 0 && es->ss.first ? 1 + sub * es->right

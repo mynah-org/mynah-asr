@@ -214,6 +214,24 @@ int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
 /* Language detected so far ("" when not emitted yet). */
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
 
+/* A new utterance on the SAME stream object: every cache, the decoder state,
+ * the VAD state and the emitted-text bookkeeping go back to what open() gave,
+ * without freeing or allocating anything (~13 MB per stream on nemotron, and a
+ * server pools its slots). lang = NULL keeps the current language prompt; the
+ * lookahead cannot change (it sizes the scratch). Returns 0, or -1 when lang is
+ * not supported (the stream is then unchanged). Gate: reset+feed is byte-identical
+ * to close+open+feed (tests/test_streaming.c). */
+int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang);
+
+/* Samples the stream still needs before its next chunk is complete and the
+ * callback can fire: a scheduler that feeds exactly this much per step gives
+ * every stream one encoder chunk per step, no more. 0 never happens after a
+ * feed (a complete chunk is consumed by the feed that completes it). */
+size_t mynah_asr_stream_need_samples(const mynah_asr_stream *s);
+
+/* Audio seconds fed so far. */
+double mynah_asr_stream_audio_seconds(const mynah_asr_stream *s);
+
 void mynah_asr_stream_close(mynah_asr_stream *s);
 
 #ifdef __cplusplus
