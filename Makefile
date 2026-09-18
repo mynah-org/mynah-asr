@@ -137,6 +137,7 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
+	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
 
 # S1-3: zero allocations per streaming chunk after warm-up (model-gated).
 test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
@@ -215,6 +216,18 @@ bench: mynah-asr
 #   tests/bench_throughput models/<m> tests/audio/long_60s.wav --backend cuda --max-batch 64
 bench-throughput: tests/bench_throughput
 	@echo "usage: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
+
+# S4-2 streaming load against a RUNNING server (see docs/serving.md for the order of work).
+# WAVE screens and may disqualify; only a SOAK with a drift gate promotes.
+# Override: make bench-stream-soak STREAM_N=8 STREAM_PORT=8090 STREAM_DURATION=900
+STREAM_CLIPS ?= samples/*/fleurs_*.wav tests/audio/test_*.wav
+STREAM_PORT ?= 8090
+STREAM_N ?= 4
+STREAM_DURATION ?= 600
+bench-stream-wave:
+	@python3 tools/bench/stream_load.py --mode wave --streams $(STREAM_N) --repeat 2 --port $(STREAM_PORT) --clips $(STREAM_CLIPS) --json wave-$(STREAM_N).json
+bench-stream-soak:
+	@python3 tools/bench/stream_load.py --mode soak --streams $(STREAM_N) --duration $(STREAM_DURATION) --warmup 30 --window 60 --bank short,medium,long --seed 42 --port $(STREAM_PORT) --clips $(STREAM_CLIPS) --json soak-$(STREAM_N).json
 
 # End-to-end server test (REST + concurrency + WebSocket)
 test-server: mynah-asr-server
@@ -347,4 +360,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples test-stream-allocs cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot

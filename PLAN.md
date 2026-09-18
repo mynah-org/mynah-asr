@@ -68,10 +68,10 @@ there; macOS is the development machine, nice to have, never the target.**
 - [ ] S3-4 `SIGUSR1` dump forwarded to workers; named threads
 
 ### S4 — Measure, then qualify → [`.work/bench-harness-streaming.md`](.work/bench-harness-streaming.md)
-- [ ] S4-1 Streaming metrics module: every metric defined once, known-answer self-test in `make test`
-- [ ] S4-2 WAVE / SOAK modes, mixed-length bank, manifest, drift gate, refusal on pacing failure
+- [x] S4-1 Streaming metrics module: every metric defined once, known-answer self-test in `make test` ([`tools/bench/streaming_metrics.py`](tools/bench/streaming_metrics.py))
+- [x] S4-2 WAVE / SOAK modes, mixed-length bank, manifest, drift gate, refusal on pacing failure ([`tools/bench/stream_load.py`](tools/bench/stream_load.py); exercised on the macOS dev host only — the qualifying run is S4-3)
 - [ ] S4-3 First SOAK on the ARM box at the derived operating point; verdict by the envelope → [`.work/axion-first-run.md`](.work/axion-first-run.md)
-- [ ] S4-4 Serving operations doc: how a new box is approached, the vocabulary, the envelope
+- [x] S4-4 Serving operations doc: how a new box is approached, the vocabulary, the envelope → [`docs/serving.md`](docs/serving.md)
 
 ### S5 — Kernels for the batched step, ARM and x86 in one step → [`.work/cpu-kernels-arm-x86.md`](.work/cpu-kernels-arm-x86.md)
 - [ ] S5-1 Weight-stationary int8 GEMM for T ≤ 64: SMMLA (i8mm) and VNNI, bit-exact vs single rows; no per-call dequant
