@@ -37,6 +37,7 @@ there; macOS is the development machine, nice to have, never the target.**
 - [x] v1 history (Italian, closed, local only): the old plan and TODO live in the untracked private archive folder under the work notes
 
 ### S0 — Baseline (trimmed 2026-09-18: the v1 server is not worth measuring; S1/S2 start now)
+- [ ] S0-6 **The box day**: the ordered runbook for the Linux host — dispatch proof, identity gates, the two questions macOS could not ask, the qualification, multi-model → [`.work/box-day-plan.md`](.work/box-day-plan.md)
 - [~] S0-1 Build, gates and single-stream step cost (Q=4, int8, T=1..4, pinned, idle box) on the 32-core ARM host → [`.work/axion-first-run.md`](.work/axion-first-run.md)
 - [~] S0-2 Streaming load tool v0: N WebSocket clients paced at 1x, stdlib only → [`.work/bench-harness-streaming.md`](.work/bench-harness-streaming.md)
 - [-] S0-3 The v1 server under N streams — dropped: it is broken by construction and the number would not size v2 → [`.work/baseline-streaming-concurrency.md`](.work/baseline-streaming-concurrency.md)
