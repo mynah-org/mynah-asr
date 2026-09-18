@@ -50,4 +50,10 @@ Gate: a soak on the Axion at the derived operating point promotes or fails
 by the envelope in `serving-v2-design.md` §6, with the manifest in
 `axion-first-run.md`.
 
-Evidence / Conclusion / Next action: S0-2 first, alongside S0-1.
+Evidence: S0-2 v0 written as `tools/bench/stream_load.py` (commit 578a4fa): one
+process per stream, real-time pacing, TTFP / emission lag / finalization lag,
+pacing lateness gate, text-identity gate across streams, JSON with manifest.
+Not yet exercised against a live server (no converted model on the laptop);
+first run is S0-3 on the ARM box.
+Conclusion: pending S0-3.
+Next action: run it against the v1 server on the box at N = 1, 2, 4, 8, 16.
