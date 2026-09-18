@@ -144,14 +144,17 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
 	@$(MAKE) --no-print-directory test-stream-batch-allocs
 
-# S1-3: zero allocations per streaming chunk after warm-up (model-gated).
-test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
-	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \
-	  if [ $$rc -eq 77 ]; then echo "SKIP stream-allocs: model missing or interposition unavailable"; \
-	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
-
 # S1-4: the BATCHED step allocates nothing per step either. Same counter, but
 # sampled in-process (the batched API has no CLI entry to difference two runs of).
+# Under a sanitizer the counter cannot be preloaded (ASan must be the first
+# library in the process), so the gate is skipped there rather than failing
+# before the test can say 77.
+ifneq (,$(findstring sanitize,$(CFLAGS)))
+test-stream-batch-allocs: tests/test_stream_batch
+	@echo "SKIP stream-batch-allocs: sanitized build, the malloc counter cannot be preloaded"
+test-stream-allocs: mynah-asr
+	@echo "SKIP stream-allocs: sanitized build, the malloc counter cannot be preloaded"
+else
 test-stream-batch-allocs: tests/test_stream_batch $(MALLOC_COUNT_LIB)
 	@if [ "$(UNAME_S)" = "Darwin" ]; then \
 	  DYLD_INSERT_LIBRARIES=$(MALLOC_COUNT_LIB) DYLD_FORCE_FLAT_NAMESPACE=1 \
@@ -162,6 +165,13 @@ test-stream-batch-allocs: tests/test_stream_batch $(MALLOC_COUNT_LIB)
 	fi; \
 	if [ $$rc -eq 77 ]; then echo "SKIP stream-batch-allocs: model missing or interposition unavailable"; \
 	elif [ $$rc -ne 0 ]; then exit $$rc; fi
+# S1-3: zero allocations per streaming chunk after warm-up (model-gated).
+test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
+	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP stream-allocs: model missing or interposition unavailable"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+endif
 
 golden-dump:
 	cd tools && uv run python -m oracle.transcribe ../$(MODEL_DIR) ../tests/audio/test_it.wav \
