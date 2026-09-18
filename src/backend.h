@@ -21,6 +21,10 @@ void mynah_asr_gemm_wt(const float *x, const float *w, float *out, int T, int n,
 /* Fused FFN: out[T,n2] = SiLU(x @ W1^T) @ W2^T. scratch: >= T*n1 floats (used
  * only in the CPU fallback). On Metal the intermediate stays on GPU (one sync). */
 void mynah_asr_silu(float *x, size_t n);   /* x = x*sigmoid(x), vectorized via Accelerate */
+/* Same, with caller-owned scratch (>= n floats) for the vectorized path, so a
+ * hot loop never allocates. scratch == NULL behaves exactly like mynah_asr_silu.
+ * Identical arithmetic in both forms (the scratch only replaces the malloc). */
+void mynah_asr_silu_scratch(float *x, size_t n, float *scratch);
 void mynah_asr_ffn_wt(const float *x, const float *w1, int n1, const float *w2, int n2,
                   float *out, int T, int k, float *scratch);
 

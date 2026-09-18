@@ -64,6 +64,12 @@ int mynah_asr_encoder_layer(const mynah_asr_encoder *enc, int li, float *x, int 
 void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T, int prompt_id,
                         float *out);
 
+/* Same, with caller-owned scratch (NULL = allocate internally, i.e. exactly
+ * mynah_asr_encoder_post). Floats required: mynah_asr_encoder_post_scratch_floats. */
+void mynah_asr_encoder_post_scratch(const mynah_asr_encoder *enc, const float *x, int T,
+                                int prompt_id, float *out, float *scratch);
+size_t mynah_asr_encoder_post_scratch_floats(const mynah_asr_encoder *enc, int T);
+
 /* Full offline forward: valid feats [T_mel, n_mels] -> out [T_enc, d_out] (malloc'd). */
 float *mynah_asr_encoder_forward(const mynah_asr_encoder *enc, const float *feats, int t_mel,
                              int n_mels, int prompt_id, int left_ctx, int right_ctx,
@@ -105,6 +111,8 @@ typedef struct {
     float *sa_pe, *sa_q, *sa_keys, *sa_rk, *sa_sc, *sa_bd,   /* attention */
           *sa_qb, *sa_ctx;
     float *sc_h2, *sc_gp, *sc_c, *sc_t;                      /* conv module */
+    float *ssilu;               /* SiLU exp buffer (>= Qmax * ffn_dim) */
+    float *spost;               /* prompt + projector (encoder_post) */
 } mynah_asr_enc_stream;
 
 int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
