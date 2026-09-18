@@ -45,6 +45,7 @@ libmynah_asr.a
 tests/test_qmat
 tests/test_gguf
 tests/test_threads
+tests/test_flags
 tests/test_features
 tests/test_subsampling
 tests/test_encoder

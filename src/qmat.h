@@ -82,6 +82,23 @@ void mynah_asr_qmat_dequant(const mynah_asr_qmat *m, float *wd);
  * are compile-time (Apple Silicon always has dotprod). */
 int mynah_asr_set_caps(const char *name);
 
+/* Dispatch predicates OWNED by src/qmat.c (S3-2). src/dispatch.c calls these
+ * instead of re-deriving "compiled && supported", which is the guess that lets
+ * a report and a README agree and both be wrong. Pure readers, no side effect
+ * beyond the same one-time cpuid the first kernel call would do anyway.
+ *   mynah_asr_qmat_int8_kernel  "neon-sdot" | "avx512vnni" | "avx2" |
+ *                               "neon-f32" | "scalar"
+ *   mynah_asr_qmat_int4_kernel  "neon-sdot-q4" | "avx2-q4" | "neon-f32-q4" |
+ *                               "scalar"
+ *   mynah_asr_qmat_qgemm        1 on, 0 off, -1 no native int8 kernel compiled
+ *   mynah_asr_caps_detected/_effective  x86 SIMD level, -1 on a non-x86 build */
+const char *mynah_asr_qmat_int8_kernel(void);
+const char *mynah_asr_qmat_int4_kernel(void);
+int         mynah_asr_qmat_qgemm(void);
+int         mynah_asr_caps_detected(void);
+int         mynah_asr_caps_effective(void);
+const char *mynah_asr_caps_name(int level);
+
 /* Quantize an f32 [n,k] buffer into out_q/out_scales (caller-owned buffers):
  * INT8: out_q [n*k] int8, out_scales [n]
  * INT4: out_q [n*k/2] uint8, out_scales [n*k/32]

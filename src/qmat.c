@@ -500,6 +500,93 @@ static void qgemm_block(void *ctx, int blk) {
 }
 #endif
 
+/* ------------------------------------------------- dispatch predicates (S3-2)
+ * The dispatch report NEVER re-derives which kernel runs from "compiled &&
+ * supported": it asks the owner of the decision, and the owner is this file.
+ * Everything below is a read of the same macros and the same cached x86 level
+ * that mynah_asr_qmat_mul() branches on a few lines further down, so the answer
+ * cannot drift from the code that produces the numbers. No behaviour change:
+ * these are pure readers. */
+
+/* The MYNAH_ASR_QGEMM gate, hoisted out of mynah_asr_qmat_mul so the report and
+ * the hot path read ONE definition (and one cached value). */
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+static int qmat_qgemm_env(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_QGEMM");
+        v = e && e[0] == '1';
+    }
+    return v;
+}
+#endif
+
+/* 1 = the threaded int8xint8 GEMM may run, 0 = off by default or by the env,
+ * -1 = this build has no native int8 kernel to run it with. */
+int mynah_asr_qmat_qgemm(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    return qmat_qgemm_env();
+#else
+    return -1;
+#endif
+}
+
+const char *mynah_asr_caps_name(int level) {
+    switch (level) {
+        case 0: return "scalar";
+        case 1: return "avx2";
+        case 2: return "vnni";
+        default: return "n/a";
+    }
+}
+
+int mynah_asr_caps_detected(void) {
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_detect_caps();
+#else
+    return -1;   /* not an x86 build: there is no runtime SIMD level to pick */
+#endif
+}
+
+int mynah_asr_caps_effective(void) {
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_caps();   /* reads MYNAH_ASR_CAPS once, exactly as the kernels do */
+#else
+    return -1;
+#endif
+}
+
+/* The int8 dot that mynah_asr_qmat_mul() will use for T <= QMAT_SMALL_T with
+ * k <= QMAT_K_MAX — i.e. every streaming/decode projection. */
+const char *mynah_asr_qmat_int8_kernel(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT)
+    return "neon-sdot";
+#elif defined(MYNAH_ASR_HAVE_X86)
+    const int c = x86_caps();
+    if (c >= MYNAH_ASR_CAPS_VNNI) return "avx512vnni";
+    if (c >= MYNAH_ASR_CAPS_AVX2) return "avx2";
+    return "scalar";
+#elif defined(MYNAH_ASR_HAVE_NEON)
+    return "neon-f32";      /* widen + FMA: vectorized, but no integer unit */
+#else
+    return "scalar";
+#endif
+}
+
+const char *mynah_asr_qmat_int4_kernel(void) {
+#if defined(MYNAH_ASR_HAVE_SDOT)
+    return "neon-sdot-q4";
+#elif defined(MYNAH_ASR_HAVE_X86)
+    const int c = x86_caps();
+    if (c >= MYNAH_ASR_CAPS_AVX2) return "avx2-q4";   /* no VNNI q4 kernel exists */
+    return "scalar";
+#elif defined(MYNAH_ASR_HAVE_NEON)
+    return "neon-f32-q4";
+#else
+    return "scalar";
+#endif
+}
+
 void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int T) {
     if (m->qtype == MYNAH_ASR_Q_F32) {
         mynah_asr_gemm_wt(x, m->f32, out, T, m->n, m->k);
@@ -604,11 +691,7 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
      * -> default OFF. The expected upside is on x86 VNNI (no AMX): validate
      * there before considering a per-platform default. */
 #if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
-    static int g_qgemm = -1;
-    if (g_qgemm < 0) {
-        const char *e = getenv("MYNAH_ASR_QGEMM");
-        g_qgemm = e && e[0] == '1';
-    }
+    const int g_qgemm = qmat_qgemm_env();
 #ifdef MYNAH_ASR_HAVE_X86
     const int gnative = g_qgemm && x86_caps() >= MYNAH_ASR_CAPS_AVX2 && m->k <= QMAT_K_MAX;
 #else
