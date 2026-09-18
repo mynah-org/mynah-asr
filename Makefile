@@ -55,7 +55,8 @@ all: mynah-asr mynah-asr-server
 mynah-asr: $(OBJ) build/cli/main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o
+mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o \
+                  build/server/stream_out.o build/server/slot.o build/server/sched.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
 # objects in build/ (never next to the sources: the variant builds — ubsan, cuda
@@ -90,7 +91,7 @@ tests/test_stream_out: build/tests/test_stream_out.o build/server/stream_out.o
 PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tests/test_batch
 # tests driven by a shell script (their own arguments): built here, run below
 SCRIPTED_TESTS := tests/test_vad
-test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
+test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@for t in $(TESTS); do \
 	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
@@ -121,6 +122,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: $(VAD_DIR)/silero_vad.onnx or uv missing (see tests/test_vad.sh)"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 golden-dump:
@@ -205,6 +209,14 @@ test-server: mynah-asr-server
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_server_concurrency.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-concurrency: model missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# Concurrent WebSocket streaming: identity against the CLI under 4 real-time
+# streams, slow-reader isolation, the same identity under --prefork. Needs a
+# streaming model (Nemotron), so it is gated like test-server.
+test-server-stream: mynah-asr-server mynah-asr
+	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
 # Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
@@ -316,4 +328,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-samples cuda update-ingot
+.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-concurrency test-samples cuda update-ingot

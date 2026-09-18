@@ -82,6 +82,27 @@ const uint8_t *mynah_asr_memmem(const uint8_t *hay, size_t hay_len,
     return NULL;
 }
 
+size_t mynah_asr_ws_frame(unsigned char *buf, size_t cap, int opcode,
+                          const void *payload, size_t len) {
+    size_t hl = 2;
+    if (len >= 126) hl = len < 65536 ? 4 : 10;
+    if (cap < hl + len) return 0;
+    buf[0] = (unsigned char)(0x80 | (opcode & 0x0F));
+    if (len < 126) {
+        buf[1] = (unsigned char)len;
+    } else if (len < 65536) {
+        buf[1] = 126;
+        buf[2] = (unsigned char)(len >> 8);
+        buf[3] = (unsigned char)len;
+    } else {
+        buf[1] = 127;
+        for (int i = 0; i < 8; i++)
+            buf[2 + i] = (unsigned char)((uint64_t)len >> (56 - 8 * i));
+    }
+    if (len) memcpy(buf + hl, payload, len);
+    return hl + len;
+}
+
 void mynah_asr_thread_set_name(const char *name) {
     if (name == NULL || name[0] == '\0') return;
     char buf[16];

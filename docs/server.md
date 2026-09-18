@@ -38,9 +38,9 @@ parent prints the per-worker table and forwards to every worker; `SIGTERM`
 stops the fleet. `/v1/health` reports which worker answered.
 
 Design and the measurements it rests on: `.work/serving-v2-design.md`,
-`.work/server-prefork.md`. This is the first piece of serving v2; the
-per-worker scheduler, timeouts, the asynchronous writer and multi-model worker
-groups follow (`PLAN.md` S2).
+`.work/server-prefork.md`, `.work/server-scheduler.md`. The prefork router, the
+asynchronous writer and the per-worker scheduler are in; multi-model worker
+groups and the batched stream step follow (`PLAN.md` S2).
 
 ## Endpoints
 
@@ -102,41 +102,134 @@ sending that language in the request, because the alternative is a fluent invent
 transcript. Requests that name a language explicitly never pay for any of this.
 Ignored (with a note) on a model that already detects by itself.
 
-### GET /v1/audio/stream — WebSocket streaming
+### GET /v1/audio/stream — WebSocket streaming (protocol v2)
 
-Query: `?lang=auto&lookahead=3`. Protocol:
-- client → server: **binary** frames with PCM s16le 16 kHz mono (any size);
-- server → client: JSON text frames `{"text": "<final delta>", "language": ...,
-  "audio_seconds": ...}` as the text is finalized;
-- on client close the server processes the tail, sends `{"done": true,
-  "language": "..."}` and closes.
+Query: `?lang=auto&lookahead=3`.
 
-Reference client (Python stdlib): `tools/eval/ws_client.py`.
+**Client → server**
+
+| frame | meaning |
+|---|---|
+| binary | PCM s16le 16 kHz mono, any size up to `--max-frame-bytes` |
+| text `{"type":"finalize"}` | flush the tail, emit `done`, keep the socket: audio after that starts a new utterance |
+| text `{"type":"reset","lang":"it-IT"}` | new utterance on the same socket, optionally a new language |
+| ping | answered with a pong |
+| close | finalize, emit `done`, close |
+
+An unknown text message is answered with an `error` frame and does **not** end
+the session. A binary frame larger than `--max-frame-bytes` does.
+
+**Server → client** — every frame carries `seq` (per session, counting every
+frame), `audio_s` (audio consumed when it was produced) and `lag_ms` (wall time
+from the arrival of the last sample consumed to the frame being enqueued):
+
+```json
+{"type":"delta","text":"...","final":true,"lang":"it-IT","seq":3,"audio_s":1.32,"lag_ms":146,
+ "language":"it-IT","audio_seconds":1.32}
+{"type":"eou","t":4.10,"seq":9,"audio_s":4.16,"lag_ms":91}
+{"type":"done","done":true,"lang":"it-IT","language":"it-IT","audio_s":5.21,"audio_seconds":5.21,
+ "steps":16,"deltas":15,"lag_p50_ms":144,"lag_max_ms":358,"seq":17}
+{"type":"error","code":"idle_timeout","message":"..."}
+```
+
+`text`, `language`, `audio_seconds` and `done:true` are the **v1 fields, kept
+for one release** so existing clients keep working; they go away in S2-5 proper.
+Nemotron deltas are always `final:true` (monotonic greedy, never retracted); the
+field exists so an unstable-tail decoder can later send `final:false` without a
+protocol change. `lag_p50_ms` in `done` is a median over 8 ms buckets, which is
+the histogram the session keeps — a p50 to the nearest 8 ms, not a mean wearing
+a median's name. An `error` frame raised by the transport (a bad control
+message, an oversized frame) carries no `seq`: it is about the message the
+client just sent, not about the audio.
+
+**Error codes**: `idle_timeout` · `frame_too_large` · `peer_gone` ·
+`shutting_down` · `decode_failed` · `reset_failed` · `unknown_message` ·
+`unsupported_opcode` · `model_not_streaming`.
+
+**Refusals happen before the upgrade**, as HTTP statuses, so a client reads a
+status and not a transport error: `503` with `error.code`
+`server_at_capacity` and `Retry-After` when every slot of this worker is taken,
+`400` with `error.code` `model_not_streaming` on an offline-only model
+(Parakeet, Canary — they have no cache-aware streaming presets and never will,
+so there is no `Retry-After`).
+
+Reference client (Python stdlib): `tools/eval/ws_client.py`. Load harness:
+`tools/bench/stream_load.py`.
 
 ### GET /v1/models · GET /v1/health · OPTIONS (CORS)
 
-`/v1/health` also reports the adaptive-BLAS state, handy under load:
+`/v1/health` reports what the scheduler actually did, not what it was configured
+to do:
 
 ```json
-{"status":"ok","inflight":1,"blas_budget":5,"threads":10}
+{"status":"ok","inflight":2,"blas_budget":8,"threads":8,"worker":-1,
+ "slots":{"active":2,"cap":4},"steps":312,"deltas":270,"eous":0,"sessions":9,
+ "cancelled":1,"offline_jobs":4,"offline_pending":0,
+ "lag_p50_ms":144,"lag_max_ms":358.6,"streaming":true}
 ```
 
-`inflight` = inferences computing right now (a batch counts as one), `threads` =
-`mynah_asr_num_threads()`, `blas_budget` = threads one inference may ask of BLAS.
-At rest `blas_budget == threads`.
+`inflight` = stream slots this worker is holding (a slot is held from the 101
+until the ingest thread lets go) · `slots.cap` = `--cap` · `steps` = scheduler
+steps that fed a chunk · `deltas`/`eous` = frames emitted · `sessions` = slots
+claimed since start · `cancelled` = sessions ended by a cap or a dead peer ·
+`offline_pending` = REST jobs waiting for a step · `lag_*` = emission lag since
+start, from the same 8 ms histogram the `done` frame uses · `threads` =
+`mynah_asr_num_threads()` · `blas_budget` = threads one inference may ask of
+BLAS, now a constant (see below).
 
-## Concurrency
+## Concurrency: one scheduler thread owns the model
 
-The model is **read-only** (mmap'd weights) and shared across workers: each request
-only holds its own decode state (~12 MB per stream). `--threads N` = requests served
-in parallel; excess requests queue up (503 beyond 128 queued). No model cloning,
-no locks on the hot path.
+The model is **read-only** (mmap'd weights) and shared. Inside a worker exactly
+one thread — `mynah-sched` — calls the inference API, and the program asserts it
+at every callback rather than promising it in a comment. The HTTP threads
+(`mynah-http`) parse requests; for a WebSocket each becomes that connection's
+ingest thread (`mynah-ingest`) for its life, converting PCM into the slot's
+bounded ring. Output leaves on a per-connection writer (`mynah-out<fd>`).
 
-**Cross-request batching** (`--batch N`, default 8): pending REST transcriptions
-are aggregated (25 ms window) and processed **weight-stationary**: padding-free
-packing of the frames of all requests, per-frame GEMM (FFN/projections, >95% of FLOPs)
-on `[ΣT, d]` with weights read once per layer; attention/conv stay per-sequence.
-Output identical to the B=1 path (verified).
+One step: poll cancellation for every slot first, apply resets, then feed **one
+encoder chunk to each ready slot in round-robin order**, then run at most one
+batched offline call. A slot is ready when its ring holds
+`mynah_asr_stream_need_samples()` — so a client uploading faster than real time
+fills its ring, blocks on its own socket and can never take more than one chunk
+per step from the others. When nothing is ready the scheduler waits on a
+condvar: there is no tick, and the first chunk of a new stream runs the moment
+it lands.
+
+This is the design the sibling repos qualified, including the part they
+falsified: a second submitter on the engine pool cost qwen-tts its cohort
+(TTFA 174 → 1126 ms), so there is one submitter and only one.
+
+**Offline REST work runs on the same thread**, batched **weight-stationary**:
+padding-free packing of the frames of all queued requests, per-frame GEMM
+(FFN/projections, >95% of FLOPs) on `[ΣT, d]` with weights read once per layer;
+attention/conv stay per-sequence. Output identical to the B=1 path (verified).
+A batch is one lookahead, because the batched call resolves it once for the
+whole batch. Consequence to know: a long offline file stalls this worker's
+streams for the duration of its step. v2.0 accepts that; offline-heavy
+deployments get their own worker group (S2-6).
+
+### Per-stream limits
+
+| flag | default | what it does |
+|---|---|---|
+| `--cap C` | `--threads` | stream slots per worker; beyond it, `503 server_at_capacity` **before** the 101 |
+| `--ring-seconds S` | 30 | PCM buffered per slot; beyond it the ingest stops reading and TCP throttles the client |
+| `--idle-ms N` | 60000 | no audio for this long → the slot is cancelled with `idle_timeout` |
+| `--max-frame-bytes N` | 1048576 | a larger WebSocket frame ends the stream with `frame_too_large` |
+| `--max-pending N` | `2 × --threads` | offline requests queued for the scheduler; beyond it, `503 server_at_capacity` |
+
+A client that stops **reading** is a different case from one that stops
+**sending**, and it is worth being precise about which cap catches it. The
+output ring is bounded and backpressure is cancellation, so a reader slow enough
+to fill the ring or to hold a write past `SO_SNDTIMEO` (5 s) loses its stream —
+but small JSON deltas take a long time to fill a socket buffer, so on a normal
+loopback the cap that actually reclaims a silent client is `--idle-ms`. That is
+what `tests/test_server_stream.sh` observes, and it is stated here rather than
+claimed the other way round.
+
+`SIGTERM` stops accepting, cancels live streams with an `error` frame carrying
+`code:"shutting_down"`, lets the scheduler finish its step, joins it and frees
+the weights.
 
 Honest numbers on Apple Silicon (multithreaded Accelerate): batching ≈ thread pool for
 throughput (a single GEMM already saturates the cores) — batching is worth ~1.4× over
@@ -144,35 +237,42 @@ sequential with a warm cache and reduces contention/footprint. The big gain is e
 on many-core x86/OpenBLAS and on future GPU backends (M5), where reading weights once
 really matters. `--batch 1` disables it (back to per-request in the workers).
 
-### Adaptive BLAS threads (OpenBLAS)
+### BLAS threads: the knob stopped moving
 
-Several inferences running at once must NOT each ask OpenBLAS for every core: the
-concurrent calls thrash on its internal lock and aggregate throughput collapses
-(measured on the A100 host: fine at 2 concurrent requests, collapsing from 4 up;
-capping the threads restored it). The server therefore counts the inferences
-actually computing and sets the per-call budget to `threads / inflight` —
-previously this needed `OPENBLAS_NUM_THREADS` tuned by hand.
+Several inferences running at once must NOT each ask OpenBLAS for every core:
+the concurrent calls thrash on its internal lock and aggregate throughput
+collapses (measured on the A100 host: fine at 2 concurrent requests, collapsing
+from 4 up). The v1 server therefore counted the inferences actually computing
+and divided the budget between them.
 
-The count is kept around the compute calls only, so a WebSocket stream sitting
-idle between chunks does not hold a slot down, and the knob is written only when
-the value really changes, so a steady-state server pays nothing for it. An
-explicit `OPENBLAS_NUM_THREADS` in the environment still wins, and
-`MYNAH_ASR_THREADS` sets the ceiling being divided.
+With the scheduler there is **one inference in flight by construction**, so the
+server sets `mynah_asr_blas_set_concurrency(1)` once at start and never touches
+it again; `blas_budget` in `/v1/health` stays equal to `threads`, and a budget
+that is anything else means something in the process is still driving the knob.
+The library keeps the policy (`tests/test_threads` covers it) for embedders that
+do run several inferences at once. An explicit `OPENBLAS_NUM_THREADS` still
+wins, and `MYNAH_ASR_THREADS` sets the ceiling.
 
-No effect with **Accelerate** (macOS), which nests through GCD and needs no knob:
-there the budget is only bookkeeping, reported in `/v1/health`. Consequence worth
-stating plainly: the *policy* is unit-tested (`tests/test_threads`) and the
-*accounting* is asserted end-to-end (`make test-server`), but the throughput win
-itself has only been measured on the A100 host — re-measuring it needs a
-many-core Linux box with OpenBLAS.
+No effect with **Accelerate** (macOS), which nests through GCD and needs no
+knob: there the budget is only bookkeeping, reported in `/v1/health`.
 
 ## Tests
 
-`make test-server` — REST (multipart, raw, verbose, errors), 4 concurrent requests,
-end-to-end WebSocket streaming. Automatically skipped if the model is not downloaded.
+- `make test-server` — REST (multipart, raw, verbose, errors), 4 concurrent
+  requests, end-to-end WebSocket streaming. Skipped without the model.
+- `make test-server-concurrency` — model-agnostic: concurrent REST, `inflight`
+  and `blas_budget` back to rest, prefork byte-identity, a readable 503.
+- `make test-server-stream` — the streaming gate: 4 real-time WebSocket streams
+  whose text is byte-identical to `mynah-asr transcribe` of the same clip, a
+  stalled reader taking only its own slot down, and the same identity under
+  `--prefork 2 --cap 2`. Needs a streaming model, so it is skipped without one.
 
 ## Operational notes
 
 - One model per process (`/v1/models` lists one).
-- Timeouts/limits: body ≤ 200 MB, headers ≤ 64 KB, queue ≤ 128 connections.
+- Timeouts/limits: body ≤ 200 MB, headers ≤ 64 KB, queue ≤ 128 connections,
+  plus the per-stream caps in the table above.
+- Threads, as `top -H` names them: `mynah-accept`/`mynah-recv` (the connection
+  source) · `mynah-http` ×`--threads`, renamed `mynah-ingest` while one drives a
+  stream · `mynah-sched` ×1 · `mynah-out<fd>` per streaming connection.
 - TLS/auth out of scope: put behind a reverse proxy (nginx/caddy) in production.
