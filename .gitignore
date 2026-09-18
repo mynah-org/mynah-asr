@@ -64,3 +64,6 @@ libmynah_asr.dylib
 *.so
 node_modules/
 package-lock.json
+
+# local converted models for tests (models/ points at a shared volume)
+models_local/

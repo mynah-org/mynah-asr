@@ -282,7 +282,10 @@ curl -F file=@audio_de.wav -F language=de http://localhost:8090/v1/audio/transla
 
 `verbose_json` includes per-word timestamps; `--batch N` enables
 weight-stationary micro-batching across concurrent requests; `--lid-model <dir>`
-answers `language=auto` on the models that cannot detect it themselves.
+answers `language=auto` on the models that cannot detect it themselves. On a
+many-core Linux box `--prefork W` runs W worker processes pinned to core-major
+cpu slices behind one router that refuses overload with a readable 503 instead
+of a hidden wait (`--prefork-plan` prints the machine and the W/T sweep).
 Details: [docs/server.md](docs/server.md).
 
 ## Bindings (Python · Node)

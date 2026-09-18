@@ -2,7 +2,45 @@
 
 ```sh
 make && ./mynah-asr-server -m models/nemotron-3.5-asr-streaming-0.6b -p 8090 --threads 4
+# Linux, many cores: add --prefork W (see below)
 ```
+
+## Prefork: pinned worker processes (Linux production)
+
+```sh
+./mynah-asr-server --prefork-plan                 # the machine's topology and the W/T sweep, no model needed
+./mynah-asr-server -m models/nemotron-3.5-asr-streaming-0.6b --quant int8 -p 8090 \
+    --prefork 8 --prefork-threads 4 --threads 4 --cap 4
+```
+
+`--prefork W` forks W worker processes after the model is mapped (one physical
+copy of the weights for the whole tree) and before any thread exists. On Linux
+each worker is pinned to a contiguous **core-major** slice of the cpus this
+process is allowed to use (`sched_getaffinity`, cgroup quota read and warned
+about); elsewhere workers run unpinned and the banner says so. The parent never
+runs inference: it accepts, picks the least-loaded worker with a free slot,
+hands the descriptor over a socketpair with `SCM_RIGHTS`, and learns of a
+finished connection by one byte coming back. `--cap C` is the number of
+connections a worker holds at once (default `--threads`); a WebSocket stream
+holds one for its whole life.
+
+Admission is a ladder, outermost first, each rung with its own counter and its
+own `error.code`: a full fleet refuses with `503 server_at_capacity` and
+`Retry-After` (the listener is always polled, so overload is a visible refusal
+and never a wait hidden in the kernel backlog); a bounded queue holds
+`MYNAH_ASR_PREFORK_QUEUE` connections per live worker (default 1, `0` refuses at
+once); an entry older than `MYNAH_ASR_PREFORK_QUEUE_MS` (default 2000) when it
+reaches the head is refused `queued_too_long`; `MYNAH_ASR_PREFORK_SERVICE_MS`
+(default 30000) is the per-request service cap. A refusal is written, the
+socket is half-closed and the client's pending body drained before `close()`,
+so the client reads the status instead of a connection reset. `SIGUSR1` on the
+parent prints the per-worker table and forwards to every worker; `SIGTERM`
+stops the fleet. `/v1/health` reports which worker answered.
+
+Design and the measurements it rests on: `.work/serving-v2-design.md`,
+`.work/server-prefork.md`. This is the first piece of serving v2; the
+per-worker scheduler, timeouts, the asynchronous writer and multi-model worker
+groups follow (`PLAN.md` S2).
 
 ## Endpoints
 

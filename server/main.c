@@ -13,7 +13,11 @@
  * Cross-request batching (B>1 kernels) is in the backlog (see TODO M4).
  */
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -29,6 +33,7 @@
 #include "../src/threads.h"   /* mynah_asr_blas_set_concurrency (inflight -> BLAS) */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
+#include "prefork.h"
 
 #define MAX_HDR (64 * 1024)
 #define MAX_BODY (200u * 1024 * 1024)
@@ -68,6 +73,12 @@ static int inflight_now(void) {
     return n;
 }
 static int g_quant = MYNAH_ASR_QUANT_F32;
+
+/* Set by SIGINT/SIGTERM; both accept loops poll with a timeout and re-read it,
+ * because closing the listening socket from a handler does not wake a blocking
+ * accept(). The handler is installed without SA_RESTART on purpose. */
+static volatile sig_atomic_t g_shutdown;
+static void on_stop(int sig) { (void)sig; g_shutdown = 1; }
 
 /* --------------------------------------------------- micro-batching scheduler
  * Connections wrap their work into jobs; a dedicated thread aggregates the
@@ -177,11 +188,15 @@ static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 
 static void q_push(int fd) {
     pthread_mutex_lock(&q_mu);
-    if (q_len == QUEUE_CAP) {   /* full: reject right away */
+    if (q_len == QUEUE_CAP) {   /* full: refuse right away */
         pthread_mutex_unlock(&q_mu);
-        const char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-        if (write(fd, msg, strlen(msg)) < 0) { /* best-effort: we close anyway */ }
-        close(fd);
+        /* Not write+close: with the request body still unread in the socket
+         * that sends an RST and the client sees a reset, never the 503.
+         * refuse_and_close does shutdown -> bounded drain -> close and emits the
+         * same error.code as the parent's ladder. It takes the descriptor; the
+         * slot the router charged for it is given back separately. */
+        mynah_asr_prefork_refuse_and_close(fd, MYNAH_ASR_PREFORK_REFUSE_AT_CAPACITY);
+        mynah_asr_prefork_conn_done();
         return;
     }
     q_fds[q_tail] = fd;
@@ -512,7 +527,7 @@ static void handle_ws_stream(int fd, const char *headers, const char *query) {
     }
 
     mynah_asr_stream *s = mynah_asr_stream_open(g_model, lang, lookahead);
-    if (!s) { close(fd); return; }
+    if (!s) return;   /* the caller closes the descriptor, exactly once */
     ws_ctx ctx = {.fd = fd};
 
     float fbuf[65536];
@@ -610,6 +625,9 @@ static void handle_conn(int fd) {
         cJSON_AddNumberToObject(j, "inflight", inflight_now());
         cJSON_AddNumberToObject(j, "blas_budget", mynah_asr_blas_budget());
         cJSON_AddNumberToObject(j, "threads", mynah_asr_num_threads());
+        /* prefork: which worker answered, so a probe under load can tell "one
+         * worker wedged" from "the server is slow" */
+        cJSON_AddNumberToObject(j, "worker", mynah_asr_prefork_worker_index());
         send_json(fd, 200, j);
         cJSON_Delete(j);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
@@ -657,13 +675,46 @@ static void handle_conn(int fd) {
 
 static void *worker(void *arg) {
     (void)arg;
-    for (;;) handle_conn(q_pop());
+    mynah_asr_thread_set_name("mynah-http");
+    for (;;) {
+        handle_conn(q_pop());
+        /* exactly once per connection: the router's only view of our load */
+        mynah_asr_prefork_conn_done();
+    }
     return NULL;
+}
+
+/* Every accepted descriptor, whichever process accepted it: blocking (BSD hands
+ * down the listener's O_NONBLOCK, Linux does not, SCM_RIGHTS keeps whatever the
+ * parent's listener had) and Nagle off, because a JSON delta is a small write
+ * followed by nothing -- exactly the shape Nagle holds back. */
+static void prepare_client_fd(int fd) {
+    const int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    const int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+}
+
+static void usage(void) {
+    fprintf(stderr,
+        "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8] [--quant int8|int4]\n"
+        "       [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n"
+        "       [--lid-model <dir>]  detector for language=auto on models that\n"
+        "                            cannot detect it themselves (Canary)\n"
+        "       [--prefork W] [--prefork-threads T] [--cap C]\n"
+        "                            W pinned worker processes (Linux: core-major cpu slices),\n"
+        "                            T threads each (default: cpus/W), C connections per\n"
+        "                            worker before the router refuses (default: --threads)\n"
+        "       --prefork-plan       print the machine's topology and the W/T sweep, exit\n"
+        "  env: MYNAH_ASR_PREFORK_QUEUE (queued per worker, default 1; 0 = refuse at once),\n"
+        "       MYNAH_ASR_PREFORK_QUEUE_MS (queue deadline, default 2000),\n"
+        "       MYNAH_ASR_PREFORK_SERVICE_MS (service cap, default 30000)\n");
 }
 
 int main(int argc, char **argv) {
     const char *model_dir = NULL, *lid_dir = NULL;
     int port = 8090, n_threads = 4;
+    int prefork_workers = 0, prefork_threads = 0, cap = 0, plan_only = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_dir = argv[++i];
         else if (strcmp(argv[i], "--lid-model") == 0 && i + 1 < argc) lid_dir = argv[++i];
@@ -677,22 +728,46 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) mynah_asr_set_backend(argv[++i]);
         else if (strcmp(argv[i], "--caps") == 0 && i + 1 < argc) mynah_asr_set_caps(argv[++i]);
-        else {
-            fprintf(stderr, "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] "
-                            "[--batch 8] [--backend cpu|metal|cuda] [--caps auto|scalar|avx2|vnni]\n"
-                            "       [--lid-model <dir>]  detector for language=auto on models that\n"
-                            "                            cannot detect it themselves (Canary)\n");
-            return 2;
-        }
-    }
-    if (!model_dir) {
-        fprintf(stderr, "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8]\n");
-        return 2;
+        else if (strcmp(argv[i], "--prefork") == 0 && i + 1 < argc) prefork_workers = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) prefork_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cap") == 0 && i + 1 < argc) cap = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--prefork-plan") == 0) plan_only = 1;
+        else { usage(); return 2; }
     }
     if (g_max_batch < 1) g_max_batch = 1;
     if (g_max_batch > 64) g_max_batch = 64;
+    if (n_threads < 1) n_threads = 1;
+    if (cap <= 0) cap = n_threads;   /* one connection per HTTP thread: a WS stream holds one */
+
+    /* A plan is about the machine, not the model: it must work before anyone
+     * has downloaded the weights. */
+    mynah_asr_prefork_config pf;
+    memset(&pf, 0, sizeof(pf));
+    pf.listen_fd = -1;
+    pf.workers = prefork_workers;
+    pf.threads_per = prefork_threads;
+    pf.slots_per = cap;
+    if (plan_only) {
+        mynah_asr_prefork_print_plan(&pf, stdout);
+        return 0;
+    }
+    if (!model_dir) { usage(); return 2; }
+    if (prefork_workers < 0) { usage(); return 2; }
+    /* BEFORE the model is opened: the pool resolves its width once, on first
+     * use, so MYNAH_ASR_THREADS has to be right before anything can dispatch. */
+    if (prefork_workers > 0) {
+        mynah_asr_prefork_reserve_threads(&pf);
+        prefork_workers = pf.workers;
+    }
 
     signal(SIGPIPE, SIG_IGN);
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_stop;        /* no SA_RESTART: accept/poll must return EINTR */
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
     g_model = mynah_asr_load_quant(model_dir, g_quant);
     if (!g_model) return 1;
     if (lid_dir) {
@@ -721,6 +796,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* ---- prefork: fork W workers now, with the model mapped and no thread
+     * yet. The parent routes until shutdown and never enters the model; a
+     * worker continues below with chan_fd as its only source of connections. */
+    int chan_fd = -1;
+    if (prefork_workers > 0) {
+        pf.listen_fd = srv;
+        const mynah_asr_prefork_role role = mynah_asr_prefork_run(&pf, &g_shutdown, &chan_fd);
+        if (role == MYNAH_ASR_PREFORK_ERROR) { close(srv); mynah_asr_free(g_model); return 1; }
+        if (role == MYNAH_ASR_PREFORK_PARENT_DONE) { mynah_asr_free(g_model); return 0; }
+        srv = -1;   /* a worker never accepts: the router closed our copy */
+    }
+    mynah_asr_thread_set_name(chan_fd >= 0 ? "mynah-recv" : "mynah-accept");
+
     for (int i = 0; i < n_threads; i++) {
         pthread_t t;
         pthread_create(&t, NULL, worker, NULL);
@@ -731,13 +819,50 @@ int main(int argc, char **argv) {
         pthread_create(&t, NULL, batch_worker, NULL);
         pthread_detach(t);
     }
-    fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d workers, batch %d)\n"
-                    "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
-            mynah_asr_version(), port, n_threads, g_max_batch);
+    if (chan_fd >= 0)
+        fprintf(stderr, "mynah-asr-server %s: prefork worker %d ready (%d http threads, cap %d, batch %d)\n",
+                mynah_asr_version(), mynah_asr_prefork_worker_index(), n_threads, cap, g_max_batch);
+    else
+        fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, batch %d)\n"
+                        "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
+                mynah_asr_version(), port, n_threads, g_max_batch);
 
-    for (;;) {
-        int fd = accept(srv, NULL, NULL);
-        if (fd < 0) continue;
+    /* Where a connection comes from is the ONLY difference between the single
+     * process server and a prefork worker: a worker has no listening socket,
+     * the router accepted, chose it and passed the descriptor down a
+     * socketpair. Everything after this loop is the same code in both shapes. */
+    while (!g_shutdown) {
+        if (mynah_asr_prefork_take_dump_request())
+            fprintf(stderr, "[stats] worker %d inflight %d blas_budget %d\n",
+                    mynah_asr_prefork_worker_index(), inflight_now(), mynah_asr_blas_budget());
+        int fd;
+        if (chan_fd >= 0) {
+            fd = mynah_asr_prefork_recv_conn(chan_fd, 200);
+            if (fd == -2) continue;            /* timeout or signal: re-read the flag */
+            if (fd < 0) {
+                fprintf(stderr, "mynah-asr-server: worker %d: the router closed the channel; "
+                                "shutting down\n", mynah_asr_prefork_worker_index());
+                break;
+            }
+        } else {
+            struct pollfd pfd = {.fd = srv, .events = POLLIN};
+            const int ready = poll(&pfd, 1, 200);
+            if (ready < 0) { if (errno == EINTR) continue; break; }
+            if (ready == 0) continue;
+            fd = accept(srv, NULL, NULL);
+            if (fd < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) continue;
+                break;
+            }
+        }
+        prepare_client_fd(fd);
         q_push(fd);
     }
+    /* Shutdown: stop taking connections. In-flight requests finish on their
+     * detached threads; draining them and answering 503 to what was never
+     * served is S2-3 (.work/server-admission.md). */
+    if (srv >= 0) close(srv);
+    if (chan_fd >= 0) close(chan_fd);
+    fprintf(stderr, "mynah-asr-server: worker %d stopped\n", mynah_asr_prefork_worker_index());
+    return 0;
 }

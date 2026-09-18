@@ -1,5 +1,8 @@
 #include "http_util.h"
 
+#include <pthread.h>
+#include <stdio.h>
+
 #include <string.h>
 
 /* SHA-1 (RFC 3174) — compact, only for the WebSocket handshake. */
@@ -77,4 +80,17 @@ const uint8_t *mynah_asr_memmem(const uint8_t *hay, size_t hay_len,
         if (hay[i] == needle[0] && memcmp(hay + i, needle, needle_len) == 0)
             return hay + i;
     return NULL;
+}
+
+void mynah_asr_thread_set_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s", name);
+#if defined(__APPLE__)
+    (void)pthread_setname_np(buf);
+#elif defined(__linux__)
+    (void)pthread_setname_np(pthread_self(), buf);
+#else
+    (void)buf;
+#endif
 }

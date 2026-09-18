@@ -1,6 +1,6 @@
 # S2 — prefork parent, pinned workers, fd handoff
 
-Status: OPEN
+Status: IN PROGRESS (landed 2026-09-18; Linux pinned run and WS-through-router pending an idle box)
 
 Task: S2-1
 Question: lift `server/prefork.{c,h}` from mynah-tts (zero model types, takes a
@@ -43,4 +43,35 @@ Acceptance gate: N concurrent REST and WS requests through the parent produce
 responses byte-identical to the same requests alone; a worker killed with
 SIGKILL is reaped and its slots freed; a dead client leaves no orphan fd.
 
-Evidence / Conclusion / Next action: after S1-5.
+Evidence (2026-09-18, macOS dev machine, 8 cpus, unpinned by platform, model
+parakeet-tdt_ctc-110m Q4_K_M GGUF under `models_local/`)
+- `server/prefork.{c,h}` lifted from mynah-tts at 8aa714a with the
+  `mynah_asr_` prefix; the decoder-lane and cost-map calls removed (reported
+  as "requested but not implemented" if asked); the fork-precondition text
+  and the lock inventory rewritten for this tree. `src/threads.c` gained
+  `mynah_asr_threadpool_after_fork()` / `mynah_asr_blas_after_fork()`;
+  `server/http_util.c` gained thread naming. `server/main.c`: `--prefork W
+  --prefork-threads T --cap C --prefork-plan`, reserve-threads before the model
+  opens, fork after listen, worker loop on the channel, `conn_done` exactly
+  once per connection, queue-full refusal through `refuse_and_close`,
+  `TCP_NODELAY` + blocking mode on every accepted descriptor, SIGINT/SIGTERM
+  handler with a polled accept loop, `/v1/health.worker`. Fixed a latent double
+  `close()` on the WebSocket path.
+- `tests/test_server_concurrency.sh` now runs three phases: single process,
+  the same requests through `--prefork 2 --cap 2` **byte-identical** (4/4),
+  and `--prefork 1 --cap 1 MYNAH_ASR_PREFORK_QUEUE=0` with three concurrent
+  requests: 1 served, 2 refused with a readable `503 server_at_capacity` +
+  `Retry-After` (refusal latency 0.8 ms). Shutdown leaves no worker. CI runs
+  this target on Linux x86, Linux ARM and macOS with the 110m model, so the
+  pinned path is exercised there even before the box run.
+- Worker SIGKILL: the parent logs "channel closed after 1 completed", the
+  surviving worker serves the next three requests (queue peak 1), SIGTERM
+  exits 0 with zero survivors.
+- `make test` model-free tests green; the plan text (`--prefork-plan`)
+  rewritten in ASR terms (bench for T*, stream_load for the W sweep).
+Conclusion: the process model of v2 is in place and gated; on macOS it is a
+handoff-and-routing test only (no affinity API), which the banner says.
+Remaining for `[x]`: one pinned run on the Linux ARM box with the printed
+masks checked against `taskset -p`, and a WebSocket stream through the
+router with Nemotron (byte-identical to a direct one).
+Next action: S2-2 (scheduler and slots); the box run when the owner frees it.
