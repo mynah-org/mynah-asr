@@ -35,21 +35,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # BLAS is stated, never inferred (ENGINEERING.md §5): `none` is the
+        # Linux default and is what production links, so that is what the
+        # functional suite runs on both x86 and ARM. The OpenBLAS arm is kept
+        # alive by the build-openblas job below.
         include:
           - os: ubuntu-latest        # x86_64: also validates the AVX2/VNNI kernels
+            blas: none
           - os: ubuntu-24.04-arm     # aarch64: NEON/SDOT
+            blas: none
           - os: macos-latest         # arm64: Accelerate + Metal
+            blas: accelerate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      BLAS: ${{ matrix.blas }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
-
       - name: Build
-        run: make
+        run: make BLAS=$BLAS
+
+      # The banner is the proof that the build really linked what the matrix
+      # asked for; a job that only says "make succeeded" proves nothing.
+      # BLAS=none links our own sgemm, which the runtime calls `own`.
+      - name: Prove the f32 GEMM provider
+        run: |
+          want=$BLAS
+          [ "$want" = none ] && want=own
+          ./mynah-asr --dispatch-map > map.txt
+          grep -qE "^gemm\.f32 +$want " map.txt || { cat map.txt; exit 1; }
+          echo "f32 GEMM provider: $want"
 
       # Board, repository and flag-registry integrity (ENGINEERING.md §1, §12, §6):
       # no dangling plan link, no tracked script depending on an untracked file,
@@ -58,11 +74,16 @@ jobs:
         run: make check
 
       - name: Kernel self-test (no model needed)
-        run: make tests/test_qmat && tests/test_qmat
+        run: make BLAS=$BLAS tests/test_qmat && tests/test_qmat
+      # Our own f32 GEMM: every family against the scalar reference, the seam
+      # against the reference in whichever build this is, and byte-identical
+      # output at 1/2/4/8 threads. Model-free, so it fails fast here.
+      - name: f32 GEMM self-test (no model needed)
+        run: make BLAS=$BLAS tests/test_sgemm && tests/test_sgemm
         # the forced aligner is model-free too, and it runs again inside `make
         # test` below; here it fails fast, before the model download
       - name: Forced alignment self-test (no model needed)
-        run: make tests/test_align && tests/test_align
+        run: make BLAS=$BLAS tests/test_align && tests/test_align
 
       - name: Kernel self-test — explicit SIMD levels (x86)
         if: matrix.os == 'ubuntu-latest'
@@ -96,13 +117,13 @@ jobs:
       # Without the checkpoint the VAD parity inside `make test` exits 77 and
       # proves nothing; it is 2.3 MB and MIT, so CI simply fetches it.
       - name: Silero VAD checkpoint (make the vad parity in `make test` real)
-        run: make fetch-vad
+        run: make BLAS=$BLAS fetch-vad
 
       - name: Int8 checkpoint (exercises the quantize path)
         run: ./mynah-asr quantize -m models/${{ env.MODEL }} --quant int8
 
       - name: Tests (parity vs oracle + e2e; big models skip)
-        run: make test
+        run: make BLAS=$BLAS test
 
       # The bindings are public surface that `make test` never touches: they load
       # the shared library by name and call the exported symbols by name, so a
@@ -110,7 +131,7 @@ jobs:
       # still said `Mynah` after the mynah-asr rename). This transcribes for
       # real through both FFI layers.
       - name: Shared library for the bindings
-        run: make shared
+        run: make BLAS=$BLAS shared
 
       - name: Bindings end-to-end (Python ctypes + Node koffi)
         run: |
@@ -126,10 +147,37 @@ jobs:
       # model-agnostic check covers concurrent requests plus the adaptive-BLAS
       # accounting (a leaked inflight slot caps BLAS for the whole process life).
       - name: Server under concurrent load (model-agnostic)
-        run: make test-server-concurrency CONC_MODEL_DIR=models/${{ env.MODEL }}
+        run: make BLAS=$BLAS test-server-concurrency CONC_MODEL_DIR=models/${{ env.MODEL }}
 
       - name: Quality on real audio (samples/ FLEURS, CER with the 110m)
         run: make test-samples
+
+  # The comparison arm, forever. BLAS=openblas is what every Linux A/B is
+  # measured against (S1-6a), so it has to keep building and keep passing the
+  # model-free self-tests; the day it stops, the A/B has no second arm and the
+  # ownership decision has nothing to be compared with. Compile plus the
+  # kernel, sgemm and thread self-tests — `make test` for it would double the
+  # model download for a build that is not what production links.
+  build-openblas:
+    name: Build & self-test (BLAS=openblas, the comparison arm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Build
+        run: make BLAS=openblas
+      - name: Prove the f32 GEMM provider
+        run: |
+          ./mynah-asr --dispatch-map > map.txt
+          grep -qE "^gemm\.f32 +openblas " map.txt || { cat map.txt; exit 1; }
+      - name: Model-free self-tests
+        run: |
+          make BLAS=openblas tests/test_qmat tests/test_sgemm tests/test_threads
+          tests/test_qmat
+          tests/test_sgemm
+          tests/test_threads
 
   # Compile-only CUDA build: no GPU on the runner, but it catches build/link
   # regressions in the nvcc path (e.g. the MYNAH_ASR_BUILD quoting bug found on the

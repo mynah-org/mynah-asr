@@ -1,8 +1,8 @@
 # S1 — the thread pool, the lane, and BLAS ownership
 
-Status: OPEN
+Status: S1-6 CLOSED for correctness and ownership · ALL TIMING DEFERRED to S1-6a on the Linux box · S1-5 OPEN
 
-Task: S1-5, S1-6
+Task: S1-5, S1-6, S1-6a
 Question: replace `src/threads.c` (a parallel_for that serialises under
 concurrency, plus a process-global weak-symbol BLAS knob) with the mynah-tts
 pool, and decide who owns the threads in a worker.
@@ -23,9 +23,8 @@ Known facts
   be absent" as a forbidden-env rule because a stray export replaced a
   qualified topology once.
 - Here: every f32 linear, attention GEMMs, subsampling, LSTM sgemv and the
-  joint head go through `cblas_*` (src/backend.c, src/encoder.c, src/decoder.c,
-  src/subsampling.c). Accelerate on macOS, OpenBLAS on Linux, hard `$(error)`
-  without `cblas.h`.
+  joint head went through `cblas_*` directly, in seven translation units.
+  Accelerate on macOS, OpenBLAS on Linux, hard `$(error)` without `cblas.h`.
 
 Decision (standing, as in mynah-tts): **OpenBLAS leaves the Linux worker**,
 for ownership, not speed. Own f32 GEMM plus the int8 kernels; `BLAS=openblas`
@@ -42,26 +41,254 @@ f32 GEMMs outside regions do not. The int8 stream step barely touches BLAS
 OpenBLAS = 1 thread in a worker; it is a measurement on the box, not a guess,
 and it disappears with S1-6.
 
-Unknowns
-- Whether the own sgemm at the stream-step shapes (m = B·Q ≤ 64, n = 1024/4096,
-  k = 1024/4096) is within the OpenBLAS single-thread number; it needs the
-  A/B before it becomes default. The int8 batched path (S5-1) is the real
-  production kernel, so f32 only has to be *not embarrassing*.
+Unknowns (state at the close of S1-6)
+- **Every timing measurement is DEFERRED TO THE LINUX BOX (S1-6a).** The
+  decision on 2026-09-18 was to take none of them here: this Mac was loaded
+  (another agent's full `make test`, loadavg 4.7-7.6 on 8 cores) and low on
+  RAM, so an RTF or step-time table taken on it would have been a number with
+  no envelope. Concretely NOT measured and owed by S1-6a: `mynah-asr bench`
+  RTF, the `--steptime` table at B = 1,2,4,8, `openblas` vs `none` in any
+  form, the thread count inside a pinned prefork worker, and the OpenBLAS f32
+  row-stability gate. The only timing that IS recorded below is the
+  server-stream envelope, and only because it was a correctness GATE that
+  failed and had to be explained — it is labelled with its load and it
+  promotes nothing.
+- **Everything Linux.** No number exists for our own sgemm on the Axion or on
+  x86. That is the whole of S1-6a and it is the half of this decision that
+  actually matters, because production is Linux. What landed below is an
+  ownership change plus correctness gates.
 - macOS: `parallel_for` P-core default is a macOS concept; on Linux the pool
   width is the worker's mask size.
+- S1-5 (the mynah-tts pool itself) has NOT been lifted. `src/sgemm.c` runs on
+  this repo's existing pool, which takes ONE dispatch at a time and runs inline
+  when busy. That is correct and deterministic, but it is not the spin-then-park
+  pool with the meter, and the sgemm cost model
+  (`SG_PARALLEL_MIN_WORK`, `SG_PANEL_NV`) was written against the sibling's
+  dispatch cost, not against this one measured here.
 
-Plan
-- S1-5 copy `threads.{c,h}` with the `mynah_asr_` prefix; replace
-  `mynah_asr_parallel_for`; delete `g_blas_budget`, the weak
-  `openblas_set_num_threads` and `blas_set_concurrency`; register
-  `after_fork`; run the litmus in `make test`. Gate: `make test` green,
-  `make leaks`, `make ubsan`, meter report from a 60 s stream showing
-  dispatches per chunk and barrier %.
-- S1-6 copy `sgemm.{c,h}` and `kernels.{c,h}` (dot, layernorm, softmax, silu
-  vectors); add `BLAS=none|openblas|accelerate` to the Makefile with `none`
-  the Linux default; per-call-site switch behind `mynah_asr_gemm_wt`. Gate:
-  self-test of every family against the reference on the stream-step shapes;
-  transcripts byte-identical; A/B table f32 stream step OpenBLAS vs own at
-  T=1,2,4 on the Axion.
+---
 
-Evidence / Conclusion / Next action: pending S0.
+## Acceptance gate for S1-6 (stated before the work)
+
+1. Transcripts byte-identical between `BLAS=accelerate` and `BLAS=none` on this
+   host: `make test` green in both, `tests/test_streaming` and
+   `tests/test_stream_batch` identical. A difference stops the work and goes in
+   this note against the oracle's per-stage tolerances.
+2. `mynah_asr_sgemm_self_test()` in `make test`: every compiled family against
+   the reference over the real shapes and the edge cases, a thread-count sweep
+   proving the result is identical at 1, 2, 4 and 8 threads, and a REFUSAL if a
+   family never ran.
+3. `BLAS=none` links no cblas at all; `BLAS=openblas` keeps building;
+   `--dispatch-map` and `[EFFECTIVE-CONFIG]` report the provider actually linked.
+4. A/B on this host, labelled as a macOS dev signal.
+5. `make check` green, one UBSan run of `tests/test_streaming`.
+6. CI exercises `BLAS=none` on Linux x86 and ARM.
+
+## Evidence — S1-6, 2026-09-18
+
+Host: Apple M1 (4P+4E, 8 logical), macOS 25.5, Apple clang, `-O3 -march=native
+-ffast-math`. Model `nemotron-3.5-asr-streaming-0.6b`, int8 checkpoint,
+preset [56,3]. **The box was NOT quiet**: `loadavg` 2.1–2.8 throughout
+(other agents on the same machine). Every A/B below is therefore a WAVE-grade
+dev signal and nothing here promotes anything.
+
+### What landed
+
+- `src/sgemm.{c,h}` — lifted from mynah-tts with the `mynah_asr_` prefix and
+  this repo's pool. Five families (REFERENCE, DOT, MATVEC, NARROW, PANEL), the
+  reduction over k never split, the row block always rounded up to `SG_MR`, so
+  **the result does not depend on the thread count**; `narrow_max` derived from
+  the register file (NEON 16, AVX2 16, scalar 4); the never-vectorised
+  `mynah_asr_sgemm_f32_reference` always compiled, used both as the oracle and
+  as the scalar fallback. Not lifted: the conv-tap fusion (this runtime has no
+  conv1d tap GEMM — the subsampling convolutions go through im2col and one
+  GEMM), and `kernels.c` (the DOT family's dot is written in the same `SG_*`
+  ISA macros as the micro-kernels, so this file has one ISA abstraction rather
+  than two).
+- `src/backend.c` — `mynah_asr_gemm_f32` and `mynah_asr_gemv_f32` are the ONE
+  seam, plus `mynah_asr_gemm_provider()` returning `accelerate` / `openblas` /
+  `own`. Every direct `cblas_*` call site now goes through it: 22 GEMMs
+  (encoder 9, subsampling 5, decoder 3, decoder_ctc 2, vad 2, and the f32
+  fallback in qmat 1) and 7 GEMVs (decoder 3, decoder_aed 2, vad 2). **No file outside
+  `backend.c` includes `cblas.h` or `Accelerate/Accelerate.h` for arithmetic.**
+- `Makefile` — `BLAS=none|openblas|accelerate`, `none` the Linux default,
+  `accelerate` the macOS default. The `$(error)` on a missing `cblas.h` now
+  lives inside the `openblas` branch only.
+- **`MYNAH_ASR_ACCELERATE` is split from `MYNAH_ASR_BLAS_ACCELERATE`.** The
+  Accelerate FRAMEWORK is linked in every macOS build (Metal needs it, and so
+  does the vForce `vvexpf` in `mynah_asr_silu`); the BLAS provider is a
+  different question. Without that split, `BLAS=none` on macOS would silently
+  have changed the SiLU's arithmetic as well as the GEMM's, and an
+  accelerate-vs-none transcript difference would have had two possible causes.
+- `src/threads.c` — the budget mechanism is kept and made honest: with provider
+  `own` there is exactly one pool, `mynah_asr_blas_budget()` IS its width, and
+  `mynah_asr_blas_set_concurrency()` records the declaration without inventing a
+  smaller number for a team that does not exist. `OPENBLAS_NUM_THREADS` is
+  reported IGNORED by the flag registry in that build. The OpenBLAS path is
+  untouched.
+- `tests/test_sgemm.c` in `make test` and in CI before the model download.
+
+### Gate 2 — the self-test
+
+`tests/test_sgemm` (provider `own`, isa `neon`, narrow_max 16), all OK:
+
+- every compiled family against the reference over 13 real shapes
+  (m = 1..176, n/k in {1024, 4096, 13088}, the attention window, the
+  subsampling flatten) x {trans_b, no trans} x {beta 0, beta 1} and 13 edge
+  cases x {both transpose flags} x {alpha 1 / -0.75 / 0.5, beta 0 / 2.5 /
+  -1.25}, plus the coverage refusal;
+- worst relative deviation **6.55e-05** against a 1e-04 bound. That number was
+  chased rather than accepted: against a DOUBLE-PRECISION oracle on the same
+  shape (m=64 n=1024 k=4096, trans_b) the **reference** is 6.81e-05 off and the
+  **kernel** 3.85e-05 — the kernel is nearly twice as close to the exact answer
+  as the scalar reference it is compared against, and the gap between them is
+  dominated by the reference's own sequential summation over 4096 terms. On the
+  same shape with trans_b == 0 (NARROW/PANEL) the kernel is **bit-identical**
+  to the reference. The bound is therefore a bound on a known quantity;
+  tightening it would first trip over the reference, not over a bug.
+- task-count sweep (1, 2, 3, 5, 64 blocks) byte-identical, in both transposes;
+- **real** thread widths 1, 2, 4, 8, each a re-exec'd child with its own pool
+  (`mynah_asr_num_threads()` caches on first call, so a plain fork would have
+  reported a sweep it never ran): the whole self-test passes at each width and
+  the 64x1024x1024 trans_b output is byte-identical across all four.
+
+### Gate 1 — transcripts: IDENTICAL, with one named exception
+
+`make test` with `BLAS=none`: everything green except the load-sensitive server
+phase below. Per-stage oracle parity (Nemotron, `test_it.wav`), `BLAS=none`:
+
+| stage        | max abs diff | tolerance | verdict |
+|--------------|--------------|-----------|---------|
+| mel          | 0.000e+00    | 5e-04     | OK      |
+| subsampling  | 5.320e-04    | 1.2e-02   | OK      |
+| layer_0      | 8.144e-05    | 3.5e-02   | OK      |
+| layer_12     | 5.188e-05    | 1.5e-02   | OK      |
+| layer_23     | 2.668e-07    | 9.0e-05   | OK      |
+| enc_proj     | 1.927e-06    | 1.2e-04   | OK      |
+
+Every stage is 1.5 to 2.5 orders of magnitude inside its tolerance. The e2e
+transcripts (it/en/de/fr/es, int8 quant, timestamps, segment, metal) are all OK
+and word-for-word what the accelerate build produces.
+
+Direct diff of the two builds, same host, same binaries' outputs:
+
+- `tests/test_streaming` — **byte-identical** (`accelerate` vs `none`), and also
+  identical to the pre-change `accelerate` baseline, which is the regression
+  check that says the seam itself changed nothing for Accelerate.
+- `tests/test_stream_batch` — all identity gates pass in BOTH builds:
+  `[f32] encoder bit-exact B=2/4/8`: 74,240 / 133,120 / 266,240 floats compared,
+  **0 differ**, 0 caches differ, in both. `[int8]` the same. `[f32] B=1..8
+  IDENTICAL OK` in both, and on `none` the f32 path really did stack (104 / 152 /
+  196 / 416 stacked rows at B=2/3/4/8, `rows_stacked > 0`), which is the
+  by-construction row-stability claim actually exercised rather than asserted.
+- **The one difference**, and it is named rather than smoothed over: the
+  **es-ES clip's single-stream int8 decode**.
+
+      offline (both builds):  "...empieza a las vuelve en la sala grande."
+      single, accelerate:     "...empieza a las nueve en la sala grande."
+      single, none:           "...empieza a la submuer en la sala grande."
+
+  This is the clip `tests/test_stream_batch` already prints as
+  `single stream != offline (pre-existing, not a batching effect)`: BOTH builds
+  disagree with their own offline transcript on it, before and after this work.
+  What moved is which way it falls. The mechanism is not mysterious — an int8
+  model still runs f32 attention scores, f32 subsampling and an f32 LSTM
+  pred-net, all of which now go through a different GEMM, and a greedy decode
+  sitting on a knife edge flips. It is a NUMERICAL difference, so per
+  ENGINEERING.md §9 it is not promoted on anything: **the int8 weight path,
+  which is exact by construction, is the production answer**, and a CER gate on
+  `samples/` on the Linux box is what would settle whether `own` is better or
+  worse here. One clip on a dev host is not that gate.
+
+### Gate 4 — the server-stream phase, and what it really measured
+
+`tests/test_server_stream.sh`, 4 real-time paced streams, run twice on `none`
+and once on `accelerate`, on a box carrying another agent's full `make test`:
+
+| build      | TTFP p50/p95 | emission lag p50/p95 | envelope | 4-stream identity |
+|------------|--------------|----------------------|----------|-------------------|
+| none       | 1359/2481 ms | 759/2943 ms          | INVALID  | **FAIL**          |
+| none (2nd) | 1292/2383 ms | 612/1787 ms          | INVALID  | **FAIL**          |
+| accelerate |  965/1029 ms | 159/ 242 ms          | GOOD     | OK                |
+
+The identity failure is the French clip losing its leading word
+(`"Bonjour, la réunion…"` -> `"La réunion…"`). Three facts place it:
+
+1. the harness itself refuses the run — `envelope INVALID`, backlog max 1.74 s
+   against a 0.64 s limit, and it prints `NOT BELIEVABLE` next to the diff;
+2. on the SAME `none` build the `prefork-identity` and the `batched-identity`
+   phases (8 streams, 5 clips, `--cap 8`) both passed byte-identical, and the
+   CLI's own e2e French transcript is correct;
+3. so the stream fell behind real time and was finalized before its first chunk
+   had been served — a pacing failure, not an arithmetic one.
+
+**But the cause of the pacing failure is ours**: our sgemm is materially slower
+than Accelerate on this M1 — enough that four real-time streams stop being
+streamable where Accelerate stays GOOD. That is the expected macOS result
+(Accelerate reaches the AMX block; a portable NEON micro-kernel does not) and it
+is stated plainly here rather than buried: **on macOS, Accelerate wins, and it
+is not close.** It changes nothing about the decision, because the decision is
+ownership on Linux against OpenBLAS, and no Linux number exists yet. It does
+mean `BLAS=none` must not be made the macOS default, and it is not.
+
+No RTF and no step-time A/B is reported at all: benchmarking on this host was
+stopped by decision (loaded, low on RAM) and every timing is deferred to the
+Linux box as S1-6a. The table above is a GATE that failed, kept because a
+failing gate must be explained, not a measurement anyone may quote.
+
+### Gate 2 — the self-test: see above. Gate 3 — the builds
+
+`BLAS=none` links no cblas symbol (`nm -u` is empty of them) and the
+`$(error)` on a missing `cblas.h` does not fire. `--dispatch-map` prints
+`blas=own` / `gemm.f32 own` on that build and `blas=accelerate` on the other,
+with two extra rows (`gemm.f32_kernel`, `gemm.f32_families`) that call the
+predicate and read the counters rather than restating them. `BLAS=openblas`
+cannot be built on this host (no OpenBLAS) — CI covers it.
+
+### Gate 5 — `make check` and UBSan
+
+`make check`: check_plan PASS, check_repo_integrity PASS, flag registry ok
+(21 flags). `tests/test_streaming` built with `-fsanitize=undefined` (no
+`-ffast-math`) and run on the Nemotron model: **no sanitizer diagnostic**,
+transcripts IDENTICAL.
+
+### Gate 6 — CI
+
+`.github/workflows/ci.yml`: the Linux x86 and ARM matrix entries now build and
+run the whole functional suite with `BLAS=none` (macOS with `accelerate`), each
+job proving the provider from `--dispatch-map` before it trusts the build; a
+new model-free `tests/test_sgemm` step runs before the model download; and a
+separate `build-openblas` job keeps the comparison arm compiling and passing the
+model-free self-tests forever.
+
+## Conclusion
+
+S1-6 is done as an OWNERSHIP change and is honest about being nothing else yet.
+The f32 GEMM is ours, it is deterministic across thread counts by construction
+and proven so with memcmp at 1/2/4/8 real threads, the seam is the only place in
+the tree that knows what a BLAS is, `BLAS=none` is the Linux default and links
+none, and `BLAS=openblas` stays as the arm every Linux A/B will be measured
+against. Transcripts are unchanged except one already-unstable clip, named above.
+
+**On speed this closes nothing.** Accelerate beats our sgemm on macOS by enough
+to break a 4-stream real-time envelope, and the Linux question — the only one
+that matters — has not been asked at all.
+
+## Next action
+
+S1-6a on the Linux box, with nothing else running on it:
+
+1. `BLAS=openblas` vs `BLAS=none`, x86 and Axion: `mynah-asr bench` RTF and the
+   `tests/test_stream_batch --steptime` table at B = 1,2,4,8, dispatch proven
+   per run.
+2. Thread count inside a prefork worker pinned to T cpus: confirm T, not 2T.
+3. `tests/test_server_stream.sh` in both builds on a quiet box — the envelope
+   comparison this dev host could not give.
+4. The OpenBLAS f32 row-stability gate (`MYNAH_ASR_BATCH_F32=1`), which decides
+   that default on the openblas arm (S1-8).
+5. A CER gate on `samples/` for `own` vs `accelerate`/`openblas`, to settle the
+   es-ES clip rather than leave it as an anecdote.
+6. If the Linux numbers are bad, the cost-model constants written blind against
+   the sibling's dispatch cost (`SG_PARALLEL_MIN_WORK`, `SG_PANEL_NV`,
+   `SG_PANEL_FLOATS`) are the first things to sweep, and S1-5 (the spin-then-park
+   pool with the meter) is the second.

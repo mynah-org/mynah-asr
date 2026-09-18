@@ -1,4 +1,19 @@
-# Mynah — build. CPU-first: BLAS = Accelerate (macOS) / OpenBLAS (Linux).
+# Mynah — build.
+#
+# BLAS = who computes the f32 GEMMs.  `make BLAS=none|openblas|accelerate`.
+#
+#   none         src/sgemm.c, ours.  No cblas symbol anywhere in the binary.
+#                THE LINUX DEFAULT, for ownership: OpenBLAS brings a second
+#                thread pool into a worker that is already pinned to T cpus
+#                (.work/threadpool-and-lane.md).
+#   openblas     -lopenblas.  Kept building forever: it is the comparison arm
+#                the Linux A/B (S1-6a) is measured against.
+#   accelerate   macOS only, and the macOS default: a development convenience
+#                behind the same seam, never a production claim.
+#
+# The choice is stamped into the binary and reported by `--dispatch-map` and
+# the [EFFECTIVE-CONFIG] line, so a run says which provider it actually linked
+# instead of leaving it to be inferred from this file (ENGINEERING.md §5).
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O3 -march=native -ffast-math -Wall -Wextra -iquote src -D_DEFAULT_SOURCE
 LDFLAGS ?=
@@ -7,21 +22,51 @@ CFLAGS += -fPIC
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
+  BLAS ?= accelerate
+else
+  BLAS ?= none
+endif
+
+# Accelerate the FRAMEWORK is linked on every macOS build: Metal needs it and
+# so does the vForce exp in mynah_asr_silu.  That is a different question from
+# "which library computes sgemm", and conflating the two is how BLAS=none would
+# silently change an activation's arithmetic and make the A/B meaningless.
+ifeq ($(UNAME_S),Darwin)
   LDFLAGS += -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation
-  BLAS_DEF := MYNAH_ASR_BLAS_ACCELERATE
-  CFLAGS  += -DMYNAH_ASR_BLAS_ACCELERATE -DACCELERATE_NEW_LAPACK -DMYNAH_ASR_METAL
+  PLATFORM_CFLAGS := -DMYNAH_ASR_ACCELERATE -DACCELERATE_NEW_LAPACK
+  METAL_CFLAGS := -DMYNAH_ASR_METAL
   OBJ_EXTRA := build/src/metal_mps.o
 else
-  LDFLAGS += -lopenblas -lm -lpthread
-  BLAS_DEF := MYNAH_ASR_BLAS_OPENBLAS
-  CFLAGS  += -DMYNAH_ASR_BLAS_OPENBLAS
+  LDFLAGS += -lm -lpthread
+  PLATFORM_CFLAGS :=
+  METAL_CFLAGS :=
+endif
+BLAS_CFLAGS :=
+
+# Does this build need a cblas header and library at all?  Only `openblas` and
+# `accelerate` do; `none` must build on a box that has never seen OpenBLAS, so
+# the $(error) below is inside the openblas branch and nowhere else.
+ifeq ($(BLAS),accelerate)
+  ifneq ($(UNAME_S),Darwin)
+    $(error BLAS=accelerate is macOS only. Use BLAS=none (the default here) or BLAS=openblas)
+  endif
+  BLAS_CFLAGS += -DMYNAH_ASR_BLAS_ACCELERATE
+else ifeq ($(BLAS),openblas)
+  BLAS_CFLAGS += -DMYNAH_ASR_BLAS_OPENBLAS
+  LDFLAGS += -lopenblas
   # fail early with a clear hint instead of "cblas.h: No such file or directory"
   ifeq ($(filter clean,$(MAKECMDGOALS)),)
     ifeq ($(shell printf '\043include <cblas.h>\n' | $(CC) -E -xc - >/dev/null 2>&1 && echo ok),)
       $(error OpenBLAS headers not found. Install them first: `sudo apt install libopenblas-dev` (Debian/Ubuntu) or `sudo dnf install openblas-devel` (Fedora))
     endif
   endif
+else ifeq ($(BLAS),none)
+  # nothing to add: src/sgemm.c is always compiled and is the provider here
+else
+  $(error unknown BLAS=$(BLAS). Use none, openblas or accelerate)
 endif
+
+CFLAGS += $(PLATFORM_CFLAGS) $(METAL_CFLAGS) $(BLAS_CFLAGS)
 
 # hook for the recursive variant builds (cuda): these add to the flags the
 # Makefile computed instead of overriding CFLAGS (which would lose the quoting of
@@ -70,7 +115,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_threads tests/test_flags tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch
+TESTS := tests/test_qmat tests/test_sgemm tests/test_threads tests/test_flags tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib
@@ -104,7 +149,7 @@ PARITY_BOTH := tests/test_features tests/test_subsampling tests/test_encoder tes
 SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@for t in $(TESTS); do \
-	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_flags ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
+	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_sgemm ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_flags ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
 	  elif [ $$t = tests/test_stream_batch ]; then $$t $(MODEL_DIR); rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
@@ -228,17 +273,17 @@ build/src/cuda_gemm.o: src/cuda_gemm.cu
 # overhead). ASan is VERY SLOW on a Mac and tends to hang with the large model:
 # Linux CI only.
 debug:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF)"
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)"
 # NOTE: clean at the end too — the sanitized objects (without -DMYNAH_ASR_METAL
 # and referencing the ubsan runtime) must NOT be left behind to pollute the
 # normal build
 ubsan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g -fsanitize=undefined \
-	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
+	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=undefined" all test && $(MAKE) clean
 asan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined \
-	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK" \
+	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test && $(MAKE) clean
 
 # reproducible bench: warm RTF + peak RAM for every model present

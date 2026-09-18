@@ -43,6 +43,7 @@ tests/golden/
 tests/audio/langs/
 libmynah_asr.a
 tests/test_qmat
+tests/test_sgemm
 tests/test_gguf
 tests/test_threads
 tests/test_flags

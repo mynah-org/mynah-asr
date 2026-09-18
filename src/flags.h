@@ -70,7 +70,7 @@ const char *mynah_asr_flag_str(const char *name, const char *dflt);
  *
  *   [FLAGS] v=1 <NAME>=<value> ...              every registered flag SET in
  *                                               the environment (nothing else)
- *   [EFFECTIVE-CONFIG] v=1 build=<git rev> blas=<accelerate|openblas|none>
+ *   [EFFECTIVE-CONFIG] v=1 build=<git rev> blas=<accelerate|openblas|own>
  *       simd=<compiled ISA profile> <NAME>=<requested>-><effective>(<reason>) ...
  *
  * where <reason> is `applied`, `clamped`, or `IGNORED: <inert reason>`.  Only
@@ -80,9 +80,10 @@ const char *mynah_asr_flag_str(const char *name, const char *dflt);
  * lines stay token-separated. */
 void mynah_asr_flags_print(FILE *out);
 
-/* The build's BLAS provider and compiled SIMD profile, as printed above.
- * Pure compile-time gates, exported so the dispatch report shares one
- * definition with the banner instead of keeping a second copy. */
+/* The build's f32 GEMM provider and compiled SIMD profile, as printed above.
+ * The provider is not decided here: this forwards mynah_asr_gemm_provider()
+ * from src/backend.c, which owns the branch, so the banner and the dispatch
+ * report cannot drift from what the binary actually linked. */
 const char *mynah_asr_blas_provider(void);
 const char *mynah_asr_simd_profile(void);
 const char *mynah_asr_build_id(void);

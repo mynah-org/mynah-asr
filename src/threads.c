@@ -1,5 +1,7 @@
 #include "threads.h"
 
+#include "backend.h"   /* mynah_asr_gemm_provider(): who owns the other pool */
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -109,7 +111,31 @@ static int g_blas_budget;
 static int g_blas_applied;
 static pthread_mutex_t g_blas_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* IS THERE A SECOND POOL IN THIS PROCESS AT ALL?
+ *
+ * The whole budget mechanism exists because OpenBLAS runs its own team of
+ * threads next to ours.  With BLAS=none there is no second team: src/sgemm.c
+ * dispatches onto the SAME mynah_asr_parallel_for, so there is exactly one
+ * pool and its width is the only number there is.  Splitting a budget then
+ * would not divide anything — it would just print a smaller number on
+ * /v1/health than the pool the process actually runs, which is precisely the
+ * kind of plausible fiction ENGINEERING.md §6 forbids.
+ *
+ * So the public functions stay (the tests and the server read them) and become
+ * HONEST rather than inert: with `own` the budget is the pool width, always,
+ * and set_concurrency records the caller's declaration without pretending to
+ * act on it.  Accelerate keeps its existing bookkeeping semantics unchanged —
+ * it also takes no knob, but that behaviour is what the server's health output
+ * and tests/test_server_concurrency.sh were written against, and changing it
+ * is not this item's business.  The OpenBLAS path is untouched. */
+static int blas_own_pool(void) {
+    static int cached = -1;
+    if (cached < 0) cached = strcmp(mynah_asr_gemm_provider(), "own") == 0;
+    return cached;
+}
+
 static void blas_apply(int n) {
+    if (blas_own_pool()) return;   /* nothing to apply it to */
     if (n < 1) n = 1;
     pthread_mutex_lock(&g_blas_mu);
     if (g_blas_applied != n) {
@@ -120,6 +146,7 @@ static void blas_apply(int n) {
 }
 
 int mynah_asr_blas_budget(void) {
+    if (blas_own_pool()) return mynah_asr_num_threads();
     pthread_mutex_lock(&g_blas_mu);
     const int b = g_blas_budget;
     pthread_mutex_unlock(&g_blas_mu);

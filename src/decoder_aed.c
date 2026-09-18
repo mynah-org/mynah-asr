@@ -1,15 +1,11 @@
 #include "decoder_aed.h"
 
+#include "backend.h"   /* the f32 seam: mynah_asr_gemv_f32 */
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
 
 /* y = W x + b (T=1 on the qmats: direct dot kernel for int8/int4) */
 static void mv(const mynah_asr_qmat *w, const float *b, const float *x, float *y) {
@@ -122,11 +118,10 @@ static void attend(const float *q, const float *K, const float *V, int n_kv,
     const float scale = 1.0f / sqrtf((float)dk);
     for (int h = 0; h < H; h++) {
         const float *qh = q + h * dk;
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_kv, dk, scale, K + h * dk, d,
-                    qh, 1, 0.0f, scores, 1);
+        mynah_asr_gemv_f32(0, n_kv, dk, scale, K + h * dk, d, qh, 0.0f, scores);
         softmax_inplace(scores, n_kv);
-        cblas_sgemv(CblasRowMajor, CblasTrans, n_kv, dk, 1.0f, V + h * dk, d,
-                    scores, 1, 0.0f, out + h * dk, 1);
+        mynah_asr_gemv_f32(1, n_kv, dk, 1.0f, V + h * dk, d, scores, 0.0f,
+                           out + h * dk);
     }
 }
 

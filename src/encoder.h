@@ -167,9 +167,12 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                 const float *const *mel, const int *n_mel, int n_mels,
                                 const int *prompt_id, float *const *out, int *q_out);
 
-/* f32 only: whether the batched path is allowed to stack the rows. cblas_sgemm
- * is not contractually row-stable in M, so the answer is a MEASUREMENT of this
- * build's BLAS (see the note in encoder.c); MYNAH_ASR_BATCH_F32=0|1 overrides it. */
+/* f32 only: whether the batched path is allowed to stack the rows. A vendor
+ * cblas_sgemm is not contractually row-stable in M, so for those the answer is
+ * a MEASUREMENT of this build's BLAS; on our own sgemm the stacked shape is the
+ * DOT family and row stability follows from the code. One answer per provider,
+ * each with its ground, in the note in encoder.c. MYNAH_ASR_BATCH_F32=0|1
+ * overrides it. */
 int mynah_asr_enc_batch_f32_ok(void);
 
 /* ------------------------------------------- rel-pos projection sharing (S1-7)

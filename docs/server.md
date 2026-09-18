@@ -607,6 +607,15 @@ The library keeps the policy (`tests/test_threads` covers it) for embedders that
 do run several inferences at once. An explicit `OPENBLAS_NUM_THREADS` still
 wins, and `MYNAH_ASR_THREADS` sets the ceiling.
 
+Since S1-6 the **Linux default build has no OpenBLAS at all** (`BLAS=none`):
+`src/sgemm.c` computes every f32 GEMM on the same pool as everything else, so
+there is no second team to divide. `blas_budget` is then the pool width by
+definition and `mynah_asr_blas_set_concurrency()` cannot move it —
+`--dispatch-map` says so on the `threads.blas_budget` row, and
+`OPENBLAS_NUM_THREADS` is reported IGNORED on the `[EFFECTIVE-CONFIG]` line.
+The knob and the collapse above still apply to `make BLAS=openblas`, the
+comparison build.
+
 No effect with **Accelerate** (macOS), which nests through GCD and needs no
 knob: there the budget is only bookkeeping, reported in `/v1/health`.
 

@@ -210,11 +210,13 @@ chunk per call; a stream whose chunk does not complete is simply fed.
   model. Call `mynah_asr_stream_batch_reserve(m, cap)` once at start-up and the
   step allocates nothing (`make test-stream-batch-allocs`).
 - **Dtype**: int8/int4 always stack (per-row integer accumulation is
-  order-independent). f32 stacks where `cblas_sgemm` has been *measured*
-  row-stable in M — on by default with Accelerate, off with OpenBLAS until its
-  own gate runs, and then the call degrades to per-stream steps through the same
-  API. `MYNAH_ASR_BATCH_F32=0|1` forces it; `stream_batch_rows_stacked()` says
-  what actually happened (0 = nothing was stacked).
+  order-independent). f32 stacks where the provider's sgemm is row-stable in M:
+  *measured* for Accelerate, true *by construction* for our own (`BLAS=none`:
+  the stacked GEMM is `x @ W^T`, one dot per output element over the whole of
+  `k`, so nothing in it depends on M), and still unverified on OpenBLAS, where
+  the call degrades to per-stream steps through the same API.
+  `MYNAH_ASR_BATCH_F32=0|1` forces it; `stream_batch_rows_stacked()` says what
+  actually happened (0 = nothing was stacked).
 - **Finalizing** a stream is not part of this call: use `mynah_asr_stream_finish`
   per stream for the tail.
 

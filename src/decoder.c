@@ -1,15 +1,11 @@
 #include "decoder.h"
 
+#include "backend.h"   /* the f32 seam: mynah_asr_gemm_f32, mynah_asr_gemv_f32 */
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef MYNAH_ASR_BLAS_ACCELERATE
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
 
 int mynah_asr_decoder_init(mynah_asr_decoder *dec, const mynah_asr_safetensors *st,
                        int blank, int max_symbols, int quantize,
@@ -77,10 +73,8 @@ static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int 
 
     for (int l = 0; l < dec->n_layers; l++) {
         for (int i = 0; i < 4 * H; i++) z[i] = dec->b_ih[l][i] + dec->b_hh[l][i];
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, dec->w_ih[l], H,
-                    x, 1, 1.0f, z, 1);
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, dec->w_hh[l], H,
-                    s->h[l], 1, 1.0f, z, 1);
+        mynah_asr_gemv_f32(0, 4 * H, H, 1.0f, dec->w_ih[l], H, x, 1.0f, z);
+        mynah_asr_gemv_f32(0, 4 * H, H, 1.0f, dec->w_hh[l], H, s->h[l], 1.0f, z);
         for (int i = 0; i < H; i++) {
             const float ig = sigmoid_f(z[i]);
             const float fg = sigmoid_f(z[H + i]);
@@ -93,8 +87,8 @@ static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int 
     }
     /* decoder_projector */
     memcpy(s->g, dec->proj_b, (size_t)H * sizeof(float));
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, H, H, 1.0f, dec->proj_w, H,
-                s->h[dec->n_layers - 1], 1, 1.0f, s->g, 1);
+    mynah_asr_gemv_f32(0, H, H, 1.0f, dec->proj_w, H, s->h[dec->n_layers - 1],
+                       1.0f, s->g);
     s->last_token = token;
 }
 
@@ -156,8 +150,8 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
             joint[i] = v > 0.0f ? v : 0.0f;                /* ReLU */
         }
         if (W)
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, VL, H,
-                        1.0f, joint, H, W, H, 0.0f, logits, VL);
+            mynah_asr_gemm_f32(0, 1, 1, VL, H,
+                               1.0f, joint, H, W, H, 0.0f, logits, VL);
         else
             mynah_asr_qmat_mul(&dec->head, joint, logits, 1);
 
@@ -231,8 +225,8 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
             }
         }
         if (W)
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Bc, V, H,
-                        1.0f, jin, H, W, H, 0.0f, logits, V);
+            mynah_asr_gemm_f32(0, 1, Bc, V, H,
+                               1.0f, jin, H, W, H, 0.0f, logits, V);
         else
             mynah_asr_qmat_mul(&dec->head, jin, logits, Bc);
 
@@ -257,8 +251,8 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
                     joint[i] = v > 0.0f ? v : 0.0f;
                 }
                 if (W)
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, H,
-                                1.0f, joint, H, W, H, 0.0f, logits, V);
+                    mynah_asr_gemm_f32(0, 1, 1, V, H,
+                                       1.0f, joint, H, W, H, 0.0f, logits, V);
                 else
                     mynah_asr_qmat_mul(&dec->head, joint, logits, 1);
                 best = argmax_bias(logits, dec->head_b, V);
