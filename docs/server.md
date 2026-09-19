@@ -282,13 +282,21 @@ frame), `audio_s` (audio consumed when it was produced) and `lag_ms` (wall time
 from the arrival of the last sample consumed to the frame being enqueued):
 
 ```json
-{"type":"delta","text":"...","final":true,"lang":"it-IT","seq":3,"audio_s":1.32,"lag_ms":146,
- "language":"it-IT","audio_seconds":1.32}
+{"type":"delta","text":"...","final":true,"lang":"it-IT","t0":1.04,"t1":1.32,
+ "seq":3,"audio_s":1.32,"lag_ms":146,"language":"it-IT","audio_seconds":1.32}
 {"type":"eou","t":4.10,"seq":9,"audio_s":4.16,"lag_ms":91}
 {"type":"done","done":true,"lang":"it-IT","language":"it-IT","audio_s":5.21,"audio_seconds":5.21,
  "steps":16,"deltas":15,"lag_p50_ms":144,"lag_max_ms":358,"seq":17}
 {"type":"error","code":"idle_timeout","message":"..."}
 ```
+
+`t0`/`t1` are the audio window the text covers, `(t0, t1]`. Deltas partition
+the stream, so a client can place text in time without keeping a running total
+of its own; `audio_s` is the same `t1`, and it is on every frame type including
+those that have no window (`eou`, `error`). It is a window, not an alignment —
+a token in this delta may have been spoken slightly earlier, because the encoder
+works in chunks and the decoder trails it. Word-level times come from the
+offline path's timestamps.
 
 `text`, `language`, `audio_seconds` and `done:true` are the **v1 fields, kept
 for one release** so existing clients keep working; they go away in S2-5 proper.
@@ -615,6 +623,27 @@ definition and `mynah_asr_blas_set_concurrency()` cannot move it —
 `OPENBLAS_NUM_THREADS` is reported IGNORED on the `[EFFECTIVE-CONFIG]` line.
 The knob and the collapse above still apply to `make BLAS=openblas`, the
 comparison build.
+
+### The pool spins before it parks
+
+With one pool in the process, the cost of a dispatch stops being an
+implementation detail: a stream step issues dozens of small GEMMs back to back,
+and a condvar broadcast plus a completion wake per GEMM is paid on every one of
+them. The workers therefore watch an atomic generation counter for
+`MYNAH_ASR_POOL_SPIN_US` microseconds (default 50) before sleeping, so a
+dispatch that follows another by a microsecond finds them hot. Setting it to `0`
+restores the pure condvar pool, which is the arm this is measured against.
+
+An idle worker burns at most that budget of its own core per wait, once: between
+two streaming chunks (320 ms apart at lookahead 3) every worker is parked. The
+`SIGUSR1` dump carries the meter — `worker_spin_pct` and `caller_spin_pct` — so
+a run says whether the spin caught anything rather than leaving it assumed. A
+`worker_spin_pct` near zero under load means the budget is too small for this
+host; near 100 with an idle server means it is too large.
+
+The other half of the same problem lives in `src/sgemm.c`, which refuses to
+split a GEMM smaller than `SG_PARALLEL_MIN_WORK` **per thread**: work the pool
+cannot pay for never reaches it at all.
 
 No effect with **Accelerate** (macOS), which nests through GCD and needs no
 knob: there the budget is only bookkeeping, reported in `/v1/health`.

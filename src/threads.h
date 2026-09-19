@@ -8,6 +8,34 @@
 
 int mynah_asr_num_threads(void);
 
+/* ------------------------------------------------------------- the pool meter
+ *
+ * The pool spins before it parks (see src/threads.c). Two things can go wrong
+ * silently: the spin is never long enough and every dispatch still pays a
+ * kernel round trip, or it is far too long and idle workers burn cores. These
+ * counters say which happened in THIS run rather than leaving it to be assumed:
+ *   worker_spin / (worker_spin + worker_park)  how often a worker caught the
+ *                                              next job while still hot
+ *   caller_spin / (caller_spin + caller_park)  the same for the completion wait
+ *   inline_runs                                dispatches that never reached the
+ *                                              pool (busy, or width 1)
+ * Relaxed atomics, one increment per dispatch or per wait, never per task. */
+typedef struct {
+    unsigned long long dispatches;
+    unsigned long long worker_spin, worker_park;
+    unsigned long long caller_spin, caller_park;
+    unsigned long long inline_runs;
+    int spin_us;     /* MYNAH_ASR_POOL_SPIN_US as resolved; 0 = spin disabled */
+    int workers;     /* threads built, caller excluded */
+} mynah_asr_pool_stats;
+
+void mynah_asr_pool_stats_get(mynah_asr_pool_stats *out);
+void mynah_asr_pool_stats_reset(void);
+
+/* The spin budget per wait, in microseconds. 0 = park immediately, which is the
+ * pure condvar pool this replaced and the arm any A/B is measured against. */
+int mynah_asr_pool_spin_us(void);
+
 /* Runs fn(ctx, i) for i in [0, n): the tasks are spread over
  * min(n, mynah_asr_num_threads()) threads (the caller takes part).
  * With n <= 1, or a single thread, it runs in place without spawning. */

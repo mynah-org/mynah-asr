@@ -749,6 +749,7 @@ struct mynah_asr_stream {
     float *dec_scr;             /* greedy-decode scratch (joint input + logits) */
     mynah_asr_detok detok;      /* incremental transcript: no re-decode per chunk */
     size_t chars_emitted;       /* bytes of text already handed to the callback */
+    double emitted_t1;          /* end of the window the last delta covered: the next delta's t0 */
     char lang[16];
     size_t samples_fed;
     /* endpointing (VAD-5c): its own VAD instance — the object carries LSTM state,
@@ -890,6 +891,7 @@ int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
     s->n_tokens = 0;
     mynah_asr_detok_reset(&s->detok);
     s->chars_emitted = 0;
+    s->emitted_t1 = 0.0;
     s->lang[0] = '\0';
     s->samples_fed = 0;
     if (s->vad) {
@@ -954,15 +956,24 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
     if (cb) {
         const size_t total = strlen(text);
         if (total > s->chars_emitted) {
+            /* The window this delta covers: everything fed since the previous
+             * one was emitted. Deltas partition the stream, so a client can
+             * place text in time without accumulating anything of its own —
+             * which it could not do while t0 was always 0. It is the audio
+             * window, not an alignment: a token emitted here may have been
+             * spoken slightly earlier (the encoder works in chunks and the
+             * decoder is behind it). Word-level times come from the offline
+             * path's timestamps, not from this. */
             const double t1 = (double)s->samples_fed / (double)m->feat.sample_rate;
             mynah_asr_result res = {
                 .text = text + s->chars_emitted,
-                .t0 = 0.0, .t1 = t1,
+                .t0 = s->emitted_t1, .t1 = t1,
                 .is_final = true,
                 .lang = s->lang[0] ? s->lang : NULL,
             };
             cb(&res, ud);
             s->chars_emitted = total;
+            s->emitted_t1 = t1;
         }
     }
     return 0;
@@ -1013,7 +1024,8 @@ static void stream_emit_eou(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
     if (!cb) return;
     mynah_asr_result res = {
         .text = "",
-        .t0 = 0.0, .t1 = s->eou_sec,
+        /* a point in time, not a window: the endpoint is at t1 */
+        .t0 = s->eou_sec, .t1 = s->eou_sec,
         .is_final = true,
         .lang = s->lang[0] ? s->lang : NULL,
         .is_eou = true,

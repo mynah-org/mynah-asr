@@ -115,6 +115,11 @@ static const mynah_asr_flag g_flags[] = {
      "tests/test_stream_batch: run only the zero-allocation gate of the batched step (same as --allocs)",
      NULL, NULL},
 
+    {"MYNAH_ASR_POOL_SPIN_US", MYNAH_ASR_FLAG_RUNTIME, "50",
+     "microseconds a pool thread spins watching for the next dispatch before parking on the condvar;"
+     " 0 parks immediately (the pure condvar pool, the A/B arm), clamped to 10000",
+     NULL, NULL},
+
     {"MYNAH_ASR_GEMM_PROFILE", MYNAH_ASR_FLAG_DEBUG, "unset",
      "1 records every f32 GEMM/GEMV through the backend seam per distinct shape and dumps the table at exit"
      " ([GEMM-PROFILE]/[GEMM-SHAPE] on stderr); the replay input of tests/bench_gemm_shapes",

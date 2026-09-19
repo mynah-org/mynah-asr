@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PF_MAX_THREADS 64
@@ -38,34 +39,168 @@ static void pf_run(pf_state *st) {
 }
 
 /* ------------------------------------------------------------ persistent pool
- * Workers are created on the first parallel_for and sleep on a condvar: no
- * pthread_create/join in the hot path (before: thousands of spawns per batched
- * transcription). ONE dispatch at a time (g_pool_mu): when the pool is busy —
- * concurrent calls from the server workers — the caller runs inline and serial,
- * which is already parallel ACROSS requests (no oversubscription).
- * The workers are detached and live until process exit (like the BLAS pools). */
+ * Workers are created on the first parallel_for and then SPIN-THEN-PARK: they
+ * watch an atomic generation counter for a bounded time before sleeping on the
+ * condvar.  No pthread_create/join in the hot path, and no kernel round trip
+ * between two dispatches that are microseconds apart.
+ *
+ * WHY THE SPIN.  The cost of a dispatch is not an abstraction: a condvar
+ * broadcast wakes N threads through the kernel and the completion wakes the
+ * caller back, and it is paid per GEMM.  Measured on the M1 dev host before
+ * this change, the representative shapes under 2M MACs -- a streaming step's
+ * attention GEMMs, dozens of them back to back -- cost MORE with eight threads
+ * than with one.  src/sgemm.c now refuses to split work that small
+ * (SG_PARALLEL_MIN_WORK per thread), which stops the pool being used where it
+ * cannot pay; the spin is the other half, so that the work just above that line
+ * is not eaten by the wake-up either.
+ *
+ * ONE dispatch at a time (g_pool_mu): when the pool is busy -- concurrent calls
+ * from server workers -- the caller runs inline and serial, which is already
+ * parallel ACROSS requests (no oversubscription).  The workers are detached and
+ * live until process exit (like the BLAS pools).
+ *
+ * The spin budget is bounded in REAL TIME (MYNAH_ASR_POOL_SPIN_US, default 50)
+ * and is per wait, so an idle worker burns at most that much of its own core
+ * before parking: between two streaming chunks (320 ms apart at lookahead 3)
+ * every worker is parked.  0 disables the spin and restores the pure condvar
+ * pool, which is how the two are compared.
+ *
+ * WHAT IT COSTS TO GET WRONG.  Both rendezvous have a missed-wakeup hazard: a
+ * worker that decides to park just as a job is published, and a caller that
+ * parks just as the last worker finishes.  The generation store and the parked
+ * count are therefore SEQUENTIALLY CONSISTENT on both sides -- with a single
+ * total order, a worker that waited must have incremented `parked` before the
+ * publisher's load of it -- and the completion side does not gamble at all: the
+ * worker that takes the count to zero always takes the mutex and signals.  One
+ * uncontended lock per dispatch against a lost wake-up is not a trade. */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
 static pf_state *g_job;
-static unsigned g_gen;
-static int g_pending;
+static atomic_uint g_gen;
+static atomic_int g_pending;
+static atomic_int g_parked;
 static int g_workers;
 static pthread_once_t g_pool_once = PTHREAD_ONCE_INIT;
 
+/* The meter.  A pool that silently stopped spinning, or one that spins and
+ * never catches anything, both look like "it works"; these say which
+ * (ENGINEERING.md §6). Relaxed: one per dispatch or per wait, never per task. */
+static atomic_ullong g_m_dispatches, g_m_worker_spin, g_m_worker_park;
+static atomic_ullong g_m_caller_spin, g_m_caller_park, g_m_inline;
+
+void mynah_asr_pool_stats_get(mynah_asr_pool_stats *out) {
+    if (!out) return;
+    out->dispatches  = atomic_load_explicit(&g_m_dispatches, memory_order_relaxed);
+    out->worker_spin = atomic_load_explicit(&g_m_worker_spin, memory_order_relaxed);
+    out->worker_park = atomic_load_explicit(&g_m_worker_park, memory_order_relaxed);
+    out->caller_spin = atomic_load_explicit(&g_m_caller_spin, memory_order_relaxed);
+    out->caller_park = atomic_load_explicit(&g_m_caller_park, memory_order_relaxed);
+    out->inline_runs = atomic_load_explicit(&g_m_inline, memory_order_relaxed);
+    out->spin_us     = mynah_asr_pool_spin_us();
+    out->workers     = g_workers;
+}
+
+void mynah_asr_pool_stats_reset(void) {
+    atomic_store_explicit(&g_m_dispatches, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_m_worker_spin, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_m_worker_park, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_m_caller_spin, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_m_caller_park, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_m_inline, 0, memory_order_relaxed);
+}
+
+int mynah_asr_pool_spin_us(void) {
+    static int us = -1;
+    if (us < 0) {
+        const char *env = getenv("MYNAH_ASR_POOL_SPIN_US");
+        long v = env ? atol(env) : 50;
+        if (v < 0) v = 0;
+        if (v > 10000) v = 10000;   /* 10 ms: past this it is not a spin */
+        us = (int)v;
+    }
+    return us;
+}
+
+static void pf_relax(void) {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+static double pf_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* Spin until `pred(arg)` or the budget runs out. 1 = the predicate won. */
+static int pf_spin_until(int (*pred)(void *), void *arg) {
+    const int us = mynah_asr_pool_spin_us();
+    if (us <= 0) return pred(arg);
+    const double deadline = pf_now() + (double)us * 1e-6;
+    for (;;) {
+        for (int k = 0; k < 64; k++) {
+            if (pred(arg)) return 1;
+            pf_relax();
+        }
+        if (pf_now() >= deadline) return pred(arg);
+    }
+}
+
+static int pred_gen_moved(void *arg) {
+    return atomic_load_explicit(&g_gen, memory_order_acquire) != *(unsigned *)arg;
+}
+static int pred_done(void *arg) {
+    (void)arg;
+    return atomic_load_explicit(&g_pending, memory_order_acquire) <= 0;
+}
+
 static void *pool_worker(void *arg) {
     (void)arg;
+    /* ZERO, not the current generation, and this is load-bearing.  pool_init
+     * runs under pthread_once inside the first dispatch, so a worker can reach
+     * its first read AFTER that dispatch has already published its job and
+     * counted this thread in g_pending.  A worker that started from the live
+     * generation would then see gen == seen, park, and wait for a job that was
+     * published before it looked -- while the caller waits for a pending count
+     * that will never reach zero.  Generations only ever increase and the first
+     * job is generation 1, so starting from 0 means the first check always
+     * finds work, which is exactly right for a thread the dispatcher is already
+     * counting on.
+     *
+     * Found by running the A/B arm: with the default spin the worker catches
+     * the bump inside its spin window and the race never fires.  The pure
+     * condvar arm (MYNAH_ASR_POOL_SPIN_US=0) deadlocked on the first dispatch,
+     * every time. A knob whose other setting is never exercised is a knob that
+     * hides bugs. */
     unsigned seen = 0;
-    pthread_mutex_lock(&g_job_mu);
     for (;;) {
-        while (g_gen == seen) pthread_cond_wait(&g_job_cv, &g_job_mu);
-        seen = g_gen;
-        pf_state *job = g_job;
-        pthread_mutex_unlock(&g_job_mu);
-        pf_run(job);
-        pthread_mutex_lock(&g_job_mu);
-        if (--g_pending == 0) pthread_cond_signal(&g_done_cv);
+        if (!pf_spin_until(pred_gen_moved, &seen)) {
+            pthread_mutex_lock(&g_job_mu);
+            atomic_fetch_add(&g_parked, 1);              /* seq_cst on purpose */
+            while (atomic_load(&g_gen) == seen)
+                pthread_cond_wait(&g_job_cv, &g_job_mu);
+            atomic_fetch_sub(&g_parked, 1);
+            pthread_mutex_unlock(&g_job_mu);
+            atomic_fetch_add_explicit(&g_m_worker_park, 1, memory_order_relaxed);
+        } else {
+            atomic_fetch_add_explicit(&g_m_worker_spin, 1, memory_order_relaxed);
+        }
+        seen = atomic_load_explicit(&g_gen, memory_order_acquire);
+        pf_run(g_job);   /* published before the generation bump (release) */
+        if (atomic_fetch_sub_explicit(&g_pending, 1, memory_order_acq_rel) == 1) {
+            /* the caller may be parked and may have decided that after our last
+             * look, so this never guesses */
+            pthread_mutex_lock(&g_job_mu);
+            pthread_cond_signal(&g_done_cv);
+            pthread_mutex_unlock(&g_job_mu);
+        }
     }
     return NULL;   /* never reached */
 }
@@ -186,20 +321,30 @@ void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     const int active = n < nth ? n : nth;
     blas_apply(active <= 2 ? budget / active : 1);
     if (g_workers == 0 || pthread_mutex_trylock(&g_pool_mu) != 0) {
+        atomic_fetch_add_explicit(&g_m_inline, 1, memory_order_relaxed);
         pf_run(&st);              /* no pool or busy: run inline */
         blas_apply(budget);
         return;
     }
-    pthread_mutex_lock(&g_job_mu);
+    atomic_fetch_add_explicit(&g_m_dispatches, 1, memory_order_relaxed);
     g_job = &st;
-    g_pending = g_workers;
-    g_gen++;
-    pthread_cond_broadcast(&g_job_cv);
-    pthread_mutex_unlock(&g_job_mu);
+    atomic_store_explicit(&g_pending, g_workers, memory_order_relaxed);
+    atomic_fetch_add(&g_gen, 1);                  /* seq_cst: publishes the job */
+    if (atomic_load(&g_parked) > 0) {             /* seq_cst: pairs with the park */
+        pthread_mutex_lock(&g_job_mu);
+        pthread_cond_broadcast(&g_job_cv);
+        pthread_mutex_unlock(&g_job_mu);
+    }
     pf_run(&st);                  /* the caller does its share too */
-    pthread_mutex_lock(&g_job_mu);
-    while (g_pending > 0) pthread_cond_wait(&g_done_cv, &g_job_mu);
-    pthread_mutex_unlock(&g_job_mu);
+    if (pf_spin_until(pred_done, NULL)) {
+        atomic_fetch_add_explicit(&g_m_caller_spin, 1, memory_order_relaxed);
+    } else {
+        pthread_mutex_lock(&g_job_mu);
+        while (atomic_load_explicit(&g_pending, memory_order_acquire) > 0)
+            pthread_cond_wait(&g_done_cv, &g_job_mu);
+        pthread_mutex_unlock(&g_job_mu);
+        atomic_fetch_add_explicit(&g_m_caller_park, 1, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_pool_mu);
     blas_apply(budget);
 }
@@ -215,8 +360,9 @@ void mynah_asr_threadpool_after_fork(void) {
     pthread_cond_init(&g_job_cv, NULL);
     pthread_cond_init(&g_done_cv, NULL);
     g_job = NULL;
-    g_gen = 0;
-    g_pending = 0;
+    atomic_store(&g_gen, 0);
+    atomic_store(&g_pending, 0);
+    atomic_store(&g_parked, 0);
     g_workers = 0;
     {
         static const pthread_once_t fresh = PTHREAD_ONCE_INIT;

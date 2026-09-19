@@ -232,13 +232,20 @@ float *mynah_asr_resample(const float *in, size_t n_in, int sr_in, int sr_out, s
 ```c
 typedef struct {
     const char *text;     /* UTF-8, valid only during the callback */
-    double t0, t1;
+    double t0, t1;        /* the audio window this text covers, (t0, t1] */
     bool is_final;
     const char *lang;
-    bool is_eou;          /* VAD endpoint: text is "", t1 = when speech stopped */
+    bool is_eou;          /* VAD endpoint: text is "", t0 == t1 == when speech stopped */
 } mynah_asr_result;
 typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata);
 ```
+
+In a stream the deltas **partition** the audio: each one's `t0` is the previous
+one's `t1`, so a consumer can place text in time without accumulating anything
+of its own. It is a window, not an alignment — a token may have been spoken
+slightly before the window it is reported in, because the encoder works in
+chunks and the decoder trails it. For word-level times use
+`mynah_asr_transcribe_ts`.
 
 ## Minimal complete example
 

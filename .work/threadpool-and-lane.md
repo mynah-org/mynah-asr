@@ -418,3 +418,78 @@ tests/bench_gemm_shapes shapes.txt          # weighted total, both arms, one pro
 If the weighted total says OpenBLAS wins by enough to cost capacity, the
 Makefile line goes back and this note records the number. That is what
 reversible-by-a-number means.
+
+---
+
+## 2026-09-19 — S1-5: the pool spins before it parks
+
+The third finding of the same instrument, and the other half of the parallel
+threshold above. `sg_plan_rows` now refuses to give the pool work it cannot pay
+for; this is about the work just ABOVE that line, which a stream step issues
+dozens of times in a row.
+
+A dispatch was a condvar broadcast to N sleeping threads plus a completion wake
+back to the caller — two kernel round trips per GEMM, at a few microseconds
+each, on GEMMs that take tens of microseconds. The workers now watch an atomic
+generation counter for `MYNAH_ASR_POOL_SPIN_US` microseconds (default 50) before
+parking, so a dispatch that follows another by a microsecond finds them hot.
+`0` restores the pure condvar pool and is the arm this is measured against.
+
+### Result (M1 dev host, `tests/bench_gemm_shapes --demo`)
+
+The 49 representative shapes under 2M MACs — a streaming step's attention:
+
+| threads | spin off | spin 50 us |
+|---|---|---|
+| 4 | 318 us | **219 us** (-31%) |
+| 8 | 355 us | **285 us** (-20%) |
+
+The large shapes do not move (57.6 vs 56.4 ms at T=4, 47.7 vs 49.8 at T=8, i.e.
+inside the noise of a loaded dev host): as expected, a 4 ms GEMM does not care
+about a 3 us wake-up.
+
+Idle cost is bounded by construction: a worker burns at most the budget of its
+own core per wait, once, then parks. Between two streaming chunks (320 ms apart
+at lookahead 3) every worker is parked.
+
+### The meter
+
+`worker_spin_pct` and `caller_spin_pct` (via `mynah_asr_pool_stats_get`, printed
+in the server's SIGUSR1 dump). A pool that silently stopped spinning and one
+that spins and catches nothing look identical from the outside; near-zero under
+load means the budget is too small for the host, near-100 on an idle server
+means it is too large.
+
+### What the A/B arm found on its first run
+
+**The `SPIN_US=0` arm deadlocked on the first dispatch, every time.** Every
+worker parked on the job condvar, the caller parked on the completion condvar,
+the process at 0% cpu.
+
+The cause was one line of the rewrite: the worker initialised its generation
+from the live counter. `pool_init` runs under `pthread_once` INSIDE the first
+dispatch, so a worker can reach its first read after that dispatch has already
+published its job and counted the thread in `g_pending` — it then sees
+`gen == seen`, parks, and waits for a job published before it looked, while the
+caller waits for a count that will never reach zero. Generations only increase
+and the first job is generation 1, so the correct start is 0: a thread the
+dispatcher is already counting on must find work at its first check.
+
+Two things worth keeping from that:
+
+1. **The default hid it.** With a 50 us spin the worker catches the bump inside
+   its spin window and the race never fires. The bug was reachable only through
+   the flag that exists to make the comparison possible. A knob whose other
+   position is never exercised is a knob that hides bugs — which is the argument
+   for running every A/B in both directions, not only the one expected to win.
+2. **A deadlock is not a failing assertion, it is a test that never returns.**
+   `tests/test_threads.c` gates the first dispatch at three spin budgets in
+   PRISTINE children (the flags are read once and cached, so a fresh process is
+   the only honest way to set them) with the parent holding a deadline.
+
+Writing that gate turned up a second hang, this one in the test rather than the
+pool: a child forked from a process with a warm pool inherits `g_workers` but
+not the worker threads, so it waits forever for threads that no longer exist.
+That is exactly the contract `mynah_asr_threadpool_after_fork()` exists for and
+exactly what the prefork server does — now gated too, with its failure mode on
+record: a hang, not a crash.

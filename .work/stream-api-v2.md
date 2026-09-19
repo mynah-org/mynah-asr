@@ -475,3 +475,33 @@ hardest. Do not read the B = 8 cell as a measurement.
 7. **Assert the single-owner invariant** around the batched call the same way
    `mynah_asr_sched_assert_thread` does around `stream_feed`: one thread per
    model may run a batched step, because the batch scratch lives on the model.
+
+---
+
+## 2026-09-19 — S1-2 closed: the delta window
+
+`t0` was `0.0` on every streaming delta, which left `t1` as the only usable
+field and forced any consumer that wanted to place text in time to keep its own
+running total — and to get it right, which it cannot, because it does not know
+how the runtime chunked the audio.
+
+Deltas now partition the stream: `t0` is the `t1` of the previous delta of the
+same stream (`emitted_t1`, reset with the stream). The WebSocket `delta` frame
+carries both beside `audio_s`, which stays because `eou` and `error` frames have
+no window and still need to say where they are.
+
+Stated where it is easy to get wrong (`docs/api.md`, `docs/server.md`): this is
+the audio WINDOW the text was produced from, not an alignment. A token may have
+been spoken slightly before the window it is reported in — the encoder works in
+chunks and the decoder trails it. Word-level times remain the offline path's
+`mynah_asr_transcribe_ts`.
+
+An `eou` result is now a point, `t0 == t1 == eou_sec`, instead of a window
+starting at zero.
+
+**The chunk-arrival passthrough asked for in the item was deliberately NOT
+added.** The server stages the chunk, so the server owns its arrival:
+`emit_ctx.arrival` comes from the slot's arrival record and the result callback
+runs synchronously inside that step (`server/sched.c`). A library-level copy
+would be a number the library has no way to check, duplicated in the one place
+that already has the right one.

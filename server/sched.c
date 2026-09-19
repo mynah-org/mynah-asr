@@ -230,6 +230,13 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
         cJSON_AddStringToObject(j, "text", res->text ? res->text : "");
         cJSON_AddBoolToObject(j, "final", res->is_final ? 1 : 0);
         cJSON_AddStringToObject(j, "lang", lang);
+        /* The audio window this text covers, (t0, t1]. Deltas partition the
+         * stream, so a client places text in time without keeping a running
+         * total of its own. `audio_s` in frame_common is the same t1, kept
+         * because every frame type carries it, including the ones with no
+         * window (`eou`, `error`). */
+        cJSON_AddNumberToObject(j, "t0", res->t0);
+        cJSON_AddNumberToObject(j, "t1", res->t1);
         /* v1 fields, kept for one release: tools/eval/ws_client.py and
          * tools/bench/stream_load.py read `text` and `audio_seconds`. */
         cJSON_AddStringToObject(j, "language", lang);

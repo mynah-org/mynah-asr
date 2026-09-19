@@ -432,6 +432,19 @@ void mynah_asr_obs_dump(void) {
             widx, n, st.batched_steps, st.rows_stacked,
             st.batched_steps ? (double)st.ready_sum / (double)st.batched_steps : 0.0,
             st.step_wall_count ? st.step_wall_ms_sum / (double)st.step_wall_count : 0.0);
+    {   /* the pool meter: whether the spin-then-park pool is catching its
+         * dispatches hot or paying a kernel round trip for each one. Under real
+         * load this is the difference the small GEMMs of a stream step feel. */
+        mynah_asr_pool_stats ps;
+        mynah_asr_pool_stats_get(&ps);
+        const unsigned long long ww = ps.worker_spin + ps.worker_park;
+        const unsigned long long cc = ps.caller_spin + ps.caller_park;
+        OBS_ADD("[DUMP] worker=%d seq=%lu pool spin_us=%d workers=%d dispatches=%llu "
+                "inline=%llu worker_spin_pct=%.1f caller_spin_pct=%.1f\n",
+                widx, n, ps.spin_us, ps.workers, ps.dispatches, ps.inline_runs,
+                ww ? 100.0 * (double)ps.worker_spin / (double)ww : 0.0,
+                cc ? 100.0 * (double)ps.caller_spin / (double)cc : 0.0);
+    }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
     OBS_ADD("[DUMP] worker=%d seq=%lu cancelled=%lu", widx, n, st.cancelled);
