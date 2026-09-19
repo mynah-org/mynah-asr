@@ -74,6 +74,17 @@ address space — switching weights per request would cost a whole pass over the
 and the sibling repos costed exactly that and rejected it.
 
 `--model name=dir[:workers=W][:cpus=N][:cap=C][:quant=int8|int4|f32][:lookahead=L]`
+**The serving default is `int8`, and the CLI's is `f32`.** They differ on
+purpose. On a CPU box int8 is 2.24x faster (M1, one stream: f32 RTF 1.528, int8
+0.682 — f32 did not sustain one real-time stream there) for a documented and
+small quality cost (`docs/quantization.md`: mean CER 0.133 -> 0.145 over 34
+locales, identical on ~90% of them). Every capacity number in this repo was
+taken at int8, so a f32 default would have meant the shipped configuration and
+the measurements disagreed. The CLI keeps f32 because there it is the reference
+the other modes are checked against. `--quant f32` restores it here, and the
+`[SERVER-CONFIG]` banner prints what was actually loaded.
+
+
 is repeatable and names one group:
 
 | option | |
@@ -82,7 +93,7 @@ is repeatable and names one group:
 | `:workers=W` | processes in the group. The counts must add up to `--prefork` |
 | `:cpus=N` | cpus the group's workers share, carved contiguously out of the allowed mask in group order; each worker takes an equal share and, unless `--prefork-threads` is explicit, that share is its thread count |
 | `:cap=C` | that group's stream slots per worker: rung 1 of the ladder, per group |
-| `:quant=` | that group's quantization; without it, the fleet's `--quant` |
+| `:quant=` | that group's quantization; without it, the fleet's `--quant`, which defaults to **int8** |
 | `:lookahead=L` | the default streaming preset for that group's sessions when the client names none |
 
 `--default <name>` picks the group a request that names no model gets; without
@@ -383,7 +394,7 @@ health endpoint that reports both is one that will be quoted for the wrong one.
           "by_b":{"1":{"steps":80,"wall_ms_sum":14984.0,"wall_ms_mean":187.3},
                   "4":{"steps":132,"wall_ms_sum":45672.0,"wall_ms_mean":346.0}}},
  "model":{"name":"nemotron-3.5-asr-streaming-0.6b","engine":"nemotron-streaming",
-          "quant":"f32","lookahead_default":3},
+          "quant":"int8","lookahead_default":3},
  "group":"nemotron",
  "groups":"nemotron=6 parakeet=2",
  "process":{"worker":-1,"pid":6392,"uptime_s":30.2,"pool_threads":8,
@@ -421,7 +432,7 @@ the one run whose banner is missing is the run that will be quoted
 [FLAGS] v=1 MYNAH_ASR_THREADS=8
 [EFFECTIVE-CONFIG] v=1 build=v0.9.1-38-gd480467 blas=accelerate simd=neon+dotprod MYNAH_ASR_THREADS=8->8(applied)
 [SERVER-CONFIG] v=1 model_dir=... model=nemotron-3.5-asr-streaming-0.6b engine=nemotron-streaming
-    quant=f32 lid_model=none streaming=yes lookahead_default=3 lookahead_presets=3,0,6,13
+    quant=int8 lid_model=none streaming=yes lookahead_default=3 lookahead_presets=3,0,6,13
     chunk_ms=320 port=8397 cap=4 ring_s=30 idle_ms=60000 ping_ms=20000 max_audio_s=14400
     max_frame_bytes=1048576 max_pending=8 batch=8 http_threads=4 pool_threads=8
     blas_budget=8 prefork=single-process worker=-1 metrics=on
@@ -536,7 +547,7 @@ view.
 [DUMP] v=1 worker=0 seq=1 begin
 [DUMP] worker=0 seq=1 process pid=1720 uptime_s=41.3 pool_threads=4 blas_budget=4 pinned=no mask=unpinned
 [DUMP] worker=0 seq=1 build=... blas=accelerate simd=neon+dotprod int8_kernel=neon-sdot int8_gemm=off
-[DUMP] worker=0 seq=1 model=... engine=... quant=f32 streaming=yes lookahead_default=3 chunk_ms=320
+[DUMP] worker=0 seq=1 model=... engine=... quant=int8 streaming=yes lookahead_default=3 chunk_ms=320
 [DUMP] worker=0 seq=1 slots active=0 cap=2 sessions=1 steps=17 deltas=15 eous=0 audio_s=5.2
 [DUMP] worker=0 seq=1 batch steps=17 rows_stacked=0 ready_mean=1.00 step_wall_ms_mean=187.3
 [DUMP] worker=0 seq=1 offline queued=0 done=4 max_pending=4

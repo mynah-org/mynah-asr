@@ -63,7 +63,25 @@ static char g_model_engine[64] = "unknown";
 static double g_encoder_frame_ms;      /* streaming.encoder_frame_ms, 0 if none */
 static int    g_default_preset_index;
 static int g_max_batch = 8;          /* --batch N; 1 = disabled */
-static int g_quant = MYNAH_ASR_QUANT_F32;
+/* int8, not f32, and this is a SERVING default rather than a library one.
+ *
+ * Measured on the M1 dev host, one stream, tests/audio/test_en.wav with an
+ * explicit language: f32 RTF 1.528, int8 RTF 0.682. The f32 default did not
+ * sustain a single real-time stream there, and every capacity number this repo
+ * has -- including the Axion step table (a = 31.7 ms, b = 4.58 ms/stream, about
+ * 49 streams in one 32-thread worker) -- was taken at int8. The shipped default
+ * and the measurements disagreed, which is the worse of the two problems.
+ *
+ * The quality cost is documented and small (docs/quantization.md, 34 locales,
+ * 102 samples): mean CER 0.133 -> 0.145, identical on about 90% of languages,
+ * one genuine regression (ro-RO, already borderline at f32). On a CPU box that
+ * trade is not close.
+ *
+ * The CLI keeps f32: there it is the reference the other modes are checked
+ * against, and a tool that quietly quantised would make its own oracle useless.
+ * `--quant f32` restores it here, and the [SERVER-CONFIG] banner prints what
+ * was actually loaded, so no run has to infer it from this line. */
+static int g_quant = MYNAH_ASR_QUANT_INT8;
 
 /* ------------------------------------------------------------ model groups
  *
