@@ -324,8 +324,16 @@ ubsan:
 	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g $(SAN_MARCH) -fsanitize=undefined \
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=undefined" all test && $(MAKE) clean
+# -O2, not -O1, and it is not a cosmetic difference.  Since BLAS=none became the
+# Linux default this job sanitizes OUR f32 GEMM instead of calling into an
+# uninstrumented OpenBLAS, so the sanitizer now pays for all of the arithmetic.
+# Measured on the M1, our DOT family through tests/bench_gemm_shapes with ASan
+# on: 21.9 GF/s at -O1 against 60.4 at -O2, with the uninstrumented production
+# build at 172.  -fno-omit-frame-pointer keeps the stack traces readable, which
+# is the only thing -O1 was buying, and the ubsan target above has always been
+# -O2 -- this one was the outlier.
 asan:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O1 -g $(SAN_MARCH) -fsanitize=address,undefined \
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g $(SAN_MARCH) -fsanitize=address,undefined \
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test && $(MAKE) clean
 

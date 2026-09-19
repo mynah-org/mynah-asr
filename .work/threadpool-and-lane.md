@@ -607,3 +607,49 @@ A comment in `sg_micro_tail` claimed its results were "consistent with the rest
 of the row". The ORDER is the same; the ROUNDING is not guaranteed to be.
 Corrected in place, because a comment that overstates a guarantee is how the
 wrong gate gets written in the first place.
+
+---
+
+## 2026-09-19 (end of day) — what owning the GEMM costs the sanitizer
+
+With `-march` restored and the gate corrected, the ASan job still hit its
+ceiling, at the same place both times: `tests/test_batch`, after
+`tests/test_encoder`, with no output for nine minutes.
+
+**It is not a hang.** The pool was the obvious suspect, because `test_batch` is
+the only test that nests — `src/encoder.c:1281` runs a `parallel_for` over the
+batch segments and every sgemm inside each segment dispatches again. A
+model-free stress harness (outer `parallel_for` over 4 segments, each doing
+thousands of inner ones) ran 1.4M nested dispatches at widths 2/4/8 with the
+spin both on and off: no hang, correct counts, every time. The pool is clear.
+
+**It is the ownership decision, arriving.** The timestamps give the multiplier
+directly: `tests/test_encoder` on the 110m takes about 0.2 s in the normal CI
+and 5.6 s here — about 28x. `test_batch` does eight full forwards of a 17-layer
+model, so twenty-odd seconds becomes nine minutes. The reason is not ASan being
+slow in general: it is that **until this morning every f32 GEMM in that job went
+into OpenBLAS, which is a prebuilt library that ASan does not instrument**. Now
+they go into our code, which it does. Owning the GEMM means sanitizing the GEMM.
+
+The honest options were: raise the ceiling (hides it), cut coverage (pays for
+speed with the thing the job is for), or make the instrumented code faster. The
+third one turned out to be available for free, because the ASan target was
+built at `-O1` while the UBSan target beside it has always been `-O2`. Measured
+model-free, our DOT family under ASan:
+
+| build | own DOT mean |
+|---|---|
+| ASan `-O1` | 21.9 GF/s |
+| ASan `-O2` | **60.4 GF/s** |
+| production `-O3 -ffast-math`, no sanitizer | 172.1 GF/s |
+
+2.76x, no coverage lost: `-fno-omit-frame-pointer` is what keeps the stack
+traces readable and it was already there — `-O1` was buying nothing else. That
+should put `test_batch` near three minutes and the job near six, which is where
+it was before.
+
+Worth writing down as a method point: **a default flip lands wherever the old
+default was doing work for you, and a sanitizer job is exactly such a place.**
+The first symptom was a 30-minute timeout that read as `cancelled`; the second,
+after fixing `-march`, was the same timeout at 12 minutes. Neither said "the
+GEMM moved". Only the ratio between two jobs running the same tests did.
