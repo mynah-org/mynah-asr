@@ -93,8 +93,13 @@ TRANSFERRED = {
     "axion": {"a_ms": 31.7, "b_ms": 4.58, "cpus": 32,
               "where": "Neoverse-V2 32c, int8, one 32-thread process, unpinned, "
                        "box not verified idle (2026-09-19)"},
-    "m1":    {"a_ms": 37.8, "b_ms": 20.3, "cpus": 8,
-              "where": "Apple M1 8 threads, int8, Accelerate GEMM (2026-09-18)"},
+    "m1":    {"a_ms": 42.4, "b_ms": 12.00, "cpus": 8,
+              "where": "Apple M1 8 threads, int8, Accelerate f32 GEMM, calibrated by this "
+                       "tool 2026-09-19 (fit over B=2..8, worst residual 3.6 ms = 4 %). "
+                       "The S1-7 note recorded a = 37.8 / b = 20.3 on the same machine the "
+                       "day before, under third-party load and best-of-4 interleaved; b "
+                       "halving is unexplained and the two were not taken under comparable "
+                       "conditions, so neither supersedes the other"},
 }
 
 # How far a transferred constant may travel before it stops meaning anything.
@@ -113,7 +118,11 @@ TRANSFER_CPU_RATIO_MAX = 1.5
 CAL_POINTS = [
     # (machine, topology, predicted B_max, measured B_max, note)
     ("Neoverse-V2 32c", "1x32 int8 la3", 49, None,
-     "no WAVE has been run yet: the prediction is unverified on every machine"),
+     "no WAVE run: unverified"),
+    ("Apple M1 8c", "1x8 int8 la3", 18, None,
+     "the only server evidence is 8 streams at emission lag p95 258 ms, inside the "
+     "320 ms gate (2026-09-18) -- so >= 8, ceiling unknown. 18 is likely optimistic: "
+     "the step table carries no ingest, no framing and no writer"),
 ]
 
 

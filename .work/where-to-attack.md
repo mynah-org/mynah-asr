@@ -196,3 +196,42 @@ Conclusion: A1 is a one-line change with a 2.24× effect and should land first;
 A2 is the biggest single lever and is a product decision; A3 and A4 are one
 experiment each and they decide whether A5 is worth a week.
 Next action: A1, then the advisor's calibration step, then A4 on the box.
+
+---
+
+## 2026-09-19 (later) — the advisor calibrated itself, and the M1 constants moved
+
+`tools/bench/box_advisor.py` ran its own calibration on the development Mac:
+
+```
+[CALIBRATED] a = 42.4 ms fixed, b = 12.00 ms per stream
+             (fit over B=2..8, B=1 discarded: warm-up)
+             worst residual 3.6 ms (4 % of the mean step)
+step rows    B=1 106.59 | B=2 63.19 | B=4 90.58 | B=6 111.71 | B=8 137.57
+```
+
+Two things worth recording.
+
+**B=1 is anomalously high on both machines** — 106.59 ms here against 63.19 at
+B=2, exactly the pattern the Axion showed (88.11 vs 37.75). That is the first
+step paying the first touch of the weights, and it is why the fit discards it.
+Two machines showing the same shape is what turns a rule of thumb into a rule.
+
+**`b` halved against the note from the previous day.** `.work/stream-api-v2.md`
+records `a = 37.8, b = 20.3` for the same Mac on 2026-09-18; today the same tool
+on the same machine fits `b = 12.00`. The tempting story is that the week's work
+— the DOT register tile, the derived panel width, the parallel threshold, the
+spin-then-park pool — landed on the int8 step. It is probably part of it. But
+yesterday's pair was taken UNDER THIRD-PARTY LOAD, best-of-4 interleaved, and
+today's is a single run at loadavg 1.95, so **the two were not measured under
+comparable conditions and neither supersedes the other**. Both are in the
+transferred table with their conditions attached, and the discrepancy is
+recorded rather than resolved by choosing the flattering one.
+
+**The prediction for this Mac is 18 streams at lookahead 3, and the only server
+evidence says >= 8.** The 2026-09-18 WAVE held 8 streams at emission lag p95
+258 ms, inside the 320 ms gate, with no ceiling established. So 18 is unverified
+and probably optimistic: the step table carries no ingest thread, no WebSocket
+framing, no writer and no admission. That gap — between what the compute can do
+and what the server delivers — is the single most useful thing the first WAVE
+will measure, on either machine.
