@@ -399,6 +399,45 @@ typedef struct {
 #define MYNAH_ASR_PREFORK_QUEUE_DEADLINE_MS    2000
 #define MYNAH_ASR_PREFORK_SERVICE_CAP_MS       30000
 
+/* THE KERNEL BACKLOG -- the queue in FRONT of rung 1, and the only one this
+ * process does not own.
+ *
+ * listen()'s backlog bounds the connections the kernel holds between the SYN
+ * and this server's accept(). Past it the kernel drops SYNs: the client sees a
+ * connect timeout and retries, and nothing here counts anything -- rung 1's
+ * invisible wait, one layer further out, where not even the router can see it.
+ * A fixed literal (this server had 64) has nothing to do with the capacity it
+ * was configured for, and at a hundred simultaneous arrivals the run measures
+ * the accept queue instead of the server.
+ *
+ * So it is derived from the ladder, printed, and overridable:
+ *
+ *   max_connections  W * (slots + queue per worker) -- what the ladder holds
+ *                    at once. The REFUSED ones count too: a refusal is only
+ *                    visible if the connection was accepted first.
+ *   listen_backlog   2 * max_connections, because the clients that will be
+ *                    told 503 arrive in the same burst as the ones that will
+ *                    be served. Floored at SOMAXCONN and capped at
+ *                    MYNAH_ASR_PREFORK_BACKLOG_MAX; MYNAH_ASR_LISTEN_BACKLOG
+ *                    overrides it, under the same cap.
+ *   somaxconn        what the kernel will ACTUALLY hold (net.core.somaxconn on
+ *                    Linux, kern.ipc.somaxconn on Darwin). listen() clamps to
+ *                    it silently, so the banner prints both and a difference
+ *                    is a line an operator can act on -- macOS defaults to
+ *                    128, which is below a hundred-stream burst.
+ *
+ * All of it is safe before the fork and in a single-process server, where
+ * `workers` is 1 and the arithmetic is unchanged. The caller passes the
+ * resolved W because the config's own field may still be the operator's
+ * unresolved request. */
+#define MYNAH_ASR_PREFORK_BACKLOG_MAX          4096
+
+int mynah_asr_prefork_max_connections(const mynah_asr_prefork_config *cfg, int workers);
+int mynah_asr_prefork_listen_backlog(const mynah_asr_prefork_config *cfg, int workers);
+int mynah_asr_prefork_somaxconn(void);
+/* The sysctl name to quote in a message about that cap, per platform. */
+const char *mynah_asr_prefork_somaxconn_knob(void);
+
 /* Prints the topology this machine offers and the sweep that turns it into a
  * choice of W. Never forks; safe before the model is open. */
 void mynah_asr_prefork_print_plan(const mynah_asr_prefork_config *cfg, FILE *out);
@@ -638,6 +677,11 @@ int mynah_asr_prefork_service_cap_ms(void);
  *                             removes the bound and warns loudly.
  *   MYNAH_ASR_PREFORK_QUEUE_MS    rung 3, the queue deadline. 0 disables it.
  *   MYNAH_ASR_PREFORK_SERVICE_MS  rung 4, the service cap. 0 disables it.
+ *   MYNAH_ASR_LISTEN_BACKLOG      the kernel backlog, overriding the value
+ *                             derived above. Read by
+ *                             mynah_asr_prefork_listen_backlog(), not here:
+ *                             it is not part of `cfg`, because the listener
+ *                             is bound by the caller before this module runs.
  *   MYNAH_ASR_LANE_SPLIT          not implemented yet: cpus at the tail of each worker's slice
  *                             that become the private pinned decoder team.
  *                             0 (the default) leaves the decoder inline. */

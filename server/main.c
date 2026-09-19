@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -27,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>   /* RLIMIT_NOFILE: the descriptor ceiling (S7-2) */
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -1367,6 +1369,88 @@ static int check_model_name(const char *want, char *msg, size_t cap) {
     }
     return 404;
 }
+
+/* RLIM_INFINITY is a real answer and prints as one: the sentinel rendered as a
+ * number is 18446744073709551615 on a line meant to be read. */
+static void nofile_text(rlim_t v, char *out, size_t cap) {
+    if (v == RLIM_INFINITY) snprintf(out, cap, "unlimited");
+    else                    snprintf(out, cap, "%llu", (unsigned long long)v);
+}
+
+/* ---------------------------------------------------- the descriptor ceiling
+ *
+ * S7-2. A stream costs TWO descriptors -- the client socket and the dup() the
+ * ingest side reads from -- so a hundred streams is over two hundred, plus the
+ * listener, the metrics listener and one socketpair end per worker. A process
+ * takes whatever soft limit it inherited (256 on some systems, 1024 on most),
+ * and when that runs out accept() fails with EMFILE: a refusal with no rung,
+ * no counter and no code, which is exactly the unexplained refusal this raise
+ * exists to prevent.
+ *
+ * Raise the SOFT limit toward the HARD one and never above it -- crossing the
+ * hard limit needs a privilege a server must not require -- then report what
+ * it ACTUALLY became. Called before the models are opened and before the fork,
+ * so every worker inherits the result rather than repeating it. */
+static void raise_nofile_limit(int max_connections, int workers) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        fprintf(stderr, "mynah-asr-server: WARNING RLIMIT_NOFILE is unreadable (%s): "
+                        "this process cannot say what its descriptor ceiling is\n",
+                strerror(errno));
+        return;
+    }
+    const rlim_t had = rl.rlim_cur;
+    rlim_t want = rl.rlim_max;
+#if defined(__APPLE__)
+    /* Darwin refuses RLIM_INFINITY here, and anything above
+     * kern.maxfilesperproc; OPEN_MAX is the most a process may ask for. */
+    if (want == RLIM_INFINITY || want > (rlim_t)OPEN_MAX) want = (rlim_t)OPEN_MAX;
+#else
+    /* Linux refuses a soft limit above fs.nr_open with EPERM, and
+     * RLIM_INFINITY is above it by construction. */
+    if (want == RLIM_INFINITY) want = (rlim_t)1048576;
+#endif
+    /* Halving backoff rather than one attempt: the hard limit says what the
+     * kernel allows in principle, and a sysctl below it (Darwin's
+     * maxfilesperproc, a container's fs.nr_open) turns the honest ask into
+     * EINVAL. Landing above what we inherited beats landing on nothing. */
+    for (rlim_t n = want; n > had; n = had + (n - had) / 2) {
+        rl.rlim_cur = n;
+        if (setrlimit(RLIMIT_NOFILE, &rl) == 0) break;
+    }
+
+    struct rlimit now;
+    if (getrlimit(RLIMIT_NOFILE, &now) != 0) now = rl;
+    char soft[32], hard[32], before[32];
+    nofile_text(now.rlim_cur, soft, sizeof(soft));
+    nofile_text(now.rlim_max, hard, sizeof(hard));
+    nofile_text(had, before, sizeof(before));
+    /* Two per connection, plus one channel per worker and the two listeners;
+     * the constant is slack for the model files, the pack's JSON and stdio. */
+    const rlim_t need = (rlim_t)2 * (rlim_t)max_connections + (rlim_t)workers + 32;
+    fprintf(stderr, "mynah-asr-server: RLIMIT_NOFILE soft %s -> %s (hard %s); "
+                    "this configuration admits %d connections at 2 descriptors each, "
+                    "so it needs about %llu\n",
+            before, soft, hard, max_connections, (unsigned long long)need);
+    if (now.rlim_cur != RLIM_INFINITY && now.rlim_cur < need) {
+        fprintf(stderr,
+            "mynah-asr-server: WARNING the descriptor ceiling is BELOW this "
+            "configuration. soft=%s hard=%s, needed about %llu. %s Raise the hard "
+            "limit (ulimit -Hn, LimitNOFILE= in the unit file) or lower "
+            "--cap/--prefork. Left as it is, the streams past the ceiling are "
+            "refused by accept() with EMFILE -- a refusal no rung of the admission "
+            "ladder issued and no counter in this process explains.\n",
+            soft, hard, (unsigned long long)need,
+            now.rlim_cur >= now.rlim_max
+                ? "The soft limit is at the hard one, so nothing here can raise it "
+                  "further."
+                : "The kernel refused to raise it to the hard limit, which means a "
+                  "sysctl below it (kern.maxfilesperproc, fs.nr_open) is the real "
+                  "ceiling.");
+    }
+    fflush(stderr);
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage: mynah-asr-server -m <model_dir> [-p 8090] [--threads 4] [--batch 8] [--quant int8|int4]\n"
@@ -1397,7 +1481,9 @@ static void usage(void) {
         "       --dispatch-map [--json]  which kernel/backend/pool this binary resolved, exit\n"
         "  env: MYNAH_ASR_PREFORK_QUEUE (queued per worker, default 1; 0 = refuse at once),\n"
         "       MYNAH_ASR_PREFORK_QUEUE_MS (queue deadline, default 2000),\n"
-        "       MYNAH_ASR_PREFORK_SERVICE_MS (service cap, default 30000)\n");
+        "       MYNAH_ASR_PREFORK_SERVICE_MS (service cap, default 30000),\n"
+        "       MYNAH_ASR_LISTEN_BACKLOG (listen() backlog; default 2*workers*(slots+queue),\n"
+        "         floored at SOMAXCONN, capped at 4096, and clamped by the kernel's somaxconn)\n");
 }
 
 int main(int argc, char **argv) {
@@ -1620,6 +1706,27 @@ int main(int argc, char **argv) {
         prefork_workers = pf.workers;
     }
 
+    /* The fleet's plan is complete BEFORE the listener is bound, because the
+     * backlog is sized from it: a group's own `:cap=` is part of how many
+     * connections this server will hold at once. `listen_fd` is the one field
+     * that cannot be filled yet and is set where the socket is bound. */
+    pf.models = group_name_table();
+    pf.model_count = g_n_groups;
+    pf.default_model = g_default_group;
+    pf.model_workers = g_n_groups > 1 ? grp_workers : NULL;
+    pf.model_slots = have_slots ? grp_slots : NULL;
+    pf.model_cpus = have_cpus ? grp_cpus : NULL;
+
+    /* S7-1/S7-2, resolved here: before any model is opened, before the fork and
+     * before the listener exists, so the ceiling the parent raises is the
+     * ceiling every worker inherits. W is 1 when there is no prefork, and the
+     * single-process server sizes its queue by the same arithmetic. */
+    const int listen_workers = prefork_workers > 0 ? prefork_workers : 1;
+    const int max_conns = mynah_asr_prefork_max_connections(&pf, listen_workers);
+    const int backlog = mynah_asr_prefork_listen_backlog(&pf, listen_workers);
+    const int somaxconn = mynah_asr_prefork_somaxconn();
+    raise_nofile_limit(max_conns, listen_workers);
+
     signal(SIGPIPE, SIG_IGN);
     {
         struct sigaction sa;
@@ -1670,14 +1777,36 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* S7-1. The backlog is derived from what this fleet will admit (above) and
+     * printed on the banner, never a literal: a hundred clients arriving
+     * together against the old listen(srv, 64) were dropped as SYNs before
+     * accept(), and the run then measured the accept queue rather than the
+     * server. This is the ONE place either shape binds -- with --prefork the
+     * router keeps this descriptor across the fork and every worker closes its
+     * copy -- so the single process and the fleet get the same queue. */
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
                                .sin_addr.s_addr = htonl(INADDR_ANY)};
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 64) != 0) {
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(srv, backlog) != 0) {
         fprintf(stderr, "mynah-asr-server: bind/listen failed on port %d\n", port);
         return 1;
+    }
+    if (somaxconn > 0 && somaxconn < backlog) {
+        /* listen() clamps in silence, so this is the only place the difference
+         * can be stated. Above the clamp a burst is dropped as SYNs before
+         * accept(), which makes the concurrency number a measurement of the
+         * accept queue -- ENGINEERING.md §7, a contradiction nobody benchmarks. */
+        fprintf(stderr,
+            "mynah-asr-server: WARNING the listen backlog was sized at %d for this "
+            "capacity and the kernel caps it at %d (%s). Connections arriving "
+            "together past %d are dropped as SYNs before accept(), where nothing in "
+            "this process can count them: raise the sysctl, or read any concurrency "
+            "above %d as a measurement of the accept queue.\n",
+            backlog, somaxconn, mynah_asr_prefork_somaxconn_knob(),
+            somaxconn, somaxconn);
     }
 
     /* ---- prefork: fork W workers now, with every model mapped and no thread
@@ -1687,12 +1816,6 @@ int main(int argc, char **argv) {
     int chan_fd = -1;
     if (prefork_workers > 0) {
         pf.listen_fd = srv;
-        pf.models = group_name_table();
-        pf.model_count = g_n_groups;
-        pf.default_model = g_default_group;
-        pf.model_workers = g_n_groups > 1 ? grp_workers : NULL;
-        pf.model_slots = have_slots ? grp_slots : NULL;
-        pf.model_cpus = have_cpus ? grp_cpus : NULL;
         const mynah_asr_prefork_role role = mynah_asr_prefork_run(&pf, &g_shutdown, &chan_fd);
         if (role == MYNAH_ASR_PREFORK_ERROR) {
             close(srv);
@@ -1805,6 +1928,8 @@ int main(int argc, char **argv) {
         oc.prefork_threads = mynah_asr_prefork_worker_threads();
         oc.metrics_port = metrics_port;
         oc.metrics_bind = metrics_bind;
+        oc.listen_backlog = backlog;
+        oc.listen_somaxconn = somaxconn;
         mynah_asr_obs_init(&oc);
         mynah_asr_obs_banner();
     }
@@ -1838,11 +1963,14 @@ int main(int argc, char **argv) {
                 g_groups[g_group].name, n_threads, cap,
                 g_max_batch, mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
     else
+        /* The backlog belongs on this line too: a single-process server has no
+         * admission ladder to print it beside, and it is the first limit a
+         * burst of connections meets. */
         fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, "
-                        "%d stream slots, batch %d, streaming %s)\n"
+                        "%d stream slots, batch %d, backlog %d, streaming %s)\n"
                         "  one scheduler thread owns the model; offline jobs share its steps\n"
                         "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
-                mynah_asr_version(), port, n_threads, cap, g_max_batch,
+                mynah_asr_version(), port, n_threads, cap, g_max_batch, backlog,
                 mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
 
     /* Where a connection comes from is the ONLY difference between the single

@@ -30,6 +30,20 @@ cat /sys/fs/cgroup/cpu.max                                       # a quota the b
 uptime                                   # refuse to measure while something else runs (§10)
 ```
 
+All of it, with every fact's source named, is one read-only command:
+
+```sh
+tools/bench/box_doctor.sh                # describes the box; measures nothing
+```
+
+It adds the SMT sibling pairs and the core-major order the server would use,
+what `--dispatch-map` resolves to here, the ~14 MB per stream quoted from
+`.work/fleet-observability.md` §4, the limits that bite at high fan-in
+(`nofile`, `somaxconn`, the ephemeral range), and the affinity mask that makes
+`nproc` a lie. It refuses with exit 3 above loadavg 2.0 as `box_qualify.sh` does,
+and prints UNAVAILABLE for what a platform cannot tell it. Its `W x T` table
+lists CANDIDATES for the sweep in §3: the sweep decides, it never recommends.
+
 ## 2. Build for this ISA, then make the binary prove what it runs
 
 ```sh

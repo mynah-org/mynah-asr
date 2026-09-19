@@ -65,6 +65,7 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>   /* kern.ipc.somaxconn: the cap listen() is clamped to */
 #endif
 
 #define PREFORK_MAX_WORKERS 256
@@ -862,6 +863,76 @@ static int resolve_service_cap_ms(const mynah_asr_prefork_config *cfg) {
     return cfg->service_cap_ms;
 }
 
+/* --------------------------------------------------- the kernel backlog
+ *
+ * See prefork.h. It lives here because it is sized from the ladder's own
+ * arithmetic: a second copy of that arithmetic in server/main.c is how a
+ * banner comes to print a number the listener was never given. */
+
+int mynah_asr_prefork_max_connections(const mynah_asr_prefork_config *cfg, int workers) {
+    mynah_asr_prefork_config local = *cfg;
+    mynah_asr_prefork_apply_env(&local);
+    if (workers <= 0) workers = local.workers > 0 ? local.workers : 1;
+    if (workers > PREFORK_MAX_WORKERS) workers = PREFORK_MAX_WORKERS;
+
+    int slots = local.slots_per > 0 ? local.slots_per : 1;
+    /* A group with its own `:cap=` may hold MORE than the fleet's --cap, and
+     * the largest is what the listener has to survive: a backlog one short is
+     * a dropped SYN nobody counts, one too long is a few kernel entries. */
+    for (int i = 0; local.model_slots != NULL && i < local.model_count; i++)
+        if (local.model_slots[i] > slots) slots = local.model_slots[i];
+
+    const int q_per = resolve_queue_per_worker(&local);
+    /* UNBOUNDED is not a size. Sizing the backlog from "no bound" would invent
+     * one, so an unbounded queue is counted as the default depth and the
+     * queue's own shout below covers what that leaves uncovered. */
+    const int queued = q_per > 0 ? q_per
+                     : (q_per < 0 ? MYNAH_ASR_PREFORK_QUEUE_DEFAULT : 0);
+    return workers * (slots + queued);
+}
+
+int mynah_asr_prefork_listen_backlog(const mynah_asr_prefork_config *cfg, int workers) {
+    int n = 0;
+    if (env_int("MYNAH_ASR_LISTEN_BACKLOG", &n) && n > 0) {
+        /* Still capped: a cap an override can exceed is not a cap. */
+        return n > MYNAH_ASR_PREFORK_BACKLOG_MAX ? MYNAH_ASR_PREFORK_BACKLOG_MAX : n;
+    }
+    /* Twice the capacity, because the clients that will be REFUSED arrive in
+     * the same burst as the ones that will be served, and a refusal is only
+     * visible if the connection was accepted first. */
+    n = 2 * mynah_asr_prefork_max_connections(cfg, workers);
+    if (n < SOMAXCONN) n = SOMAXCONN;   /* never below the platform's own idea of full */
+    if (n > MYNAH_ASR_PREFORK_BACKLOG_MAX) n = MYNAH_ASR_PREFORK_BACKLOG_MAX;
+    return n;
+}
+
+int mynah_asr_prefork_somaxconn(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/sys/net/core/somaxconn", "r");
+    if (f != NULL) {
+        int v = 0;
+        const int got = fscanf(f, "%d", &v);
+        fclose(f);
+        if (got == 1 && v > 0) return v;
+    }
+#elif defined(__APPLE__)
+    int v = 0;
+    size_t vn = sizeof(v);
+    if (sysctlbyname("kern.ipc.somaxconn", &v, &vn, NULL, 0) == 0 && v > 0) return v;
+#endif
+    return SOMAXCONN;   /* the header's constant: a floor, not a reading */
+}
+
+const char *mynah_asr_prefork_somaxconn_knob(void) {
+#if defined(__linux__)
+    return "net.core.somaxconn";
+#elif defined(__APPLE__)
+    return "kern.ipc.somaxconn";
+#else
+    return "the listen-backlog sysctl";
+#endif
+}
+
 /* Prints the ladder that is actually in force, and shouts about an unbounded
  * queue. The shout is deliberately impossible to skim past: an unbounded
  * admission queue is not a generous setting, it is the listener-backlog
@@ -869,8 +940,13 @@ static int resolve_service_cap_ms(const mynah_asr_prefork_config *cfg) {
  * still unbounded, and the only thing that changed is that the wait now
  * happens somewhere this process can see and chooses not to act on. */
 static void describe_ladder(int workers, int slots, int q_per, int deadline_ms,
-                            int service_ms, FILE *out) {
-    fprintf(out, "prefork: admission   rung1 slots %d/worker (%d total)",
+                            int service_ms, int backlog, int somaxconn, FILE *out) {
+    /* The backlog first, because it is the rung in FRONT of rung 1 and the
+     * only one the kernel owns: what it drops is dropped before accept(), so
+     * no counter below can see it. */
+    fprintf(out, "prefork: admission   backlog %d", backlog);
+    if (somaxconn > 0 && somaxconn < backlog) fprintf(out, " (kernel caps it at %d)", somaxconn);
+    fprintf(out, " · rung1 slots %d/worker (%d total)",
             slots, slots * workers);
     if (q_per < 0)      fprintf(out, " · rung2 queue UNBOUNDED");
     else if (q_per == 0) fprintf(out, " · rung2 queue disabled (refuse immediately)");
@@ -1015,7 +1091,9 @@ void mynah_asr_prefork_print_plan(const mynah_asr_prefork_config *cfg, FILE *out
     describe_ladder(workers, cfg->slots_per > 0 ? cfg->slots_per : 1,
                     resolve_queue_per_worker(&local),
                     resolve_queue_deadline_ms(&local),
-                    resolve_service_cap_ms(&local), out);
+                    resolve_service_cap_ms(&local),
+                    mynah_asr_prefork_listen_backlog(&local, workers),
+                    mynah_asr_prefork_somaxconn(), out);
 
     for (int i = 0; i < workers; ++i) {
         const int first = i * per;
@@ -2129,7 +2207,9 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
             fprintf(stderr, "prefork:   default    %s (a request naming no model)\n",
                     local.models[default_grp] != NULL ? local.models[default_grp] : "?");
         }
-        describe_ladder(workers, slots, q_per, deadline_ms, g_service_cap_ms, stderr);
+        describe_ladder(workers, slots, q_per, deadline_ms, g_service_cap_ms,
+                        mynah_asr_prefork_listen_backlog(&local, workers),
+                        mynah_asr_prefork_somaxconn(), stderr);
 #if !defined(__linux__)
         fprintf(stderr, "prefork: WARNING this platform has no cpu affinity API. "
                         "Workers are NOT pinned: they float across every cpu and two "

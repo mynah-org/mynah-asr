@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>   /* RLIMIT_NOFILE, read back for the banner */
 #include <time.h>
 #include <unistd.h>
 
@@ -97,6 +98,14 @@ static void lag_thresholds(int out[OBS_LAG_THRESHOLDS]) {
 
 /* ---------------------------------------------------------------- the banner */
 
+/* A soft limit of RLIM_INFINITY is a real answer and prints as one; printing
+ * the sentinel as a number would put 18446744073709551615 on a line an
+ * operator is supposed to read. */
+static void rlim_text(rlim_t v, char *out, size_t cap) {
+    if (v == RLIM_INFINITY) snprintf(out, cap, "unlimited");
+    else                    snprintf(out, cap, "%llu", (unsigned long long)v);
+}
+
 static void print_server_config(FILE *out) {
     char pres[64] = "none";
     if (g_cfg.n_lookaheads > 0) {
@@ -150,6 +159,29 @@ static void print_server_config(FILE *out) {
         fprintf(out, "[SERVER-CONFIG] v=1 metrics_bind=%s metrics_port=%d\n",
                 g_cfg.metrics_bind ? g_cfg.metrics_bind : "127.0.0.1",
                 g_cfg.metrics_port);
+    /* S7-1/S7-2: the two ceilings a hundred streams arriving at once hit
+     * first, and the two this process can be stopped by without saying so.
+     * `listen_backlog` is what listen() was given, `somaxconn` what the kernel
+     * will hold -- a backlog above it is a burst dropped as SYNs before
+     * accept(), where no rung of the admission ladder and no counter here can
+     * see it. `nofile_*` is READ BACK now rather than passed in: what matters
+     * is the ceiling THIS process is running under, and a prefork worker
+     * inherited it across the fork instead of raising it. A worker also does
+     * not own the listener, so the backlog says whose it is, as `metrics=`
+     * above does. */
+    {
+        struct rlimit rl;
+        char soft[32] = "unknown", hard[32] = "unknown";
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rlim_text(rl.rlim_cur, soft, sizeof(soft));
+            rlim_text(rl.rlim_max, hard, sizeof(hard));
+        }
+        fprintf(out, "[SERVER-CONFIG] v=1 listen_backlog=%d somaxconn=%d "
+                     "listen_owner=%s nofile_soft=%s nofile_hard=%s\n",
+                g_cfg.listen_backlog, g_cfg.listen_somaxconn,
+                mynah_asr_prefork_worker_index() >= 0 ? "router" : "self",
+                soft, hard);
+    }
     fflush(out);
 }
 

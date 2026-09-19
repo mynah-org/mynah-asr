@@ -66,6 +66,15 @@ typedef struct {
     int   batch;
     int   prefork_workers;       /* 0 = single process                         */
     int   prefork_threads;
+    /* The kernel accept queue this server asked listen() for, and what the
+     * kernel says it will actually hold. Both, because listen() clamps to the
+     * second without telling anyone, and a backlog nobody can read is a limit
+     * nobody checks -- the difference is what turns a hundred simultaneous
+     * connects into dropped SYNs. The descriptor ceiling is NOT here: it is
+     * read back from the kernel when the banner is printed, so what is
+     * reported is what this process ended up with. */
+    int   listen_backlog;
+    int   listen_somaxconn;
     int   metrics_port;
     const char *metrics_bind;
 } mynah_asr_obs_config;

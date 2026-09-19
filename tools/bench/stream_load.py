@@ -136,6 +136,35 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def load_transcripts(path):
+    """clip -> human reference text.
+
+    Accepts either a plain {clip: text} map or a bank manifest in the shape this repo
+    already uses (samples/manifest.json: a "samples" list whose entries carry "file" and
+    "text"). Keys are stored BOTH as given and as the bare basename, because the harness
+    plays a clip by whatever path the caller passed on the command line and the manifest
+    knows it by its path inside the bank."""
+    with open(path) as f:
+        doc = json.load(f)
+    out = {}
+    if isinstance(doc, dict) and isinstance(doc.get("samples"), list):
+        for e in doc["samples"]:
+            fn, txt = e.get("file"), e.get("text")
+            if fn and txt:
+                out[fn] = txt
+                out[os.path.basename(fn)] = txt
+    elif isinstance(doc, dict):
+        for k, v in doc.items():
+            if isinstance(v, str):
+                out[k] = v
+                out[os.path.basename(k)] = v
+    else:
+        raise SystemExit(f"--transcripts {path}: expected a manifest or a {{clip: text}} map")
+    if not out:
+        raise SystemExit(f"--transcripts {path}: no clip carried a reference text")
+    return out
+
+
 def classify(duration_s: float, bounds) -> str:
     """Duration classes for the stratified bank.  Boundaries are a flag, not a belief."""
     return "short" if duration_s < bounds[0] else ("medium" if duration_s < bounds[1] else "long")
@@ -345,6 +374,10 @@ def build_args():
     ap.add_argument("--done-timeout", type=float, default=60.0)
     ap.add_argument("--json", help="write the manifest, the summary and every utterance here")
     ap.add_argument("--reference", help="JSON {clip: expected_text}; mismatches invalidate the run")
+    ap.add_argument("--transcripts", help="bank manifest (samples/*/manifest.json) or a JSON "
+                                          "{clip: human_reference}; gives every utterance a CER "
+                                          "and lets the run be judged DEGRADED — cadence held, "
+                                          "transcripts got worse")
 
     ap.add_argument("--mode", choices=("wave", "soak"), default="wave",
                     help="wave: N at once, R each, screening only. soak: closed loop, the gate")
@@ -446,8 +479,10 @@ def main() -> int:
     warmup = a.warmup if a.mode == "soak" else 0.0
     window = a.window if a.mode == "soak" else None
     reference = json.load(open(a.reference)) if a.reference else None
+    transcripts = load_transcripts(a.transcripts) if a.transcripts else None
     summary = M.aggregate(utts, frame_ms=a.frame_ms, pace=a.pace, window_s=window,
-                          warmup_s=warmup, t0=a._t0, reference=reference)
+                          warmup_s=warmup, t0=a._t0, reference=reference,
+                          transcripts=transcripts)
     if expected is not None and len(records) < expected:
         summary["identity_fail"] = dict(summary["identity_fail"])
         summary["counts"]["missing"] = expected - len(records)
@@ -506,7 +541,7 @@ def main() -> int:
                        "utterances": utts}, f, indent=1)
         print(f"  -> {a.json}")
 
-    return {"INVALID": 2, "NOT STREAMABLE": 1}.get(env["verdict"], 0)
+    return {"INVALID": 2, "NOT STREAMABLE": 1, "DEGRADED": 1}.get(env["verdict"], 0)
 
 
 if __name__ == "__main__":

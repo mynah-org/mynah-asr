@@ -165,6 +165,13 @@ static const mynah_asr_flag g_flags[] = {
      "per-request service cap in ms; 0 disables it (server only)",
      NULL, NULL},
 
+    {"MYNAH_ASR_LISTEN_BACKLOG", MYNAH_ASR_FLAG_SERVER,
+     "2 * (workers * (slots + queue)), floored at SOMAXCONN, capped at 4096",
+     "listen() backlog for the service port, overriding the value derived from the"
+     " admission ladder; the kernel still clamps it to somaxconn, and both numbers"
+     " are on the [SERVER-CONFIG] banner (server only)",
+     NULL, NULL},
+
     {"MYNAH_ASR_PREFORK_ALLOW_GPU", MYNAH_ASR_FLAG_SERVER, "unset (refuse)",
      "set to allow prefork with a GPU backend, which forks a GPU context "
      "(server only)",

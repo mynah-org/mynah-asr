@@ -351,3 +351,47 @@ What Linux still owes for this item is unchanged and listed above: SMMLA on real
 i8mm silicon, the three x86 kernels, and a before/after byte dump of the float
 epilogue under GCC's `-ffast-math` (the barrier pins one grouping; that GCC chose
 the same one is an assumption until dumped).
+
+---
+
+## 2026-09-19 — SMMLA executes, and it is exact
+
+S5-1 has been `[~]` since it was written, for one reason: the development Mac
+has `dotprod` but no `i8mm`, so the SMMLA kernel was compiled, validated against
+a scalar model of its lane mapping, and never issued a single instruction.
+
+On the Axion (Neoverse-V2, 32 cores, 62 GB, L3 80 MiB), from a clean build of
+this tree:
+
+```
+[DISPATCH-MAP] v=1 build=dev blas=own simd=neon+dotprod+i8mm
+kernel.int8_dot      neon-sdot        smmla    -> neon-sdot
+kernel.int8_rows     neon-smmla+sdot  smmla    -> neon-smmla
+gemm.f32             own              -        -> own
+```
+
+and `tests/test_qmat`:
+
+```
+  dot-per-row  exact OK  82 shape/T cases, 763 kernel blocks
+  neon-smmla   exact OK  82 shape/T cases, 466 kernel blocks
+  neon-sdot    exact OK  82 shape/T cases, 466 kernel blocks
+```
+
+`exact` here is `==` on the int32 accumulator AND on the f32 epilogue, over 82
+shape/T cases, with both arms forced in one process. 466 kernel blocks actually
+ran: the kernel is not skipped, not degraded to SDOT, and not rounding
+differently from the path it replaces.
+
+Two more facts from the same build, both first-time-on-Linux:
+
+- `gemm.f32 = own`. This is the first execution of `BLAS=none` as the DEFAULT on
+  a production-shaped machine — the box has no OpenBLAS installed, so the
+  Makefile's new default is what a clean clone gets.
+- `tests/test_sgemm` passes on Neoverse including the thread sweep: 1/2/4/8
+  threads byte-identical, and the tiling-identity and row-stability gates hold
+  on a second ISA and a second compiler (gcc, not clang).
+
+What is still open in S5-1: the x86 arms (VPDPBUSD in both encodings, AVX2) are
+cross-compiled only and skip with a reason, and none of this is a SPEED claim —
+no step table has been taken here yet.

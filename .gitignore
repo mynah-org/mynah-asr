@@ -32,6 +32,10 @@ tools/.venv/
 !tests/audio/*.wav
 !samples/**/*.wav
 
+# the streaming stress bank (~640 MB, regenerable with `make fetch-stress-bank`):
+# its manifest.json and README.md are tracked, its audio never is
+samples/stress-en/**/*.wav
+
 # long bench fixtures (10 MB, LibriSpeech): regenerable with
 # scripts/make_long_fixtures.sh — do not commit
 tests/audio/long_*.wav

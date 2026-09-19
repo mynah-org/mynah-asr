@@ -36,7 +36,20 @@ module is pure arithmetic over that record, which is why it can have a known-ans
 ------------------------------------------------------------------------------- metrics
 All per utterance, milliseconds unless stated.
 
+* TTFB                first SERVER FRAME OF ANY KIND arrival - first-audio-sent time.
+                      "the server is answering". Distinct from TTFP on purpose: a stream
+                      can be acknowledged long before it has produced a word, and when the
+                      two separate it says WHERE the wait is -- transport and admission on
+                      one side, the model's own emission delay on the other.
 * TTFP                first non-empty delta arrival - first-audio-sent time.
+                      "the user can see words". This is the ASR analogue of the sibling
+                      TTS harness's time-to-first-audio, and it is the number a person
+                      waiting at a microphone actually feels.
+* CER                 character error rate of the final transcript against a HUMAN
+                      reference from the bank manifest, over normalised text (§normalise
+                      below). Optional: only utterances whose clip has a reference get one.
+                      It is the only metric here that says whether the server was RIGHT
+                      rather than fast, and it is why a run can be DEGRADED.
 * emission lag        for each delta: arrival - the send time of the frame that carried
   (client-observed)   the LAST SAMPLE THE SERVER HAD CONSUMED when it produced the delta
                       (`audio_s`).  It is client-observed: socket, kernel and Python
@@ -65,6 +78,11 @@ then a percentile over utterances).  They answer different questions and are nev
 
 Drift: the same metric recomputed over wall-clock windows; the gate is the largest
 relative distance between a window p95 and the pooled p95.
+
+Normalise (CER only): lowercase, drop the punctuation in PUNCT, collapse runs of
+whitespace, strip. Defined HERE and nowhere else, because a CER computed with a different
+normaliser is a different number wearing the same name. It is deliberately minimal -- no
+number expansion, no spelling map -- so it measures the engine and not a text pipeline.
 """
 from __future__ import annotations
 
@@ -157,6 +175,43 @@ def audio_sent_at(sends, t):
     return sends[i - 1][1] if i > 0 else 0.0
 
 
+PUNCT = ".,;:!?\u00bf\u00a1\"'`()[]{}<>\u2013\u2014-\u2026\u201c\u201d\u2018\u2019"
+
+
+def normalise(text):
+    """The CER normaliser. See the note at the top: minimal on purpose."""
+    t = (text or "").lower()
+    t = "".join(" " if ch in PUNCT else ch for ch in t)
+    return " ".join(t.split())
+
+
+def edit_distance(a, b):
+    """Levenshtein, two rows. Pure arithmetic so the self-test can pin it."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def cer(hyp, ref):
+    """Character error rate over normalised text. None when the reference is empty:
+    a rate with an empty denominator is not a large error, it is no measurement."""
+    r = normalise(ref)
+    h = normalise(hyp)
+    if not r:
+        return None
+    return edit_distance(h, r) / len(r)
+
+
 def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
     """Every per-utterance metric.  Marks are [t, value] so they can be windowed later."""
     sends = [list(s) for s in rec.get("sends") or []]
@@ -168,7 +223,7 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
         "t_start": rec.get("t_start"), "frames": len(sends),
         "error": rec.get("error"), "rejected": bool(rec.get("rejected")),
         "class": rec.get("class"),
-        "ttfp_ms": None, "fin_ms": None, "text": "", "deltas": 0, "eous": 0,
+        "ttfb_ms": None, "ttfp_ms": None, "fin_ms": None, "text": "", "deltas": 0, "eous": 0,
         "lag_marks": [], "server_lag_marks": [], "backlog_marks": [],
         "backlog_max_s": None, "max_late_ms": max(late) if late else 0.0,
         "p95_late_ms": pct(late, 95) if late else None,
@@ -178,10 +233,13 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
     out["paced"] = (out["max_late_ms"] <= half_frame + EPS) and abs(pace - 1.0) < EPS
 
     first_delta_t = None
+    first_frame_t = None
     texts = []
     for ev in events:
         t = ev.get("t")
         kind = ev.get("type")
+        if t is not None and (first_frame_t is None or t < first_frame_t):
+            first_frame_t = t   # ANY frame: delta, eou, done or error
         if kind == "eou":
             out["eous"] += 1
         if ev.get("lag_ms") is not None and kind in ("delta", "eou"):
@@ -202,6 +260,8 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
     out["text"] = "".join(texts)
     if out["backlog_marks"]:
         out["backlog_max_s"] = max(m[1] for m in out["backlog_marks"])
+    if first_frame_t is not None and sends:
+        out["ttfb_ms"] = (first_frame_t - sends[0][0]) * 1000.0
     if first_delta_t is not None and sends:
         out["ttfp_ms"] = (first_delta_t - sends[0][0]) * 1000.0
     if rec.get("done_t") is not None and sends:
@@ -264,7 +324,7 @@ def group_texts(utts):
 
 
 def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=None,
-              reference=None):
+              reference=None, transcripts=None):
     """Every run-level number.  `utts` are the dicts `analyze_utterance` returned."""
     if t0 is None:
         starts = [u["t_start"] for u in utts if u.get("t_start") is not None]
@@ -285,12 +345,14 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
     lag_marks = [m for u in ok for m in u["lag_marks"]]
     srv_marks = [m for u in ok for m in u["server_lag_marks"]]
     bkl_marks = [m for u in ok for m in u["backlog_marks"]]
+    ttfb = [u["ttfb_ms"] for u in ok if u["ttfb_ms"] is not None]
     ttfp = [u["ttfp_ms"] for u in ok if u["ttfp_ms"] is not None]
     fin = [u["fin_ms"] for u in ok if u["fin_ms"] is not None]
     lag_utt = [pct(u["lag_marks"] and [m[1] for m in u["lag_marks"]], 95)
                for u in ok if len(u["lag_marks"]) >= 2]
 
     m = {
+        "ttfb_ms": stat(ttfb, "per utterance", "ms", rep, lbl),
         "ttfp_ms": stat(ttfp, "per utterance", "ms", rep, lbl),
         "emission_lag_ms": stat([x[1] for x in lag_marks], "pooled over deltas", "ms", rep, lbl),
         "emission_lag_utt_p95_ms": stat(lag_utt, "per utterance (p95 of each)", "ms", rep, lbl),
@@ -323,6 +385,33 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
             if exp is not None and texts != [exp]:
                 ref_fail[c] = {"expected": exp, "got": texts}
 
+    # Quality, as opposed to speed. CER is per UTTERANCE against the bank's human
+    # reference; it is NOT gated by pacing, because whether the transcript is right does
+    # not depend on whether the client held its schedule -- only the cadence numbers do.
+    cers, cer_worst = [], None
+    if transcripts:
+        for u in ok:
+            clip = u.get("clip") or ""
+            ref = transcripts.get(clip)
+            if ref is None:
+                ref = transcripts.get(clip.rsplit("/", 1)[-1])
+            if ref is None:
+                continue
+            v = cer(u["text"], ref)
+            if v is None:
+                continue
+            cers.append(v)
+            if cer_worst is None or v > cer_worst[0]:
+                cer_worst = (v, clip, u["text"], ref)
+    m["cer"] = stat(cers, "per utterance", "", True, "MEASURED")
+    quality = {
+        "with_reference": len(cers),
+        "without_reference": len(ok) - len(cers),
+        "worst": ({"cer": cer_worst[0], "clip": cer_worst[1],
+                   "got": cer_worst[2], "expected": cer_worst[3]}
+                  if cer_worst else None),
+    }
+
     audio_s = sum(u["audio_s"] for u in ok)
     span = max([u["t_end"] for u in counted if u.get("t_end") is not None], default=t0) - t0
     return {
@@ -338,6 +427,7 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
         "text_groups": groups,
         "identity_fail": identity_fail,
         "reference_fail": ref_fail,
+        "quality": quality,
     }
 
 
@@ -361,14 +451,26 @@ def default_thresholds(chunk_ms):
         "backlog_max_s": 2.0 * chunk_ms / 1000.0,
         "max_drift_pct": 20.0,
         "marginal_factor": 1.5,
+        # Quality, not cadence. A PLACEHOLDER until a measured baseline exists: the CER
+        # of this model on this bank has never been recorded, so this number is a guard
+        # against a collapse (a broken kernel, a wrong blank, a batched path that drifted),
+        # NOT a quality target. Replace it with baseline + margin the first time the bank
+        # is run on a quiet box, and say in the note which run set it.
+        "cer_p95": 0.25,
     }
 
 
 def envelope_verdict(summary, thr):
-    """GOOD / MARGINAL / NOT STREAMABLE / INVALID, with the line that decided it.
+    """GOOD / MARGINAL / DEGRADED / NOT STREAMABLE / INVALID, and the line that decided it.
 
     INVALID first: a run whose text is not identical, that produced nothing, or that could
     not hold 1x pacing cannot be judged by an envelope at all — whatever the timing says.
+
+    DEGRADED is the verdict this harness exists to be able to give: the server held its
+    cadence and the transcripts got WORSE. Without it, "faster" and "better" are the same
+    word, and a kernel that quietly lost accuracy would read as an improvement. It ranks
+    below NOT STREAMABLE only because a server that cannot stream is not yet in a position
+    to be inaccurate.
     """
     lines, invalid = [], []
     c = summary["counts"]
@@ -396,6 +498,9 @@ def envelope_verdict(summary, thr):
 
     m = summary["metrics"]
     line("TTFP p95", m["ttfp_ms"]["p95"], thr["ttfp_p95_ms"], "ms")
+    # TTFB has no envelope limit and is printed as a FACT beside TTFP: the two together
+    # say whether a wait is transport or model, and inventing a limit for it would be a
+    # threshold nobody derived.
     line("emission lag p95 (pooled)", m["emission_lag_ms"]["p95"], thr["emission_lag_p95_ms"], "ms")
     line("finalization lag p95", m["finalization_lag_ms"]["p95"], thr["finalization_p95_ms"], "ms")
     line("backlog max", m["backlog_max_s"]["max"], thr["backlog_max_s"], "s")
@@ -403,10 +508,20 @@ def envelope_verdict(summary, thr):
         if d.get("max_drift_pct") is not None:
             line(f"drift {name} p95", d["max_drift_pct"], thr["max_drift_pct"], "%")
 
+    q = summary.get("quality") or {}
+    cer_p95 = summary["metrics"].get("cer", {}).get("p95")
+    quality_lines = []
+    if q.get("with_reference"):
+        before = len(lines)
+        line("CER p95", cer_p95, thr["cer_p95"], "")
+        quality_lines = lines[before:]
+
     if invalid:
         verdict = "INVALID"
-    elif any(l["status"] == "FAIL" for l in lines):
+    elif any(l["status"] == "FAIL" for l in lines if l not in quality_lines):
         verdict = "NOT STREAMABLE"
+    elif any(l["status"] == "FAIL" for l in quality_lines):
+        verdict = "DEGRADED"
     elif any(l["status"] == "MARGINAL" for l in lines) or c["rejected"] > 0 or c["errors"] > 0:
         verdict = "MARGINAL"
     elif all(l["status"] == "NO DATA" for l in lines):
@@ -428,12 +543,14 @@ def format_summary(summary, env=None, indent="  "):
     out.append(f"{indent}audio {c['audio_s']:.1f} s, {c['deltas']} deltas, span {c['span_s']:.1f} s")
     out.append(f"{indent}pacing: max lateness {p['max_late_ms']:.1f} ms vs half a frame "
                f"{p['half_frame_ms']:.0f} ms -> {p['verdict']}")
-    for key, title in (("ttfp_ms", "TTFP"),
+    for key, title in (("ttfb_ms", "TTFB (first frame)"),
+                       ("ttfp_ms", "TTFP (first word)"),
                        ("emission_lag_ms", "emission lag (client)"),
                        ("emission_lag_utt_p95_ms", "emission lag per-utt p95"),
                        ("server_lag_ms", "server lag_ms"),
                        ("finalization_lag_ms", "finalization lag"),
                        ("backlog_max_s", "backlog max"),
+                       ("cer", "CER vs reference"),
                        ("pacing_late_ms", "pacing lateness")):
         s = m[key]
         if s["n"] == 0:
@@ -453,6 +570,15 @@ def format_summary(summary, env=None, indent="  "):
             out.append(f"{indent}  {clip}: {len(texts)} distinct texts")
     if summary["reference_fail"]:
         out.append(f"{indent}REFERENCE FAIL on {len(summary['reference_fail'])} clip(s)")
+    q = summary.get("quality") or {}
+    if q.get("with_reference") or q.get("without_reference"):
+        out.append(f"{indent}quality: {q['with_reference']} utterance(s) scored against a "
+                   f"reference, {q['without_reference']} without one")
+        w = q.get("worst")
+        if w and w["cer"] > 0.0:
+            out.append(f"{indent}  worst CER {w['cer']:.3f} on {w['clip']}")
+            out.append(f"{indent}    expected: {w['expected'][:96]}")
+            out.append(f"{indent}    got:      {w['got'][:96]}")
     if env:
         for l in env["lines"]:
             v = "n/a" if l["value"] is None else _num(l["value"], l["unit"])
@@ -483,8 +609,13 @@ def _ev(t, audio_s, text, lag_ms=None, kind="delta"):
 
 
 def _eq(got, want, what, tol=1e-6):
-    ok = (got is None and want is None) or (
-        got is not None and want is not None and abs(got - want) <= tol)
+    """Numbers compare within `tol`; anything else compares exactly. The normaliser and
+    the text fields are strings, and a tolerance on a string is meaningless."""
+    if isinstance(want, str) or isinstance(got, str):
+        ok = got == want
+    else:
+        ok = (got is None and want is None) or (
+            got is not None and want is not None and abs(got - want) <= tol)
     print(f"  {'ok  ' if ok else 'FAIL'} {what}: got {got!r}, want {want!r}")
     return ok
 
@@ -573,6 +704,51 @@ def self_test():
     print(f"  {'ok  ' if envelope_verdict(agg_u, default_thresholds(320.0))['verdict'] == 'INVALID' else 'FAIL'} "
           f"unpaced run is INVALID for the envelope")
     bad += envelope_verdict(agg_u, default_thresholds(320.0))["verdict"] != "INVALID"
+
+    print("quality: the normaliser, the distance and the rate")
+    bad += not _eq(normalise("Hello, World!  "), "hello world", "normalise strips and folds")
+    bad += not _eq(normalise("It's \u201cfine\u201d \u2014 really?"), "it s fine really",
+                   "normalise drops the punctuation it declares")
+    bad += not _eq(edit_distance("kitten", "sitting"), 3, "kitten -> sitting is 3")
+    bad += not _eq(edit_distance("", "abc"), 3, "empty hypothesis costs the reference")
+    bad += not _eq(edit_distance("abc", "abc"), 0, "identical is 0")
+    bad += not _eq(cer("the cat sat", "The cat sat."), 0.0, "CER ignores case and stops", 1e-12)
+    bad += not _eq(cer("the bat sat", "the cat sat"), 1.0 / 11.0, "one substitution in 11", 1e-12)
+    bad += not _eq(cer("anything", ""), None, "an empty reference has no rate")
+
+    print("quality: CER reaches the verdict, and only when a reference exists")
+    snd_q = [[20.0, 0.1], [20.1, 0.2]]
+    def utt_q(clip, text):
+        return analyze_utterance(_mk(clip, snd_q, [_ev(20.15, 0.1, text)], 20.3, t_start=20.0),
+                                 frame_ms=100.0)
+    good = aggregate([utt_q("q.wav", "the cat sat")], frame_ms=100.0,
+                     transcripts={"q.wav": "the cat sat"})
+    bad += not _eq(good["metrics"]["cer"]["max"], 0.0, "a perfect transcript scores 0", 1e-12)
+    bad += not _eq(good["quality"]["with_reference"], 1, "the utterance was scored")
+    # TWO utterances: stat() refuses a percentile of one sample, so a single bad
+    # transcript has no p95 and the line correctly reads NO DATA. That is the module
+    # being honest, and the test has to respect it rather than work around it.
+    worse = aggregate([utt_q("q1.wav", "zzzzzzzzzzz"), utt_q("q2.wav", "zzzzzzzzzzz")],
+                      frame_ms=100.0,
+                      transcripts={"q1.wav": "the cat sat", "q2.wav": "the cat sat"})
+    thr_q = default_thresholds(320.0)
+    vq = envelope_verdict(worse, thr_q)
+    print(f"  {'ok  ' if vq['verdict'] == 'DEGRADED' else 'FAIL'} "
+          f"cadence fine, transcript wrong -> {vq['verdict']}")
+    bad += vq["verdict"] != "DEGRADED"
+    bad += not _eq(worse["quality"]["worst"]["clip"], "q1.wav", "the worst utterance is named")
+    none_ref = aggregate([utt_q("q1.wav", "zzzzzzzzzzz"), utt_q("q2.wav", "zzzzzzzzzzz")],
+                         frame_ms=100.0)
+    print(f"  {'ok  ' if envelope_verdict(none_ref, thr_q)['verdict'] != 'DEGRADED' else 'FAIL'} "
+          f"no reference -> no quality verdict")
+    bad += envelope_verdict(none_ref, thr_q)["verdict"] == "DEGRADED"
+
+    print("TTFB is the first frame of any kind, TTFP the first word")
+    evs_b = [{"t": 20.12, "type": "eou", "audio_s": None, "lag_ms": None, "text": ""},
+             _ev(20.25, 0.2, "hello")]
+    ub = analyze_utterance(_mk("b.wav", snd_q, evs_b, 20.4), frame_ms=100.0)
+    bad += not _eq(ub["ttfb_ms"], 120.0, "TTFB counts the eou that came first", 1e-6)
+    bad += not _eq(ub["ttfp_ms"], 250.0, "TTFP still waits for the word", 1e-6)
 
     print("aggregation: pooled over deltas vs per utterance")
     #  two utterances, 2 deltas each with lags 100, 200 and 300, 400

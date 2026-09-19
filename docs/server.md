@@ -37,6 +37,19 @@ so the client reads the status instead of a connection reset. `SIGUSR1` on the
 parent prints the per-worker table and forwards to every worker; `SIGTERM`
 stops the fleet. `/v1/health` reports which worker answered.
 
+In front of that ladder sits the one queue the server does not own: the kernel
+backlog. It is derived from the capacity — `2 × workers × (slots + queue)`,
+floored at `SOMAXCONN`, capped at 4096, overridable with
+`MYNAH_ASR_LISTEN_BACKLOG` — and printed, because what overflows it is dropped
+as SYNs before `accept()`, where no rung and no counter can see it. The kernel
+clamps the ask to its own `somaxconn` (`net.core.somaxconn`,
+`kern.ipc.somaxconn` — 128 on macOS, below a hundred-stream burst), so the
+banner prints both numbers and start-up warns when they differ. `RLIMIT_NOFILE`
+is raised once at start-up, toward the hard limit and never above it, before
+the fork so every worker inherits it: a stream costs two descriptors (its
+socket and the `dup()` the ingest side reads from), and an exhausted ceiling
+shows up as `accept()` failing with `EMFILE` — a refusal no rung issued.
+
 `--cap` is the fleet's default; a `--model` group may set its own with `:cap=`,
 and the ladder is evaluated per group (next section).
 
@@ -412,6 +425,7 @@ the one run whose banner is missing is the run that will be quoted
     chunk_ms=320 port=8397 cap=4 ring_s=30 idle_ms=60000 ping_ms=20000 max_audio_s=14400
     max_frame_bytes=1048576 max_pending=8 batch=8 http_threads=4 pool_threads=8
     blas_budget=8 prefork=single-process worker=-1 metrics=on
+[SERVER-CONFIG] v=1 listen_backlog=128 somaxconn=128 listen_owner=self nofile_soft=10240 nofile_hard=unlimited
 [TOPOLOGY] v=1 worker=-1 pid=6392 configured_mask=inherited actual_mask=unpinned threads=8 pinned=no
 ```
 
@@ -423,6 +437,13 @@ the one run whose banner is missing is the run that will be quoted
   by `_`. `chunk_ms` is `(lookahead_default + 1) × encoder_frame_ms`, taken from
   the model's `mynah.json` — it is the cadence the emission-lag thresholds below
   are multiples of.
+- The second `[SERVER-CONFIG]` line above carries the two ceilings the kernel
+  can veto: `listen_backlog` is what `listen()` was given and `somaxconn` what
+  the kernel will actually hold (a difference is a burst dropped before
+  `accept()`), while `nofile_soft`/`nofile_hard` are read back from
+  `getrlimit()` when the banner is printed, so they are what this process ended
+  up with rather than what it asked for. `listen_owner` is `router` on a
+  prefork worker, which does not hold the listening socket.
 - `[TOPOLOGY]` is printed **per worker**, by the worker, right after it pins
   itself, and `configured_mask` vs `actual_mask` is the point: the second is read
   back from the kernel, so a cgroup, an inherited `taskset` or a failed

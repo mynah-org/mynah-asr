@@ -462,6 +462,15 @@ test-nemo-langs: mynah-asr
 fetch-lang-samples:
 	cd tools && uv run python fetch_lang_samples.py 3
 
+# English STRESS BANK for the streaming load harness: FLEURS (CC-BY 4.0) clips
+# stratified over the short/medium/long classes stream_load.py uses, sized so a
+# 10-min SOAK at c=32 never replays a clip. ~1.8 GB of one-time transfer, ~640 MB
+# on disk, NOT committed (samples/stress-en is gitignored except manifest+README).
+# make fetch-stress-bank STRESS_BANK_ARGS="--dry-run"   # the plan, no audio
+STRESS_BANK_ARGS ?=
+fetch-stress-bank:
+	cd tools && uv run python fetch_stress_bank.py $(STRESS_BANK_ARGS)
+
 # Quality on real audio (the committed samples/ FLEURS): ASR CER + Canary
 # translation quality against parallel references, cpu+metal backends.
 test-samples: mynah-asr
@@ -530,4 +539,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check bench-gemm bench-throughput install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
