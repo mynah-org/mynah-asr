@@ -181,8 +181,12 @@ typedef float sg_vec;
  * MROWS*NCOLS must stay within the accumulator budget, with room for the
  * MROWS + NCOLS operand vectors: NEON 4x4 = 16 of 32 registers, AVX2 4x2 = 8
  * of 16, scalar 4x4 in whatever the compiler has. */
+#ifndef SG_DOT_MR
 #define SG_DOT_MR 4
+#endif
+#ifndef SG_DOT_NC_TILE
 #define SG_DOT_NC_TILE (SG_ACC_VECS / SG_DOT_MR)
+#endif
 
 /* Fewer than SG_DOT_MR rows left — which is the WHOLE of a gemv, and a gemv
  * through this family is the RNNT prediction network, once per emitted token.
@@ -837,12 +841,25 @@ static void sg_plan_rows(sg_job *j, size_t force_tasks) {
     if (force_tasks > 0u) {
         want = force_tasks;
     } else {
+        /* How many tasks the WORK can carry, not how many the pool would like:
+         * every task must be worth at least SG_PARALLEL_MIN_WORK, because below
+         * that its share of the dispatch costs more than its arithmetic.  The
+         * count then degrades smoothly -- a GEMM worth three tasks gets three,
+         * on a four-core box and on a thirty-two-core one alike -- instead of
+         * falling off a cliff at some multiple of the pool width.  A flat
+         * threshold was wrong in the other direction (it got worse the wider
+         * the pool); `threads * MIN_WORK` fixed the pathology but would have
+         * left medium GEMMs single-threaded on a 32-core Neoverse, which is the
+         * box this is for. */
         const int threads = mynah_asr_num_threads();
-        if (threads > 1 &&
-            (huge || work >= (size_t)threads * SG_PARALLEL_MIN_WORK))
-            want = (size_t)threads * 2u;
+        const size_t cap = (size_t)threads * 2u;
+        if (threads > 1) {
+            size_t by_work = huge ? cap : work / SG_PARALLEL_MIN_WORK;
+            if (by_work > cap) by_work = cap;
+            if (by_work > 1u) want = by_work;
+        }
     }
-    /* `want == 1` means the work is below SG_PARALLEL_MIN_WORK and this GEMM
+    /* `want == 1` means the work cannot fill even two tasks and this GEMM
      * should not touch the pool at all.  That intent is easy to lose: the
      * COLUMN grid is planned from the shape alone, so a matvec with nc = 256
      * over n = 1920 still produces grid_n = 8 tasks.  Running the same tasks

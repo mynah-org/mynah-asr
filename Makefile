@@ -93,6 +93,24 @@ endif
 
 CFLAGS += $(PLATFORM_CFLAGS) $(METAL_CFLAGS) $(BLAS_CFLAGS)
 
+# SIMD baseline for the diagnostic builds (debug / ubsan / asan).
+#
+# THIS IS NOT A TUNING FLAG, it is a coverage one.  Those three targets replace
+# CFLAGS wholesale, and until 2026-09-19 they dropped -march with it.  qmat did
+# not care -- its kernels carry __attribute__((target(...))) and are chosen by a
+# runtime probe, so they are compiled into every build regardless.  src/sgemm.c
+# is gated on __ARM_NEON / __AVX2__ instead, so with no -march it silently
+# compiled SCALAR: on x86 the sanitizer job was checking a code path production
+# never executes, and once BLAS=none became the Linux default it was doing every
+# f32 GEMM there at about 2.5 GF/s instead of OpenBLAS's hundreds, instrumented,
+# at -O1.  The ASan job went from 6m47s to over its 30-minute timeout, three
+# times, and the cause was invisible because "slower under a sanitizer" is what
+# one expects.
+#
+# `--dispatch-map` now reports a scalar sgemm on a vector host as a DOWNGRADE
+# rather than as a resolved value, which is how this is caught next time.
+SAN_MARCH ?= -march=native
+
 # hook for the recursive variant builds (cuda): these add to the flags the
 # Makefile computed instead of overriding CFLAGS (which would lose the quoting of
 # MYNAH_ASR_BUILD)
@@ -298,16 +316,16 @@ build/src/cuda_gemm.o: src/cuda_gemm.cu
 # overhead). ASan is VERY SLOW on a Mac and tends to hang with the large model:
 # Linux CI only.
 debug:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)"
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O0 -g $(SAN_MARCH) -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)"
 # NOTE: clean at the end too — the sanitized objects (without -DMYNAH_ASR_METAL
 # and referencing the ubsan runtime) must NOT be left behind to pollute the
 # normal build
 ubsan:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g -fsanitize=undefined \
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O2 -g $(SAN_MARCH) -fsanitize=undefined \
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=undefined" all test && $(MAKE) clean
 asan:
-	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined \
+	$(MAKE) clean && $(MAKE) CFLAGS="-std=c11 -O1 -g $(SAN_MARCH) -fsanitize=address,undefined \
 	  -fno-omit-frame-pointer -Wall -Wextra -iquote src -I$(INGOT_DIR)/include -D_DEFAULT_SOURCE $(PLATFORM_CFLAGS) $(BLAS_CFLAGS)" \
 	  LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" all test && $(MAKE) clean
 

@@ -229,15 +229,40 @@ int mynah_asr_dispatch_collect(mynah_asr_dispatch_row *rows, int capacity) {
         const char *why = NULL;
         const mynah_asr_sgemm_family head =
             mynah_asr_sgemm_family_for(0, 1, 64u, 1024u, 1024u, &why);
-        char res[32];
-        snprintf(res, sizeof(res), "%s", mynah_asr_sgemm_isa_name());
-        char reason[200];
-        snprintf(reason, sizeof(reason),
-                 "src/sgemm.c mynah_asr_sgemm_isa_name(): %s micro-kernels, 4 "
-                 "rows, narrow/panel boundary at n=%zu derived from the "
-                 "register file; family_for(64,1024,1024,transB) says '%s'",
-                 mynah_asr_sgemm_isa_name(), mynah_asr_sgemm_narrow_max(),
-                 mynah_asr_sgemm_family_name(head));
+        /* A SCALAR sgemm on a host that has a vector unit is not a resolved
+         * value, it is a finding: src/sgemm.c is gated on __ARM_NEON/__AVX2__
+         * rather than on target attributes, so a build that dropped -march
+         * compiles the scalar fallback and says nothing.  That is how the ASan
+         * job spent three runs timing out at 2.5 GF/s -- "slower under a
+         * sanitizer" is exactly what one expects to see, so nobody looks.
+         * Named here, it is one line of --dispatch-map away. */
+        const int scalar = strcmp(mynah_asr_sgemm_isa_name(), "scalar") == 0;
+        const int vector_host =
+#if defined(__aarch64__) || defined(__ARM_NEON)
+            1;   /* NEON is architectural on aarch64 */
+#else
+            mynah_asr_cpu_has("avx2");
+#endif
+        char res[48];
+        char reason[320];
+        if (scalar && vector_host) {
+            snprintf(res, sizeof(res), "scalar DOWNGRADE");
+            snprintf(reason, sizeof(reason),
+                     "src/sgemm.c compiled its SCALAR fallback although this CPU "
+                     "has a vector unit: the kernels are gated on __ARM_NEON / "
+                     "__AVX2__, so a build with no -march silently loses them "
+                     "(the sanitizer targets pass $(SAN_MARCH) for this reason). "
+                     "Every f32 GEMM here runs at a fraction of the speed; do not "
+                     "quote a number from this build");
+        } else {
+            snprintf(res, sizeof(res), "%s", mynah_asr_sgemm_isa_name());
+            snprintf(reason, sizeof(reason),
+                     "src/sgemm.c mynah_asr_sgemm_isa_name(): %s micro-kernels, 4 "
+                     "rows, narrow/panel boundary at n=%zu derived from the "
+                     "register file; family_for(64,1024,1024,transB) says '%s'",
+                     mynah_asr_sgemm_isa_name(), mynah_asr_sgemm_narrow_max(),
+                     mynah_asr_sgemm_family_name(head));
+        }
         row_set(&rows[n++], "gemm.f32_kernel", "yes", "yes",
                 "MYNAH_ASR_SGEMM_PROFILE", res,
                 MYNAH_ASR_DISPATCH_SRC_PREDICATE, reason);

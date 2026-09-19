@@ -493,3 +493,66 @@ not the worker threads, so it waits forever for threads that no longer exist.
 That is exactly the contract `mynah_asr_threadpool_after_fork()` exists for and
 exactly what the prefork server does — now gated too, with its failure mode on
 record: a hang, not a crash.
+
+---
+
+## 2026-09-19 (later) — what flipping the default did to CI, two layers away
+
+The ASan job had run in 6m47s for weeks. From the commit that made `BLAS=none`
+the Linux default it timed out at 30 minutes, three times, and the timeout read
+as `cancelled` rather than as a failure.
+
+The chain:
+
+1. `make asan` / `ubsan` / `debug` replace CFLAGS wholesale, and dropped
+   `-march` with it.
+2. `src/qmat.c` did not care: its kernels carry `__attribute__((target(...)))`
+   and are chosen by a runtime probe, so they are compiled into every build.
+   `src/sgemm.c` is gated on `__ARM_NEON` / `__AVX2__` instead, so with no
+   `-march` on x86 it compiled its SCALAR fallback — about 2.5 GF/s against 80.
+3. While OpenBLAS was the Linux default that cost nothing: OpenBLAS is a
+   prebuilt library, vectorised, threaded, and NOT instrumented by ASan. The
+   moment `own` became the default, every f32 GEMM in the sanitizer job went
+   through a scalar kernel at `-O1` with ASan checking each access.
+
+Two things are worth keeping from this beyond the fix.
+
+**A default is not a local change.** The flip was argued on Linux production
+grounds and was right there; its first real consequence landed in a CI job
+nobody was looking at, through a Makefile target that had been silently wrong
+since before `sgemm.c` existed.
+
+**The symptom was self-camouflaging.** "Slower under a sanitizer" is exactly
+what one expects, so a sanitizer job that got slower is the last place anyone
+looks — and a 30-minute ceiling on a 7-minute job gave it room to look normal
+for three runs.
+
+Fixed in three places, each answering a different half:
+
+- `SAN_MARCH` (default `-march=native`) on the three diagnostic targets, so the
+  sanitizer checks the code production runs instead of a path production never
+  executes. That is a COVERAGE fix; the speed is a side effect.
+- `--dispatch-map` now reports a scalar sgemm on a vector host as
+  `scalar DOWNGRADE` with the reason, instead of printing it as a resolved
+  value. One line, and the next occurrence is visible from the binary.
+- `timeout-minutes` 30 -> 12 on the ASan job. A healthy run is under 7; a run
+  that doubles should fail, not queue.
+
+### And the parallel threshold, corrected again
+
+`work >= threads * SG_PARALLEL_MIN_WORK` fixed the pathology (a flat threshold
+gets worse the wider the pool) but replaced it with a cliff: on a 32-core
+Neoverse it would leave every GEMM under 4.2M MACs single-threaded, which is a
+lot of the streaming step. The rule is now proportional — as many tasks as the
+work can fill at `SG_PARALLEL_MIN_WORK` each, capped at `2 * threads`:
+
+```
+by_work = work / SG_PARALLEL_MIN_WORK      (capped at 2*threads)
+want    = by_work > 1 ? by_work : 1
+```
+
+A GEMM worth three tasks gets three, on a four-core box and on a thirty-two-core
+one alike. On the M1 the difference against the cliff version is inside the
+noise of a loaded dev host (tiny shapes 254/295 us at T=4/8 against 219/285,
+large shapes unchanged); it is chosen for the many-core case, which is the
+target, and the constant itself still has to be re-derived on the box.

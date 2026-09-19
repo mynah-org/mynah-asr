@@ -18,7 +18,12 @@ jobs:
   asan:
     name: ASan + UBSan
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A healthy run is under 7 minutes. The ceiling is deliberately close to
+    # that: this job timed out three times at 30 minutes before anyone asked why
+    # a fast ASR needed half an hour of CI, and half an hour is exactly how long
+    # it takes to stop reading a timeout as "sanitizers are slow". A build that
+    # doubles belongs in a failure, not in a queue.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v7
 
