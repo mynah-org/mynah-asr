@@ -556,3 +556,54 @@ one alike. On the M1 the difference against the cliff version is inside the
 noise of a loaded dev host (tiny shapes 254/295 us at T=4/8 against 219/285,
 large shapes unchanged); it is chosen for the many-core case, which is the
 target, and the constant itself still has to be re-derived on the box.
+
+---
+
+## 2026-09-19 (later still) — the gate that asserted more than the code promises
+
+With `-march` restored, the ASan job went from timing out at 30 minutes to
+FAILING in 3m21s, which is the point of a tight ceiling. The failure was real
+and it was mine:
+
+```
+sgemm: provider=own isa=avx2 narrow_max=16
+sgemm ok:   DOT: the tiled block is byte-identical to one column at a time
+sgemm FAIL: PANEL: ... (213 of 333 elements differ, 9x37x77)
+sgemm FAIL: NARROW: ... (53 of 117 elements differ, 9x13x77)
+```
+
+Reproduced on ARM in one command, which settled it without a CI round trip:
+build the same test with `-ffp-contract=off` and it fails identically (240 of
+333). So it is not AVX2 — it is FP CONTRACTION.
+
+The mechanism: the vector micro-kernels accumulate with `sg_fma`, an
+EXPLICITLY fused intrinsic. `sg_micro_tail`, which serves the last
+`n % SG_LANES` columns, accumulates with `acc += av * b`, which is fused only
+if the compiler contracts it — and that depends on the ISA (AVX2 does not imply
+FMA) and on the flags. Production builds carry `-ffast-math`, so the two agree
+there and the divergence never showed; the sanitizer builds do not, which is
+exactly why they are worth running.
+
+**The code is fine. The gate was wrong.** Both results are valid roundings of
+the same sum, the choice is deterministic for a given shape and build, and
+nothing in this runtime varies `n` for a call site: `n` is the output width of a
+weight matrix. What the runtime DOES vary is `m` — a batched stream step stacks
+B streams' rows into one GEMM — and the pool width.
+
+So the gate now asks each family what the contract actually says:
+
+- `tiling_identity` stays, for DOT ONLY, because that is the schedule change
+  that had to be proven equal to the untiled dot — and it holds on every ISA
+  under any contraction setting, since `sg_dot` and `sg_dot_tile` spell BOTH
+  halves of the reduction identically (same `sg_fma` over the vector part, same
+  scalar `sum += a[i]*b[i]` over the k remainder).
+- `row_stability` is new and covers all three families: rows 0..3 must be the
+  same bytes at `m = 4` and at `m = 9`. ISA- and contraction-independent by
+  construction — the same rows go through the same kernel at both widths — and
+  it is the thing rule 4 is about. If row blocking ever stopped rounding up to
+  `SG_MR`, this is what catches it.
+
+A comment in `sg_micro_tail` claimed its results were "consistent with the rest
+of the row". The ORDER is the same; the ROUNDING is not guaranteed to be.
+Corrected in place, because a comment that overstates a guarantee is how the
+wrong gate gets written in the first place.

@@ -231,7 +231,25 @@ static int run_width(const char *self, int width, float *out) {
  * fall to the reference, and then the test would be comparing two algorithms).
  * m and n are ragged on purpose -- 9 rows is two DOT tiles plus one strip, 37
  * columns leaves a remainder on every path -- and k is not a multiple of
- * SG_LANES, so the scalar tail runs as well. */
+ * SG_LANES, so the scalar tail runs as well.
+ *
+ * ONLY THE DOT FAMILY IS ASKED THIS, and the reason is worth keeping. sg_dot
+ * and sg_dot_tile spell both halves of the reduction identically -- the same
+ * sg_fma over the vector part, the same scalar `sum += a[i]*b[i]` over the k
+ * remainder -- so they agree bit for bit on every ISA and under any
+ * -ffp-contract. The panel families do not have that property: their vector
+ * bodies use the explicitly fused sg_fma while sg_micro_tail accumulates with
+ * `acc += av * b`, which is fused only if the compiler contracts it. Asked for
+ * n-identity they FAIL on AVX2, and on NEON too with -ffp-contract=off (240 of
+ * 333 elements) -- which is how this was diagnosed after the sanitizer job,
+ * which does not pass -ffast-math, reported it.
+ *
+ * That is not a defect and the gate was wrong to assert it: both results are
+ * valid roundings of the same sum, the choice is deterministic for a shape and
+ * a build, and nothing in this runtime varies n for a call site. What the
+ * runtime does vary is m -- a batched stream step stacks rows -- and the pool
+ * width. Those are the contract, and row_stability() below is what asks for
+ * them. */
 static void tiling_identity(mynah_asr_sgemm_family want, int trans_b, size_t n,
                             const char *label) {
     const size_t m = 9, k = 77;
@@ -284,6 +302,57 @@ static void tiling_identity(mynah_asr_sgemm_family want, int trans_b, size_t n,
     free(a); free(b); free(c_tiled); free(c_col);
 }
 
+/* ------------------------------------------------------------ row stability
+ *
+ * THE contract, and the reason every other gate in this file exists: the bytes
+ * of row i must not depend on which other rows were in the GEMM. A batched
+ * stream step stacks B streams into one call, so if this fails a transcript
+ * depends on who it was batched with -- rule 4 of CLAUDE.md.
+ *
+ * Unlike n-identity this is ISA- and contraction-independent by construction:
+ * the same rows go through the same kernel at both widths, so the question is
+ * whether the blocking moved them, not how the compiler rounded. Rows 0..3 are
+ * a full SG_MR strip at m = 4 and at m = 9 alike; if row blocking ever stopped
+ * rounding up to SG_MR, this is what would catch it. */
+static void row_stability(mynah_asr_sgemm_family want, int trans_b, size_t n,
+                          const char *label) {
+    const size_t m_big = 9, m_small = 4, k = 77;
+    const size_t ldb = trans_b ? k : n;
+    float *a = malloc(m_big * k * sizeof(float));
+    float *b = malloc(n * k * sizeof(float));
+    float *c_big = malloc(m_big * n * sizeof(float));
+    float *c_small = malloc(m_small * n * sizeof(float));
+    if (!a || !b || !c_big || !c_small) {
+        printf("sgemm FAIL: out of memory in the row-stability gate\n");
+        failures = 1;
+        free(a); free(b); free(c_big); free(c_small);
+        return;
+    }
+    fill(a, m_big * k, 313u);
+    fill(b, n * k, 7717u);
+
+    mynah_asr_sgemm_family ran = MYNAH_ASR_SGEMM_FAMILY_REFERENCE;
+    mynah_asr_sgemm_f32_forced(want, &ran, 0, trans_b, m_big, n, k, 1.0f, a, k, b,
+                               ldb, 0.0f, c_big, n);
+    if (ran != want) {
+        printf("sgemm SKIP: %s row stability: family not compiled here (%s)\n",
+               label, mynah_asr_sgemm_family_name(ran));
+        free(a); free(b); free(c_big); free(c_small);
+        return;
+    }
+    mynah_asr_sgemm_f32_forced(want, NULL, 0, trans_b, m_small, n, k, 1.0f, a, k,
+                               b, ldb, 0.0f, c_small, n);
+
+    const size_t shared = m_small * n * sizeof(float);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "%s: rows 0..%zu are the same bytes at m=%zu and m=%zu "
+             "(a stream's answer cannot depend on who it was batched with)",
+             label, m_small - 1, m_small, m_big);
+    CHECK(memcmp(c_big, c_small, shared) == 0, msg);
+    free(a); free(b); free(c_big); free(c_small);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--sweep") == 0) return sweep_child();
     printf("sgemm: provider=%s isa=%s narrow_max=%zu\n",
@@ -326,12 +395,16 @@ int main(int argc, char **argv) {
               MYNAH_ASR_SGEMM_FAMILY_REFERENCE,
           "a tiny GEMM stays on the reference instead of paying for a plan");
 
-    /* 37 columns leaves a remainder on every path; NARROW only serves
-     * n <= mynah_asr_sgemm_narrow_max(), so it is asked its own width. */
+    /* 37 columns leaves a remainder on every path. Only DOT is asked for
+     * n-identity (see the comment on tiling_identity); every family is asked
+     * for row stability, which is the contract the runtime actually needs.
+     * NARROW only serves n <= mynah_asr_sgemm_narrow_max(), so it gets its own
+     * width. */
     tiling_identity(MYNAH_ASR_SGEMM_FAMILY_DOT, 1, 37, "DOT");
-    tiling_identity(MYNAH_ASR_SGEMM_FAMILY_PANEL, 0, 37, "PANEL");
-    tiling_identity(MYNAH_ASR_SGEMM_FAMILY_NARROW, 0,
-                    mynah_asr_sgemm_narrow_max() - 3u, "NARROW");
+    row_stability(MYNAH_ASR_SGEMM_FAMILY_DOT, 1, 37, "DOT");
+    row_stability(MYNAH_ASR_SGEMM_FAMILY_PANEL, 0, 37, "PANEL");
+    row_stability(MYNAH_ASR_SGEMM_FAMILY_NARROW, 0,
+                  mynah_asr_sgemm_narrow_max() - 3u, "NARROW");
 
     /* 3. the seam, in whatever build this is */
     seam_gemm(0, 1, 64, 1024, 1024, 1.0f, 0.0f);

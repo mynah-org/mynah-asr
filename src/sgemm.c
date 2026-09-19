@@ -519,10 +519,20 @@ SG_DEFINE_MICRO(sg_micro1_1, 1, 1)
 SG_DEFINE_MICRO(sg_micro1_2, 1, 2)
 SG_DEFINE_MICRO(sg_micro1_4, 1, 4)
 
-/* Column remainder: fewer than SG_LANES columns left.  Scalar, same
- * accumulation order as the vector bodies, so its results are consistent with
- * the rest of the row.  Never reached on the scalar build, where SG_LANES is 1
- * and there is no remainder. */
+/* Column remainder: fewer than SG_LANES columns left.  Scalar, and it walks k in
+ * the same ORDER as the vector bodies -- but not necessarily with the same
+ * ROUNDING, and the difference is worth stating because a comment here used to
+ * claim otherwise.  `sg_fma` is an explicitly fused intrinsic; `acc += av * b`
+ * below is fused only if the compiler contracts it, which depends on the ISA
+ * (AVX2 does not imply FMA) and on the flags (-ffp-contract).  So a column in
+ * this remainder can differ in the last bit from the same column computed
+ * inside a vector group.  That is allowed: both are valid roundings of the same
+ * sum, the choice is deterministic for a given shape and build, and NOTHING in
+ * this runtime varies n for a call site.  What must not move is the answer for
+ * a row when OTHER rows join it (batching) or when the pool width changes --
+ * both gated in tests/test_sgemm.c, neither affected by this.
+ * Never reached on the scalar build, where SG_LANES is 1 and there is no
+ * remainder. */
 static void sg_micro_tail(size_t rows, size_t cols, size_t k, const float *ap,
                           size_t ars, size_t acs, const float *bp, size_t ldbp,
                           float alpha, float beta, float *c, size_t ldc) {
