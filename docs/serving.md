@@ -8,6 +8,35 @@ Normative rules: [`ENGINEERING.md`](../ENGINEERING.md) §8, §10, §12, §14. De
 [`.work/bench-harness-streaming.md`](../.work/bench-harness-streaming.md). Method:
 [`.work/engineering-method.md`](../.work/engineering-method.md).
 
+## Three tools, three verbs
+
+Run them in this order on a new box. They are separate because they answer different
+questions and have different rights to be believed.
+
+| | command | what it does |
+|---|---|---|
+| describe | `make box-doctor` | reads the machine — cores, SMT, caches, ISA, limits, noise — and REFUSES when it is not fit to measure. Proposes candidate `W x T`; decides nothing. |
+| predict | `make box-advise MODEL_DIR=...` | CALIBRATES on this machine (runs the real step table and fits `a` and `b`), predicts capacity per lookahead, and prints a pasteable command line. Every figure carries its provenance. |
+| qualify | `tools/bench/box_qualify.sh` | MEASURES. A WAVE may disqualify; only a SOAK promotes. |
+
+The advisor's arithmetic is one line — `B_max = (rho*P - a) / b`, where `P` is the chunk
+period the pack's lookahead implies — and its trustworthiness comes from where `a` and `b`
+come from: a fit of `tests/test_stream_batch` on the machine in front of it, using the
+serving path itself rather than a proxy. A constant carried in from another box is
+labelled `[PREDICTED]`, and if that box differs in size by more than 1.5x the advisor
+shows the arithmetic and refuses to turn it into a recommendation.
+
+Two things the advisor will tell you that are easy to miss:
+
+- **Lookahead is capacity.** `P = (lookahead + 1) x encoder_frame_ms`, so raising the
+  lookahead buys streams with latency the speaker feels rather than with hardware. On the
+  Axion numbers, 3 -> 6 nearly doubles the per-worker figure.
+- **Every worker re-pays the fixed cost `a`.** Eight workers spend `8a` of every period
+  walking the weights before serving anyone, which is why the recommendation starts WIDE.
+  That is a prediction: if a `W` sweep finds capacity flat, the cost model is wrong and
+  the advice changes.
+
+
 ## Vocabulary — use these four words and no others
 
 | word | what it is | what it can do |

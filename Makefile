@@ -351,6 +351,19 @@ bench: mynah-asr
 #   MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe -m <model> a.wav 2> shapes.txt
 #   tests/bench_gemm_shapes shapes.txt
 # Model-free without one: `tests/bench_gemm_shapes --demo`.
+# Three tools, three verbs, and they are separate on purpose:
+#   box-doctor   DESCRIBES the machine and refuses when it is not fit to measure
+#   box-advise   PREDICTS capacity and RECOMMENDS a configuration (calibrates first)
+#   box_qualify  MEASURES, and only a SOAK promotes
+# The advisor fits THIS machine's step table rather than carrying a constant in from
+# another box, which is the whole reason to trust its arithmetic.
+box-doctor:
+	sh tools/bench/box_doctor.sh
+
+box-advise: tests/test_stream_batch mynah-asr
+	@test -n "$(MODEL_DIR)" || { echo "usage: make box-advise MODEL_DIR=models/<pack>"; exit 2; }
+	python3 tools/bench/box_advisor.py -m $(MODEL_DIR) $(ADVISOR_ARGS)
+
 bench-gemm: tests/bench_gemm_shapes
 	@echo "usage: tests/bench_gemm_shapes <profile>|--demo [--batches N] [--target-ms N]"
 	@echo "       MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe -m <model> a.wav 2> shapes.txt"
@@ -539,4 +552,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check bench-gemm bench-throughput install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
