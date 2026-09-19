@@ -10,11 +10,19 @@
 
 typedef struct {
     const float *w, *b;    /* ctc_head [V, d, 1] + [V]; NULL when the model has no CTC */
-    int vocab, d_in;       /* V includes the blank (last index) */
+    int vocab, d_in;       /* V includes the blank */
+    int blank;             /* from decoder.blank_id; V-1 when the pack omits it */
 } mynah_asr_ctc;
 
-/* 0 = head found, -1 = absent (not an error: a model without CTC). */
-int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st);
+/* blank_id: the pack's `decoder.blank_id`, or < 0 to keep the historical
+ * assumption that the blank is the LAST index.  It is true of every NeMo CTC
+ * pack shipped so far and it is still only an assumption, which is why the
+ * value now comes from the caller: the auxiliary head of a hybrid model has no
+ * declared blank of its own (the pack's blank_id belongs to the RNNT/TDT
+ * decoder) and passes < 0, while a pure-CTC pack passes what it declares.
+ *
+ * 0 = head found, -1 = absent (not an error: a model without CTC). */
+int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st, int blank_id);
 
 /* enc_out [T, d_in] -> raw head scores [T, vocab] (row-major, caller-allocated).
  * No softmax: for both argmax and Viterbi alignment the per-frame normalizer is

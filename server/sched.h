@@ -81,6 +81,12 @@ int mynah_asr_sched_streaming(void);
  * (mynah_asr_stream_unsupported). NULL while streaming is available. */
 const char *mynah_asr_sched_stream_why(void);
 
+/* The sample rate of the model this worker loaded: what the WebSocket accepts,
+ * what REST resamples to, and what every "samples -> seconds" in the server
+ * divides by. From the pack (mynah_asr_sample_rate), 16000 before the
+ * scheduler has started. */
+int mynah_asr_sched_sample_rate(void);
+
 /* Claims a slot for a new session, or NULL when this worker is full (the caller
  * answers 503 before the 101). The returned slot is not yet armed: the caller
  * completes the handshake, starts its writer and calls mynah_asr_slot_arm. */

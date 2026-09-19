@@ -20,6 +20,7 @@ struct mynah_asr_vad {
 
     /* geometry, all from mynah.json / the tensor shapes */
     int frame, context, pad, n_fft, hop, n_bins, stft_frames, hidden, n_enc;
+    int sample_rate;                          /* from the pack; the policy converts ms to samples with it */
     double threshold, neg_threshold;
     int min_speech_ms, min_silence_ms, speech_pad_ms;
 
@@ -119,6 +120,12 @@ mynah_asr_vad *mynah_asr_vad_open(const char *model_dir) {
     }
     int bad = 0;
     v->frame = cfg_int(vc, "frame_samples", &bad);
+    {   /* the pack carries it (tools/convert_silero.py); older packs may not,
+         * and 16 kHz is what every silero VAD published so far runs at */
+        const cJSON *jsr = obj(vc, "sample_rate");
+        v->sample_rate = (jsr && cJSON_IsNumber(jsr) && jsr->valueint > 0)
+                             ? jsr->valueint : 16000;
+    }
     v->context = cfg_int(vc, "context_samples", &bad);
     v->pad = cfg_int(vc, "reflect_pad", &bad);
     v->n_fft = cfg_int(vc, "n_fft", &bad);
@@ -372,7 +379,7 @@ float mynah_asr_vad_feed(mynah_asr_vad *v, const float *samples, size_t n) {
 
 mynah_asr_vad_policy mynah_asr_vad_policy_of(const mynah_asr_vad *v) {
     mynah_asr_vad_policy p;
-    p.sample_rate = 16000;
+    p.sample_rate = (v && v->sample_rate > 0) ? v->sample_rate : 16000;
     p.frame_samples = v ? v->frame : 512;
     p.threshold = mynah_asr_vad_threshold(v);
     p.neg_threshold = mynah_asr_vad_neg_threshold(v);

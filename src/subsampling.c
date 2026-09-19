@@ -50,6 +50,7 @@ int mynah_asr_subsampling_init(mynah_asr_subsampling *ss, const mynah_asr_safete
     if (!ss->conv_in_w || !ss->conv_in_b || !ss->lin_w || !ss->lin_b) return -1;
     ss->channels = (int)ss->conv_in_w->shape[0];
     ss->d_model = (int)ss->lin_w->shape[0];
+    ss->sub_factor = MYNAH_ASR_SS_FACTOR;
     return 0;
 }
 
@@ -293,7 +294,7 @@ int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampli
     memset(sst, 0, sizeof(*sst));
     sst->first = 1;
     int F = n_mels;
-    for (int s = 0; s < 3; s++) {
+    for (int s = 0; s < MYNAH_ASR_SS_STAGES; s++) {
         sst->cin[s] = (s == 0) ? 1 : ss->channels;
         sst->fdim[s] = F;
         sst->cache[s] = calloc((size_t)sst->cin[s] * (size_t)F, sizeof(float));
@@ -334,7 +335,7 @@ int mynah_asr_ss_stream_init(mynah_asr_ss_stream *sst, const mynah_asr_subsampli
 }
 
 void mynah_asr_ss_stream_free(mynah_asr_ss_stream *sst) {
-    for (int s = 0; s < 3; s++) { free(sst->cache[s]); sst->cache[s] = NULL; }
+    for (int s = 0; s < MYNAH_ASR_SS_STAGES; s++) { free(sst->cache[s]); sst->cache[s] = NULL; }
     free(sst->scr);
     sst->scr = sst->sa = sst->sb = sst->sflat = NULL;
     sst->sxp = sst->sim2col = sst->spad = NULL;
@@ -431,7 +432,7 @@ int mynah_asr_ss_stream_step(const mynah_asr_subsampling *ss, mynah_asr_ss_strea
 }
 
 void mynah_asr_ss_stream_reset(mynah_asr_ss_stream *sst) {
-    for (int s = 0; s < 3; s++)
+    for (int s = 0; s < MYNAH_ASR_SS_STAGES; s++)
         if (sst->cache[s]) memset(sst->cache[s], 0, (size_t)sst->cin[s] * (size_t)sst->fdim[s] * sizeof(float));
     sst->first = 1;
 }

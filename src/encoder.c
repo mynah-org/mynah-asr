@@ -642,8 +642,8 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
     es->right = right_ctx;
     es->q = right_ctx + 1;
     /* the largest mel chunk a step can be fed (see mynah_asr_enc_stream_need:
-     * 1 + 8*right on the first chunk, 8*(right+1) afterwards) */
-    const int max_n_mel = 8 * (right_ctx + 1) + 1;
+     * 1 + sub*right on the first chunk, sub*(right+1) afterwards) */
+    const int max_n_mel = enc->ss.sub_factor * (right_ctx + 1) + 1;
     if (mynah_asr_ss_stream_init(&es->ss, &enc->ss, n_mels, max_n_mel) != 0) return -1;
     const size_t kv = (size_t)enc->n_layers * (size_t)left_ctx * (size_t)enc->d_model;
     const size_t cv = (size_t)enc->n_layers * (size_t)(enc->conv_k - 1) * (size_t)enc->d_model;
@@ -723,7 +723,7 @@ void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es) {
 }
 
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
-    const int sub = 8; /* subsampling_factor: 3 stride-2 stages */
+    const int sub = es->enc->ss.sub_factor;
     return es->cache_valid == 0 && es->ss.first ? 1 + sub * es->right
                                                 : sub * (es->right + 1);
 }

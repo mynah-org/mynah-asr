@@ -80,18 +80,20 @@ into a refusal, and it is the precondition for everything below.
 Two more, not on the streaming path but on the same theme (a model constant
 that should be a config read):
 
-- `src/decoder_ctc.c:34` takes the blank as `V - 1`, while the converter emits
-  `decoder.blank_id` for both pure-CTC and hybrid packs
-  (`tools/convert_nemo.py:347, 368`) and `mynah_asr_ctc_init` is never given
-  it (`src/mynah_asr.c:243, 262`). True for today's packs, false in general.
-- `src/vad.c:375` hardcodes `p.sample_rate = 16000` although the VAD pack
-  carries the key (`tools/convert_silero.py:191`) and every other field is read
-  from its JSON.
+- `src/decoder_ctc.c` took the blank as `V - 1` while the converter emits
+  `decoder.blank_id`. **Closed (M-2)**: `mynah_asr_ctc_init` takes it, a
+  pure-CTC pack passes what it declares, a hybrid's auxiliary head passes -1
+  because the pack's `blank_id` belongs to its RNNT/TDT decoder. Identical on
+  every shipped pack — the converter writes `blank_id = vocab_size - 1`.
+- `src/vad.c` hardcoded `p.sample_rate = 16000` although the VAD pack carries
+  the key (`tools/convert_silero.py:191`). **Closed (M-2)**.
 
-And in the server, the sample rate is a literal in six places
-(`server/sched.c:730, 734, 816`; `server/main.c:420-422, 500, 661-667, 970`).
-Harmless while every NeMo speech model is 16 kHz — and it is — but it is the
-kind of thing that is cheap now and archaeological later.
+And in the server the sample rate was a literal in six places. **Closed
+(M-2)**: `mynah_asr_sample_rate()` is public, the scheduler reads it once at
+start-up and `mynah_asr_sched_sample_rate()` serves the ring sizing, the chunk
+scratch, both "samples -> seconds", the REST resample target and the `rate=`
+whitelist — whose refusal now names the model's rate instead of the string
+"16000".
 
 ## 3. What the stream state actually is
 
@@ -170,9 +172,13 @@ Three more things buffered streaming needs beyond the encoder:
 Ordered by value per unit of risk:
 
 1. **The guard** — done today, model-free, closes six silent-wrongness traps.
-2. **Config reads that are currently literals** — CTC blank, VAD sample rate,
-   subsampling factor in the three chunk-geometry sites, server sample rate.
-   Small, testable against the offline path, and each one removes a lie.
+2. **Config reads that were literals** — done 2026-09-19 (M-2). The
+   subsampling factor is derived from the convolutions the code applies
+   (`MYNAH_ASR_SS_STAGES`) rather than read or assumed, and a pack that
+   declares a different one is refused at load; the CTC blank comes from
+   `decoder.blank_id`; the VAD reads its own `sample_rate`; the server asks
+   `mynah_asr_sample_rate()` in all six places. Nothing changes for a shipped
+   pack — that is the point: each was true by coincidence.
 3. **The converter builder for the EN-only Nemotron** — the only case where a
    *cache-aware* model is not served for a reason that is not architectural.
 4. **Buffered streaming for Parakeet**, behind an explicit `stream_mode`, in

@@ -27,6 +27,7 @@ static struct {
     mynah_asr_slot *slots;
     int n_slots;
     int streaming;
+    int sample_rate;          /* from the model, not assumed */
     const char *stream_why;   /* why not, for the refusal body */
 
     pthread_t thread;
@@ -706,6 +707,9 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
      * instead of a stream that dies after the 101 -- or, worse, one that runs
      * and is wrong. Read on the calling thread, before the scheduler exists:
      * field reads, not inferences. */
+    g.sample_rate = mynah_asr_sample_rate(g.cfg.model);
+    if (g.sample_rate <= 0) g.sample_rate = 16000;
+
     int la[8];
     g.stream_why = NULL;
     if (mynah_asr_lookaheads(g.cfg.model, la) <= 0) {
@@ -740,11 +744,11 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
         !g.b_n || !g.b_ud || !g.b_slot || !g.fin)
         return -1;
 
-    const size_t ring = (size_t)g.cfg.ring_seconds * 16000u;
+    const size_t ring = (size_t)g.cfg.ring_seconds * (size_t)g.sample_rate;
     /* One chunk of the widest preset is 8*(lookahead+1)+1 mel frames; 4 s of
      * scratch covers every preset the packs ship with, and a finalize tail is
      * bounded by the ring, not by this. */
-    const size_t take = 4u * 16000u;
+    const size_t take = 4u * (size_t)g.sample_rate;
     for (int i = 0; i < g.n_slots; i++)
         if (mynah_asr_slot_init(&g.slots[i], i, ring, take) != 0) return -1;
 
@@ -772,6 +776,8 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
 int mynah_asr_sched_streaming(void) { return g.streaming; }
 
 const char *mynah_asr_sched_stream_why(void) { return g.stream_why; }
+
+int mynah_asr_sched_sample_rate(void) { return g.sample_rate > 0 ? g.sample_rate : 16000; }
 
 mynah_asr_slot *mynah_asr_sched_claim(const char *lang, int lookahead) {
     const double now = mynah_asr_now();
@@ -828,7 +834,8 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
         out->cancel_by[i] = atomic_load_explicit(&g.cancel_by[i], memory_order_relaxed);
     out->audio_seconds =
-        (double)atomic_load_explicit(&g.audio_samples, memory_order_relaxed) / 16000.0;
+        (double)atomic_load_explicit(&g.audio_samples, memory_order_relaxed) /
+        (double)g.sample_rate;
     out->lag_count = out->deltas;
     out->lag_sum_ms =
         (double)atomic_load_explicit(&g.lag_sum_us, memory_order_relaxed) / 1000.0;

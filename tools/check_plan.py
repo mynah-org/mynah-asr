@@ -53,7 +53,18 @@ def main():
                     continue
             if not os.path.exists(os.path.join(root, p)):
                 who = f" (task {current[0]}{', marked [x]' if current[1] else ''})" if current else ""
-                failures.append(f"line {n}: missing path {p}{who}")
+                # The recurring version of this failure is a BUILT artefact:
+                # the board names tests/foo, which exists on the machine that
+                # wrote the line and is gitignored everywhere else, so it fails
+                # only in CI on a fresh clone. Say so instead of leaving the
+                # next reader to rediscover it.
+                hint = ""
+                for ext in (".c", ".sh", ".py"):
+                    if os.path.exists(os.path.join(root, p + ext)):
+                        hint = (f" -- but {p}{ext} exists: the board names a built"
+                                " binary, which is not in a fresh clone; name the source")
+                        break
+                failures.append(f"line {n}: missing path {p}{who}{hint}")
 
     # addenda that name a task the plan does not have
     if os.path.isdir(a.work):

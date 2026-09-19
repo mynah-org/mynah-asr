@@ -239,8 +239,12 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
         m->is_aed = 1;
         m->engine_dflt = &ENG_AED;
     } else if (strcmp(dec_type, "ctc") == 0) {
-        /* pure CTC: no prednet/joint, the head IS the decoder */
-        if (mynah_asr_ctc_init(&m->ctc, m->weights) != 0) {
+        /* pure CTC: no prednet/joint, the head IS the decoder. The blank comes
+         * from the pack (the converter writes it for every CTC pack); -1 when
+         * it is absent keeps the last-index assumption. */
+        const cJSON *jb = cJSON_GetObjectItem(jdec, "blank_id");
+        const int ctc_blank = (jb && cJSON_IsNumber(jb)) ? jb->valueint : -1;
+        if (mynah_asr_ctc_init(&m->ctc, m->weights, ctc_blank) != 0) {
             fprintf(stderr, "mynah-asr: missing CTC head\n");
             goto fail;
         }
@@ -259,7 +263,9 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
             fprintf(stderr, "mynah-asr: decoder init failed\n");
             goto fail;
         }
-        mynah_asr_ctc_init(&m->ctc, m->weights);   /* auxiliary hybrid head, optional */
+        /* auxiliary hybrid head, optional: the pack's blank_id above belongs to
+         * the RNNT/TDT decoder, not to this head, so it keeps the last index */
+        mynah_asr_ctc_init(&m->ctc, m->weights, -1);
         m->engine_dflt = &ENG_RNNT;
     }
     m->engine = m->engine_dflt;
@@ -288,8 +294,21 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
     };
     if (bad || m->feat.sample_rate <= 0 || m->feat.hop_length <= 0) goto fail;
 
+    /* The subsampling factor is DERIVED from the convolutions src/subsampling.c
+     * actually applies, not read: the code is three stride-2 stages, so it is 8,
+     * and `encoder.subsampling_factor` is a claim about that code.  When the two
+     * disagree the pack is refused, because the alternative is every word
+     * timestamp and every chunk boundary being wrong by the ratio, silently, in
+     * a build that otherwise looks healthy. */
     const cJSON *jsf = jenc ? cJSON_GetObjectItem(jenc, "subsampling_factor") : NULL;
-    m->frame_sec = (double)m->feat.hop_length * (jsf ? jsf->valueint : 8)
+    if (jsf && cJSON_IsNumber(jsf) && jsf->valueint != m->enc.ss.sub_factor) {
+        fprintf(stderr,
+                "mynah-asr: this pack declares encoder.subsampling_factor %d but "
+                "the runtime subsamples by %d (%d stride-2 stages)\n",
+                jsf->valueint, m->enc.ss.sub_factor, MYNAH_ASR_SS_STAGES);
+        goto fail;
+    }
+    m->frame_sec = (double)m->feat.hop_length * (double)m->enc.ss.sub_factor
                    / (double)m->feat.sample_rate;
     m->seg_sec = 0.0;   /* resolved AFTER parsing the streaming section */
 
@@ -431,6 +450,10 @@ static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids
 int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]) {
     memcpy(out, m->lookaheads, sizeof(m->lookaheads));
     return m->n_lookaheads;
+}
+
+int mynah_asr_sample_rate(const mynah_asr_model *m) {
+    return m ? m->feat.sample_rate : 0;
 }
 
 /* One planner for BOTH offline paths. Long audio is decoded as independent
@@ -814,7 +837,7 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
         return NULL;
     }
     mynah_asr_dec_state_reset(&m->dec, &s->dec);
-    const int max_chunk = 8 * (right + 1) + 1;
+    const int max_chunk = m->enc.ss.sub_factor * (right + 1) + 1;
     s->mel_buf = malloc((size_t)max_chunk * (size_t)m->feat.n_mels * sizeof(float));
     s->enc_buf = malloc((size_t)s->es.q * (size_t)m->enc.d_out * sizeof(float));
     s->cap_tokens = 4096;
@@ -1386,7 +1409,7 @@ static int align_words_ctc(mynah_asr_model *m, const float *samples, size_t n_sa
         int skipped = 0;
         const int n_ids = mynah_asr_tokenize(&a->tok, text, ids, cap, &skipped);
         if (n_ids > 0 &&
-            mynah_asr_align_ctc(scores, T, V, ids, n_ids, V - 1, t0, t1) == 0)
+            mynah_asr_align_ctc(scores, T, V, ids, n_ids, a->ctc.blank, t0, t1) == 0)
             rc = mynah_asr_detokenize_words(&a->tok, ids, t0, t1, n_ids, a->frame_sec,
                                         words, n_words);
     }

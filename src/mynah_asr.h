@@ -124,6 +124,12 @@ int mynah_asr_has_vad(const mynah_asr_model *m);
 /* Lookaheads (right context) valid for the model, e.g. {3,0,6,13}. */
 int mynah_asr_lookaheads(const mynah_asr_model *m, int out[8]);
 
+/* The sample rate this model's features were built for, from the pack.  Every
+ * NeMo speech model published so far is 16 kHz; a caller that hardcodes it is
+ * right today and wrong the first time that stops being true, so the server
+ * asks instead. */
+int mynah_asr_sample_rate(const mynah_asr_model *m);
+
 /* Offline transcription: float32 [-1,1] 16 kHz mono samples.
  * lang: tag ("auto" for detection). lookahead: -1 = the model's default.
  * Returns UTF-8 text (malloc'd, freed by the caller); when lang_out != NULL

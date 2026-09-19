@@ -8,6 +8,15 @@
 
 #include "weights.h"
 
+/* Stride-2 stages: conv_in, then the two depthwise+pointwise blocks.  The
+ * count is STRUCTURAL -- it is how many convolutions this file applies, not a
+ * number read from a config -- and the subsampling factor follows from it.
+ * A pack whose `encoder.subsampling_factor` disagrees is refused at load
+ * (src/mynah_asr.c): the timestamps of every word would be wrong by the ratio,
+ * silently. */
+#define MYNAH_ASR_SS_STAGES 3
+#define MYNAH_ASR_SS_FACTOR (1 << MYNAH_ASR_SS_STAGES)
+
 typedef struct {
     /* pointers resolved ONCE at load (prior-art decision: no lookups in the forward) */
     const mynah_asr_tensor *conv_in_w, *conv_in_b;         /* [C,1,3,3], [C] */
@@ -17,6 +26,7 @@ typedef struct {
     int channels;                                      /* 256 */
     int d_model;                                       /* 1024 */
     int causal;                                        /* 1 = pad (2,1), 0 = pad (1,1) */
+    int sub_factor;                                    /* MYNAH_ASR_SS_FACTOR: derived, never read */
 } mynah_asr_subsampling;
 
 /* Resolve the tensors from the safetensors. Supports both HF namings:
@@ -35,8 +45,8 @@ float *mynah_asr_subsampling_forward(const mynah_asr_subsampling *ss, const floa
  * like the offline path. See docs/nemotron-arch.md (HF CausalConv2dCacheLayer
  * reference). */
 typedef struct {
-    float *cache[3];        /* [C_in, F] last input frame of the stage */
-    int cin[3], fdim[3];
+    float *cache[MYNAH_ASR_SS_STAGES];  /* [C_in, F] last input frame of the stage */
+    int cin[MYNAH_ASR_SS_STAGES], fdim[MYNAH_ASR_SS_STAGES];
     int first;
     /* hot-path scratch, ONE malloc at init (zero allocations per step), sized
      * for the largest chunk the stream can be fed (max_n_mel mel frames).

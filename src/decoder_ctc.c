@@ -4,7 +4,7 @@
 
 #include <stdlib.h>
 
-int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st) {
+int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st, int blank_id) {
     c->w = NULL;
     c->b = NULL;
     const mynah_asr_tensor *w = mynah_asr_st_get(st, "ctc_head.weight");
@@ -14,6 +14,7 @@ int mynah_asr_ctc_init(mynah_asr_ctc *c, const mynah_asr_safetensors *st) {
     c->b = (const float *)b->data;
     c->vocab = (int)w->shape[0];
     c->d_in = (int)w->shape[1];
+    c->blank = (blank_id >= 0 && blank_id < c->vocab) ? blank_id : c->vocab - 1;
     return 0;
 }
 
@@ -31,7 +32,7 @@ int mynah_asr_ctc_scores(const mynah_asr_ctc *c, const float *enc_out, int T, fl
 
 int mynah_asr_ctc_decode(const mynah_asr_ctc *c, const float *enc_out, int T,
                      int *tokens, int *frames, int cap) {
-    const int V = c->vocab, d = c->d_in, blank = V - 1;
+    const int V = c->vocab, d = c->d_in, blank = c->blank;
     float *logits = malloc((size_t)T * (size_t)V * sizeof(float));
     if (!logits) return 0;
     mynah_asr_gemm_f32(0, 1, T, V, d,

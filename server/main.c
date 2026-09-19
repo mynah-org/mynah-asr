@@ -417,9 +417,10 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
     int sr;
     float *samples = mynah_asr_wav_parse(f.file, f.file_len, &n_samples, &sr);
     if (!samples) { send_error(fd, 400, "invalid WAV (PCM16 required)"); return 0; }
-    if (sr != 16000) {
+    const int want_sr = mynah_asr_sched_sample_rate();
+    if (sr != want_sr) {
         size_t n2;
-        float *rs = mynah_asr_resample(samples, n_samples, sr, 16000, &n2);
+        float *rs = mynah_asr_resample(samples, n_samples, sr, want_sr, &n2);
         free(samples);
         if (!rs) { send_error(fd, 500, "resampling failed"); return 0; }
         samples = rs;
@@ -497,7 +498,7 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
             mynah_asr_words_free(j.words, j.n_words);
         }
     }
-    const double duration = (double)n_samples / 16000.0;
+    const double duration = (double)n_samples / (double)want_sr;
     free(samples);
     if (!text) { send_error(fd, 400, "transcription failed (unsupported language?)"); return 0; }
 
@@ -560,7 +561,8 @@ typedef struct {
  * reads a status naming the accepted set, instead of getting a stream that
  * silently runs with a default it never asked for.
  *
- * `rate=`: only 16000 is accepted, and the refusal says so rather than
+ * `rate=`: only the model's own sample rate is accepted (16000 for every NeMo
+ * speech pack shipped so far), and the refusal says so rather than
  * resampling. The library's resampler (src/audio.h, mynah_asr_resample) is a
  * WHOLE-BUFFER stateless windowed sinc: it keeps no filter history across calls,
  * so running it per WebSocket frame would inject a discontinuity at every frame
@@ -658,11 +660,13 @@ static int ws_parse_query(const char *query, ws_params *p, const char **code,
                 return 400;
             }
         } else if (strcmp(key, "rate") == 0) {
-            if (val[0] != '\0' && strcmp(val, "16000") != 0) {
+            char want[16];
+            snprintf(want, sizeof(want), "%d", mynah_asr_sched_sample_rate());
+            if (val[0] != '\0' && strcmp(val, want) != 0) {
                 refuse_token(val, tok, sizeof(tok));
                 snprintf(msg, msgcap,
-                         "rate '%s' is not served; accepted: 16000 (resample client-side)",
-                         tok);
+                         "rate '%s' is not served; accepted: %s (resample client-side)",
+                         tok, want);
                 *code = "unsupported_rate";
                 return 400;
             }
@@ -969,7 +973,8 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                 }
                 audio_samples += (size_t)plen / width;
                 if (g_max_audio_seconds > 0.0 &&
-                    (double)audio_samples / 16000.0 > g_max_audio_seconds) {
+                    (double)audio_samples / (double)mynah_asr_sched_sample_rate() >
+                        g_max_audio_seconds) {
                     /* Announced, then finalised rather than dropped: the audio
                      * already accepted is still owed a transcript, so the cap
                      * flushes the tail, emits `done` and closes. */
