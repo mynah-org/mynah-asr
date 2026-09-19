@@ -35,12 +35,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <time.h>
 
 #include "../src/audio.h"
 #include "../src/encoder.h"
 #include "../src/features.h"
 #include "../src/mynah_asr.h"
+#include "../src/threads.h"
 #include "../src/qmat.h"
 #include "../src/weights.h"
 
@@ -550,7 +552,18 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
 static void gate_steptime(const char *dir, clip *cs, int n_clips) {
     mynah_asr_model *m = mynah_asr_load_quant(dir, MYNAH_ASR_QUANT_INT8);
     if (!m) return;
-    printf("\n  step time, int8, macOS dev signal (NOT a serving claim)\n");
+    /* The platform is READ, not asserted. This line said "macOS dev signal" on
+     * every host until it was run on Linux and printed that about a Neoverse:
+     * a label that names the wrong machine is worse than no label, because it
+     * travels into a note as if it were provenance. */
+    {
+        struct utsname un;
+        const char *host = (uname(&un) == 0) ? un.sysname : "unknown-platform";
+        printf("\n  step time, int8, %s, threads=%d — a DIAGNOSTIC signal, NOT a serving\n"
+               "  claim: one process, unpinned, and this harness does not check that the\n"
+               "  box is idle. B=1 carries the warm-up and is not part of any fit.\n",
+               host, mynah_asr_num_threads());
+    }
     printf("  %3s | %10s | %10s | %6s | %s\n", "B", "single ms", "batched ms", "ratio", "ms/stream");
     const int Bs[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     for (int bi = 0; bi < 8; bi++) {

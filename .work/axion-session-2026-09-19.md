@@ -98,10 +98,58 @@ letting it discredit the batching gate. It is worth its own item — an int8
 instability on one clip is either a quantisation edge or a real defect, and
 nobody has decided which.
 
+## 5. The step table, and what it implies for C100
+
+`MYNAH_ASR_STEP_TIME=1 ./tests/test_stream_batch`, int8, ONE process with 32
+threads, unpinned, on a box that was NOT verified idle (my own builds were on
+it). **DIAGNOSTIC**: it says the SHAPE of the answer, not the answer.
+
+```
+    B |  single ms | batched ms |  ratio | ms/stream
+    1 |      87.32 |      88.11 |   1.01 | 88.11      <- carries the warm-up
+    2 |     155.37 |      37.75 |   0.24 | 18.88
+    4 |     281.12 |      52.70 |   0.19 | 13.17
+    6 |     427.37 |      54.63 |   0.13 | 9.11
+    8 |     557.88 |      69.27 |   0.12 | 8.66
+```
+
+Least squares over B = 2..8 (B=1 excluded: it is the first step and pays the
+first touch of the weights):
+
+```
+    a = 31.7 ms      b = 4.58 ms per stream
+    residuals: -3.1 +1.4 +2.7 +3.8 -4.6 -1.0 +0.9 ms
+```
+
+Those residuals are ±4.6 ms on a 55 ms step — about 8 %, which is what an
+unquiet box looks like. Good enough to size an experiment, not to promote.
+
+**b is 4.4x smaller than on the M1** (20.3 ms/stream there, 4.58 here). That is
+the whole point of the week's kernel work arriving at once: SMMLA on the stacked
+rows, 32 threads instead of 8, and our own sgemm on the f32 remainder.
+
+Feeding the cadence law `T_step(B) = a + b·B <= rho·P` with `P = 320 ms`:
+
+| rho | B_max in ONE 32-thread worker |
+|---|---|
+| 0.7 | 42 |
+| 0.8 | **49** |
+| 0.9 | 56 |
+
+against `B_max ~ 10.7` from the M1 numbers. So **C100 is in reach but not free**:
+one fat worker is worth about half of it, and whether the other half comes from
+the prefork fleet (W narrow workers contending less) or does not come at all is
+exactly what the W x T sweep is for. Nothing here is a fleet number: this is one
+process with every core, which is not the serving topology.
+
+One defect found by running it: the table printed "macOS dev signal" on a
+Neoverse. It now reads the platform with `uname` and prints the thread count,
+says DIAGNOSTIC in the line itself, and states that B=1 carries the warm-up — a
+label that names the wrong machine is worse than none, because it travels into
+a note as if it were provenance.
+
 ## What is still owed here
 
-- The step table (`a` and `b` of `T_step(B) = a + b·B`) on this machine, which
-  is what turns capacity into a number.
 - The OpenBLAS comparison arm (S1-6a) — needs the package.
 - Pinned prefork: the mask read back from the kernel, which macOS cannot test.
 - The ladder and the soak: what concurrency this box actually holds.
@@ -109,5 +157,7 @@ nobody has decided which.
 
 Evidence: `~/mynah-asr-v2` on the box, `~/build.log` and `~/model.log`, tmux
 sessions `asr` and `model`.
-Conclusion: dispatch proven, kernels exact, batching identical. No speed claim.
-Next action: the step table, then the ladder.
+Conclusion: dispatch proven, kernels exact, batching identical, and a diagnostic
+step table that puts one 32-thread worker near 49 concurrent real-time streams.
+Next action: the ladder on the real server, then a soak at the concurrency it
+finds.
