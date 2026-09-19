@@ -3,11 +3,9 @@
 # BLAS = who computes the f32 GEMMs.  `make BLAS=none|openblas|accelerate`.
 #
 #   none         src/sgemm.c, ours.  No cblas symbol anywhere in the binary.
-#                THE LINUX DEFAULT, for ownership: OpenBLAS brings a second
-#                thread pool into a worker that is already pinned to T cpus
-#                (.work/threadpool-and-lane.md).
-#   openblas     -lopenblas.  Kept building forever: it is the comparison arm
-#                the Linux A/B (S1-6a) is measured against.
+#                THE LINUX DEFAULT since 2026-09-19.
+#   openblas     -lopenblas.  Kept building forever: it is the comparison arm,
+#                and the arm a box may still choose if its own numbers say so.
 #   accelerate   macOS only, and the macOS default: a development convenience
 #                behind the same seam, never a production claim.
 #
@@ -21,23 +19,37 @@ LDFLAGS ?=
 CFLAGS += -fPIC
 
 UNAME_S := $(shell uname -s)
-# The f32 GEMM provider. `own` (BLAS=none) is the OWNERSHIP answer -- one thread
-# pool in the address space, a result that does not depend on the thread count,
-# nothing to set through the environment -- and it is complete, gated and
-# deterministic (tests/test_sgemm, S1-6).
+# The f32 GEMM provider.
 #
-# It is NOT yet the Linux default, and the reason is a measurement that does not
-# exist: nobody has run `own` against OpenBLAS on Linux ARM or x86. The only
-# comparison taken anywhere is on an Apple M1, where Accelerate wins by enough
-# that four real-time streams stop being streamable under `own` -- an AMX-versus-
-# portable-NEON result that says nothing about Neoverse or Zen, but does say that
-# the gap can be large enough to matter. ENGINEERING.md §12: a production default
-# changes by explicit decision, and the decision needs the A/B in
-# `.work/box-day-plan.md` step 4 (S1-6a). Flip the line below the moment it is run.
+# `own` (BLAS=none) is the Linux default.  Two reasons, one of ownership and
+# one measured:
+#
+#   OWNERSHIP.  OpenBLAS brings its own thread pool with its own policies:
+#   inside a prefork worker pinned to T cpus our pool builds T threads and
+#   OpenBLAS builds T more, so the worker runs 2T threads on T cpus and the two
+#   pools take turns owning the cores.  Measured on the Axion: one worker pinned
+#   to 8 cpus held 63 threads with OpenBLAS linked and 32 without.  On top of
+#   that comes an env var that has to be ABSENT for a profile to be valid, and a
+#   team size that ignores our own pool.  Each is a trap to recheck on every
+#   host, forever.
+#
+#   THE KERNELS.  Until 2026-09-19 `own` was ~8.7 GF/s on the DOT family, one
+#   FMA chain per output element and therefore FMA-LATENCY bound at a tenth of
+#   the core.  It is now register-tiled: 75-80 GF/s on the same M1 core, and at
+#   the shapes a streaming step actually issues (4-16 stacked rows) it BEATS
+#   Accelerate's AMX, which only pays from m >= 16.  See
+#   tests/bench_gemm_shapes, which A/Bs the two arms shape by shape in one
+#   process, and .work/threadpool-and-lane.md.
+#
+# What is still OWED is the same table on Linux against OpenBLAS (S1-6a,
+# .work/box-day-plan.md step 4): that measurement is now two commands, not a
+# box-day.  If OpenBLAS wins there by enough to cost capacity, this line goes
+# back to `openblas` and the note says why -- a default is a decision, and this
+# one is reversible by a number (ENGINEERING.md §12).
 ifeq ($(UNAME_S),Darwin)
   BLAS ?= accelerate
 else
-  BLAS ?= openblas
+  BLAS ?= none
 endif
 
 # Accelerate the FRAMEWORK is linked on every macOS build: Metal needs it and
@@ -307,6 +319,16 @@ bench: mynah-asr
 # how many times realtime the backend sustains as the batch grows. Meant for GPUs
 # (make cuda; --backend cuda) but it runs on cpu/metal too.
 #   tests/bench_throughput models/<m> tests/audio/long_60s.wav --backend cuda --max-batch 64
+# The f32 provider A/B, shape by shape, in one process: `own` against whatever
+# this build linked. With a profile it weights each shape by the call count the
+# model really issued:
+#   MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe -m <model> a.wav 2> shapes.txt
+#   tests/bench_gemm_shapes shapes.txt
+# Model-free without one: `tests/bench_gemm_shapes --demo`.
+bench-gemm: tests/bench_gemm_shapes
+	@echo "usage: tests/bench_gemm_shapes <profile>|--demo [--batches N] [--target-ms N]"
+	@echo "       MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe -m <model> a.wav 2> shapes.txt"
+
 bench-throughput: tests/bench_throughput
 	@echo "usage: tests/bench_throughput <model_dir> <wav> [--backend cuda] [--max-batch N] [--runs R]"
 
@@ -482,4 +504,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics

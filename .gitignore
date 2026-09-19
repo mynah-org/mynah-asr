@@ -59,6 +59,7 @@ tests/test_stream_out
 tests/test_stream_batch
 tests/test_vad
 tests/bench_throughput
+tests/bench_gemm_shapes
 examples/minimal
 *.dSYM/
 libmynah_asr.dylib

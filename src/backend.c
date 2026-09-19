@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 /* THE THREE PROVIDERS, and the one place they are chosen.
  *
@@ -33,6 +36,117 @@
 #endif
 
 const char *mynah_asr_gemm_provider(void) { return MYNAH_ASR_GEMM_PROVIDER_NAME; }
+
+/* ------------------------------------------------------- the shape profiler
+ *
+ * MYNAH_ASR_GEMM_PROFILE=1 makes this seam record, per DISTINCT shape, how
+ * many times it was called and how long those calls took, and dump the table
+ * at exit.  It exists because "which GEMM provider should ship" is not a
+ * question about GEMM in general: it is a question about the twenty-odd shapes
+ * THIS model issues, and those differ per family (Nemotron's streaming step,
+ * Parakeet's offline pass and Canary's AED decode do not stack the same
+ * matrices).  The dump is the input to tests/bench_gemm_shapes, which replays
+ * the same table against whichever provider a build linked — so an A/B between
+ * `own` and OpenBLAS is one run of the model plus two replays, instead of a
+ * day of end-to-end sweeps in which nobody can say WHICH shape moved.
+ *
+ * The times recorded here are indicative: two clock reads bracket calls that
+ * can be under a microsecond.  The MEASUREMENT is the replay; what this table
+ * owns is the call COUNTS and the shape set, which carry no timing error.
+ *
+ * Off by default, and when off it costs one predictable branch on a static. */
+#define GP_SLOTS 512
+enum { GP_GEMM = 0, GP_GEMV = 1 };
+typedef struct {
+    int kind, ta, tb, m, n, k;
+    unsigned long long calls, ns;
+} gp_entry;
+
+static gp_entry g_gp[GP_SLOTS];
+static int g_gp_used = 0;          /* distinct shapes recorded            */
+static unsigned long long g_gp_lost = 0;  /* calls dropped: table full    */
+static pthread_mutex_t g_gp_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_gp_dumped = 0;
+
+static int gp_enabled(void) {
+    static int on = -1;            /* benign race: every racer computes the same */
+    if (on < 0) {
+        const char *e = getenv("MYNAH_ASR_GEMM_PROFILE");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static unsigned long long gp_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static int gp_cmp(const void *a, const void *b) {
+    const gp_entry *x = (const gp_entry *)a, *y = (const gp_entry *)b;
+    if (x->ns != y->ns) return x->ns > y->ns ? -1 : 1;   /* most expensive first */
+    return 0;
+}
+
+/* One line per shape, in a form tests/bench_gemm_shapes parses back.  Written
+ * to stderr like every other banner in this runtime, prefixed with the pid so
+ * that a prefork server's workers do not read as one process. */
+static void gp_dump(void) {
+    pthread_mutex_lock(&g_gp_mu);
+    if (g_gp_dumped || g_gp_used == 0) { pthread_mutex_unlock(&g_gp_mu); return; }
+    g_gp_dumped = 1;
+    gp_entry snap[GP_SLOTS];
+    const int n = g_gp_used;
+    memcpy(snap, g_gp, (size_t)n * sizeof(snap[0]));
+    const unsigned long long lost = g_gp_lost;
+    pthread_mutex_unlock(&g_gp_mu);
+
+    qsort(snap, (size_t)n, sizeof(snap[0]), gp_cmp);
+    unsigned long long calls = 0, ns = 0;
+    for (int i = 0; i < n; i++) { calls += snap[i].calls; ns += snap[i].ns; }
+    fprintf(stderr, "[GEMM-PROFILE] v=1 pid=%d provider=%s shapes=%d calls=%llu ns=%llu dropped=%llu\n",
+            (int)getpid(), MYNAH_ASR_GEMM_PROVIDER_NAME, n, calls, ns, lost);
+    for (int i = 0; i < n; i++) {
+        if (snap[i].kind == GP_GEMV)
+            fprintf(stderr, "[GEMM-SHAPE] v=1 kind=gemv trans=%d rows=%d cols=%d lda=%d calls=%llu ns=%llu\n",
+                    snap[i].ta, snap[i].m, snap[i].n, snap[i].k, snap[i].calls, snap[i].ns);
+        else
+            fprintf(stderr, "[GEMM-SHAPE] v=1 kind=gemm ta=%d tb=%d m=%d n=%d k=%d calls=%llu ns=%llu\n",
+                    snap[i].ta, snap[i].tb, snap[i].m, snap[i].n, snap[i].k,
+                    snap[i].calls, snap[i].ns);
+    }
+    fflush(stderr);
+}
+
+static void gp_record(int kind, int ta, int tb, int m, int n, int k,
+                      unsigned long long ns) {
+    pthread_mutex_lock(&g_gp_mu);
+    for (int i = 0; i < g_gp_used; i++) {
+        gp_entry *e = &g_gp[i];
+        if (e->kind == kind && e->ta == ta && e->tb == tb &&
+            e->m == m && e->n == n && e->k == k) {
+            e->calls++; e->ns += ns;
+            pthread_mutex_unlock(&g_gp_mu);
+            return;
+        }
+    }
+    if (g_gp_used >= GP_SLOTS) {
+        g_gp_lost++;
+        pthread_mutex_unlock(&g_gp_mu);
+        return;
+    }
+    if (g_gp_used == 0) atexit(gp_dump);
+    gp_entry *e = &g_gp[g_gp_used++];
+    e->kind = kind; e->ta = ta; e->tb = tb; e->m = m; e->n = n; e->k = k;
+    e->calls = 1; e->ns = ns;
+    pthread_mutex_unlock(&g_gp_mu);
+}
+
+/* Dump now instead of at exit.  A prefork worker is killed rather than
+ * returning from main, and a profile that only exists for processes that exit
+ * cleanly would silently describe the parent alone. */
+void mynah_asr_gemm_profile_dump(void) { if (gp_enabled()) gp_dump(); }
 
 #ifdef MYNAH_ASR_METAL
 int mynah_asr_metal_available(void);
@@ -88,12 +202,33 @@ int mynah_asr_set_backend(const char *name) {
 
 int mynah_asr_backend(void) { return g_backend; }
 
+/* The provider call itself, split out so the profiler can bracket it without
+ * duplicating the #if: one body, two entry paths. */
+static void gemm_f32_call(int trans_a, int trans_b, int m, int n, int k,
+                          float alpha, const float *a, int lda,
+                          const float *b, int ldb, float beta, float *c, int ldc);
+static void gemv_f32_call(int trans, int rows, int cols, float alpha,
+                          const float *a, int lda, const float *x,
+                          float beta, float *y);
+
 /* The seam.  `own` maps 1:1 onto mynah_asr_sgemm_f32, which follows the same
  * argument contract on purpose, so this is a type conversion and not a
  * translation layer. */
 void mynah_asr_gemm_f32(int trans_a, int trans_b, int m, int n, int k,
                         float alpha, const float *a, int lda,
                         const float *b, int ldb, float beta, float *c, int ldc) {
+    if (gp_enabled()) {
+        const unsigned long long t0 = gp_now_ns();
+        gemm_f32_call(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+        gp_record(GP_GEMM, trans_a, trans_b, m, n, k, gp_now_ns() - t0);
+        return;
+    }
+    gemm_f32_call(trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+}
+
+static void gemm_f32_call(int trans_a, int trans_b, int m, int n, int k,
+                          float alpha, const float *a, int lda,
+                          const float *b, int ldb, float beta, float *c, int ldc) {
 #if MYNAH_ASR_GEMM_CBLAS
     cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans,
                 trans_b ? CblasTrans : CblasNoTrans, m, n, k, alpha, a, lda, b,
@@ -117,6 +252,18 @@ void mynah_asr_gemm_f32(int trans_a, int trans_b, int m, int n, int k,
 void mynah_asr_gemv_f32(int trans, int rows, int cols, float alpha,
                         const float *a, int lda, const float *x,
                         float beta, float *y) {
+    if (gp_enabled()) {
+        const unsigned long long t0 = gp_now_ns();
+        gemv_f32_call(trans, rows, cols, alpha, a, lda, x, beta, y);
+        gp_record(GP_GEMV, trans, 0, rows, cols, lda, gp_now_ns() - t0);
+        return;
+    }
+    gemv_f32_call(trans, rows, cols, alpha, a, lda, x, beta, y);
+}
+
+static void gemv_f32_call(int trans, int rows, int cols, float alpha,
+                          const float *a, int lda, const float *x,
+                          float beta, float *y) {
 #if MYNAH_ASR_GEMM_CBLAS
     cblas_sgemv(CblasRowMajor, trans ? CblasTrans : CblasNoTrans, rows, cols,
                 alpha, a, lda, x, 1, beta, y, 1);

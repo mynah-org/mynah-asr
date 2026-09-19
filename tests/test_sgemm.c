@@ -208,6 +208,82 @@ static int run_width(const char *self, int width, float *out) {
     return left == 0 ? 0 : -1;
 }
 
+
+/* ------------------------------------------------------------ tiling identity
+ *
+ * Every family here computes several output elements at once: the DOT family
+ * an SG_DOT_MR x SG_DOT_NC_TILE block of dot products (and a 1 x
+ * SG_DOT_NC_WIDE strip for the rows under MR, which is the whole of a gemv);
+ * the panel and narrow families a row strip against SG_PANEL_NV column
+ * vectors.  Those widths are a SCHEDULE, not a formula: an element accumulates
+ * over the whole of k into one accumulator, folds the same way and finishes
+ * with the same scalar tail whatever block it lands in.
+ *
+ * So the tiled answer must be the SAME BYTES as the untiled one.  If it is
+ * not, an element's value depends on how many columns happened to sit beside
+ * it -- and since a batched stream step stacks streams into the same GEMM,
+ * that is exactly rule 4 of CLAUDE.md ("a transcript never depends on who it
+ * was batched with") failing at the bottom of the stack.
+ *
+ * The comparison: the whole GEMM, against the same GEMM taken one column at a
+ * time, with the family FORCED on both sides so the width is the only thing
+ * that differs (left to the predicate, a one-column GEMM is small enough to
+ * fall to the reference, and then the test would be comparing two algorithms).
+ * m and n are ragged on purpose -- 9 rows is two DOT tiles plus one strip, 37
+ * columns leaves a remainder on every path -- and k is not a multiple of
+ * SG_LANES, so the scalar tail runs as well. */
+static void tiling_identity(mynah_asr_sgemm_family want, int trans_b, size_t n,
+                            const char *label) {
+    const size_t m = 9, k = 77;
+    const size_t ldb = trans_b ? k : n;
+    float *a = malloc(m * k * sizeof(float));
+    float *b = malloc(n * k * sizeof(float));
+    float *c_tiled = malloc(m * n * sizeof(float));
+    float *c_col = malloc(m * sizeof(float));
+    if (!a || !b || !c_tiled || !c_col) {
+        printf("sgemm FAIL: out of memory in the tiling gate\n");
+        failures = 1;
+        free(a); free(b); free(c_tiled); free(c_col);
+        return;
+    }
+    fill(a, m * k, 991u);
+    fill(b, n * k, 4241u);
+
+    mynah_asr_sgemm_family ran = MYNAH_ASR_SGEMM_FAMILY_REFERENCE;
+    mynah_asr_sgemm_f32_forced(want, &ran, 0, trans_b, m, n, k, 1.0f, a, k, b,
+                               ldb, 0.0f, c_tiled, n);
+    if (ran != want) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "the %s tiling gate could not force its family (ran %s): "
+                 "not compiled on this ISA", label,
+                 mynah_asr_sgemm_family_name(ran));
+        printf("sgemm SKIP: %s\n", msg);
+        free(a); free(b); free(c_tiled); free(c_col);
+        return;
+    }
+
+    size_t differing = 0;
+    for (size_t j = 0; j < n; ++j) {
+        /* one column: for the transposed families that is row j of B, for the
+         * others column j of B, which keeps its ldb and moves the base */
+        const float *bj = trans_b ? b + j * k : b + j;
+        mynah_asr_sgemm_f32_forced(want, NULL, 0, trans_b, m, 1, k, 1.0f, a, k,
+                                   bj, ldb, 0.0f, c_col, 1);
+        for (size_t i = 0; i < m; ++i)
+            if (memcmp(&c_tiled[i * n + j], &c_col[i], sizeof(float)) != 0) differing++;
+    }
+    {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "%s: the tiled block is byte-identical to one column at a time "
+                 "(%zu of %zu elements differ, %zux%zux%zu)",
+                 label, differing, m * n, m, n, k);
+        CHECK(differing == 0, msg);
+    }
+    free(a); free(b); free(c_tiled); free(c_col);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--sweep") == 0) return sweep_child();
     printf("sgemm: provider=%s isa=%s narrow_max=%zu\n",
@@ -249,6 +325,13 @@ int main(int argc, char **argv) {
     CHECK(mynah_asr_sgemm_family_for(0, 0, 2, 2, 2, NULL) ==
               MYNAH_ASR_SGEMM_FAMILY_REFERENCE,
           "a tiny GEMM stays on the reference instead of paying for a plan");
+
+    /* 37 columns leaves a remainder on every path; NARROW only serves
+     * n <= mynah_asr_sgemm_narrow_max(), so it is asked its own width. */
+    tiling_identity(MYNAH_ASR_SGEMM_FAMILY_DOT, 1, 37, "DOT");
+    tiling_identity(MYNAH_ASR_SGEMM_FAMILY_PANEL, 0, 37, "PANEL");
+    tiling_identity(MYNAH_ASR_SGEMM_FAMILY_NARROW, 0,
+                    mynah_asr_sgemm_narrow_max() - 3u, "NARROW");
 
     /* 3. the seam, in whatever build this is */
     seam_gemm(0, 1, 64, 1024, 1024, 1.0f, 0.0f);

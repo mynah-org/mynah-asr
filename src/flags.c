@@ -115,6 +115,11 @@ static const mynah_asr_flag g_flags[] = {
      "tests/test_stream_batch: run only the zero-allocation gate of the batched step (same as --allocs)",
      NULL, NULL},
 
+    {"MYNAH_ASR_GEMM_PROFILE", MYNAH_ASR_FLAG_DEBUG, "unset",
+     "1 records every f32 GEMM/GEMV through the backend seam per distinct shape and dumps the table at exit"
+     " ([GEMM-PROFILE]/[GEMM-SHAPE] on stderr); the replay input of tests/bench_gemm_shapes",
+     NULL, NULL},
+
     {"MYNAH_ASR_STEP_TIME", MYNAH_ASR_FLAG_DEBUG, "unset",
      "tests/test_stream_batch: print per-step wall time of single vs batched steps (a dev signal)",
      NULL, NULL},

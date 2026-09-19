@@ -28,6 +28,11 @@ int mynah_asr_backend(void);
  * src/dispatch.c both READ it rather than re-deriving it. */
 const char *mynah_asr_gemm_provider(void);
 
+/* Dump the MYNAH_ASR_GEMM_PROFILE table now (it is otherwise written at exit).
+ * A prefork worker is signalled rather than returning from main, so the server
+ * calls this on its way down; a no-op when the flag is unset, and idempotent. */
+void mynah_asr_gemm_profile_dump(void);
+
 /* C[m,n] = alpha * op(A) * op(B) + beta * C, row-major — cblas_sgemm's
  * contract, including beta == 0 meaning "C is written, never read". */
 void mynah_asr_gemm_f32(int trans_a, int trans_b, int m, int n, int k,

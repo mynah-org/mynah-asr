@@ -1,8 +1,8 @@
 /* sgemm.h — mynah-asr's own f32 GEMM, so that no external BLAS has to be in
  * the process.
  *
- * WHY THIS EXISTS.  The reason is OWNERSHIP, not speed (.work/threadpool-and-
- * lane.md, standing decision).  OpenBLAS brings its own thread pool with its
+ * WHY THIS EXISTS.  The first reason is OWNERSHIP (.work/threadpool-and-lane.md,
+ * standing decision).  OpenBLAS brings its own thread pool with its
  * own policies: inside a prefork worker pinned to T cpus our pool builds T
  * threads and OpenBLAS builds T more, so the worker runs 2T threads on T cpus
  * and the two pools take turns owning the cores (measured on the Axion: one
@@ -12,6 +12,18 @@
  * of those is a trap that has to be rechecked on every host, forever.
  * Production is Linux, where the BLAS is OpenBLAS, so removing it is a
  * production decision.  `BLAS=openblas` stays as the comparison arm.
+ *
+ * The second reason is that the kernels are now worth linking.  Until
+ * 2026-09-19 the DOT family below computed ONE dot product at a time into ONE
+ * accumulator: a single FMA dependency chain, latency-bound at ~8.7 GF/s on an
+ * M1 core that can do ~100.  It is register-tiled now (SG_DOT_MR x
+ * SG_DOT_NC_TILE at once, a 1 x SG_DOT_NC_WIDE strip for a gemv), which is a
+ * schedule change and not an arithmetic one — each element still accumulates
+ * over the whole of k into one accumulator, in the same order, so the answer is
+ * byte-identical and tests/test_sgemm.c gates exactly that.  75-80 GF/s, and at
+ * the shapes a streaming step issues (4-16 stacked rows) faster than
+ * Accelerate's AMX, which only pays from m >= 16.  tests/bench_gemm_shapes is
+ * where that is measured, one process, both arms, shape by shape.
  *
  * THIS FILE IS NOT THE SEAM.  src/backend.c is: `mynah_asr_gemm_f32` and
  * `mynah_asr_gemv_f32` are the one door every f32 GEMM in this runtime goes

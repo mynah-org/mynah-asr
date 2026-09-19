@@ -145,18 +145,21 @@ typedef float sg_vec;
 #define SG_NV_MAX     (SG_ACC_VECS / SG_MR)
 #define SG_NARROW_MAX (SG_NV_MAX * SG_LANES)
 
-/* Panel family: accumulator vectors per column group.  On AVX2 this is forced
- * — SG_NV_MAX is already 2 with 16 ymm registers.  On NEON it is a CHOICE
- * between two effects pulling opposite ways, and it has NOT been measured:
+/* Panel family: accumulator vectors per column group.  DERIVED, like the
+ * narrow boundary, from the accumulator budget: SG_NV_MAX is the widest group
+ * whose whole C row block still fits in the register file (NEON 4, AVX2 2,
+ * scalar 4), and a narrower group would leave registers idle while paying more
+ * passes over op(A).
  *
- *   wider groups  -> fewer passes over op(A), and a better FMA-per-load ratio
- *   narrower ones -> a smaller ragged remainder when n % (NV*LANES) != 0, and
- *                    more registers free for the op(B) stream
- *
- * 2 is the conservative end.  The sweep belongs on the Linux box with the
- * default flip (S1-6a), not on a development Mac; until then this is a
- * cost-model guess and is labelled as one rather than presented as tuned. */
-#define SG_PANEL_NV 2
+ * It used to be 2 everywhere, "the conservative end", chosen rather than
+ * measured.  Measured (M1, one thread, the attention-context shapes of
+ * tests/bench_gemm_shapes --demo, 26 of them): 2 -> 48.9 GF/s mean, 4 -> 73.0,
+ * the total time of those shapes down 34%.  A development signal, and one that
+ * cannot change a result: the group width decides how many output columns a
+ * micro-kernel covers at once, never how an element accumulates, so the answer
+ * is byte-identical either way (gated by tiling_identity in tests/test_sgemm.c).
+ * The AVX2 value does not move -- there SG_NV_MAX was already 2. */
+#define SG_PANEL_NV SG_NV_MAX
 #define SG_NR       (SG_PANEL_NV * SG_LANES)
 
 /* op(B) panel budget for the panel family, in floats: the panel is k x nc and
@@ -164,6 +167,29 @@ typedef float sg_vec;
  * room for the A strip and the C block in a 256-512 KiB private L2.  A
  * COST-MODEL estimate, not a measurement; it has never been swept. */
 #define SG_PANEL_FLOATS 32768u
+
+/* DOT family register tile: MROWS rows of op(A) against NCOLS rows of B, all
+ * MROWS*NCOLS dot products accumulated at once.  The tile is what makes this
+ * family fast, and it is NOT a numerics change: each output element still
+ * accumulates over k in SG_LANES steps into ONE vector accumulator, folds with
+ * the same sg_hadd and finishes with the same scalar tail as sg_dot, so the
+ * bytes are identical to computing the dots one at a time.  What the tile buys
+ * is (a) MROWS*NCOLS independent FMA chains instead of one, which is the whole
+ * story — a single chain is FMA-LATENCY bound and reaches a few percent of the
+ * core's throughput — and (b) each loaded vector feeding several FMAs.
+ *
+ * MROWS*NCOLS must stay within the accumulator budget, with room for the
+ * MROWS + NCOLS operand vectors: NEON 4x4 = 16 of 32 registers, AVX2 4x2 = 8
+ * of 16, scalar 4x4 in whatever the compiler has. */
+#define SG_DOT_MR 4
+#define SG_DOT_NC_TILE (SG_ACC_VECS / SG_DOT_MR)
+
+/* Fewer than SG_DOT_MR rows left — which is the WHOLE of a gemv, and a gemv
+ * through this family is the RNNT prediction network, once per emitted token.
+ * With one row there is nothing to tile against, so the independent chains have
+ * to come from the column axis instead: one row against SG_DOT_NC_WIDE rows of
+ * B.  Same accumulator budget, same per-element arithmetic. */
+#define SG_DOT_NC_WIDE (SG_ACC_VECS / 2)
 
 /* Task granularity for the two families that have no row axis to split.
  * m == 1 parallelises over columns only; the dot family is coarse because each
@@ -546,6 +572,42 @@ static float sg_dot(const float *a, const float *b, size_t n) {
     return sum;
 }
 
+/* The same reduction, MROWS x NCOLS of them at once.  Element (r, j) walks the
+ * identical sequence sg_dot() walks — same SG_LANES stride, same single
+ * accumulator, same fold, same scalar tail — so this kernel and sg_dot are
+ * interchangeable to the bit.  Only the schedule differs. */
+#define SG_DEFINE_DOT_TILE(NAME, MROWS, NCOLS)                                 \
+    static void NAME(size_t k, const float *ap, size_t lda, const float *bp,   \
+                     size_t ldb, float alpha, float beta, float *c,            \
+                     size_t ldc) {                                             \
+        sg_vec acc[MROWS][NCOLS];                                              \
+        for (int r = 0; r < (MROWS); ++r)                                      \
+            for (int j = 0; j < (NCOLS); ++j) acc[r][j] = sg_zero();           \
+        size_t p = 0;                                                          \
+        for (; p + SG_LANES <= k; p += SG_LANES) {                             \
+            sg_vec av[MROWS], bv[NCOLS];                                       \
+            for (int r = 0; r < (MROWS); ++r)                                  \
+                av[r] = sg_load(ap + (size_t)r * lda + p);                     \
+            for (int j = 0; j < (NCOLS); ++j)                                  \
+                bv[j] = sg_load(bp + (size_t)j * ldb + p);                     \
+            for (int r = 0; r < (MROWS); ++r)                                  \
+                for (int j = 0; j < (NCOLS); ++j)                              \
+                    acc[r][j] = sg_fma(acc[r][j], av[r], bv[j]);               \
+        }                                                                      \
+        for (int r = 0; r < (MROWS); ++r)                                      \
+            for (int j = 0; j < (NCOLS); ++j) {                                \
+                float sum = sg_hadd(acc[r][j]);                                \
+                const float *arow = ap + (size_t)r * lda;                      \
+                const float *brow = bp + (size_t)j * ldb;                      \
+                for (size_t q = p; q < k; ++q) sum += arow[q] * brow[q];       \
+                float *cp = c + (size_t)r * ldc + j;                           \
+                *cp = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * *cp; \
+            }                                                                  \
+    }
+
+SG_DEFINE_DOT_TILE(sg_dot_tile, SG_DOT_MR, SG_DOT_NC_TILE)
+SG_DEFINE_DOT_TILE(sg_dot_row, 1, SG_DOT_NC_WIDE)
+
 /* ======================================================================
  * The job and its tiles
  * ====================================================================== */
@@ -596,13 +658,36 @@ static void sg_tile_nn(const sg_job *j, size_t i0, size_t rows, size_t j0,
  * it to the reference. */
 static void sg_tile_dot(const sg_job *j, size_t i0, size_t rows, size_t j0,
                         size_t cols) {
-    for (size_t i = 0; i < rows; ++i) {
-        const float *arow = j->a + (i0 + i) * j->lda;
-        float *crow = j->c + (i0 + i) * j->ldc + j0;
-        for (size_t jj = 0; jj < cols; ++jj) {
-            const float s = sg_dot(arow, j->b + (j0 + jj) * j->ldb, j->k);
-            crow[jj] = (j->beta == 0.0f) ? j->alpha * s
-                                         : j->alpha * s + j->beta * crow[jj];
+    const float *abase = j->a + i0 * j->lda;
+    const float *bbase = j->b + j0 * j->ldb;
+    float *cbase = j->c + i0 * j->ldc + j0;
+
+    size_t i = 0;
+    for (; i + SG_DOT_MR <= rows; i += SG_DOT_MR) {
+        size_t jj = 0;
+        for (; jj + SG_DOT_NC_TILE <= cols; jj += SG_DOT_NC_TILE)
+            sg_dot_tile(j->k, abase + i * j->lda, j->lda, bbase + jj * j->ldb,
+                        j->ldb, j->alpha, j->beta, cbase + i * j->ldc + jj,
+                        j->ldc);
+        /* column remainder: sg_dot computes exactly what the tile would have */
+        for (; jj < cols; ++jj)
+            for (size_t r = 0; r < SG_DOT_MR; ++r) {
+                const float s = sg_dot(abase + (i + r) * j->lda,
+                                       bbase + jj * j->ldb, j->k);
+                float *cp = cbase + (i + r) * j->ldc + jj;
+                *cp = (j->beta == 0.0f) ? j->alpha * s
+                                        : j->alpha * s + j->beta * *cp;
+            }
+    }
+    for (; i < rows; ++i) {
+        size_t jj = 0;
+        for (; jj + SG_DOT_NC_WIDE <= cols; jj += SG_DOT_NC_WIDE)
+            sg_dot_row(j->k, abase + i * j->lda, j->lda, bbase + jj * j->ldb,
+                       j->ldb, j->alpha, j->beta, cbase + i * j->ldc + jj, j->ldc);
+        for (; jj < cols; ++jj) {
+            const float s = sg_dot(abase + i * j->lda, bbase + jj * j->ldb, j->k);
+            float *cp = cbase + i * j->ldc + jj;
+            *cp = (j->beta == 0.0f) ? j->alpha * s : j->alpha * s + j->beta * *cp;
         }
     }
 }
