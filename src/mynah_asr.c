@@ -739,10 +739,66 @@ struct mynah_asr_stream {
     double eou_sec;
 };
 
+/* Can the CACHE-AWARE streaming path serve THIS pack?
+ *
+ * The presets in `mynah.json` say a model was trained cache-aware.  They do not
+ * say the incremental encoder in src/encoder.c implements everything that pack
+ * needs, and the difference matters because the failure is SILENT: the
+ * streaming step would run, emit text, and be wrong.  The offline path handles
+ * every family (biases, xscaling, a folded batch_norm, symmetric conv padding,
+ * per-feature mel normalisation); the streaming step, written for Nemotron,
+ * implements none of those branches — see .work/multi-model-streaming.md, which
+ * lists each one against the line that would have to change.
+ *
+ * Today no shipped pack can reach any of these: only Nemotron carries presets
+ * and Nemotron needs none of them.  That is exactly why the check belongs here
+ * — the day someone adds a `streaming` section to a Parakeet pack, or a new
+ * cache-aware model arrives with biases, the answer must be a REFUSAL WITH A
+ * NAME and not a plausible transcript.  Asked of the loaded WEIGHTS wherever
+ * possible (a bias tensor is present or it is not) rather than of the config,
+ * because the weights are what the step will read.
+ *
+ * Returns NULL when the stream path can serve the model, else the reason.
+ * Declared in mynah_asr.h: the server asks it before the upgrade. */
+const char *mynah_asr_stream_unsupported(const mynah_asr_model *m) {
+    const mynah_asr_encoder *e = &m->enc;
+    if (e->n_layers > 0 && e->layers) {
+        const mynah_asr_enc_layer *L = &e->layers[0];
+        if (L->q_b || L->k_b || L->v_b || L->o_b || L->ff1_b1 || L->ff1_b2 ||
+            L->ff2_b1 || L->ff2_b2 || L->pw1_b || L->pw2_b || L->dw_b)
+            return "the pack has linear biases (use_bias) and the streaming step does not add them";
+    }
+    if (e->bn_fold)
+        return "the pack folds a batch_norm into the conv module and the streaming step applies layer_norm";
+    if (e->xscale != 1.0f)
+        return "the pack scales the encoder input (xscaling) and the streaming step does not";
+    if (!e->causal)
+        return "the pack uses symmetric ('same') conv padding and the streaming step is causal-only";
+    if (m->feat.normalize_per_feature)
+        return "the pack normalizes features per feature and the streaming mel does not";
+    {
+        /* the chunk geometry in this file and in src/encoder.c is written for
+         * three stride-2 stages; frame_sec is where that assumption is visible */
+        const double sub = m->frame_sec * (double)m->feat.sample_rate /
+                           (double)m->feat.hop_length;
+        if (sub < 7.5 || sub > 8.5)
+            return "the pack does not subsample by 8 and the streaming chunk geometry assumes it";
+    }
+    return NULL;
+}
+
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead) {
     if (m->n_lookaheads == 0) {
         fprintf(stderr, "mynah-asr: this model is offline-only (no cache-aware streaming)\n");
         return NULL;
+    }
+    {
+        const char *why = mynah_asr_stream_unsupported(m);
+        if (why) {
+            fprintf(stderr, "mynah-asr: this model declares streaming presets but the "
+                            "streaming path cannot serve it: %s\n", why);
+            return NULL;
+        }
     }
     const int prompt = resolve_prompt(m, lang);
     if (prompt == -2) { fprintf(stderr, "mynah-asr: language '%s' is not supported\n", lang); return NULL; }

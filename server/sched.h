@@ -75,6 +75,12 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg);
  * upgrade instead of a stream that dies after it. */
 int mynah_asr_sched_streaming(void);
 
+/* When mynah_asr_sched_streaming() is 0, the reason, in a form that can go
+ * straight into a refusal body: either the model has no presets at all, or it
+ * has them and uses something the incremental encoder does not implement
+ * (mynah_asr_stream_unsupported). NULL while streaming is available. */
+const char *mynah_asr_sched_stream_why(void);
+
 /* Claims a slot for a new session, or NULL when this worker is full (the caller
  * answers 503 before the 101). The returned slot is not yet armed: the caller
  * completes the handshake, starts its writer and calls mynah_asr_slot_arm. */

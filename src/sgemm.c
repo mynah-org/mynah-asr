@@ -204,11 +204,24 @@ typedef float sg_vec;
  * refusal, never on its exact value. */
 #define SG_MIN_BLOCKED_WORK 4096u
 
-/* Below this much work the GEMM runs as ONE task, inline.  A pool dispatch
- * costs on the order of a microsecond and 131072 MACs is a few tens of
- * microseconds of arithmetic, so this is the point where splitting starts to
- * pay.  Also a cost-model estimate; it must be re-derived on the Linux box,
- * where both the dispatch cost and the core count differ. */
+/* Below this much work PER THREAD the GEMM runs as ONE task, inline.
+ *
+ * Per thread, not in total, because a dispatch does not cost a fixed amount:
+ * mynah_asr_parallel_for wakes min(tasks, width) workers and waits for all of
+ * them, so the overhead grows with the pool width while the arithmetic per
+ * worker shrinks.  A flat threshold therefore gets WORSE the wider the pool,
+ * which is the opposite of what it is for.
+ *
+ * Measured on the M1 dev host (tests/bench_gemm_shapes --demo, the 49
+ * representative shapes under 2M MACs -- which is where a streaming step's
+ * attention GEMMs live): with the flat 131072 threshold those shapes cost
+ * 318 us at MYNAH_ASR_THREADS=1 and 630 us at 8.  Twice as slow for having
+ * eight cores.  The crossover on the same host is around 750K MACs at width 8,
+ * i.e. about 131072 per thread, which is what the constant already said -- it
+ * was just being compared against the wrong side of the multiplication.
+ *
+ * Still a cost-model estimate in the sense that the dispatch cost is per host;
+ * the Linux box re-derives the constant, not the shape of the rule. */
 #define SG_PARALLEL_MIN_WORK 131072u
 
 /* ======================================================================
@@ -825,7 +838,8 @@ static void sg_plan_rows(sg_job *j, size_t force_tasks) {
         want = force_tasks;
     } else {
         const int threads = mynah_asr_num_threads();
-        if (threads > 1 && (huge || work >= SG_PARALLEL_MIN_WORK))
+        if (threads > 1 &&
+            (huge || work >= (size_t)threads * SG_PARALLEL_MIN_WORK))
             want = (size_t)threads * 2u;
     }
     /* `want == 1` means the work is below SG_PARALLEL_MIN_WORK and this GEMM

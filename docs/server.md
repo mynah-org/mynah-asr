@@ -144,7 +144,7 @@ ambiguous prefix is refused rather than resolved.
 | status | code | when |
 |---|---|---|
 | `404` | `model_not_found` | no group holds that name. The message names the accepted set; **no `Retry-After`**, because retrying will fail identically for as long as the server runs — residency is decided at start-up and printed, never grown on demand |
-| `400` | `model_not_streaming` | a WebSocket to a group whose model has no cache-aware streaming presets. Before the upgrade, so the client reads a status and not a transport error |
+| `400` | `model_not_streaming` | a WebSocket to a group whose model cannot be streamed: it has no cache-aware presets, or it has them and uses something the incremental encoder does not implement (linear biases, a folded batch_norm, xscaling, symmetric conv padding, per-feature normalisation, a subsampling factor other than 8). The body says which. Before the upgrade, so the client reads a status and not a transport error |
 | `503` | `server_at_capacity` | **that group** is full: every worker of it is at its slot cap and its share of the admission queue is full. A free slot in another group's worker is not capacity for this request |
 
 ```

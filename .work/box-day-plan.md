@@ -58,17 +58,32 @@ make test-stream-allocs MODEL_DIR=models/nemotron-3.5-asr-streaming-0.6b   # S0-
   there too, the batched f32 default turns on for Linux; if it is not, it stays
   off and the note records the exact shapes that moved. int8 is exact either way
   and is the production path regardless.
-- **S1-6a, the A/B that owns the Linux default.** `src/sgemm.c` is complete,
-  deterministic across thread counts and gated, but it has never been compared
-  with OpenBLAS on Linux, so the Linux default is still `BLAS=openblas`. Build
-  both (`make BLAS=openblas` and `make BLAS=none`, each proving its provider with
-  `./mynah-asr --dispatch-map`), then run the same WAVE and the same
-  `tests/test_server_stream.sh` on each. On the M1 Accelerate beat `own` by
-  enough to break four real-time streams; if OpenBLAS beats `own` by anything
-  like that on Neoverse, ownership costs capacity and the answer is to keep
-  OpenBLAS until the kernels close the gap. If they are close, flip the default
-  in the Makefile (the comment there says exactly where) and OpenBLAS leaves the
-  worker for good.
+- **S1-6a, the A/B that USED to own the Linux default — now a verification.**
+  `BLAS=none` is the Linux default since 2026-09-19: the reason `own` had lost
+  on the M1 was a defect in the DOT kernel (one FMA chain per output element,
+  8.7 GF/s on a 100 GF/s core), it is register-tiled and byte-identical now, and
+  at the 4-16 row shapes a streaming step issues it beats Accelerate
+  (`.work/threadpool-and-lane.md`, 2026-09-19). What is owed here is the same
+  comparison against OpenBLAS on Neoverse and on Zen, and it is two commands:
+
+  ```
+  make BLAS=openblas && ./mynah-asr --dispatch-map          # prove the arm
+  MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe \
+      -m models/nemotron-3.5-asr-streaming-0.6b tests/audio/test_it.wav 2> shapes.txt
+  tests/bench_gemm_shapes shapes.txt
+  ```
+
+  `bench_gemm_shapes` times BOTH arms interleaved in one process and weights
+  every shape by the call count the model really issued, so the footer line
+  `[GEMM-BENCH-TOTAL]` is the whole answer: modelled GEMM milliseconds per run,
+  ours against OpenBLAS's. If OpenBLAS wins by enough to cost capacity, flip the
+  Makefile line back and write the number into the note. Then confirm with the
+  end-to-end arm that matters — the same `tests/test_server_stream.sh` on each
+  build — rather than trusting the model.
+  Worth doing per family while the models are there: the profile of a Parakeet
+  offline pass and of a Canary decode are different tables, and knowing them is
+  how the next kernel is chosen rather than guessed.
+
 - **S1-6a, the 2T-threads hazard.** Inside a prefork worker pinned to T cpus the
   pool builds T threads and OpenBLAS builds T more. Measure, do not guess:
   `OPENBLAS_NUM_THREADS=1` against the default, same topology, same bank, and

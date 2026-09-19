@@ -795,9 +795,11 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
      * stream API, so this is not a 503 and carries no Retry-After. Asked first
      * because on such a model there is no preset table to validate against. */
     if (!mynah_asr_sched_streaming()) {
+        const char *why = mynah_asr_sched_stream_why();
         refuse_json(fd, 400, "Bad Request", "invalid_request_error",
                     "model_not_streaming",
-                    "this model is offline-only (no cache-aware streaming presets)");
+                    why ? why
+                        : "this model is offline-only (no cache-aware streaming presets)");
         return 1;
     }
 

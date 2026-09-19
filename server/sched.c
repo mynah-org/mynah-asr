@@ -27,6 +27,7 @@ static struct {
     mynah_asr_slot *slots;
     int n_slots;
     int streaming;
+    const char *stream_why;   /* why not, for the refusal body */
 
     pthread_t thread;
     int started;
@@ -610,7 +611,8 @@ static void *sched_main(void *arg) {
                 s->stream_lookahead != s->lookahead) {
                 if (sched_ensure_stream(s) != 0) {
                     sched_cancel(s, "model_not_streaming",
-                                 "this model has no cache-aware streaming");
+                                 g.stream_why ? g.stream_why
+                                              : "this model has no cache-aware streaming");
                     g.req_live[i] = 0;
                     did = 1;
                     continue;
@@ -697,12 +699,23 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     if (g.cfg.max_pending < 1) g.cfg.max_pending = 1;
     g.n_slots = g.cfg.slots;
 
-    /* A model with no streaming presets has no stream API at all; knowing it
-     * here is what makes `model_not_streaming` a 400 before the upgrade. Read
-     * from the config on the calling thread, before the scheduler exists: it
-     * is a field read, not an inference. */
+    /* A model with no streaming presets has no stream API at all, and a model
+     * WITH presets may still use something the incremental encoder does not
+     * implement (mynah_asr_stream_unsupported). Knowing both here is what makes
+     * `model_not_streaming` a 400 before the upgrade, with the reason in it,
+     * instead of a stream that dies after the 101 -- or, worse, one that runs
+     * and is wrong. Read on the calling thread, before the scheduler exists:
+     * field reads, not inferences. */
     int la[8];
-    g.streaming = mynah_asr_lookaheads(g.cfg.model, la) > 0;
+    g.stream_why = NULL;
+    if (mynah_asr_lookaheads(g.cfg.model, la) <= 0) {
+        g.streaming = 0;
+        g.stream_why = "this model is offline-only (no cache-aware streaming presets)";
+    } else if ((g.stream_why = mynah_asr_stream_unsupported(g.cfg.model)) != NULL) {
+        g.streaming = 0;
+    } else {
+        g.streaming = 1;
+    }
 
     if (pthread_mutex_init(&g.mu, NULL) != 0) return -1;
     if (pthread_cond_init(&g.wake, NULL) != 0) return -1;
@@ -757,6 +770,8 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
 }
 
 int mynah_asr_sched_streaming(void) { return g.streaming; }
+
+const char *mynah_asr_sched_stream_why(void) { return g.stream_why; }
 
 mynah_asr_slot *mynah_asr_sched_claim(const char *lang, int lookahead) {
     const double now = mynah_asr_now();

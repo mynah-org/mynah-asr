@@ -204,6 +204,21 @@ typedef struct mynah_asr_stream mynah_asr_stream;
  * the encoder works in chunks and the VAD is ahead of the decoder. */
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead);
 
+/* Why the cache-aware streaming path cannot serve this model, or NULL when it
+ * can.  Two separate questions, and callers that refuse before a WebSocket
+ * upgrade need both: mynah_asr_lookaheads() == 0 says the pack was never
+ * trained cache-aware, while this says the pack IS cache-aware but uses
+ * something the incremental encoder does not implement (linear biases, a folded
+ * batch_norm, xscaling, symmetric conv padding, per-feature normalisation, a
+ * subsampling factor other than 8).  The offline path serves all of those; the
+ * streaming step, written for Nemotron, does not, and would emit plausible
+ * WRONG text instead of failing.  See .work/multi-model-streaming.md.
+ *
+ * Reads the loaded weights, so it answers for the model in memory rather than
+ * for what the config claims.  The string is static, English, and safe to put
+ * in a refusal body. */
+const char *mynah_asr_stream_unsupported(const mynah_asr_model *m);
+
 /* Feed float32 16 kHz mono samples; the callback receives the text deltas. */
 int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                       mynah_asr_result_cb cb, void *userdata);

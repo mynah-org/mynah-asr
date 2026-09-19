@@ -292,3 +292,129 @@ S1-6a on the Linux box, with nothing else running on it:
    the sibling's dispatch cost (`SG_PARALLEL_MIN_WORK`, `SG_PANEL_NV`,
    `SG_PANEL_FLOATS`) are the first things to sweep, and S1-5 (the spin-then-park
    pool with the meter) is the second.
+
+---
+
+## 2026-09-19 — why `own` was slow, and the default taken
+
+The line above — "Accelerate beats our sgemm by enough to break a 4-stream
+real-time envelope" — was true and was treated as a fact about AMX. It was a
+fact about a defect.
+
+### What was measured
+
+A new instrument, because "which provider ships" is not a question about GEMM
+in general but about the twenty-odd shapes this model issues:
+
+- `MYNAH_ASR_GEMM_PROFILE=1` (src/backend.c) records every call through the f32
+  seam per DISTINCT shape — counts and time — and dumps the table at exit.
+  Model-, family- and quantisation-specific by construction.
+- `tests/bench_gemm_shapes` replays such a table, or a representative one with
+  `--demo`, against BOTH arms **interleaved in one process**: ours is compiled
+  into every build whatever `BLAS=` linked, so `mynah_asr_sgemm_f32` and
+  `mynah_asr_gemm_f32` are both callable, on the same operands, under the same
+  thermal state and page cache. It checks the two agree numerically before it
+  times them, and weights each shape by its call count when a profile is given.
+
+M1, one thread, 77 representative shapes. The DOT family — which is every
+`x @ W^T` in this runtime, so every f32 linear, the joint head and the
+attention scores — ran at **8.7 GF/s on a core that does about 100**, flat
+across every shape, which is the signature of a latency bound rather than a
+bandwidth or a blocking problem.
+
+### The cause
+
+`sg_dot` accumulated into ONE vector accumulator and `sg_tile_dot` called it
+once per output element. One FMA dependency chain: 4 lanes x 2 flops per ~4
+cycle FMA latency at 3.2 GHz is 6.4 GF/s, against 8.7 measured. The kernel was
+doing exactly what its structure allowed.
+
+### The fix, and why it is not a numerics change
+
+A register tile: `SG_DOT_MR x SG_DOT_NC_TILE` dot products at once (NEON 4x4,
+AVX2 4x2), plus a `1 x SG_DOT_NC_WIDE` strip for the rows under MR — which is
+the whole of a gemv, i.e. the RNNT prediction network, once per emitted token.
+16 independent chains instead of one, and each loaded vector feeds several FMAs.
+
+Each element still accumulates over the whole of k into one accumulator, in
+SG_LANES steps, in the same order, folds with the same `sg_hadd` and finishes
+with the same scalar tail. So the tiled answer is the SAME BYTES as the untiled
+one, and `tiling_identity` in `tests/test_sgemm.c` proves it for DOT, PANEL and
+NARROW by running the same GEMM one column at a time with the family forced on
+both sides. That gate matters beyond tidiness: if the tile width could change an
+element, a stream's transcript would depend on how many columns sat beside it,
+which is rule 4 failing at the bottom of the stack.
+
+`SG_PANEL_NV` also stopped being a choice ("the conservative end", 2 everywhere)
+and became `SG_NV_MAX`, derived from the accumulator budget like the narrow
+boundary. AVX2 does not move; NEON goes 2 -> 4.
+
+### Result (M1 dev host, one thread, development signals)
+
+| family / shape | before | after |
+|---|---|---|
+| DOT (`x @ W^T`, m = 4..256) | 8.7 GF/s | **75-80 GF/s** |
+| PANEL (attention context, 26 shapes) | 48.9 GF/s mean | **74.8** |
+| MATVEC-through-DOT (LSTM pred-net gemv) | 8.2 GF/s | **30.2** |
+
+At 4 threads the DOT family reaches 285 GF/s. And the number that decides the
+serving question: **at 4 to 16 stacked rows — exactly what a streaming step
+issues — `own` is now FASTER than Accelerate** (ratios 0.40-0.93). Accelerate's
+AMX only pays from m >= 16, which is the offline path.
+
+The gemv stays 2.1x behind Accelerate and that is understood rather than open:
+one row makes the kernel load-bound (9 loads per 8 FMAs), and the measured 30
+GF/s is within a few percent of what that ratio allows on this core. A sweep of
+the strip width (4/8/12/16) picked 8, which is what `SG_ACC_VECS / 2` already
+gave.
+
+### A second defect the same instrument found: the parallel threshold
+
+`sg_plan_rows` went parallel when the GEMM had at least `SG_PARALLEL_MIN_WORK`
+(131072) MACs **in total**, whatever the pool width. But a dispatch is not a
+fixed cost: `mynah_asr_parallel_for` wakes `min(tasks, width)` workers and waits
+for all of them, so the overhead grows with the width while the arithmetic per
+worker shrinks. A flat threshold gets worse the more cores you have, which is
+the opposite of its purpose.
+
+Measured on the M1, the 49 representative shapes under 2M MACs — which is
+exactly where a streaming step's attention GEMMs live (`4 x 128 x 320` is
+163,840 MACs, just over the old threshold):
+
+| MYNAH_ASR_THREADS | before | after |
+|---|---|---|
+| 1 | 318 us | 318 us |
+| 2 | 339 | 324 |
+| 4 | 385 | 286 |
+| 8 | **630** | **330** |
+
+Twice as slow for having eight cores, and a prefork worker pinned to 8 cpus is
+precisely the configuration this server ships. The rule is now
+`work >= threads * SG_PARALLEL_MIN_WORK`; the constant itself did not move, it
+was being compared against the wrong side of the multiplication. Large shapes
+are unaffected (all shapes: 178 ms at T=1, 55 at 4, 44 at 8 — still a 4x).
+
+This one is worth re-deriving on the box rather than assuming: the dispatch cost
+is per host, and 32 Neoverse cores is a much wider pool than 8 Firestorms.
+
+### The decision
+
+**`BLAS=none` is the Linux default again** (Makefile, 2026-09-19). It is a
+decision, not a measurement, and it is stated as one — but it now rests on
+something: the reason to doubt `own` was a defect that is fixed and gated, the
+ownership argument was always the stronger one (63 threads in a worker pinned to
+8 cpus with OpenBLAS linked, 32 without, measured on the Axion), and the docs
+have said `BLAS=none` since S1-6 while only the Makefile disagreed — a
+contradiction in the tree is worse than either answer.
+
+S1-6a is now a VERIFICATION and costs two commands instead of a box-day:
+
+```
+make BLAS=openblas
+MYNAH_ASR_GEMM_PROFILE=1 ./mynah-asr transcribe -m <model> tests/audio/test_it.wav 2> shapes.txt
+tests/bench_gemm_shapes shapes.txt          # weighted total, both arms, one process
+```
+
+If the weighted total says OpenBLAS wins by enough to cost capacity, the
+Makefile line goes back and this note records the number. That is what
+reversible-by-a-number means.
