@@ -292,22 +292,48 @@ def windows(marks, window_s, t0, min_n=2):
 
 
 def drift(win, pooled_p95):
-    """Largest relative distance between a window p95 and the pooled p95, in percent.
+    """Largest relative distance between a STEADY window p95 and the pooled p95.
 
-    None when there is nothing to compare: fewer than two usable windows, or a pooled p95
-    of zero (a relative drift on a zero baseline is not a number)."""
+    Windows are not all the same experiment. A soak ramps up while its streams start and
+    drains while the last utterances finish, and those windows hold a fraction of the
+    samples the steady ones do: a 600 s soak at c=16 on 2026-09-20 reported windows of
+    n=471, then nine of n~1850, then n=1076 and n=61. The ramp window's p95 was 254 ms
+    against 74-116 ms in the steady ones, and comparing it to the pooled figure produced
+    a 192 % "drift" on a run whose absolute lag never left a quarter of its envelope and
+    which lost nothing. That is the gate measuring its own warm-up.
+
+    So a window counts as STEADY when it carries at least half the median window's
+    samples; the rest are reported and excluded, never silently dropped. The spread is
+    still measured strictly over what remains, and a separate TREND is measured on top
+    of it -- the last third of the steady windows against the first third -- because
+    degradation is a direction, not a spread. A p95 wandering inside its envelope is
+    noise; a p95 climbing is the thing this gate exists to catch."""
     usable = [w for w in win if w["p95"] is not None]
     if len(usable) < 2 or not pooled_p95:
         return {"max_drift_pct": None, "worst_window": None, "pooled_p95": pooled_p95,
-                "windows": win, "reason": "fewer than 2 usable windows" if len(usable) < 2
+                "windows": win, "trend_pct": None, "excluded": [],
+                "reason": "fewer than 2 usable windows" if len(usable) < 2
                 else "pooled p95 is zero"}
+    ns = sorted(w["n"] for w in usable)
+    med = ns[len(ns) // 2]
+    steady = [w for w in usable if w["n"] >= 0.5 * med]
+    excluded = [w["window"] for w in usable if w["n"] < 0.5 * med]
+    if len(steady) < 2:                       # too short to have a steady state
+        steady, excluded = usable, []
     worst, best = None, -1.0
-    for w in usable:
+    for w in steady:
         d = abs(w["p95"] - pooled_p95) / pooled_p95 * 100.0
         if d > best:
             best, worst = d, w["window"]
+    trend = None
+    if len(steady) >= 4:
+        k = max(1, len(steady) // 3)
+        first = sum(w["p95"] for w in steady[:k]) / k
+        late = sum(w["p95"] for w in steady[-k:]) / k
+        if first > 0:
+            trend = (late - first) / first * 100.0
     return {"max_drift_pct": best, "worst_window": worst, "pooled_p95": pooled_p95,
-            "windows": win, "reason": None}
+            "windows": win, "trend_pct": trend, "excluded": excluded, "reason": None}
 
 
 # ----------------------------------------------------------------------------- aggregate
@@ -449,7 +475,22 @@ def default_thresholds(chunk_ms):
         "emission_lag_p95_ms": chunk_ms,
         "finalization_p95_ms": 500.0,
         "backlog_max_s": 2.0 * chunk_ms / 1000.0,
-        "max_drift_pct": 20.0,
+        # Spread of a p95 ACROSS WINDOWS, and the direction it moves.
+        #
+        # 20 % was inherited, not derived, and it is too tight for a tail
+        # statistic: a p95 over ~1800 samples has far more sampling variance
+        # than a median, so a healthy run wanders. The sibling engine landed on
+        # the same split from its own measurements -- 30 % for a p95, 20 % for a
+        # p50 -- and the reason is statistical rather than a matter of taste.
+        #
+        # The pair is what makes this strict rather than lax. A soak on
+        # 2026-09-20 (1x24, c=16, 600 s, zero losses, pooled lag p95 87 ms
+        # against a 320 ms envelope) read 192 % under the old rule, 36 % spread
+        # with a trend of -14 % under this one: wandering, and improving. A run
+        # that wandered the same amount while CLIMBING fails on the trend line,
+        # which no spread threshold would have caught.
+        "max_drift_pct": 30.0,
+        "max_trend_pct": 15.0,
         "marginal_factor": 1.5,
         # Quality, not cadence. A PLACEHOLDER until a measured baseline exists: the CER
         # of this model on this bank has never been recorded, so this number is a guard
@@ -522,6 +563,12 @@ def envelope_verdict(summary, thr):
     for name, d in sorted(summary.get("drift", {}).items()):
         if d.get("max_drift_pct") is not None:
             line(f"drift {name} p95", d["max_drift_pct"], thr["max_drift_pct"], "%")
+        # Direction, not spread. A metric that climbs across the steady windows is
+        # degrading even while every window is inside the envelope, and that is the
+        # failure a soak exists to find; the threshold is deliberately tighter than
+        # the spread's, because a trend has no innocent explanation.
+        if d.get("trend_pct") is not None:
+            line(f"trend {name} p95", abs(d["trend_pct"]), thr["max_trend_pct"], "%")
 
     q = summary.get("quality") or {}
     cer_p95 = summary["metrics"].get("cer", {}).get("p95")
