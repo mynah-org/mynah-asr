@@ -84,6 +84,8 @@ static struct {
      * and how much is parking with nothing to do -- which is not waste. */
     double w_model, w_runnable_idle, w_no_work;
     double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
+    double fin_model_s, fin_rest_s;
+    unsigned long fin_calls;
     double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
     unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
     /* Parks split by whether work existed. A park with a ready slot behind it
@@ -581,7 +583,16 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
      * finalization lag measured from the finalize request would hide the wait
      * the audio actually had. */
     emit_ctx ctx = {.slot = s, .arrival = s->last_arrival};
+    /* Finalization is the largest serial phase at the knee -- 0.354 of wall at
+     * c=36 on the 3x8 capacity curve -- and it is two very different costs
+     * wearing one name: the model running the tail with its causal right pad,
+     * and the teardown around it (the done frame, the close, the session
+     * bookkeeping). They call for opposite fixes, so they are timed apart. */
+    const double t_fin0 = mynah_asr_now();
     (void)mynah_asr_stream_finish(s->stream, sched_on_result, &ctx);
+    const double t_fin1 = mynah_asr_now();
+    g.fin_model_s += t_fin1 - t_fin0;
+    g.fin_calls++;
     sched_emit_done(s);
     if (close_after) {
         sched_close_session(s);
@@ -591,6 +602,7 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
         s->needs_reset = 1;
         mynah_asr_slot_set_state(s, MYNAH_ASR_SLOT_ACTIVE);
     }
+    g.fin_rest_s += mynah_asr_now() - t_fin1;
 }
 
 /* ------------------------------------------------------------ offline work */
@@ -1108,6 +1120,9 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->w_model = g.w_model;
     out->w_runnable_idle = g.w_runnable_idle;
     out->w_no_work = g.w_no_work;
+    out->fin_model_s = g.fin_model_s;
+    out->fin_rest_s = g.fin_rest_s;
+    out->fin_calls = g.fin_calls;
     for (int i = 0; i < MYNAH_ASR_SCHED_PHASES; i++)
         out->w_idle_by_phase[i] = g.w_idle_by_phase[i];
     out->park_idle = g.park_idle;

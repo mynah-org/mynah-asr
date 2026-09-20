@@ -536,6 +536,12 @@ void mynah_asr_obs_dump(void) {
                 widx, n, st.w_model, three > 0 ? st.w_model / three : 0.0,
                 st.w_runnable_idle, three > 0 ? st.w_runnable_idle / three : 0.0,
                 st.w_no_work, three > 0 ? st.w_no_work / three : 0.0);
+        if (st.fin_calls > 0)
+            OBS_ADD("[DUMP] worker=%d seq=%lu finalize model_s=%.2f rest_s=%.2f "
+                    "calls=%lu model_mean_ms=%.1f rest_mean_ms=%.1f\n",
+                    widx, n, st.fin_model_s, st.fin_rest_s, st.fin_calls,
+                    1e3 * st.fin_model_s / (double)st.fin_calls,
+                    1e3 * st.fin_rest_s / (double)st.fin_calls);
         for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) {
             if (st.w_idle_by_phase[i] <= 0.0) continue;
             OBS_ADD("[DUMP] worker=%d seq=%lu idle_in %-13s wall_s=%8.2f share_of_idle=%.3f\n",
