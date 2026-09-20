@@ -200,7 +200,11 @@ typedef struct {
      * an interval counts as avoidable idle whenever the model is not running
      * and at least one slot holds a whole chunk, whatever the scheduler is
      * doing at the time. */
-    double w_model, w_runnable_idle, w_no_work;
+    /* w_model is the batched step; w_model_solo is model execution OUTSIDE it
+     * -- the finalization tail and the offline batch, both at batch width one.
+     * Together they are the machine's real model duty; apart, the second one
+     * is the inefficiency worth attacking. */
+    double w_model, w_model_solo, w_runnable_idle, w_no_work;
     /* the avoidable idle, attributed to the phase that consumed it */
     double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
     /* How long a chunk waits between being EXECUTABLE and the model starting

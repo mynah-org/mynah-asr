@@ -137,7 +137,7 @@ static struct {
      * This is what turns "the box sits at 45%" into an accounting: how much of
      * the wall is model execution, how much is the scheduler's own serial work,
      * and how much is parking with nothing to do -- which is not waste. */
-    double w_model, w_runnable_idle, w_no_work;
+    double w_model, w_model_solo, w_runnable_idle, w_no_work;
     double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
     double fin_model_s, fin_rest_s;
     unsigned long fin_calls;
@@ -208,6 +208,17 @@ static struct {
          * can spend its time in slot-poll, stage, finalize or cancel while a \
          * chunk sits ready, and that interval is avoidable idle just the same. */ \
         if (prev_ == 4) g.w_model += d_; \
+        /* Phase 5 and phase 6 are the model too, and calling them idle was a \
+         * real error in this file: finalize measured 99.8 % \
+         * mynah_asr_stream_finish, so charging it to `runnable_idle` reported \
+         * the model executing a tail as the model doing nothing. It made the \
+         * duty read 0.82 at c=40 when model execution was 0.94, and it made \
+         * 13-14 % of wall look like reclaimable waste when the reclaimable \
+         * part is 1-3 %. They are kept in their OWN bucket rather than folded \
+         * into w_model, because what distinguishes them is the thing worth \
+         * fixing: this is model work at batch width one, while phase 4 runs \
+         * the same model over a ready set averaging 4.7 rows. */ \
+        else if (prev_ == 5 || prev_ == 6) g.w_model_solo += d_; \
         else if (mynah_asr_slot_ready_count() > 0) { \
             g.w_runnable_idle += d_; \
             /* WHICH phase is holding the model off work that is ready. The \
@@ -1232,6 +1243,7 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->w_model = g.w_model;
     out->w_runnable_idle = g.w_runnable_idle;
     out->w_no_work = g.w_no_work;
+    out->w_model_solo = g.w_model_solo;
     out->dly_ready_sel_ms[0] = sched_dly_pct(g.h_ready_sel, 0.50);
     out->dly_ready_sel_ms[1] = sched_dly_pct(g.h_ready_sel, 0.95);
     out->dly_ready_sel_ms[2] = sched_dly_pct(g.h_ready_sel, 0.99);

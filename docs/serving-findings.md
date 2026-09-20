@@ -558,6 +558,15 @@ Topology: **3 workers x 8 threads**, `--threads 96 --cap 96`.
 Envelope: emission lag p95 <= 320 ms (= `(lookahead+1) x 80 ms`), backlog max
 <= 0.640 s, lost established streams = 0.
 
+**The `finalize` column of this table is WITHDRAWN — see F21.** The harness
+that printed it computed the share against the wrong denominator and overstated
+it by about 3x. Recomputed from the raw per-worker dumps, finalize is 0.106 of
+wall at C = 32, 0.118 at C = 36 and 0.125 at C = 40; the other nine rungs cannot
+be recomputed because a later run overwrote their server logs, so their values
+are struck rather than corrected. Every other column here was recomputed from
+the same raw dumps and is unchanged: `duty` and `runnable_idle` at C = 32/36/40
+reproduce to within 0.003.
+
 **FACT**: on this machine, this build and this workload, **C_safe = 32**
 (lag p95 231 ms, backlog 0.464 s, zero loss), the **latency knee begins at
 C = 36** (345 ms, first crossing of the envelope), **C = 40 still completes all
@@ -584,7 +593,7 @@ has not been run since F17, and no result here licenses 3x8 on another box.
 
 ---
 
-## F19 — Model execution duty plateaus at 0.82 while runnable work still exists
+## F19 — RETIRED by F21: "duty plateaus at 0.82 while runnable work exists"
 
 **EVIDENCE**: the same F18 run, three-way split of scheduler wall (commit
 `bc572f0` instrumentation: `model_busy` / `runnable_idle` / `no_work`, computed
@@ -602,19 +611,27 @@ rising, the split stops moving:
 | 56 | 0.817 | 0.142 | 0.041 | 13.65 | 3.544 |
 | 64 | 0.818 | 0.144 | 0.038 | 15.34 | 4.564 |
 
-**FACT**: at saturation the scheduler spends approximately **82 % executing the
-model, 13-14 % with work runnable and the model not executing, and 4-5 % with
-genuinely nothing to do.** `no_work` collapses towards zero as expected;
-`runnable_idle` does **not** — it bottoms at 0.133 at C = 36 and then *rises*
-again to 0.144.
+**RETIRED, 2026-09-20, by F21.** The measurement is sound; the reading of it was
+not. `w_model` counted **only phase 4**, the batched step. Phase 5, which is
+99.8 % `mynah_asr_stream_finish` — the model executing a tail — was charged to
+`runnable_idle`. So the sentence this entry used to carry, "13-14 % with work
+runnable and the model not executing", described the model *executing*.
 
-**FACT**: this is the answer to the question F10 left open. Cores 0-23 are not
-idle because the offered load is too small — above the knee there is almost
-always a chunk ready, and for one wall second in seven the model is not running
-it.
+Corrected, from the same raw dumps: model execution is **0.896 of wall at
+C = 32, 0.928 at C = 36 and 0.940 at C = 40**, and the genuinely reclaimable
+idle is **1-3 %**, not 13-14 %.
 
-**This is the central open performance question.** 13-14 % of scheduler wall is
-the entire budget available to a software fix without adding CPUs.
+**What survives**: the phase-4 plateau itself is real and reproduces — the
+batched step holds 0.790 / 0.810 / 0.815 of wall at C = 32/36/40 while
+concurrency, backlog and mean batch all keep rising. What does NOT survive is
+the claim that the remainder is available to reclaim. It is mostly the same
+model, running at batch width one.
+
+**And this answers F10 the other way round.** Cores 0-23 are not idle at the
+knee: the fleet executes the model for 94 % of scheduler wall at C = 40. The
+serving problem is not utilisation, it is **efficiency** — 12.5 % of the wall
+runs the model one stream at a time while the batched path over the same
+weights averages 4.71 rows.
 
 **NOT ESTABLISHED**: that finalize *causes* the plateau. F20 shows finalize is
 large and correlates with `runnable_idle`, and the phase attribution charges
@@ -632,9 +649,15 @@ rungs at the knee:
 
 | C | finalize model | teardown | calls | model ms/call | teardown ms/call | finalize share of wall |
 |---|---|---|---|---|---|---|
-| 32 | 31.5 s (**100 %**) | 0.0 s (0 %) | 384 | **82.1** | 0.0 | 0.319 |
-| 36 | 35.5 s (**100 %**) | 0.0 s (0 %) | 432 | **82.3** | 0.0 | 0.356 |
-| 40 | 38.3 s (**100 %**) | 0.0 s (0 %) | 468 | **81.9** | 0.0 | 0.376 |
+| 32 | 31.5 s (**99.8 %**) | 0.0 s (0 %) | 384 | **82.1** | 0.0 | **0.106** |
+| 36 | 35.5 s (**99.8 %**) | 0.0 s (0 %) | 432 | **82.3** | 0.0 | **0.118** |
+| 40 | 38.3 s (**99.8 %**) | 0.0 s (0 %) | 468 | **81.9** | 0.0 | **0.125** |
+
+The share column is the corrected one (F21): the harness printed 0.319 / 0.354 /
+0.373 against the wrong denominator. The 99.8 % is `mynah_asr_stream_finish`
+against the whole of scheduler phase 5, recomputed from the raw per-worker
+dumps — so `sched_feed_tail` and the availability scan that share the phase cost
+0.2 % of it between them, and the tail really is all of it.
 
 **FACT**: the teardown — the done frame, the session close, the bookkeeping, the
 reset — costs **nothing measurable**. Every microsecond charged to finalize is
@@ -651,8 +674,18 @@ outright — "never through the batch".
 and not per stream-hour. Its share of scheduler wall is set by the utterance
 rate. At C = 40 the workload's mean utterance is ~6.8 audio-s, so the server pays
 82 ms of exclusive B = 1 model time for every ~6.8 s of audio it transcribes —
-**37.6 % of all scheduler wall**, spent at a batch width of one while the ready
+**12.5 % of all scheduler wall**, spent at a batch width of one while the ready
 set holds 4.71 rows on average.
+
+**ARITHMETIC, stated before the experiment rather than after it.** Removing
+finalize entirely can return at most 12.5 % of wall at C = 40, and only if the
+tail work vanished rather than moved. Going from C = 32 to C = 40 is +25 %
+offered load. So batching finalization, on its own, is **predicted not to be
+enough to make C = 40 healthy**. If the probe below shows C = 40 healthy with
+finalize near zero, that prediction is wrong and finalize is worth attacking
+hard; if it shows C = 40 still outside the envelope, finalize is not the
+barrier and the limit is in phase 4. Either way the answer arrives before any
+code is written.
 
 **DECISION**: this is the candidate mechanism, and it is testable without
 touching the code. Finalize's share depends on utterance length and on nothing
@@ -670,3 +703,68 @@ criterion, not the profiler's percentages).
 **CONSTRAINT on any fix**: rule 4. The tail carries `is_last = 1` and the causal
 right pad; any batched finalization ships with a bit-exactness gate against the
 serial path, or it does not ship.
+
+---
+
+## F21 — The avoidable idle was mostly the model: a denominator and a predicate, both wrong
+
+**How it was caught**: not by a new experiment. By recomputing F18's own table
+from the raw per-worker `[DUMP]` lines instead of trusting the campaign script
+that printed it, before building an optimisation on the number.
+
+**DEFECT 1, the denominator.** The capacity harness computed finalize's share of
+wall against a denominator roughly 3x too small, so it reported 0.319 / 0.354 /
+0.373 at C = 32/36/40 where the raw dumps say **0.106 / 0.118 / 0.125**. Every
+other column of that table recomputes to within 0.003, so the error is confined
+to that one column. Nine of the twelve rungs cannot be recomputed: a later run
+reused the output directory and overwrote their server logs. Those nine values
+are struck, not corrected.
+
+**DEFECT 2, and the one that mattered.** The three-way split of scheduler wall
+counted **only phase 4** as model execution:
+
+```c
+if (prev_ == 4) g.w_model += d_;
+else if (mynah_asr_slot_ready_count() > 0) g.w_runnable_idle += d_;
+else g.w_no_work += d_;
+```
+
+Phase 5 is finalization, and F20 measured it at **99.8 % `mynah_asr_stream_finish`**
+— the model, executing. So every tail the fleet ran was booked as *the model
+not executing while work was ready*. The instrumentation was measuring
+correctly and the label was false.
+
+**FACT**, recomputed from the raw dumps of the same run, commit `a941390`:
+
+| C | phase 4 (batched step) | phase 5 (finalize) | runnable idle | no work | **model execution** |
+|---|---|---|---|---|---|
+| 32 | 0.790 | 0.106 | 0.135 | 0.075 | **0.896** |
+| 36 | 0.810 | 0.118 | 0.132 | 0.058 | **0.928** |
+| 40 | 0.815 | 0.125 | 0.137 | 0.048 | **0.940** |
+
+`runnable_idle` minus `finalize` is **0.029 / 0.014 / 0.012**. That residue is
+the avoidable idle. Everything else in that bucket was the model.
+
+**This retires the central claim of F19.** There is no 13-14 % of reclaimable
+wall on this box. At C = 40 the fleet executes the model for **94 % of scheduler
+wall**, and the question is not how to keep it busier but how to make 12.5 % of
+that work stop running at batch width one.
+
+**DECISION, in the code**: `w_model_solo` is now a bucket of its own, holding
+phase 5 and phase 6 — model execution *outside* the batched ready set. It is
+deliberately not folded into `w_model`, because the distinction between them is
+exactly the thing worth fixing. The dump prints `execution_duty` (phase 4) and
+`model_duty` (phases 4+5+6) side by side: one number can never separate "the box
+is idle" from "the box is busy at batch width one", and this repo reported the
+second as the first for a day.
+
+**DECISION, in method**: a number that selects what to optimise gets recomputed
+from the raw artefact before it is acted on. Both defects here survived a
+12-rung campaign, a findings entry, a profile and a commit, and neither would
+have been caught by re-running the campaign — only by recomputing it.
+
+**FACT about the readiness predicate, from the audit added the same day**: the
+diagnostic predicate has **false_ready 0 and false_not_ready 6 of 65** on a
+3-stream smoke. Its errors are one-sided, so the measured `runnable_idle` is a
+floor and never a ceiling. That is the opposite direction from the error above
+and does not offset it.

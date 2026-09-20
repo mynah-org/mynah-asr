@@ -7,7 +7,10 @@
     "objective": {
       "primary": "concurrent_realtime_streams",
       "secondary": "emission_lag_p95",
-      "concurrency_range": [1, 32],
+      "concurrency_range": [
+        1,
+        32
+      ],
       "preferred_concurrency": 32,
       "quality_changes_allowed": false
     }
@@ -21,8 +24,16 @@
     "numa_nodes": 1,
     "l3_mib": 80,
     "ram_gib": 62,
-    "isa_features_used": ["asimd", "asimddp", "i8mm"],
-    "isa_features_idle": ["bf16", "sve", "sve2"],
+    "isa_features_used": [
+      "asimd",
+      "asimddp",
+      "i8mm"
+    ],
+    "isa_features_idle": [
+      "bf16",
+      "sve",
+      "sve2"
+    ],
     "smt_policy": "OFF; one thread per physical core",
     "notes": "bf16/sve/sve2 are present and the binary issues none of them. That is three unspent levers, not a defect, and --dispatch-map prints them as IDLE so the gap stays visible."
   },
@@ -108,34 +119,217 @@
     "throughput_ceiling_audio_s_per_wall_s": 40,
     "ceiling_concurrency": 32,
     "ladder": [
-      {"c": 8,  "audio_s_per_wall_s": 7.62,  "emission_lag_p50_ms": 38,   "emission_lag_p95_ms": 75,   "backlog_max_s": 0.184, "duty": 0.247, "runnable_idle": 0.248, "no_work": 0.505, "finalize_share": 0.086, "mean_batch": 1.02,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 12, "audio_s_per_wall_s": 11.55, "emission_lag_p50_ms": 37,   "emission_lag_p95_ms": 80,   "backlog_max_s": 0.164, "duty": 0.352, "runnable_idle": 0.201, "no_work": 0.446, "finalize_share": 0.119, "mean_batch": 1.06,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 16, "audio_s_per_wall_s": 15.17, "emission_lag_p50_ms": 38,   "emission_lag_p95_ms": 93,   "backlog_max_s": 0.184, "duty": 0.473, "runnable_idle": 0.202, "no_work": 0.325, "finalize_share": 0.167, "mean_batch": 1.11,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 20, "audio_s_per_wall_s": 19.07, "emission_lag_p50_ms": 39,   "emission_lag_p95_ms": 103,  "backlog_max_s": 0.244, "duty": 0.589, "runnable_idle": 0.192, "no_work": 0.219, "finalize_share": 0.209, "mean_batch": 1.17,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 24, "audio_s_per_wall_s": 22.65, "emission_lag_p50_ms": 51,   "emission_lag_p95_ms": 129,  "backlog_max_s": 0.244, "duty": 0.677, "runnable_idle": 0.162, "no_work": 0.161, "finalize_share": 0.251, "mean_batch": 1.32,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 28, "audio_s_per_wall_s": 26.33, "emission_lag_p50_ms": 70,   "emission_lag_p95_ms": 173,  "backlog_max_s": 0.284, "duty": 0.755, "runnable_idle": 0.145, "no_work": 0.100, "finalize_share": 0.293, "mean_batch": 1.59,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 32, "audio_s_per_wall_s": 29.58, "emission_lag_p50_ms": 94,   "emission_lag_p95_ms": 231,  "backlog_max_s": 0.464, "duty": 0.793, "runnable_idle": 0.135, "no_work": 0.072, "finalize_share": 0.319, "mean_batch": 2.11,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
-      {"c": 36, "audio_s_per_wall_s": 32.90, "emission_lag_p50_ms": 145,  "emission_lag_p95_ms": 345,  "backlog_max_s": 0.564, "duty": 0.813, "runnable_idle": 0.133, "no_work": 0.055, "finalize_share": 0.354, "mean_batch": 3.12,  "lost": 0, "rejected": 0, "verdict": "NEAR KNEE"},
-      {"c": 40, "audio_s_per_wall_s": 35.03, "emission_lag_p50_ms": 234,  "emission_lag_p95_ms": 601,  "backlog_max_s": 0.904, "duty": 0.817, "runnable_idle": 0.136, "no_work": 0.047, "finalize_share": 0.373, "mean_batch": 4.71,  "lost": 0, "rejected": 0, "verdict": "NEAR KNEE"},
-      {"c": 48, "audio_s_per_wall_s": 39.76, "emission_lag_p50_ms": 856,  "emission_lag_p95_ms": 1379, "backlog_max_s": 1.604, "duty": 0.820, "runnable_idle": 0.144, "no_work": 0.036, "finalize_share": 0.423, "mean_batch": 11.05, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"},
-      {"c": 56, "audio_s_per_wall_s": 38.47, "emission_lag_p50_ms": 1580, "emission_lag_p95_ms": 3265, "backlog_max_s": 3.544, "duty": 0.817, "runnable_idle": 0.142, "no_work": 0.041, "finalize_share": 0.413, "mean_batch": 13.65, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"},
-      {"c": 64, "audio_s_per_wall_s": 40.84, "emission_lag_p50_ms": 2273, "emission_lag_p95_ms": 4763, "backlog_max_s": 4.564, "duty": 0.818, "runnable_idle": 0.144, "no_work": 0.038, "finalize_share": 0.434, "mean_batch": 15.34, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"}
+      {
+        "c": 8,
+        "audio_s_per_wall_s": 7.62,
+        "emission_lag_p50_ms": 38,
+        "emission_lag_p95_ms": 75,
+        "backlog_max_s": 0.184,
+        "duty": 0.247,
+        "runnable_idle": 0.248,
+        "no_work": 0.505,
+        "finalize_share": null,
+        "mean_batch": 1.02,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 12,
+        "audio_s_per_wall_s": 11.55,
+        "emission_lag_p50_ms": 37,
+        "emission_lag_p95_ms": 80,
+        "backlog_max_s": 0.164,
+        "duty": 0.352,
+        "runnable_idle": 0.201,
+        "no_work": 0.446,
+        "finalize_share": null,
+        "mean_batch": 1.06,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 16,
+        "audio_s_per_wall_s": 15.17,
+        "emission_lag_p50_ms": 38,
+        "emission_lag_p95_ms": 93,
+        "backlog_max_s": 0.184,
+        "duty": 0.473,
+        "runnable_idle": 0.202,
+        "no_work": 0.325,
+        "finalize_share": null,
+        "mean_batch": 1.11,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 20,
+        "audio_s_per_wall_s": 19.07,
+        "emission_lag_p50_ms": 39,
+        "emission_lag_p95_ms": 103,
+        "backlog_max_s": 0.244,
+        "duty": 0.589,
+        "runnable_idle": 0.192,
+        "no_work": 0.219,
+        "finalize_share": null,
+        "mean_batch": 1.17,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 24,
+        "audio_s_per_wall_s": 22.65,
+        "emission_lag_p50_ms": 51,
+        "emission_lag_p95_ms": 129,
+        "backlog_max_s": 0.244,
+        "duty": 0.677,
+        "runnable_idle": 0.162,
+        "no_work": 0.161,
+        "finalize_share": null,
+        "mean_batch": 1.32,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 28,
+        "audio_s_per_wall_s": 26.33,
+        "emission_lag_p50_ms": 70,
+        "emission_lag_p95_ms": 173,
+        "backlog_max_s": 0.284,
+        "duty": 0.755,
+        "runnable_idle": 0.145,
+        "no_work": 0.1,
+        "finalize_share": null,
+        "mean_batch": 1.59,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 32,
+        "audio_s_per_wall_s": 29.58,
+        "emission_lag_p50_ms": 94,
+        "emission_lag_p95_ms": 231,
+        "backlog_max_s": 0.464,
+        "duty": 0.793,
+        "runnable_idle": 0.135,
+        "no_work": 0.072,
+        "finalize_share": 0.106,
+        "mean_batch": 2.11,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "HEALTHY"
+      },
+      {
+        "c": 36,
+        "audio_s_per_wall_s": 32.9,
+        "emission_lag_p50_ms": 145,
+        "emission_lag_p95_ms": 345,
+        "backlog_max_s": 0.564,
+        "duty": 0.813,
+        "runnable_idle": 0.133,
+        "no_work": 0.055,
+        "finalize_share": 0.118,
+        "mean_batch": 3.12,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "NEAR KNEE"
+      },
+      {
+        "c": 40,
+        "audio_s_per_wall_s": 35.03,
+        "emission_lag_p50_ms": 234,
+        "emission_lag_p95_ms": 601,
+        "backlog_max_s": 0.904,
+        "duty": 0.817,
+        "runnable_idle": 0.136,
+        "no_work": 0.047,
+        "finalize_share": 0.125,
+        "mean_batch": 4.71,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "NEAR KNEE"
+      },
+      {
+        "c": 48,
+        "audio_s_per_wall_s": 39.76,
+        "emission_lag_p50_ms": 856,
+        "emission_lag_p95_ms": 1379,
+        "backlog_max_s": 1.604,
+        "duty": 0.82,
+        "runnable_idle": 0.144,
+        "no_work": 0.036,
+        "finalize_share": null,
+        "mean_batch": 11.05,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "OVERLOADED"
+      },
+      {
+        "c": 56,
+        "audio_s_per_wall_s": 38.47,
+        "emission_lag_p50_ms": 1580,
+        "emission_lag_p95_ms": 3265,
+        "backlog_max_s": 3.544,
+        "duty": 0.817,
+        "runnable_idle": 0.142,
+        "no_work": 0.041,
+        "finalize_share": null,
+        "mean_batch": 13.65,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "OVERLOADED"
+      },
+      {
+        "c": 64,
+        "audio_s_per_wall_s": 40.84,
+        "emission_lag_p50_ms": 2273,
+        "emission_lag_p95_ms": 4763,
+        "backlog_max_s": 4.564,
+        "duty": 0.818,
+        "runnable_idle": 0.144,
+        "no_work": 0.038,
+        "finalize_share": null,
+        "mean_batch": 15.34,
+        "lost": 0,
+        "rejected": 0,
+        "verdict": "OVERLOADED"
+      }
     ],
     "overload_behaviour": "Graceful. Zero lost established streams and zero admission rejections at EVERY rung through C = 64: above the knee this fleet degrades by getting slow, never by dropping work that was already accepted. Do not read C = 64 as supported -- losing no streams is the floor the engine owes, not a capacity claim, and at C = 64 the backlog is seven times the gate.",
     "saturation": {
-      "duty_plateau": 0.82,
-      "runnable_idle_at_plateau": 0.135,
-      "no_work_at_plateau": 0.045,
-      "note": "From C = 36 upward the three-way split stops moving while concurrency, backlog and mean batch all keep rising. no_work collapses towards zero as it should; runnable_idle does not -- it bottoms at 0.133 at C = 36 and rises again to 0.144 at C = 64. About one wall second in seven has a chunk ready and the model not running it. That 13-14 % is the entire budget a software fix can reclaim without adding cpus, and it is the open question this profile does not answer."
+      "batched_step_plateau": 0.815,
+      "model_execution_at_c40": 0.94,
+      "runnable_idle_at_c40": 0.137,
+      "avoidable_idle_at_c40": 0.012,
+      "no_work_at_c40": 0.048,
+      "note": "Two duties, because one cannot express this. The BATCHED step plateaus at 0.790/0.810/0.815 across C = 32/36/40 while concurrency, backlog and mean batch all keep rising -- that part is real. But total model execution is 0.896/0.928/0.940: the finalization tail is the model too, and the three-way split used to charge it to runnable_idle. Subtracting finalize from runnable_idle leaves 0.029/0.014/0.012, and THAT is the avoidable idle. There is no 13-14 % of reclaimable wall on this box; at C = 40 the fleet runs the model 94 % of the time. The serving question is efficiency, not utilisation."
     },
     "finalize_composition": {
       "date": "2026-09-20",
       "commit": "0761a35",
-      "model_share": 1.0,
+      "model_share": 0.998,
       "teardown_share": 0.0,
-      "ms_per_call": [82.1, 82.3, 81.9],
-      "at_concurrency": [32, 36, 40],
-      "note": "Teardown -- done frame, session close, bookkeeping, reset -- costs nothing measurable. Finalize is entirely the model running inside mynah_asr_stream_finish, at B = 1, one slot at a time in scheduler phase 5, and the per-call cost is FLAT across the three loads while the mean batch of ordinary steps goes 2.11 -> 3.12 -> 4.71. It is a fixed cost per UTTERANCE that does not amortise with load because it is not batched. CANDIDATE mechanism for the duty plateau, not an established cause."
+      "ms_per_call": [
+        82.1,
+        82.3,
+        81.9
+      ],
+      "at_concurrency": [
+        32,
+        36,
+        40
+      ],
+      "note": "Teardown -- done frame, session close, bookkeeping, reset -- costs nothing measurable, and so does sched_feed_tail: mynah_asr_stream_finish is 99.8 % of the whole finalize phase, recomputed from the raw per-worker dumps. It runs at B = 1, one slot at a time in scheduler phase 5, and the per-call cost is FLAT at ~82 ms across all three loads while the mean batch of ordinary steps goes 2.11 -> 3.12 -> 4.71. A fixed cost per UTTERANCE that does not amortise with load because it is not batched. Removing it entirely returns at most 12.5 % of wall at C = 40, against the +25 % of offered load that C = 32 -> C = 40 asks for, so batching it is PREDICTED not to be sufficient on its own.",
+      "share_of_wall": [
+        0.106,
+        0.118,
+        0.125
+      ]
     },
     "cost_model_on_the_serving_path": {
       "a_ms": 39.5,
@@ -147,10 +341,33 @@
     "soak": null,
     "solo_group_ab": {
       "date": "2026-09-20",
-      "on": {"emission_lag_p95_ms": [105, 104, 103], "lost": [0, 0, 0]},
-      "off": {"emission_lag_p95_ms": [175, 175, 43793], "lost": [0, 0, 3]},
+      "on": {
+        "emission_lag_p95_ms": [
+          105,
+          104,
+          103
+        ],
+        "lost": [
+          0,
+          0,
+          0
+        ]
+      },
+      "off": {
+        "emission_lag_p95_ms": [
+          175,
+          175,
+          43793
+        ],
+        "lost": [
+          0,
+          0,
+          3
+        ]
+      },
       "note": "The third OFF rung is the pre-F15 stall, not a property of the arm. It landing in the CONTROL arm is what rules the change out as its cause -- a ladder run just before this A/B had shown the failure twice with the change ON, which on its own would have been read as a regression."
-    }
+    },
+    "ladder_note": "finalize_share is null on nine rungs ON PURPOSE. The campaign harness printed that column against a denominator about 3x too small, and the raw per-worker dumps that would correct it were overwritten by a later run on every rung but C = 32/36/40. A wrong number removed beats a wrong number kept; see docs/serving-findings.md F21. Every other column recomputes from the raw dumps to within 0.003."
   },
   "provenance": {
     "measured_on": "gabrielemastrapasqua@c4a-highcpu-32, Linux 7.0.0-1011-gcp, loadavg < 0.5 at start, one fresh server per rung",
@@ -161,7 +378,8 @@
       "The capacity stated is for the 24-cpu SLICE, not for the 32-cpu box, and it is not scaled up. The load generator is one process per stream and shares the machine; the 8 reserved cpus are what keeps it out of the measurement.",
       "status stays `screened` and long_soak_qualified stays null until an independent soak of at least 10 minutes holds C = 32 with zero lost streams and transcripts checked. Rungs here are 90 s, and serving-findings F12 exists because a short ladder once promoted a topology that lost streams over ten minutes.",
       "Finalize is a per-utterance cost, so this curve is a function of the corpus's mean utterance length as well as of the machine. A deployment whose utterances are much shorter than 6.8 s should expect the knee to the LEFT of 36.",
-      "CLOSED since the previous revision of this file: the stall in which every stream received a first partial and then nothing for tens of seconds. Root cause and fix in serving-findings F15/F17 -- a blocking recv(MSG_PEEK) on a socket with two readers. It was never a prefork property; prefork only made it likelier."
+      "CLOSED since the previous revision of this file: the stall in which every stream received a first partial and then nothing for tens of seconds. Root cause and fix in serving-findings F15/F17 -- a blocking recv(MSG_PEEK) on a socket with two readers. It was never a prefork property; prefork only made it likelier.",
+      "The 2026-09-20 revision of this file carried a finalize share about 3x too large and a duty that excluded the finalization tail from model execution. Both were found by recomputing the campaign's own table from the raw dumps rather than by re-running it, and both are recorded in docs/serving-findings.md F21 rather than quietly edited away."
     ]
   }
 }

@@ -527,15 +527,26 @@ void mynah_asr_obs_dump(void) {
                                          "take-requests", "cancel", "peer-check"};
         double tot = 0.0;
         for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) tot += st.phase_wall_s[i];
-        const double three = st.w_model + st.w_runnable_idle + st.w_no_work;
+        const double four = st.w_model + st.w_model_solo +
+                            st.w_runnable_idle + st.w_no_work;
+        /* Two duties, and the pair is the point. `batched` is the ready set
+         * going through one call; `model` adds the tails and the offline batch,
+         * which execute the same weights one stream at a time. A single duty
+         * number cannot tell "the box is idle" from "the box is busy at batch
+         * width one", and this file reported the second as the first until
+         * 2026-09-20. */
         OBS_ADD("[DUMP] worker=%d seq=%lu wall uptime_s=%.1f accounted_s=%.1f "
-                "execution_duty=%.3f\n", widx, n, st.uptime_s, tot,
-                tot > 0.0 ? st.phase_wall_s[4] / tot : 0.0);
+                "execution_duty=%.3f model_duty=%.3f\n", widx, n, st.uptime_s, tot,
+                tot > 0.0 ? st.phase_wall_s[4] / tot : 0.0,
+                tot > 0.0 ? (st.phase_wall_s[4] + st.phase_wall_s[5] +
+                             st.phase_wall_s[6]) / tot : 0.0);
         OBS_ADD("[DUMP] worker=%d seq=%lu split model_busy_s=%.2f (%.3f) "
+                "model_solo_s=%.2f (%.3f) "
                 "runnable_idle_s=%.2f (%.3f) no_work_s=%.2f (%.3f)\n",
-                widx, n, st.w_model, three > 0 ? st.w_model / three : 0.0,
-                st.w_runnable_idle, three > 0 ? st.w_runnable_idle / three : 0.0,
-                st.w_no_work, three > 0 ? st.w_no_work / three : 0.0);
+                widx, n, st.w_model, four > 0 ? st.w_model / four : 0.0,
+                st.w_model_solo, four > 0 ? st.w_model_solo / four : 0.0,
+                st.w_runnable_idle, four > 0 ? st.w_runnable_idle / four : 0.0,
+                st.w_no_work, four > 0 ? st.w_no_work / four : 0.0);
         if (st.dly_samples > 0)
             OBS_ADD("[DUMP] worker=%d seq=%lu delay_ms ready_sel=%.1f/%.1f/%.1f "
                     "sel_start=%.1f/%.1f/%.1f ready_start=%.1f/%.1f/%.1f n=%lu\n",
