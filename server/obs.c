@@ -486,7 +486,10 @@ void mynah_asr_obs_dump(void) {
      * file that is atomic, and on a pipe the ordering within a dump still
      * holds. Bracketed begin/end with the same seq so two dumps can never be
      * read as one. */
-    char b[4096];
+    /* Room for the per-slot block: 16 slots at ~150 bytes each on top of the
+     * aggregate lines. OBS_ADD truncates rather than overruns, and a truncated
+     * dump is exactly the artefact a stall investigation cannot afford. */
+    char b[16384];
     size_t k = 0;
 #define OBS_ADD(...) do { \
         if (k < sizeof(b)) \
@@ -531,6 +534,24 @@ void mynah_asr_obs_dump(void) {
                 widx, n, ps.spin_us, ps.workers, ps.dispatches, ps.inline_runs,
                 ww ? 100.0 * (double)ps.worker_spin / (double)ww : 0.0,
                 cc ? 100.0 * (double)ps.caller_spin / (double)cc : 0.0);
+    }
+    {   /* Per-slot, because a stall is a property of PARTICULAR streams. The
+         * aggregate says the fleet is behind; this says which ones, how much
+         * audio is waiting in each ring, and whether the scheduler can even see
+         * them (`out=0` is a slot it skips by design, mid-handshake). A stream
+         * whose ring is full while its neighbours step is starved; one whose
+         * ring is empty is simply not being fed. */
+        mynah_asr_sched_slot_view sv[16];
+        const int nv = mynah_asr_sched_slots_view(sv, 16);
+        for (int i = 0; i < nv; i++)
+            OBS_ADD("[DUMP] worker=%d seq=%lu slot id=%d state=%d out=%d stream=%d "
+                    "la=%d steps=%lu deltas=%lu ring_s=%.1f need_s=%.2f age_s=%.1f "
+                    "since_rx_s=%.1f lag_max_ms=%.0f\n",
+                    widx, n, sv[i].id, sv[i].state, sv[i].has_out, sv[i].has_stream,
+                    sv[i].lookahead, sv[i].steps, sv[i].deltas,
+                    (double)sv[i].ring_samples / 16000.0,
+                    (double)sv[i].need_samples / 16000.0,
+                    sv[i].age_s, sv[i].since_arrival_s, sv[i].lag_max_ms);
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);

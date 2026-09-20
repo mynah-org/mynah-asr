@@ -925,6 +925,33 @@ int mynah_asr_sched_active(void) {
 
 /* --------------------------------------------------------- the snapshot */
 
+int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max) {
+    const double now = mynah_asr_now();
+    int n = 0;
+    for (int i = 0; i < g.n_slots && n < max; i++) {
+        mynah_asr_slot *s = &g.slots[i];
+        mynah_asr_stream_out *o = NULL;
+        size_t avail = 0;
+        const mynah_asr_slot_state st = mynah_asr_slot_poll(s, &o, &avail);
+        if (st != MYNAH_ASR_SLOT_ACTIVE && st != MYNAH_ASR_SLOT_FINISHING)
+            continue;
+        mynah_asr_sched_slot_view *v = &out[n++];
+        v->id = i;
+        v->state = (int)st;
+        v->has_out = o != NULL;
+        v->has_stream = s->stream != NULL;
+        v->lookahead = s->lookahead;
+        v->steps = (unsigned long)s->steps;
+        v->deltas = (unsigned long)s->deltas;
+        v->ring_samples = avail;
+        v->need_samples = s->stream ? mynah_asr_stream_need_samples(s->stream) : 0;
+        v->age_s = s->t_open > 0.0 ? now - s->t_open : -1.0;
+        v->since_arrival_s = s->last_arrival > 0.0 ? now - s->last_arrival : -1.0;
+        v->lag_max_ms = s->lag_max_ms;
+    }
+    return n;
+}
+
 void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     memset(out, 0, sizeof(*out));
     out->slots_active = mynah_asr_sched_active();

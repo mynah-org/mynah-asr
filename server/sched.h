@@ -187,6 +187,30 @@ typedef struct {
     double window_wait_ms_sum;
 } mynah_asr_sched_stats;
 
+/* One live slot, as the scheduler sees it. The aggregate counters say the fleet
+ * is behind; only this says WHICH streams are behind and what state they are in
+ * when they are. A stall on 2026-09-20 kept p50 emission lag at 70-95 ms for ten
+ * minutes while p95 reached 55 s in three-minute episodes -- most streams fine,
+ * a subset starved, self-healing. No aggregate can express that. */
+typedef struct {
+    int id;
+    int state;                  /* mynah_asr_slot_state                        */
+    int has_out;                /* the scheduler skips a slot with no output    */
+    int has_stream;             /* NULL until the first step opens one          */
+    int lookahead;
+    unsigned long steps, deltas;
+    size_t ring_samples;        /* audio received and not yet taken             */
+    size_t need_samples;        /* what one step of this stream wants           */
+    double age_s;               /* since the slot was claimed                   */
+    double since_arrival_s;     /* since the last audio arrived (-1 = never)    */
+    double lag_max_ms;
+} mynah_asr_sched_slot_view;
+
+/* Fills up to `max` views, returns how many slots were live. Safe from any
+ * thread: it reads each slot under that slot's own lock, which is what the
+ * scheduler's own poll does. */
+int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max);
+
 void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out);
 
 /* Quantile of the emission-lag histogram, in ms, quantised to the 8 ms bucket
