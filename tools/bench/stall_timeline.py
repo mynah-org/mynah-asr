@@ -41,7 +41,9 @@ SLOT = re.compile(
     r"ready=(?P<ready>\d+) steps=(?P<steps>\d+) deltas=(?P<deltas>\d+) "
     r"ring_s=(?P<ring>[-\d.]+) need_s=(?P<need>[-\d.]+) age_s=(?P<age>[-\d.]+) "
     r"since_rx_s=(?P<rx>[-\d.]+) since_step_s=(?P<step>[-\d.]+) "
-    r"lag_max_ms=(?P<lag>[-\d.]+)")
+    r"lag_max_ms=(?P<lag>[-\d.]+)"
+    r"(?: mu_owner=(?P<owner>[0-9a-f]+) mu_held_s=(?P<held>[-\d.]+) "
+    r"mu_where=(?P<where>\S+))?")
 PROC = re.compile(r"\[DUMP\] worker=(?P<worker>-?\d+) seq=(?P<seq>\d+) process pid=(?P<pid>\d+)")
 
 # A slot that has not been served for this long, while a neighbour has, is the
@@ -67,7 +69,9 @@ def parse(path):
             "la": int(d["la"]), "ready": int(d["ready"]), "steps": int(d["steps"]),
             "deltas": int(d["deltas"]), "ring": float(d["ring"]), "need": float(d["need"]),
             "age": float(d["age"]), "rx": float(d["rx"]), "step": float(d["step"]),
-            "lag": float(d["lag"])})
+            "lag": float(d["lag"]),
+            "owner": d.get("owner") or "0", "held": float(d.get("held") or -1.0),
+            "where": d.get("where") or "-"})
     return samples, pid_of
 
 
@@ -155,8 +159,8 @@ def main():
         print(f"  slot {sid} on worker {worker}"
               + (f" (pid {pid})" if pid else "") + f"  ->  CLASS {letter}")
         print(f"    {why}")
-        print(f"    {'seq':>5} {'state':>5} {'out':>3} {'rdy':>3} {'steps':>6} "
-              f"{'ring_s':>7} {'need_s':>7} {'since_rx':>9} {'since_step':>11} {'lag_max':>8}")
+        print(f"    {'seq':>5} {'out':>3} {'rdy':>3} {'steps':>6} {'ring_s':>7} "
+              f"{'since_rx':>9} {'since_step':>11} {'mu_owner':>10} {'held_s':>7}  who")
         # the whole life of the slot, so onset and recovery are both visible
         life = sorted((r for key, rs in samples.items() if key[0] == worker
                        for r in rs if r["id"] == sid), key=lambda r: r["seq"])
@@ -170,9 +174,10 @@ def main():
                     mark = "   <== onset"
                 if r["steps"] > prev["steps"] and prev["step"] > a.stall_s:
                     mark += f" (+{r['steps'] - prev['steps']} steps)"
-            print(f"    {r['seq']:>5} {r['state']:>5} {r['out']:>3} {r['ready']:>3} "
-                  f"{r['steps']:>6} {r['ring']:>7.1f} {r['need']:>7.2f} {r['rx']:>9.1f} "
-                  f"{r['step']:>11.1f} {r['lag']:>8.0f}{mark}")
+            own = r["owner"] if r["owner"] != "0" else "-"
+            print(f"    {r['seq']:>5} {r['out']:>3} {r['ready']:>3} {r['steps']:>6} "
+                  f"{r['ring']:>7.1f} {r['rx']:>9.1f} {r['step']:>11.1f} "
+                  f"{own:>10} {r['held']:>7.1f}  {r['where']}{mark}")
             prev = r
         # a healthy neighbour at the same instants: "not stepping" means nothing alone
         if peers:
@@ -183,6 +188,25 @@ def main():
                 print(f"    healthiest peer at seq {worst_seq}: slot {p['id']} "
                       f"ring {p['ring']:.1f}s since_step {p['step']:.1f}s steps {p['steps']}")
         print()
+    # The wait chain, if the dumps carry a lock owner. "held for N seconds" is
+    # not the answer: the answer is why that owner cannot release, and the next
+    # edge is whatever IT is waiting on.
+    held = [r for key, rs in samples.items() for r in rs
+            if r["owner"] != "0" and r["held"] > STALL_S]
+    if held:
+        print("  LOCK OWNERS HELD LONGER THAN THE THRESHOLD:")
+        seen = set()
+        for r in sorted(held, key=lambda r: -r["held"]):
+            k = (r["id"], r["owner"], r["where"])
+            if k in seen: continue
+            seen.add(k)
+            print(f"    slot {r['id']:<3} mutex held {r['held']:.1f}s by thread "
+                  f"{r['owner']} taken in {r['where']}")
+        print("    -> next edge: what is THAT thread waiting on? "
+              "A held mutex is not a cause until its owner cannot release it.")
+    else:
+        print("  No slot mutex was held longer than the threshold in these dumps:")
+        print("    whatever froze the scheduler, it was not a slot lock held by a peer.")
     print("  CLASS A scheduler/model-service starvation · B readiness bookkeeping ·")
     print("  C ingest/transport · D chunk accounting · E worker-wide · F global capacity")
     return 0
