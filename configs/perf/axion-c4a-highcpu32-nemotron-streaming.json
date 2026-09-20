@@ -99,7 +99,7 @@
     "backlog_max_s": 0.64,
     "utterances_lost": 0,
     "ttfp_p95_ms": null,
-    "notes": "320 ms is not a taste: it is (lookahead + 1) x 80 ms, the cadence the model itself sets, so a stream whose emission lag exceeds it is falling behind the audio. ttfp is deliberately null -- the committed English clips start speaking at 0.18 s, 0.64 s and 0.02 s and samples/en/fleurs_long.wav does not start until 23.2 s, so TTFP measured from stream open is measuring leading silence: it read 1636 ms at the safe point and 2755 ms at four times the backlog, tracking the corpus and not the server. A TTFP gate needs a corpus trimmed to speech onset first."
+    "notes": "320 ms is not a taste: it is (lookahead + 1) x 80 ms, the cadence the model itself sets, so a stream whose emission lag exceeds it is falling behind the audio. ttfp_p95_ms is null because this repo cannot yet defend a number for it, NOT because TTFP does not matter. It has a load-independent floor of about 1545 ms on this build and corpus -- 1544 at C=8, 1545 at C=16, 1646 at C=32 -- plus a queueing term that appears only past the knee (1925 at C=40, 2827 at C=64). The earlier note here claimed the floor was leading silence; that holds for samples/en/fleurs_long.wav, which is silent until 23.2 s, and NOT for the three clips actually used, whose onsets are 0.02, 0.18 and 0.64 s. Roughly one second is unaccounted for. A TTFP gate needs that second explained and a corpus trimmed to speech onset, in that order."
   },
   "measured": {
     "date": "2026-09-20",
@@ -338,7 +338,32 @@
       "b_ms_per_stream_at_c24": 10.13,
       "note": "Fitted from mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count on the 1x24 topology, i.e. the step AS THE SCHEDULER CALLS IT. The bench in isolation says b = 4.58. These constants have NOT been refitted for 3x8 and must not be applied to it: b is a function of how many cores walk the weights, and 8 threads per worker is a different function from 24."
     },
-    "soak": null,
+    "soak": {
+      "date": "2026-09-20",
+      "commit": "d0c36f4",
+      "concurrency": 32,
+      "duration_s": 600,
+      "utterances": "2362/2362 ok",
+      "lost": 0,
+      "rejected": 0,
+      "audio_s_per_wall_s": 30.71,
+      "emission_lag_p95_ms": 229,
+      "finalization_p95_ms": 390,
+      "backlog_max_s": 0.444,
+      "ttfp_p95_ms": 1657,
+      "drift_pct": 10,
+      "trend_pct": 7,
+      "model_execution": 0.965,
+      "runnable_idle": 0.015,
+      "mean_batch": 2.25,
+      "ready_to_model_start_ms": [
+        37,
+        104,
+        147
+      ],
+      "harness_verdict": "MARGINAL",
+      "why_not_qualifying": "Every serving gate passes and no stream was lost in ten minutes. It does not qualify for two reasons. Transcripts were not checked -- 0 utterances scored against a reference, because no manifest exists in this repo and make fetch-stress-bank has never been run -- and the profile's own condition is zero losses AND transcripts checked. And TTFP p95 is 1657 ms against a 1160 ms limit; that is load-independent (1544 ms at C=8) so it is not a capacity signal, but the explanation this file used to give for it -- leading silence -- is wrong for this corpus, whose clips start speaking at 0.02, 0.18 and 0.64 s. About a second of pipeline latency is unexplained. The limit is not being moved."
+    },
     "solo_group_ab": {
       "date": "2026-09-20",
       "on": {

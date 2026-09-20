@@ -990,3 +990,66 @@ emission lag.
 on its size in a profile. F23's prediction stands unchanged and unhedged —
 batching the tail moves the knee from about 35 to about 39, and leaves C = 40
 just outside.
+
+---
+
+## F25 — C=32 holds for ten minutes with zero losses, and is still NOT qualified
+
+**EVIDENCE**, Axion, commit `d0c36f4`, 3x8, cpus 0-23 server / 24-31 generator,
+600 s closed loop at C = 32, mixed corpus, seed 42, one fresh server.
+
+```
+utterances 2362/2362 ok, 0 errors, 0 rejected, 136 excluded by warm-up
+audio 17776.7 s, 39201 deltas, span 611.8 s, pacing PACED (max lateness 1.5 ms)
+[PASS    ] utterances lost                      0    (limit 0)
+[PASS    ] emission lag p95 (pooled)          229 ms (limit 320)
+[PASS    ] finalization lag p95               390 ms (limit 500)
+[PASS    ] backlog max                      0.444 s  (limit 0.640)
+[PASS    ] drift / trend, all four series      10 % / 3-7 %  (limits 20 / 15)
+[MARGINAL] TTFP p95                          1657 ms (limit 1160)
+verdict: MARGINAL
+```
+
+Per-window emission lag p95 over the ten minutes: 237, 252, 235, 235, 221, 228,
+222, 225, 224, 222 ms. Flat.
+
+**FACT**: at C = 32 this fleet sustained **30.71 audio-s per wall second for ten
+minutes with zero lost established streams and zero rejections**, every serving
+envelope inside its limit and no drift.
+
+**FACT — the strongest confirmation yet that the box is compute-bound.** Server
+accounting over the same window: step 0.852, finalize 0.113, **model 0.965**,
+runnable_idle **0.015**, no_work 0.020, mean batch 2.25, ready-to-model-start
+37/104/147 ms. Over a long run, with no ramp in the window, avoidable idle is
+**1.5 % of scheduler wall**.
+
+**NOT PROMOTED to `long_soak_qualified`, for two reasons, neither of them
+softened.**
+
+**1. Transcripts were not checked.** `quality: 0 utterance(s) scored against a
+reference, 2362 without one`. The profile's own condition is "zero lost streams
+**and transcripts checked**", and the reference manifest does not exist in this
+repo — `make fetch-stress-bank` has never been run. A soak that proves timing
+while proving nothing about what was transcribed is half a qualification.
+
+**2. TTFP fails its limit, and the explanation previously recorded for that is
+wrong.** This file and the Axion profile said TTFP was measuring leading
+silence. For THIS corpus that is false: `test_en` starts speaking at 0.02 s,
+`fleurs_1521` at 0.18 s and `fleurs_1534` at 0.64 s, against a TTFP p95 of
+1657 ms. About **1 second of pipeline latency is unexplained** and is being
+dismissed by an explanation that only fits `fleurs_long.wav`.
+
+**FACT: the TTFP floor is load-independent.** Across the F22 ladder it reads
+1544 ms at C = 8, 1545 at C = 16, 1646 at C = 32, then 1925 at C = 40 and
+2827 at C = 64. So it has a floor of about 1545 ms present on an almost idle
+fleet, plus a queueing term that only appears past the knee. **The MARGINAL
+verdict at C = 32 is therefore not a statement about capacity** — but the floor
+is a real, user-visible 1.5 s to first partial and it is NOT explained. Roughly
+1.0 s of it is about three chunk periods, which is the shape of an encoder
+filling context before the decoder will emit, but that is a guess and is
+labelled as one.
+
+**DECISION**: the TTFP gate is NOT relaxed and the limit is NOT moved. Two
+things are owed instead — a corpus with a reference manifest so transcripts can
+be scored, and a measurement of where the 1545 ms floor is spent. Until both
+exist, C = 32 stays `measured_short_run_safe`.
