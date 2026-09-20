@@ -216,6 +216,13 @@ typedef struct {
     double since_step_s;        /* since the model last served it (-1 = never)  */
     int ready;                  /* the ring holds a whole chunk for this stream  */
     double lag_max_ms;
+    /* Who holds this slot's mutex right now, where they took it and for how
+     * long. A scheduler blocked in its poll pass is waiting on exactly one of
+     * these, and naming the holder is the difference between a hypothesis and a
+     * cause. */
+    unsigned long mu_owner;
+    double mu_held_s;
+    const char *mu_where;
 } mynah_asr_sched_slot_view;
 
 /* Fills up to `max` views, returns how many slots were live. Safe from any

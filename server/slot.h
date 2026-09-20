@@ -121,6 +121,18 @@ typedef struct mynah_asr_slot {
     unsigned char *frame;          /* scratch for one outgoing WS frame */
     size_t frame_cap;
     float *take;                   /* scratch for one chunk of PCM */
+    /* Who holds this slot's mutex, where they took it, and since when.
+     *
+     * The 2026-09-20 stall froze the scheduler inside its poll pass for 26 s and
+     * the static audit found no lock-order cycle, which leaves a long critical
+     * section -- and a long critical section has an owner that nothing in the
+     * server could name. Two relaxed stores per acquisition, against the cost of
+     * the mutex itself, buys a dump that says "waiting on slot 7, held by the
+     * ingest thread in push for 26 s" instead of "waiting". */
+    _Atomic unsigned long mu_owner;   /* a thread id, 0 = free                  */
+    _Atomic double mu_since;          /* when it was taken                      */
+    const char *_Atomic mu_where;     /* the call site that took it             */
+
     size_t take_cap;
 } mynah_asr_slot;
 

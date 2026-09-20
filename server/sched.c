@@ -993,6 +993,12 @@ int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max) {
         v->since_step_s = s->t_last_step > 0.0 ? now - s->t_last_step : -1.0;
         v->ready = s->stream && v->need_samples > 0 && avail >= v->need_samples;
         v->lag_max_ms = s->lag_max_ms;
+        v->mu_owner = atomic_load_explicit(&s->mu_owner, memory_order_relaxed);
+        {
+            const double since = atomic_load_explicit(&s->mu_since, memory_order_relaxed);
+            v->mu_held_s = v->mu_owner ? now - since : -1.0;
+        }
+        v->mu_where = atomic_load_explicit(&s->mu_where, memory_order_relaxed);
     }
     return n;
 }

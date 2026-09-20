@@ -336,3 +336,41 @@ CANDIDATE on this box and is deliberately not in
 Evidence: `.work/axion-session-2026-09-20.md`,
 `configs/perf/axion-c4a-highcpu32-nemotron-streaming.json`, and on the box
 `~/hunt/`, `~/ladder2/`, `~/sweep/`, `~/window_ab/`, `~/solo_ab/`.
+
+---
+
+## F14 — The static lock audit finds NO cycle, so the stall is a long critical section
+
+**FACT**, from reading every acquisition of the three locks rather than assuming:
+
+| edge | where | inverse found? |
+|---|---|---|
+| `s->mu` → `g.mu` | `mynah_asr_slot_push()` rings the doorbell with the slot lock held: `g_notify()` → `mynah_asr_sched_wake()` → `g.mu` | **none** |
+| `g.mu` → anything | every `g.mu` critical section in `sched.c` touches only the offline queue and the wake flags | never takes a slot or ring lock |
+| `o->mu` → `close(fd)` | the writer retires the descriptor under the ring lock | `close()` cannot block: no `SO_LINGER` is set |
+| `s->mu` → `cond_wait` | `slot_push` on a full ring | releases the mutex while it waits |
+
+There is **no lock-order cycle**, so this is not a deadlock. That leaves the
+other shape: a critical section held long enough to stop everything behind it.
+
+Two candidates were cleared by reading, not by measuring:
+
+- `mynah_asr_stream_out_finish()` does **not** join the writer — the writer is
+  detached and there is no `pthread_join` in `server/stream_out.c` at all.
+- `SO_SNDTIMEO` defaults to **5 s** (`STREAM_OUT_DEFAULT_TIMEOUT_MS`), and the
+  observed freeze is 26-28 s, so a single send timeout does not explain it.
+
+**HYPOTHESIS**: some holder of `s->mu` or `o->mu` keeps it for tens of seconds,
+and nothing in the server can currently name that holder.
+
+**EXPERIMENT, built and ready, not yet run** (the box was handed to another
+campaign): every acquisition of a slot's mutex now records the owning thread,
+the call site that took it, and when — two relaxed stores against the cost of
+the mutex itself — and `cond_wait` clears the owner while it waits, so a dump
+cannot name a thread that is holding nothing. SIGUSR1 prints
+`mu_owner=<tid> mu_held_s=<s> mu_where=<function>` on every live slot, beside
+the scheduler's own `phase=<sub-phase> slot=<index>`.
+
+The next episode therefore answers three questions in one dump: which lock the
+scheduler is waiting for, who owns it, and since when. **No scheduler behaviour
+is changed until those three agree with the graph above.**
