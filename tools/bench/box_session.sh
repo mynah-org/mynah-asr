@@ -190,7 +190,7 @@ stop_server() {
     done
     SRV=""
 }
-trap 'stop_server' EXIT INT TERM
+trap 'sample_stop; stop_server' EXIT INT TERM
 
 # Two corpora, because the two phases ask different questions. A WAVE rung is
 # paced at real time, so its wall clock is the LONGEST clip in it: one 94 s
@@ -200,6 +200,53 @@ trap 'stop_server' EXIT INT TERM
 WAVE_CLIPS="samples/en/fleurs_1521.wav samples/en/fleurs_1534.wav tests/audio/test_en.wav"
 SOAK_CLIPS="samples/en/fleurs_1521.wav samples/en/fleurs_1534.wav samples/en/fleurs_long.wav tests/audio/test_en.wav"
 verdict_of() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['envelope']['verdict'])" "$1" 2>/dev/null || echo UNREADABLE; }
+
+# A rung that breaks must say WHERE it broke, or the next session re-runs it to
+# find out. On 2026-09-20 a c=8 rung emitted a first partial on all eight
+# streams and then stopped: every reader timed out, pooled emission lag came
+# back as 59 729 ms, and nothing in the artefacts could distinguish "the server
+# wedged" from "the client could not keep up" -- the server-side counters were
+# only read after the rung, when whatever it was had passed.
+#
+# So sample the metrics port THROUGH the rung. If mynah_asr_steps_total stops
+# advancing while streams are open, the server stopped stepping; if it keeps
+# advancing while the client sees nothing, the problem is downstream of the
+# step. One curl every two seconds costs nothing and answers the question
+# without a second run.
+sample_start() {
+    ( while :; do
+        printf '%s ' "$(date +%s)"
+        curl -fsS --max-time 1 "http://localhost:$METRICS/metrics" 2>/dev/null \
+            | awk '/^mynah_asr_steps_total|^mynah_asr_deltas_total|^mynah_asr_emission_lag_ms_max/{printf "%s=%s ", $1, $2}'
+        echo
+        sleep 2
+      done ) > "$1" 2>&1 &
+    SAMPLER=$!
+}
+sample_stop() { [ -n "${SAMPLER:-}" ] && kill "$SAMPLER" 2>/dev/null; SAMPLER=""; }
+sample_verdict() {   # $1 = the sample file
+    python3 - "$1" <<'PYEOF'
+import re, sys
+rows = []
+for line in open(sys.argv[1]):
+    t = re.match(r"(\d+) ", line)
+    m = re.search(r"mynah_asr_steps_total\S*\s*(\d+(?:\.\d+)?)", line)
+    if t and m:
+        rows.append((int(t.group(1)), float(m.group(1))))
+if len(rows) < 3:
+    print("  steps: not sampled (metrics port unreadable)"); raise SystemExit
+worst, at = 0, None
+for (t0, s0), (t1, s1) in zip(rows, rows[1:]):
+    if s1 == s0 and t1 - t0 > worst:
+        worst, at = t1 - t0, t0
+total = rows[-1][1] - rows[0][1]
+if worst >= 6:
+    print(f"  steps: the server STOPPED STEPPING for {worst}s "
+          f"(longest flat stretch, at t={at}); {total:.0f} steps over the rung")
+else:
+    print(f"  steps: advanced throughout ({total:.0f} steps, longest pause {worst}s)")
+PYEOF
+}
 
 # ------------------------------------------------------ P4 the streaming ladder
 say ""; say "---- P4 WAVE ladder (screening: it may disqualify a rung, it never promotes one)"
@@ -222,11 +269,14 @@ else
         if over_budget; then say "  budget reached, ladder stops at C=$C (not attempted)"; break; fi
         say ""
         say "  ======== WAVE c=$C ========"
+        sample_start "$RUN/steps-c$C.txt"
         lrun python3 tools/bench/stream_load.py --mode wave --streams "$C" --repeat 2 \
             --clips $WAVE_CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
             --json "$RUN/wave-c$C.json" > "$RUN/wave-c$C.txt" 2>&1
+        sample_stop
         grep -E '^\s+(wall|utterances|\[|verdict|rejections)' "$RUN/wave-c$C.txt" \
             | sed 's/^/  /' | tee -a "$RUN/session.log"
+        sample_verdict "$RUN/steps-c$C.txt" | tee -a "$RUN/session.log"
         V=$(verdict_of "$RUN/wave-c$C.json")
         case "$V" in
             GOOD)     STREAMS_OK=$C ;;
