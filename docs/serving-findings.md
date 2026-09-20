@@ -524,3 +524,149 @@ serial bottleneck, temporal hole-filling between independent domains, different
 ready-set dynamics, different step widths, reduced rendezvous, cache effects, or
 a combination. The execution-duty experiment exists to separate them, and no
 number here chooses one.
+
+---
+
+## F18 — The 3x8 capacity curve on the Axion: C_safe 32, knee 36, overload 48
+
+**EVIDENCE**, Axion (GCP `c4a-highcpu-32`, Neoverse-V2, 32 vCPU), commit
+`a941390`, 2026-09-20T15:19Z. Concurrency is the **only** independent variable:
+every rung is a fresh server, same commit, same model
+(`nemotron-3.5-asr-streaming-0.6b`, `--quant int8`), same corpus
+(`fleurs_1521` 7.4 s / `fleurs_1534` 11.9 s / `test_en` 4.3 s, bank
+`short,medium`, seed 42), same pacing (`lookahead 3`, real time), same affinity
+(server `taskset -c 0-23`, generator `taskset -c 24-31`), same warm-up (25 s)
+and same run length (90 s).
+
+Topology: **3 workers x 8 threads**, `--threads 96 --cap 96`.
+
+| C | est. | lost | rej | audio/wall | ttfp p95 | lag p50/p95 | backlog | duty | r_idle | no_work | finalize | meanB | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 86 | 0 | 0 | 7.62 | 1545 | 38/75 | 0.184 | 0.247 | 0.248 | 0.505 | 0.086 | 1.02 | HEALTHY |
+| 12 | 129 | 0 | 0 | 11.55 | 1529 | 37/80 | 0.164 | 0.352 | 0.201 | 0.446 | 0.119 | 1.06 | HEALTHY |
+| 16 | 169 | 0 | 0 | 15.17 | 1546 | 38/93 | 0.184 | 0.473 | 0.202 | 0.325 | 0.167 | 1.11 | HEALTHY |
+| 20 | 210 | 0 | 0 | 19.07 | 1552 | 39/103 | 0.244 | 0.589 | 0.192 | 0.219 | 0.209 | 1.17 | HEALTHY |
+| 24 | 252 | 0 | 0 | 22.65 | 1559 | 51/129 | 0.244 | 0.677 | 0.162 | 0.161 | 0.251 | 1.32 | HEALTHY |
+| 28 | 292 | 0 | 0 | 26.33 | 1597 | 70/173 | 0.284 | 0.755 | 0.145 | 0.100 | 0.293 | 1.59 | HEALTHY |
+| **32** | 329 | **0** | 0 | **29.58** | 1636 | 94/**231** | **0.464** | 0.793 | 0.135 | 0.072 | 0.319 | 2.11 | **HEALTHY** |
+| **36** | 369 | 0 | 0 | 32.90 | 1744 | 145/**345** | 0.564 | 0.813 | 0.133 | 0.055 | 0.354 | 3.12 | **NEAR KNEE** |
+| 40 | 399 | 0 | 0 | 35.03 | 1924 | 234/601 | 0.904 | 0.817 | 0.136 | 0.047 | 0.373 | 4.71 | NEAR KNEE |
+| **48** | 420 | 0 | 0 | 39.76 | 2113 | 856/**1379** | **1.604** | 0.820 | 0.144 | 0.036 | 0.423 | 11.05 | **OVERLOADED** |
+| 56 | 432 | 0 | 0 | 38.47 | 2448 | 1580/3265 | 3.544 | 0.817 | 0.142 | 0.041 | 0.413 | 13.65 | OVERLOADED |
+| 64 | 449 | 0 | 0 | 40.84 | 2755 | 2273/4763 | 4.564 | 0.818 | 0.144 | 0.038 | 0.434 | 15.34 | OVERLOADED |
+
+Envelope: emission lag p95 <= 320 ms (= `(lookahead+1) x 80 ms`), backlog max
+<= 0.640 s, lost established streams = 0.
+
+**FACT**: on this machine, this build and this workload, **C_safe = 32**
+(lag p95 231 ms, backlog 0.464 s, zero loss), the **latency knee begins at
+C = 36** (345 ms, first crossing of the envelope), **C = 40 still completes all
+its work** but at 601 ms and 0.904 s backlog, and **C = 48 is overloaded**
+(backlog 2.5x the limit).
+
+**FACT**: useful throughput ceiling is approximately **40 audio-s/wall-s**. From
+C = 48 upward the curve is flat (39.76, 38.47, 40.84) while latency grows by
+3.5x — more offered concurrency buys latency, not work.
+
+**FACT**: **zero lost established streams and zero admission rejections at every
+rung, including C = 64.** Above the knee this server degrades by getting slow,
+not by dropping work. That is the post-F15 behaviour and it is the behaviour
+rule 5 asks for.
+
+**This is a short-run result, not a production capacity claim.** Rungs are 90 s.
+F12 says in this same file that a short ladder cannot qualify a topology.
+C = 32 is `measured_short_run_safe`; it becomes `long_soak_qualified` only after
+an independent long soak at that point.
+
+**NOT universally optimal.** 3x8 is the current best measured candidate **on
+this machine and this workload**. The topology comparison at equal concurrency
+has not been run since F17, and no result here licenses 3x8 on another box.
+
+---
+
+## F19 — Model execution duty plateaus at 0.82 while runnable work still exists
+
+**EVIDENCE**: the same F18 run, three-way split of scheduler wall (commit
+`bc572f0` instrumentation: `model_busy` / `runnable_idle` / `no_work`, computed
+independently of phase).
+
+From C = 36 upward, with concurrency, backlog and mean batch size all still
+rising, the split stops moving:
+
+| C | duty | runnable_idle | no_work | meanB | backlog |
+|---|---|---|---|---|---|
+| 32 | 0.793 | 0.135 | 0.072 | 2.11 | 0.464 |
+| 36 | 0.813 | 0.133 | 0.055 | 3.12 | 0.564 |
+| 40 | 0.817 | 0.136 | 0.047 | 4.71 | 0.904 |
+| 48 | 0.820 | 0.144 | 0.036 | 11.05 | 1.604 |
+| 56 | 0.817 | 0.142 | 0.041 | 13.65 | 3.544 |
+| 64 | 0.818 | 0.144 | 0.038 | 15.34 | 4.564 |
+
+**FACT**: at saturation the scheduler spends approximately **82 % executing the
+model, 13-14 % with work runnable and the model not executing, and 4-5 % with
+genuinely nothing to do.** `no_work` collapses towards zero as expected;
+`runnable_idle` does **not** — it bottoms at 0.133 at C = 36 and then *rises*
+again to 0.144.
+
+**FACT**: this is the answer to the question F10 left open. Cores 0-23 are not
+idle because the offered load is too small — above the knee there is almost
+always a chunk ready, and for one wall second in seven the model is not running
+it.
+
+**This is the central open performance question.** 13-14 % of scheduler wall is
+the entire budget available to a software fix without adding CPUs.
+
+**NOT ESTABLISHED**: that finalize *causes* the plateau. F20 shows finalize is
+large and correlates with `runnable_idle`, and the phase attribution charges
+63-96 % of the avoidable idle to it. Correlation between two aggregate shares is
+not causality, and the readiness predicate used by the diagnostic has not yet
+been validated against the scheduler's own runnable predicate.
+
+---
+
+## F20 — Finalize is 100 % model tail and 0 % teardown, at a flat 82 ms per call
+
+**EVIDENCE**, Axion, commit `0761a35` (which times `mynah_asr_stream_finish`
+apart from the teardown around it), 2026-09-20T15:48Z, same 3x8 setup as F18,
+rungs at the knee:
+
+| C | finalize model | teardown | calls | model ms/call | teardown ms/call | finalize share of wall |
+|---|---|---|---|---|---|---|
+| 32 | 31.5 s (**100 %**) | 0.0 s (0 %) | 384 | **82.1** | 0.0 | 0.319 |
+| 36 | 35.5 s (**100 %**) | 0.0 s (0 %) | 432 | **82.3** | 0.0 | 0.356 |
+| 40 | 38.3 s (**100 %**) | 0.0 s (0 %) | 468 | **81.9** | 0.0 | 0.376 |
+
+**FACT**: the teardown — the done frame, the session close, the bookkeeping, the
+reset — costs **nothing measurable**. Every microsecond charged to finalize is
+the model running inside `mynah_asr_stream_finish`.
+
+**FACT**: the per-call cost is **flat at 82 ms across C = 32, 36 and 40**, while
+the mean batch of ordinary steps over the same rungs goes 2.11 -> 3.12 -> 4.71.
+Finalize does not amortise with load **because it is not batched**: `sched.c`
+runs it one slot at a time in phase 5, and `mynah_asr_stream_finish` is a loop of
+`stream_flush_chunk` calls at B = 1. The comment in `sched_feed_tail` says so
+outright — "never through the batch".
+
+**FACT**: finalize is therefore a fixed cost **per utterance**, not per second
+and not per stream-hour. Its share of scheduler wall is set by the utterance
+rate. At C = 40 the workload's mean utterance is ~6.8 audio-s, so the server pays
+82 ms of exclusive B = 1 model time for every ~6.8 s of audio it transcribes —
+**37.6 % of all scheduler wall**, spent at a batch width of one while the ready
+set holds 4.71 rows on average.
+
+**DECISION**: this is the candidate mechanism, and it is testable without
+touching the code. Finalize's share depends on utterance length and on nothing
+else the server controls, so slicing one source file into 7 s / 24 s / 94 s
+clips varies the finalization rate ~13x with the audio content, model, quant,
+topology, affinity, pacing, seed and run length all held identical. If finalize
+limits the knee, C = 40 returns inside the envelope as the utterances grow. That
+probe runs before any finalize optimisation is written.
+
+**NOT ESTABLISHED, and must not be asserted until the probe returns**: that
+batching finalization would move C_safe. A cheaper finalize that does not move
+the capacity curve is not a serving improvement (F18's envelope is the
+criterion, not the profiler's percentages).
+
+**CONSTRAINT on any fix**: rule 4. The tail carries `is_last = 1` and the causal
+right pad; any batched finalization ships with a bit-exactness gate against the
+serial path, or it does not ship.

@@ -2,16 +2,13 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-highcpu32-nemotron-streaming",
-    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, Nemotron 3.5 streaming 0.6B, int8, cache-aware streaming over WebSocket. One wide worker on a 24-cpu slice, the remaining 8 cpus reserved for whatever generates the load. Screened, not qualified: a ladder found the ceiling, no soak has held it yet.",
+    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, Nemotron 3.5 streaming 0.6B, int8, cache-aware streaming over WebSocket. Three workers of 8 threads over a 24-cpu slice, the remaining 8 cpus reserved for whatever generates the load. A 12-rung capacity ladder (C = 8..64) found C_safe = 32 with zero lost streams; no long soak has held it yet, so the status is screened, not qualified.",
     "status": "screened",
     "objective": {
       "primary": "concurrent_realtime_streams",
       "secondary": "emission_lag_p95",
-      "concurrency_range": [
-        1,
-        16
-      ],
-      "preferred_concurrency": 16,
+      "concurrency_range": [1, 32],
+      "preferred_concurrency": 32,
       "quality_changes_allowed": false
     }
   },
@@ -24,16 +21,8 @@
     "numa_nodes": 1,
     "l3_mib": 80,
     "ram_gib": 62,
-    "isa_features_used": [
-      "asimd",
-      "asimddp",
-      "i8mm"
-    ],
-    "isa_features_idle": [
-      "bf16",
-      "sve",
-      "sve2"
-    ],
+    "isa_features_used": ["asimd", "asimddp", "i8mm"],
+    "isa_features_idle": ["bf16", "sve", "sve2"],
     "smt_policy": "OFF; one thread per physical core",
     "notes": "bf16/sve/sve2 are present and the binary issues none of them. That is three unspent levers, not a defect, and --dispatch-map prints them as IDLE so the gap stays visible."
   },
@@ -48,13 +37,14 @@
     "kernel.int8_dot": "neon-sdot",
     "gemm.f32": "own",
     "gemm.f32_kernel": "neon",
-    "threads.pool": 24
+    "threads.pool": 8
   },
   "server": {
-    "prefork_workers": 1,
-    "threads_per_worker": 24,
-    "http_threads": 64,
-    "cap": 24,
+    "prefork_workers": 3,
+    "threads_per_worker": 8,
+    "http_threads": 96,
+    "cap": 96,
+    "metrics_port": 9910,
     "quant": "int8",
     "lookahead": 3,
     "chunk_period_ms": 320,
@@ -62,8 +52,9 @@
     "server_cpus": "0-23",
     "reserved_cpus": "24-31",
     "notes": [
-      "prefork_workers is 1 ON PURPOSE and it is the measured answer, not the lazy one. The 2026-09-20 W x T sweep, re-scored once lost streams counted as failures, reads: 1x24 holds c=16 with zero losses at every rung; 4x6 and 8x3 hold c=8; 2x12 holds nothing. The narrow topologies looked better only while dropped streams were scored MARGINAL.",
-      "http_threads is NOT the compute width. It is the server's HTTP thread pool and a WebSocket stream holds one for its whole life, so it is the concurrency ceiling; the compute pool sizes itself from the process's affinity mask, which is what server_cpus sets.",
+      "3x8 replaced 1x24 on 2026-09-20 and the reason is measured, not stylistic. At an equal 24-cpu budget the useful audio per cpu reads 1x12 0.806, 1x24 0.537, 2x12 0.800, 3x8 0.826: two independent 12-thread domains deliver twice one of them, so the domains do not contend, while one 24-thread domain loses a third of its per-cpu throughput inside the step. The limit is intra-step thread scaling past about 12 threads, not cross-worker interference.",
+      "The 1x24 ceiling of 16 recorded in this file before 2026-09-20 was taken while the scheduler could freeze for tens of seconds on a blocking peek (serving-findings F15). Every topology number from before that fix is retired, not merely superseded.",
+      "http_threads is NOT the compute width. It is the server's HTTP thread pool and a WebSocket stream holds one for its whole life, so it is the fleet's connection ceiling; the compute pool sizes itself from each worker's affinity mask, which prefork_threads sets. 96 is 3 workers x 32 and leaves headroom above the 64 streams the ladder reached.",
       "batch_window_ms is 0 because widening the ready set did not move the ceiling: 40 ms took the mean ready set from 3.69 to 5.85 at c=16 and the ceiling stayed at 16, and 80 ms took it to 7.98 and cost a rung. Kept at 0 until something makes the fixed cost matter again."
     ]
   },
@@ -71,7 +62,7 @@
     "environment": {
       "MYNAH_ASR_THREADS": {
         "value": null,
-        "why": "must be ABSENT: the pool sizes itself from sched_getaffinity, which is what makes server_cpus mean anything. Setting it silently overrides the slice."
+        "why": "must be ABSENT: each worker's pool sizes itself from sched_getaffinity, which is what makes prefork_threads and server_cpus mean anything. Setting it silently overrides every worker's slice at once."
       },
       "MYNAH_ASR_CAPS": {
         "value": null,
@@ -87,7 +78,7 @@
       },
       "MYNAH_ASR_STACK_SOLO": {
         "value": "1",
-        "why": "default, stated here because it is load-bearing: a ready set of one goes through the stacked encoder path. Measured on this box, one binary, flag as the only difference, arms alternated, c=8 on a fresh server each time -- ON 105/104/103 ms emission lag p95, OFF 175/175 ms. The step itself goes 86.7 -> 16.8 ms for a lone stream."
+        "why": "default, stated here because it is load-bearing: a ready set of one goes through the stacked encoder path. Measured on this box, one binary, flag as the only difference, arms alternated, c=8 on a fresh server each time -- ON 105/104/103 ms emission lag p95, OFF 175/175 ms. The step itself goes 86.7 -> 16.8 ms for a lone stream. It matters most at low concurrency, which on a 3x8 fleet is every worker's common case."
       }
     }
   },
@@ -97,88 +88,80 @@
     "backlog_max_s": 0.64,
     "utterances_lost": 0,
     "ttfp_p95_ms": null,
-    "notes": "ttfp is deliberately null. The committed English clips start speaking at 0.18 s, 0.64 s and 0.02 s and samples/en/fleurs_long.wav does not start until 23.2 s, so TTFP measured from stream open is measuring leading silence: it was flat at 1660-1760 ms across a ladder whose emission lag tripled. A TTFP gate needs a corpus trimmed to speech onset first."
+    "notes": "320 ms is not a taste: it is (lookahead + 1) x 80 ms, the cadence the model itself sets, so a stream whose emission lag exceeds it is falling behind the audio. ttfp is deliberately null -- the committed English clips start speaking at 0.18 s, 0.64 s and 0.02 s and samples/en/fleurs_long.wav does not start until 23.2 s, so TTFP measured from stream open is measuring leading silence: it read 1636 ms at the safe point and 2755 ms at four times the backlog, tracking the corpus and not the server. A TTFP gate needs a corpus trimmed to speech onset first."
   },
   "measured": {
     "date": "2026-09-20",
-    "ceiling_concurrency": 16,
+    "measured_short_run_safe": {
+      "concurrency": 32,
+      "run_length_s": 90,
+      "emission_lag_p95_ms": 231,
+      "backlog_max_s": 0.464,
+      "audio_s_per_wall_s": 29.58,
+      "lost": 0,
+      "rejected": 0,
+      "what_this_licenses": "Comparisons against other 90 s runs on this box. Nothing else. It is the point the ladder selected for qualification, not a supported capacity."
+    },
+    "long_soak_qualified": null,
+    "knee_concurrency": 36,
+    "overload_concurrency": 48,
+    "throughput_ceiling_audio_s_per_wall_s": 40,
+    "ceiling_concurrency": 32,
     "ladder": [
-      {
-        "c": 8,
-        "emission_lag_p95_ms": 176,
-        "finalization_p95_ms": 378,
-        "lost": 0,
-        "verdict": "MARGINAL"
-      },
-      {
-        "c": 12,
-        "emission_lag_p95_ms": 223,
-        "finalization_p95_ms": 387,
-        "lost": 0,
-        "verdict": "MARGINAL"
-      },
-      {
-        "c": 16,
-        "emission_lag_p95_ms": 296,
-        "finalization_p95_ms": 707,
-        "lost": 0,
-        "verdict": "MARGINAL"
-      },
-      {
-        "c": 20,
-        "emission_lag_p95_ms": 500,
-        "finalization_p95_ms": 887,
-        "lost": 0,
-        "verdict": "NOT STREAMABLE"
-      }
+      {"c": 8,  "audio_s_per_wall_s": 7.62,  "emission_lag_p50_ms": 38,   "emission_lag_p95_ms": 75,   "backlog_max_s": 0.184, "duty": 0.247, "runnable_idle": 0.248, "no_work": 0.505, "finalize_share": 0.086, "mean_batch": 1.02,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 12, "audio_s_per_wall_s": 11.55, "emission_lag_p50_ms": 37,   "emission_lag_p95_ms": 80,   "backlog_max_s": 0.164, "duty": 0.352, "runnable_idle": 0.201, "no_work": 0.446, "finalize_share": 0.119, "mean_batch": 1.06,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 16, "audio_s_per_wall_s": 15.17, "emission_lag_p50_ms": 38,   "emission_lag_p95_ms": 93,   "backlog_max_s": 0.184, "duty": 0.473, "runnable_idle": 0.202, "no_work": 0.325, "finalize_share": 0.167, "mean_batch": 1.11,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 20, "audio_s_per_wall_s": 19.07, "emission_lag_p50_ms": 39,   "emission_lag_p95_ms": 103,  "backlog_max_s": 0.244, "duty": 0.589, "runnable_idle": 0.192, "no_work": 0.219, "finalize_share": 0.209, "mean_batch": 1.17,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 24, "audio_s_per_wall_s": 22.65, "emission_lag_p50_ms": 51,   "emission_lag_p95_ms": 129,  "backlog_max_s": 0.244, "duty": 0.677, "runnable_idle": 0.162, "no_work": 0.161, "finalize_share": 0.251, "mean_batch": 1.32,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 28, "audio_s_per_wall_s": 26.33, "emission_lag_p50_ms": 70,   "emission_lag_p95_ms": 173,  "backlog_max_s": 0.284, "duty": 0.755, "runnable_idle": 0.145, "no_work": 0.100, "finalize_share": 0.293, "mean_batch": 1.59,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 32, "audio_s_per_wall_s": 29.58, "emission_lag_p50_ms": 94,   "emission_lag_p95_ms": 231,  "backlog_max_s": 0.464, "duty": 0.793, "runnable_idle": 0.135, "no_work": 0.072, "finalize_share": 0.319, "mean_batch": 2.11,  "lost": 0, "rejected": 0, "verdict": "HEALTHY"},
+      {"c": 36, "audio_s_per_wall_s": 32.90, "emission_lag_p50_ms": 145,  "emission_lag_p95_ms": 345,  "backlog_max_s": 0.564, "duty": 0.813, "runnable_idle": 0.133, "no_work": 0.055, "finalize_share": 0.354, "mean_batch": 3.12,  "lost": 0, "rejected": 0, "verdict": "NEAR KNEE"},
+      {"c": 40, "audio_s_per_wall_s": 35.03, "emission_lag_p50_ms": 234,  "emission_lag_p95_ms": 601,  "backlog_max_s": 0.904, "duty": 0.817, "runnable_idle": 0.136, "no_work": 0.047, "finalize_share": 0.373, "mean_batch": 4.71,  "lost": 0, "rejected": 0, "verdict": "NEAR KNEE"},
+      {"c": 48, "audio_s_per_wall_s": 39.76, "emission_lag_p50_ms": 856,  "emission_lag_p95_ms": 1379, "backlog_max_s": 1.604, "duty": 0.820, "runnable_idle": 0.144, "no_work": 0.036, "finalize_share": 0.423, "mean_batch": 11.05, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"},
+      {"c": 56, "audio_s_per_wall_s": 38.47, "emission_lag_p50_ms": 1580, "emission_lag_p95_ms": 3265, "backlog_max_s": 3.544, "duty": 0.817, "runnable_idle": 0.142, "no_work": 0.041, "finalize_share": 0.413, "mean_batch": 13.65, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"},
+      {"c": 64, "audio_s_per_wall_s": 40.84, "emission_lag_p50_ms": 2273, "emission_lag_p95_ms": 4763, "backlog_max_s": 4.564, "duty": 0.818, "runnable_idle": 0.144, "no_work": 0.038, "finalize_share": 0.434, "mean_batch": 15.34, "lost": 0, "rejected": 0, "verdict": "OVERLOADED"}
     ],
-    "c20_reproduced": "3 of 3 clean servers: 500, 529, 688 ms",
+    "overload_behaviour": "Graceful. Zero lost established streams and zero admission rejections at EVERY rung through C = 64: above the knee this fleet degrades by getting slow, never by dropping work that was already accepted. Do not read C = 64 as supported -- losing no streams is the floor the engine owes, not a capacity claim, and at C = 64 the backlog is seven times the gate.",
+    "saturation": {
+      "duty_plateau": 0.82,
+      "runnable_idle_at_plateau": 0.135,
+      "no_work_at_plateau": 0.045,
+      "note": "From C = 36 upward the three-way split stops moving while concurrency, backlog and mean batch all keep rising. no_work collapses towards zero as it should; runnable_idle does not -- it bottoms at 0.133 at C = 36 and rises again to 0.144 at C = 64. About one wall second in seven has a chunk ready and the model not running it. That 13-14 % is the entire budget a software fix can reclaim without adding cpus, and it is the open question this profile does not answer."
+    },
+    "finalize_composition": {
+      "date": "2026-09-20",
+      "commit": "0761a35",
+      "model_share": 1.0,
+      "teardown_share": 0.0,
+      "ms_per_call": [82.1, 82.3, 81.9],
+      "at_concurrency": [32, 36, 40],
+      "note": "Teardown -- done frame, session close, bookkeeping, reset -- costs nothing measurable. Finalize is entirely the model running inside mynah_asr_stream_finish, at B = 1, one slot at a time in scheduler phase 5, and the per-call cost is FLAT across the three loads while the mean batch of ordinary steps goes 2.11 -> 3.12 -> 4.71. It is a fixed cost per UTTERANCE that does not amortise with load because it is not batched. CANDIDATE mechanism for the duty plateau, not an established cause."
+    },
     "cost_model_on_the_serving_path": {
       "a_ms": 39.5,
       "b_ms_per_stream": 8.57,
       "at_concurrency": 16,
       "b_ms_per_stream_at_c24": 10.13,
-      "note": "Fitted from mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count, i.e. the step AS THE SCHEDULER CALLS IT. The bench in isolation says b = 4.58; the serving path is roughly twice that and gets worse with load. B_max = (0.8*320 - 39.5)/8.57 = 25, against a ceiling of 16-20 observed -- the first time the prediction and the measurement have been in the same neighbourhood."
+      "note": "Fitted from mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count on the 1x24 topology, i.e. the step AS THE SCHEDULER CALLS IT. The bench in isolation says b = 4.58. These constants have NOT been refitted for 3x8 and must not be applied to it: b is a function of how many cores walk the weights, and 8 threads per worker is a different function from 24."
     },
     "soak": null,
     "solo_group_ab": {
       "date": "2026-09-20",
-      "on": {
-        "emission_lag_p95_ms": [
-          105,
-          104,
-          103
-        ],
-        "lost": [
-          0,
-          0,
-          0
-        ]
-      },
-      "off": {
-        "emission_lag_p95_ms": [
-          175,
-          175,
-          43793
-        ],
-        "lost": [
-          0,
-          0,
-          3
-        ]
-      },
-      "note": "The third OFF rung is the open stall, not a property of the arm. It landing in the CONTROL arm is what rules the change out as its cause -- a ladder run just before this A/B had shown the failure twice with the change ON, which on its own would have been read as a regression."
+      "on": {"emission_lag_p95_ms": [105, 104, 103], "lost": [0, 0, 0]},
+      "off": {"emission_lag_p95_ms": [175, 175, 43793], "lost": [0, 0, 3]},
+      "note": "The third OFF rung is the pre-F15 stall, not a property of the arm. It landing in the CONTROL arm is what rules the change out as its cause -- a ladder run just before this A/B had shown the failure twice with the change ON, which on its own would have been read as a regression."
     }
   },
   "provenance": {
-    "measured_on": "gabrielemastrapasqua@c4a-highcpu-32, Linux 7.0.0-1011-gcp, loadavg < 0.5 at start",
-    "commit": "15de486 (ladder), 0f8db50 (window A/B)",
-    "harness": "tools/bench/stream_load.py --mode wave --repeat 2, generator pinned to cpus 24-31, one process per stream",
-    "corpus": "samples/en/fleurs_1521.wav, samples/en/fleurs_1534.wav, tests/audio/test_en.wav",
+    "measured_on": "gabrielemastrapasqua@c4a-highcpu-32, Linux 7.0.0-1011-gcp, loadavg < 0.5 at start, one fresh server per rung",
+    "commit": "a941390 (capacity ladder C = 8..64), 0761a35 (finalize composition at C = 32/36/40)",
+    "harness": "tools/bench/stream_load.py --mode soak --streams C --duration 90 --warmup 10 --window 30 --bank short,medium --lookahead 3, generator pinned to cpus 24-31, one process per stream, 25 s warm-up run discarded before each measured rung",
+    "corpus": "samples/en/fleurs_1521.wav (7.4 s), samples/en/fleurs_1534.wav (11.9 s), tests/audio/test_en.wav (4.3 s); mean utterance about 6.8 audio-s",
     "notes": [
       "The capacity stated is for the 24-cpu SLICE, not for the 32-cpu box, and it is not scaled up. The load generator is one process per stream and shares the machine; the 8 reserved cpus are what keeps it out of the measurement.",
-      "status stays `screened` until a soak of at least 10 minutes holds c=16 with transcripts checked. A WAVE may disqualify a rung; it never promotes one.",
-      "OPEN DEFECT, not reproduced: a stall in which every stream receives a first partial and then nothing for tens of seconds, seen once at c=8 and once at c=16 on used servers and never on 5 clean repeats. It correlates with prefork -- every prefork topology in the sweep lost streams to it and 1x24 lost none."
+      "status stays `screened` and long_soak_qualified stays null until an independent soak of at least 10 minutes holds C = 32 with zero lost streams and transcripts checked. Rungs here are 90 s, and serving-findings F12 exists because a short ladder once promoted a topology that lost streams over ten minutes.",
+      "Finalize is a per-utterance cost, so this curve is a function of the corpus's mean utterance length as well as of the machine. A deployment whose utterances are much shorter than 6.8 s should expect the knee to the LEFT of 36.",
+      "CLOSED since the previous revision of this file: the stall in which every stream received a first partial and then nothing for tens of seconds. Root cause and fix in serving-findings F15/F17 -- a blocking recv(MSG_PEEK) on a socket with two readers. It was never a prefork property; prefork only made it likelier."
     ]
   }
 }
