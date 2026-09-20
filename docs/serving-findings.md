@@ -768,3 +768,69 @@ diagnostic predicate has **false_ready 0 and false_not_ready 6 of 65** on a
 3-stream smoke. Its errors are one-sided, so the measured `runnable_idle` is a
 floor and never a ceiling. That is the opposite direction from the error above
 and does not offset it.
+
+---
+
+## F22 — The BEFORE ladder, with the accounting fixed: the box is compute-bound, not scheduling-bound
+
+**EVIDENCE**, Axion, commit `a48d443`, 2026-09-20T16:42Z-17:10Z. Same protocol as
+F18 — fresh server per rung, 3x8, cpus 0-23 server / 24-31 generator, 25 s
+warm-up discarded, 90 s measured, mixed corpus — with two differences: the build
+carries the ready-to-execution histograms and the corrected split, and the
+generator is given `--seed 42`. Every share is computed from the raw per-worker
+dumps, not from a ratio the server printed (F21).
+
+| C | audio/wall | lag p50/p95 | backlog | step | finalize | r_idle | no_work | **model** | meanB | rdy->start p50/95/99 | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 7.70 | 38/75 | 0.144 | 0.248 | 0.028 | 0.236 | 0.488 | 0.276 | 1.02 | 0/34/44 | HEALTHY |
+| 12 | 11.43 | 37/78 | 0.184 | 0.356 | 0.040 | 0.189 | 0.416 | 0.396 | 1.06 | 0/40/60 | HEALTHY |
+| 16 | 15.02 | 39/92 | 0.184 | 0.477 | 0.056 | 0.161 | 0.306 | 0.533 | 1.12 | 0/40/77 | HEALTHY |
+| 20 | 18.76 | 40/105 | 0.224 | 0.591 | 0.070 | 0.124 | 0.215 | 0.661 | 1.19 | 4/47/80 | HEALTHY |
+| 24 | 22.65 | 52/133 | 0.244 | 0.684 | 0.084 | 0.082 | 0.150 | 0.768 | 1.30 | 13/63/93 | HEALTHY |
+| 28 | 26.29 | 70/170 | 0.284 | 0.758 | 0.095 | 0.051 | 0.095 | 0.854 | 1.57 | 20/84/134 | HEALTHY |
+| **32** | **29.58** | 100/**236** | **0.444** | 0.798 | 0.108 | 0.030 | 0.064 | **0.905** | 2.17 | 27/**114**/171 | **HEALTHY** |
+| **36** | 32.86 | 150/**373** | 0.604 | 0.811 | 0.121 | 0.021 | 0.048 | 0.931 | 3.26 | 43/**173**/243 | **NEAR KNEE** |
+| 40 | 35.17 | 249/667 | 0.964 | 0.815 | 0.125 | 0.014 | 0.046 | 0.940 | 4.77 | 80/277/347 | NEAR KNEE |
+| **48** | 39.36 | 920/**1475** | **1.664** | 0.817 | 0.146 | 0.007 | 0.030 | 0.963 | 11.41 | 280/437/480 | **OVERLOADED** |
+| 56 | 38.62 | 1611/3306 | 3.564 | 0.819 | 0.143 | 0.005 | 0.033 | 0.962 | 13.77 | 360/516/620 | OVERLOADED |
+| 64 | 40.21 | 2335/4926 | 4.824 | 0.818 | 0.146 | 0.002 | 0.034 | 0.964 | 16.76 | 406/586/704 | OVERLOADED |
+
+**FACT, the serving result reproduces F18.** C_safe = 32, knee at 36, overload
+at 48, ceiling ~40 audio-s/wall-s, zero lost established streams and zero
+rejections at every rung. Throughput per rung agrees within about 1 %. The
+instrumentation did not move the answer, which is what makes this a usable
+BEFORE.
+
+**FACT, and it closes a line of investigation: `runnable_idle` falls
+monotonically to 0.002.** 0.236 at C = 8, 0.030 at C = 32, 0.014 at C = 40,
+**0.002 at C = 64**. It does not bottom out and rise again — that shape was
+entirely the accounting defect of F21. Model execution runs the other way:
+0.276 at C = 8 to **0.964 at C = 64**.
+
+**Therefore this box is compute-bound at the knee, not scheduling-bound.** At
+C = 40 the fleet executes the model 94 % of scheduler wall; the whole
+non-model remainder is 6 %, and only 1.4 points of it is avoidable. **No
+scheduling change can move the knee.** The only lever left is making the model's
+work cheaper per second of audio.
+
+**FACT: the ready-to-execution delay grows smoothly and does not change regime
+at the knee.** p95 reads 84 / 114 / 173 / 277 / 437 ms at C = 28/32/36/40/48 —
+accelerating, but with no discontinuity anywhere near C = 32-36. It is a
+queueing curve approaching saturation, so the delay is a CONSEQUENCE of the
+knee and not its cause. At C = 40 it is 277 ms of a 320 ms budget, against an
+emission lag p95 of 667 ms: queueing is about 40 % of what a client sees.
+
+**FACT: the readiness predicate's error is one-sided at every rung.**
+`false_ready` is 0-10 per rung against `false_not_ready` 200-1326, on 2528-13729
+runnable slots. So the measured `runnable_idle` is a floor, never a ceiling —
+and since the floor is now 0.002, the conclusion above only gets stronger.
+
+**CAVEAT, stated rather than explained away**: this ladder passed `--seed 42`
+and F18 did not, so the two drew different clip schedules. At equal audio per
+wall second this run completed more utterances (385 vs 329 at C = 32), i.e.
+shorter ones, i.e. more finalizations — and its lag p95 is correspondingly worse
+at the high rungs (667 vs 601 at C = 40). That difference is NOT attributed to
+the instrumentation, because nothing here measures the instrumentation's cost.
+It is the reason both sides of the BEFORE/AFTER must be this build.
+
+**DECISION**: this table, not F18, is the baseline the optimisation must move.
