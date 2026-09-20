@@ -108,3 +108,75 @@ Evidence: `~/wave.log`, `~/wave-server.log` on the box (the invalid ladder);
 Conclusion: (pending the run)
 Next action: run it, then close S8-4 by writing the measured capacity next to
 the predicted one.
+
+---
+
+## 4. The ladder, measured: c=16 on 24 cores, and c=20 breaks three times out of three
+
+One server, cpus 0-23, generator on 24-31, int8, lookahead 3, `--cap 64`,
+counters sampled every 2 s through each rung:
+
+```
+  c=8   lag 176  ttfp 1660  fin 378   MARGINAL        16/16   steps+387  flat 0s
+  c=12  lag 223  ttfp 1691  fin 387   MARGINAL        24/24   steps+608  flat 0s
+  c=16  lag 296  ttfp 1719  fin 707   MARGINAL        32/32   steps+786  flat 0s
+  c=20  lag 500  ttfp 1756  fin 887   NOT STREAMABLE  40/40   steps+1010 flat 0s
+  confirm c=20 on a clean server: lag 529, then lag 688 — NOT STREAMABLE both times
+```
+
+Three things to read out of that table beyond the headline.
+
+- **It is saturation, not the anomaly.** `steps_total` never has a flat stretch,
+  and at c=20 every utterance still completes (40/40) — they are late, not lost.
+- **TTFP is flat across the whole ladder** (1660 → 1756 ms) while emission lag
+  triples. A load-induced latency grows with load; this one does not, so TTFP
+  here is a property of the CORPUS and the model's own latency, not of capacity.
+  The clips' speech starts at 0.18 s, 0.64 s and 0.02 s, and `samples/en/fleurs_long.wav`
+  does not start until **23.2 s** — a TTFP gate measured from stream open is
+  measuring the leading silence. It must be measured from speech onset, or the
+  soak corpus must be trimmed; otherwise every FLEURS clip fails it.
+- **Predicted 45, measured 16.** That is the S8-4 number, and the rest of this
+  section is where the missing 2.8x went.
+
+## 5. Where the factor of three goes: the ready set is 2 to 4 streams, not 8 to 16
+
+The capacity law `T_step(B) = a + b*B <= rho*P` prices ONE step serving B
+streams. Its whole economy is that `a = 30.8 ms` is paid once per step and
+amortised over B. The server exports what B actually was —
+`batch_ready_size_sum / batched_steps_total` — and it says:
+
+| streams in flight | mean ready-set B | batched steps per 320 ms period | fixed cost per period |
+|---|---|---|---|
+| 8 | **2.11** | 3.8 | **117 ms** (vs 31 if B=8) |
+| 16 | **3.73** | 4.3 | **132 ms** (vs 31 if B=16) |
+
+So at c=16 the worker spends 132 ms of every 320 ms period re-walking the
+weights, four times over, because the ready set never fills. That is the 2.8x,
+almost exactly, and it is arithmetic rather than inference.
+
+The mechanism is in `sched_main` (`server/sched.c` §3): the loop parks on a
+condvar and steps **as soon as anything is ready**. Clients send 100 ms frames
+independently, so at any wake only the one or two slots that have just crossed a
+whole chunk are staged; the rest are a few tens of milliseconds short and get
+their own step moments later. Nothing is wrong with any individual step — the
+batching is bit-exact and `MYNAH_ASR_STREAM_BATCH_MAX` is 256, so nothing is
+clipping the set. The set is simply small when it is looked at.
+
+Note what this does NOT say: it is not pool contention, not the kernels, not
+SMMLA, and not the f32 remainder. Every one of those was a candidate this
+morning and the counter settles it without another run.
+
+The fix has a shape and a constraint. A bounded collection window — when the
+first slot becomes ready, wait up to W ms (or until N are ready) before
+stepping — is the standard continuous-batching answer, and the slack exists at
+low concurrency where it costs nothing. The constraint is repo rule 5: **load
+never enters the chunk size.** A collection window does not change the chunk; it
+changes when the step runs, and it must be bounded so the emission-lag envelope
+still holds at the top of the ladder. What W should be, and whether the sibling
+engines already answer this, is the next question rather than a guess.
+
+Evidence: `~/ladder2/` (the ladder and its per-rung metrics), `~/sweep/m-*.txt`
+(the batch counters quoted above), `~/repro8/` (c=8 four times).
+Conclusion: the streaming ceiling on 24 Neoverse-V2 cores is **c=16 today**, and
+the gap to the predicted 45 is a scheduling gap, not a compute gap.
+Next action: the W x T sweep (running), then a collection window with a measured W.
