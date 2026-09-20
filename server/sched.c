@@ -72,6 +72,7 @@ static struct {
      * livelock, and a static count with phase=step is the model. */
     _Atomic unsigned long loops;
     _Atomic int phase;
+    _Atomic int phase_slot;
     _Atomic double phase_since;
 
     _Atomic unsigned long window_entered, window_filled;
@@ -113,8 +114,14 @@ static struct {
 
 /* One store each, relaxed: this runs on every pass of the scheduler loop and
  * must not become a synchronisation point of its own. */
-#define SCHED_PHASE(p) do { \
+#define SCHED_PHASE(p) SCHED_PHASE_AT((p), -1)
+/* `at` is the slot the pass is working on, so a phase that stops says WHICH
+ * stream's lock it stopped on. Pass (1) is three different waits wearing one
+ * name -- the slot lock, the peer check, the cancel path -- and the 2026-09-20
+ * stall stopped in it for 26 s without saying which. */
+#define SCHED_PHASE_AT(p, at) do { \
     atomic_store_explicit(&g.phase, (p), memory_order_relaxed); \
+    atomic_store_explicit(&g.phase_slot, (at), memory_order_relaxed); \
     atomic_store_explicit(&g.phase_since, mynah_asr_now(), memory_order_relaxed); \
 } while (0)
 
@@ -655,16 +662,22 @@ static void *sched_main(void *arg) {
         for (int i = 0; i < g.n_slots; i++) {
             mynah_asr_slot *s = &g.slots[i];
             g.req_live[i] = 0;
+            SCHED_PHASE_AT(1, i);
             const mynah_asr_slot_state st =
                 mynah_asr_slot_poll(s, &g.req_out[i], &g.req_avail[i]);
             if ((st != MYNAH_ASR_SLOT_ACTIVE && st != MYNAH_ASR_SLOT_FINISHING) ||
                 g.req_out[i] == NULL)
                 continue;
+            SCHED_PHASE_AT(8, i);
             g.req[i] = mynah_asr_slot_take_requests(s, g.req_lang[i], &g.req_reason[i]);
             g.req_live[i] = 1;
 
             const int finalizing = (g.req[i] & (MYNAH_ASR_SLOT_REQ_FINALIZE |
                                                 MYNAH_ASR_SLOT_REQ_CLOSE)) != 0;
+            /* Covers the whole decision block: the cancel test is a bit
+             * check, but peer_gone takes the output ring's lock and
+             * sched_cancel writes a frame through it. */
+            SCHED_PHASE_AT(9, i);
             if ((g.req[i] & MYNAH_ASR_SLOT_REQ_CANCEL) != 0) {
                 sched_cancel(s, mynah_asr_slot_cancel_code(g.req_reason[i]),
                              "the stream was cancelled");
@@ -1015,6 +1028,7 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->step_wall_count = out->batched_steps;
     out->loops = atomic_load_explicit(&g.loops, memory_order_relaxed);
     out->phase = atomic_load_explicit(&g.phase, memory_order_relaxed);
+    out->phase_slot = atomic_load_explicit(&g.phase_slot, memory_order_relaxed);
     {
         const double since = atomic_load_explicit(&g.phase_since, memory_order_relaxed);
         out->phase_s = since > 0.0 ? mynah_asr_now() - since : -1.0;

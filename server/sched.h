@@ -188,8 +188,10 @@ typedef struct {
      * is a lost wakeup; climbing loops that stage nothing is a livelock; static
      * loops with phase 4 is a step that will not end. */
     unsigned long loops;
-    int phase;                  /* 1 poll 2 reset 3 stage 4 step 5 finalize
-                                   6 offline 7 park */
+    int phase;                  /* 1 slot-poll 2 reset 3 stage 4 step 5 finalize
+                                   6 offline 7 park 8 take-requests 9 cancel
+                                   10 peer-check */
+    int phase_slot;             /* which slot that pass was on (-1 = not a slot) */
     double phase_s;
     unsigned long window_entered, window_filled;
     double window_wait_ms_sum;

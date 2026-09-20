@@ -518,11 +518,13 @@ void mynah_asr_obs_dump(void) {
             widx, n, st.slots_active, st.slots_cap, st.sessions, st.steps,
             st.deltas, st.eous, st.audio_seconds);
     {
-        static const char *const PHASE[] = {"?", "poll", "reset", "stage", "step",
-                                            "finalize", "offline", "park"};
-        const int ph = st.phase >= 0 && st.phase <= 7 ? st.phase : 0;
-        OBS_ADD("[DUMP] worker=%d seq=%lu sched loops=%lu phase=%s phase_s=%.1f\n",
-                widx, n, st.loops, PHASE[ph], st.phase_s);
+        static const char *const PHASE[] = {"?", "slot-poll", "reset", "stage",
+                                            "step", "finalize", "offline", "park",
+                                            "take-requests", "cancel", "peer-check"};
+        const int ph = st.phase >= 0 && st.phase <= 10 ? st.phase : 0;
+        OBS_ADD("[DUMP] worker=%d seq=%lu sched loops=%lu phase=%s slot=%d "
+                "phase_s=%.1f\n",
+                widx, n, st.loops, PHASE[ph], st.phase_slot, st.phase_s);
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu batch steps=%lu rows_stacked=%llu "
             "ready_mean=%.2f step_wall_ms_mean=%.1f\n",
