@@ -74,6 +74,21 @@ static struct {
     _Atomic int phase;
     _Atomic int phase_slot;
     _Atomic double phase_since;
+    /* Wall time and call count per phase, written ONLY by the scheduler thread
+     * (the macro runs nowhere else), so plain fields and no atomics: a reader
+     * may see a torn double and will be one sample behind, which is the right
+     * trade for a counter on a path that runs a few hundred times a second.
+     *
+     * This is what turns "the box sits at 45%" into an accounting: how much of
+     * the wall is model execution, how much is the scheduler's own serial work,
+     * and how much is parking with nothing to do -- which is not waste. */
+    double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
+    unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
+    /* Parks split by whether work existed. A park with a ready slot behind it
+     * would be a scheduling defect; a park with nothing ready is the stream
+     * cadence and cannot be optimised away. */
+    unsigned long park_idle, park_ready, park_partial;
+    double t_start;
 
     _Atomic unsigned long window_entered, window_filled;
     _Atomic unsigned long window_wait_us;
@@ -120,9 +135,16 @@ static struct {
  * name -- the slot lock, the peer check, the cancel path -- and the 2026-09-20
  * stall stopped in it for 26 s without saying which. */
 #define SCHED_PHASE_AT(p, at) do { \
+    const double now_ = mynah_asr_now(); \
+    const int prev_ = atomic_load_explicit(&g.phase, memory_order_relaxed); \
+    const double since_ = atomic_load_explicit(&g.phase_since, memory_order_relaxed); \
+    if (prev_ > 0 && prev_ < MYNAH_ASR_SCHED_PHASES && since_ > 0.0) { \
+        g.phase_wall_s[prev_] += now_ - since_; \
+        g.phase_calls[prev_]++; \
+    } \
     atomic_store_explicit(&g.phase, (p), memory_order_relaxed); \
     atomic_store_explicit(&g.phase_slot, (at), memory_order_relaxed); \
-    atomic_store_explicit(&g.phase_since, mynah_asr_now(), memory_order_relaxed); \
+    atomic_store_explicit(&g.phase_since, now_, memory_order_relaxed); \
 } while (0)
 
 static const char *const CANCEL_BUCKET_NAME[MYNAH_ASR_SCHED_CANCEL__COUNT] = {
@@ -644,6 +666,7 @@ static void sched_drain_on_stop(void) {
 static void *sched_main(void *arg) {
     (void)arg;
     g.tid = pthread_self();
+    g.t_start = mynah_asr_now();
     atomic_store_explicit(&g.tid_ready, 1, memory_order_release);
     mynah_asr_thread_set_name("mynah-sched");
 
@@ -817,6 +840,25 @@ static void *sched_main(void *arg) {
 
         /* (7) Nothing ready and nothing queued: park. Never a fixed tick -- the
          * first chunk of a new stream runs the moment it lands. */
+        /* Was there work when we decided to park? Counted from the availability
+         * this pass already read, so it costs nothing extra. `partial` is a slot
+         * holding audio that is not yet a whole chunk: real work, not yet
+         * runnable, and the honest middle category between the two. */
+        if (!did) {
+            int ready = 0, partial = 0;
+            for (int i = 0; i < g.n_slots; i++) {
+                if (!g.req_live[i]) continue;
+                mynah_asr_slot *s = &g.slots[i];
+                if (s->stream == NULL) continue;
+                size_t need = mynah_asr_stream_need_samples(s->stream);
+                if (need == 0) need = 1;
+                if (g.req_avail[i] >= need) ready++;
+                else if (g.req_avail[i] > 0) partial++;
+            }
+            if (ready > 0) g.park_ready++;
+            else if (partial > 0) g.park_partial++;
+            else g.park_idle++;
+        }
         SCHED_PHASE(7);
         pthread_mutex_lock(&g.mu);
         while (!did && !g.woken && g.q_head == NULL &&
@@ -1036,6 +1078,14 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->loops = atomic_load_explicit(&g.loops, memory_order_relaxed);
     out->phase = atomic_load_explicit(&g.phase, memory_order_relaxed);
     out->phase_slot = atomic_load_explicit(&g.phase_slot, memory_order_relaxed);
+    for (int i = 0; i < MYNAH_ASR_SCHED_PHASES; i++) {
+        out->phase_wall_s[i] = g.phase_wall_s[i];
+        out->phase_calls[i] = g.phase_calls[i];
+    }
+    out->park_idle = g.park_idle;
+    out->park_ready = g.park_ready;
+    out->park_partial = g.park_partial;
+    out->uptime_s = g.t_start > 0.0 ? mynah_asr_now() - g.t_start : -1.0;
     {
         const double since = atomic_load_explicit(&g.phase_since, memory_order_relaxed);
         out->phase_s = since > 0.0 ? mynah_asr_now() - since : -1.0;

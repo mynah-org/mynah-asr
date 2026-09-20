@@ -517,6 +517,30 @@ void mynah_asr_obs_dump(void) {
             "steps=%lu deltas=%lu eous=%lu audio_s=%.1f\n",
             widx, n, st.slots_active, st.slots_cap, st.sessions, st.steps,
             st.deltas, st.eous, st.audio_seconds);
+    {   /* The wall-time accounting. execution_duty is the share of the
+         * scheduler's life spent inside the model; the rest is its own serial
+         * work and parking. A park with nothing buffered is the stream cadence
+         * and is not waste; a park with a READY slot behind it would be a
+         * scheduling defect, which is why the three are counted apart. */
+        static const char *const PN[] = {"?", "slot-poll", "reset", "stage", "step",
+                                         "finalize", "offline", "park",
+                                         "take-requests", "cancel", "peer-check"};
+        double tot = 0.0;
+        for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) tot += st.phase_wall_s[i];
+        OBS_ADD("[DUMP] worker=%d seq=%lu wall uptime_s=%.1f accounted_s=%.1f "
+                "execution_duty=%.3f\n", widx, n, st.uptime_s, tot,
+                tot > 0.0 ? st.phase_wall_s[4] / tot : 0.0);
+        for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) {
+            if (st.phase_calls[i] == 0) continue;
+            OBS_ADD("[DUMP] worker=%d seq=%lu phase %-13s wall_s=%8.2f share=%.3f "
+                    "calls=%-9lu mean_us=%.1f\n", widx, n, PN[i], st.phase_wall_s[i],
+                    tot > 0.0 ? st.phase_wall_s[i] / tot : 0.0, st.phase_calls[i],
+                    1e6 * st.phase_wall_s[i] / (double)st.phase_calls[i]);
+        }
+        OBS_ADD("[DUMP] worker=%d seq=%lu park idle=%lu partial=%lu ready=%lu"
+                "   (ready>0 would be a scheduling defect)\n",
+                widx, n, st.park_idle, st.park_partial, st.park_ready);
+    }
     {
         static const char *const PHASE[] = {"?", "slot-poll", "reset", "stage",
                                             "step", "finalize", "offline", "park",

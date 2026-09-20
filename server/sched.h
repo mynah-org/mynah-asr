@@ -154,6 +154,8 @@ const char *mynah_asr_sched_cancel_bucket_name(int bucket);
  * single mean: two sizes in one run give a and b, and a mean over a run whose
  * B moved gives neither. Index = B, the last bucket is "that many or more". */
 #define MYNAH_ASR_SCHED_B_BUCKETS 33
+/* 1 slot-poll .. 7 park, 8 take-requests, 9 cancel; index 0 unused */
+#define MYNAH_ASR_SCHED_PHASES 11
 
 typedef struct {
     int  slots_active, slots_cap, streaming;
@@ -192,6 +194,12 @@ typedef struct {
                                    6 offline 7 park 8 take-requests 9 cancel
                                    10 peer-check */
     int phase_slot;             /* which slot that pass was on (-1 = not a slot) */
+    double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
+    unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
+    unsigned long park_idle;      /* parked with nothing buffered anywhere      */
+    unsigned long park_partial;   /* parked with audio buffered, none a chunk   */
+    unsigned long park_ready;     /* parked with a READY slot: a defect if > 0  */
+    double uptime_s;
     double phase_s;
     unsigned long window_entered, window_filled;
     double window_wait_ms_sum;
