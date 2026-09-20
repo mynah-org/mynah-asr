@@ -133,6 +133,19 @@ typedef struct mynah_asr_slot {
     _Atomic double mu_since;          /* when it was taken                      */
     const char *_Atomic mu_where;     /* the call site that took it             */
 
+    /* Readiness, maintained in O(1) so that "is there runnable work RIGHT NOW"
+     * is a single relaxed load instead of a scan over every slot.
+     *
+     * The scheduler publishes how many samples one step of this stream wants;
+     * the push and take paths both run under this slot's mutex and refresh the
+     * flag when `len` crosses it, adjusting one process-wide counter. That is
+     * what lets wall time be split three ways -- model busy, no runnable work,
+     * runnable work with the model idle -- regardless of which scheduler phase
+     * happens to be consuming the third interval. Counting only the parks with
+     * a ready slot would answer a much weaker question. */
+    _Atomic size_t need_hint;
+    _Atomic int ready_flag;
+
     size_t take_cap;
 } mynah_asr_slot;
 
@@ -210,3 +223,11 @@ int mynah_asr_slot_wait_done(mynah_asr_slot *s, int timeout_ms);
 double mynah_asr_now(void);
 
 #endif
+
+/* How many slots currently hold a whole chunk for their stream. One relaxed
+ * load; the flags behind it are maintained under each slot's own mutex. */
+int mynah_asr_slot_ready_count(void);
+
+/* The scheduler publishes what one step of this stream wants, so the push and
+ * take paths can keep the readiness flag without knowing about streams. */
+void mynah_asr_slot_set_need(mynah_asr_slot *s, size_t need_samples);

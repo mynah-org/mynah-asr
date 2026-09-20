@@ -82,6 +82,7 @@ static struct {
      * This is what turns "the box sits at 45%" into an accounting: how much of
      * the wall is model execution, how much is the scheduler's own serial work,
      * and how much is parking with nothing to do -- which is not waste. */
+    double w_model, w_runnable_idle, w_no_work;
     double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
     unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
     /* Parks split by whether work existed. A park with a ready slot behind it
@@ -139,8 +140,18 @@ static struct {
     const int prev_ = atomic_load_explicit(&g.phase, memory_order_relaxed); \
     const double since_ = atomic_load_explicit(&g.phase_since, memory_order_relaxed); \
     if (prev_ > 0 && prev_ < MYNAH_ASR_SCHED_PHASES && since_ > 0.0) { \
-        g.phase_wall_s[prev_] += now_ - since_; \
+        const double d_ = now_ - since_; \
+        g.phase_wall_s[prev_] += d_; \
         g.phase_calls[prev_]++; \
+        /* The accounting that matters, and it does NOT depend on which phase \
+         * was running: model busy, or idle of the model with runnable work \
+         * available, or idle with nothing to run. Counting only the parks that \
+         * had a ready slot would answer a much weaker question -- the scheduler \
+         * can spend its time in slot-poll, stage, finalize or cancel while a \
+         * chunk sits ready, and that interval is avoidable idle just the same. */ \
+        if (prev_ == 4) g.w_model += d_; \
+        else if (mynah_asr_slot_ready_count() > 0) g.w_runnable_idle += d_; \
+        else g.w_no_work += d_; \
     } \
     atomic_store_explicit(&g.phase, (p), memory_order_relaxed); \
     atomic_store_explicit(&g.phase_slot, (at), memory_order_relaxed); \
@@ -388,6 +399,9 @@ static void sched_emit_done(mynah_asr_slot *s) {
 static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     size_t need = mynah_asr_stream_need_samples(s->stream);
     if (need == 0) need = 1;
+    /* Publish it: the push and take paths keep this slot's readiness flag from
+     * it, which is what makes "is there runnable work right now" one load. */
+    mynah_asr_slot_set_need(s, need);
     if (avail < need) return 0;
 
     const size_t want = need > s->take_cap ? s->take_cap : need;
@@ -1082,6 +1096,9 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
         out->phase_wall_s[i] = g.phase_wall_s[i];
         out->phase_calls[i] = g.phase_calls[i];
     }
+    out->w_model = g.w_model;
+    out->w_runnable_idle = g.w_runnable_idle;
+    out->w_no_work = g.w_no_work;
     out->park_idle = g.park_idle;
     out->park_ready = g.park_ready;
     out->park_partial = g.park_partial;

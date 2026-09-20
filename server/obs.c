@@ -527,9 +527,15 @@ void mynah_asr_obs_dump(void) {
                                          "take-requests", "cancel", "peer-check"};
         double tot = 0.0;
         for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) tot += st.phase_wall_s[i];
+        const double three = st.w_model + st.w_runnable_idle + st.w_no_work;
         OBS_ADD("[DUMP] worker=%d seq=%lu wall uptime_s=%.1f accounted_s=%.1f "
                 "execution_duty=%.3f\n", widx, n, st.uptime_s, tot,
                 tot > 0.0 ? st.phase_wall_s[4] / tot : 0.0);
+        OBS_ADD("[DUMP] worker=%d seq=%lu split model_busy_s=%.2f (%.3f) "
+                "runnable_idle_s=%.2f (%.3f) no_work_s=%.2f (%.3f)\n",
+                widx, n, st.w_model, three > 0 ? st.w_model / three : 0.0,
+                st.w_runnable_idle, three > 0 ? st.w_runnable_idle / three : 0.0,
+                st.w_no_work, three > 0 ? st.w_no_work / three : 0.0);
         for (int i = 1; i < MYNAH_ASR_SCHED_PHASES; i++) {
             if (st.phase_calls[i] == 0) continue;
             OBS_ADD("[DUMP] worker=%d seq=%lu phase %-13s wall_s=%8.2f share=%.3f "

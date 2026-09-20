@@ -196,6 +196,11 @@ typedef struct {
     int phase_slot;             /* which slot that pass was on (-1 = not a slot) */
     double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
     unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
+    /* The three-way split of the scheduler's wall time. Independent of phase:
+     * an interval counts as avoidable idle whenever the model is not running
+     * and at least one slot holds a whole chunk, whatever the scheduler is
+     * doing at the time. */
+    double w_model, w_runnable_idle, w_no_work;
     unsigned long park_idle;      /* parked with nothing buffered anywhere      */
     unsigned long park_partial;   /* parked with audio buffered, none a chunk   */
     unsigned long park_ready;     /* parked with a READY slot: a defect if > 0  */

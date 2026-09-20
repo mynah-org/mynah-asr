@@ -11,8 +11,15 @@
 /* See mynah_asr_slot_set_notify: one scheduler per process, so one hook. */
 static void (*g_notify)(void);
 
-/* Take/release a slot's mutex and leave a trace of who did it. `where` is a
- * literal, so storing the pointer costs nothing and a dump can print it. */
+/* Process-wide count of slots holding a whole chunk. Maintained by the two
+ * paths that change `len`, each under the slot's own mutex. */
+static _Atomic int g_ready_slots;
+
+int mynah_asr_slot_ready_count(void) {
+    const int n = atomic_load_explicit(&g_ready_slots, memory_order_relaxed);
+    return n > 0 ? n : 0;
+}
+
 static unsigned long slot_self(void) {
     return (unsigned long)(uintptr_t)pthread_self();
 }
@@ -50,6 +57,29 @@ static int slot_cond_timedwait(mynah_asr_slot *s, pthread_cond_t *cv,
     atomic_store_explicit(&s->mu_where, where, memory_order_relaxed);
     return rc;
 }
+
+/* Set or clear this slot's readiness and keep the global count in step. Called
+ * with the slot's mutex held, by every path that changes `len` or `need`. */
+static void slot_refresh_ready_locked(mynah_asr_slot *s) {
+    const size_t need = atomic_load_explicit(&s->need_hint, memory_order_relaxed);
+    const int want = need > 0 && s->len >= need;
+    const int had = atomic_load_explicit(&s->ready_flag, memory_order_relaxed);
+    if (want == had) return;
+    atomic_store_explicit(&s->ready_flag, want, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_ready_slots, want ? 1 : -1, memory_order_relaxed);
+}
+
+void mynah_asr_slot_set_need(mynah_asr_slot *s, size_t need_samples) {
+    slot_lock(s, "mynah_asr_slot_set_need");
+    atomic_store_explicit(&s->need_hint, need_samples, memory_order_relaxed);
+    slot_refresh_ready_locked(s);
+    slot_unlock(s);
+}
+
+
+/* Take/release a slot's mutex and leave a trace of who did it. `where` is a
+ * literal, so storing the pointer costs nothing and a dump can print it. */
+
 
 void mynah_asr_slot_set_notify(void (*notify)(void)) { g_notify = notify; }
 
@@ -162,6 +192,8 @@ void mynah_asr_slot_arm(mynah_asr_slot *s, mynah_asr_stream_out *out) {
 
 void mynah_asr_slot_release(mynah_asr_slot *s) {
     slot_lock(s, "mynah_asr_slot_release");
+    atomic_store_explicit(&s->need_hint, (size_t)0, memory_order_relaxed);
+    slot_refresh_ready_locked(s);
     slot_reset_queue_locked(s);
     s->state = MYNAH_ASR_SLOT_FREE;
     s->out = NULL;
@@ -236,6 +268,7 @@ size_t mynah_asr_slot_push(mynah_asr_slot *s, const float *samples, size_t n,
         s->samples_in += take;
         done += take;
         slot_record_arrival_locked(s, now);
+        slot_refresh_ready_locked(s);
         /* Ring the doorbell from inside the lock, and before parking again on a
          * full ring: a push that fills the ring must wake the scheduler, or the
          * two would end up waiting for each other. */
@@ -267,6 +300,7 @@ size_t mynah_asr_slot_take(mynah_asr_slot *s, float *dst, size_t n, double *arri
     if (arrival) *arrival = t;
 
     pthread_cond_broadcast(&s->space);
+    slot_refresh_ready_locked(s);
     slot_unlock(s);
     return n;
 }
