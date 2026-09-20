@@ -195,6 +195,18 @@ static int pred_done(void *arg) {
 
 static void *pool_worker(void *arg) {
     (void)arg;
+    /* Name the thread, because it is created BY the scheduler thread and Linux
+     * copies the creator's name: twenty-three pool workers all reported as
+     * "mynah-sched" in top -H and in /proc, which hid the one measurement that
+     * mattered -- that the scheduler thread burns 1.85x the CPU of any worker
+     * (174.8 s against 94.5 s over one run, 2026-09-20) because the serial work
+     * between steps is all its own. A diagnostic name that lies costs more than
+     * no name at all. */
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "mynah-pool");
+#elif defined(__APPLE__)
+    pthread_setname_np("mynah-pool");
+#endif
     /* ZERO, not the current generation, and this is load-bearing.  pool_init
      * runs under pthread_once inside the first dispatch, so a worker can reach
      * its first read AFTER that dispatch has already published its job and
