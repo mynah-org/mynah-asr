@@ -339,7 +339,7 @@ Evidence: `.work/axion-session-2026-09-20.md`,
 
 ---
 
-## F14 — The static lock audit finds NO cycle, so the stall is a long critical section
+## F14 — No lock-order cycle among the AUDITED paths; the stall is not yet explained
 
 **FACT**, from reading every acquisition of the three locks rather than assuming:
 
@@ -350,8 +350,15 @@ Evidence: `.work/axion-session-2026-09-20.md`,
 | `o->mu` → `close(fd)` | the writer retires the descriptor under the ring lock | `close()` cannot block: no `SO_LINGER` is set |
 | `s->mu` → `cond_wait` | `slot_push` on a full ring | releases the mutex while it waits |
 
-There is **no lock-order cycle**, so this is not a deadlock. That leaves the
-other shape: a critical section held long enough to stop everything behind it.
+**No lock-order cycle was found among the audited `g.mu`, `s->mu` and `o->mu`
+acquisition paths.** That is the whole claim. It does **not** exclude a wait
+cycle through another primitive — the condition variables `s->space`, `o->cv`,
+`g.wake`, `g.job_done`, the thread pool's own rendezvous — nor a dependency
+outside the three locks audited here. Those are un-audited, not cleared.
+
+What it does mean is that a critical section held long enough to stop everything
+behind it is now at least as likely as an inversion, and it is the cheaper of
+the two to falsify.
 
 Two candidates were cleared by reading, not by measuring:
 
@@ -365,9 +372,19 @@ and nothing in the server can currently name that holder.
 
 **EXPERIMENT, built and ready, not yet run** (the box was handed to another
 campaign): every acquisition of a slot's mutex now records the owning thread,
-the call site that took it, and when — two relaxed stores against the cost of
-the mutex itself — and `cond_wait` clears the owner while it waits, so a dump
-cannot name a thread that is holding nothing. SIGUSR1 prints
+the call site that took it, and when — **three** relaxed stores against the cost
+of the mutex itself — and both waits clear the owner while they wait, so a dump
+cannot name a thread that is holding nothing.
+
+**The instrument was audited before it was trusted**, and the audit found a real
+defect in it: `mynah_asr_slot_wait_done()` used a raw `pthread_cond_timedwait`
+that released `s->mu` without clearing the owner. That is the call the INGEST
+thread makes at the end of a stream — precisely the moment the stall occurs — so
+the first dump would have accused a thread that was holding nothing, at exactly
+the point where the accusation would have looked most convincing. Both waits are
+wrapped now, the owner is restored on every return including a timeout, and the
+four raw primitives that remain in `server/slot.c` are the ones inside the
+wrappers themselves. SIGUSR1 prints
 `mu_owner=<tid> mu_held_s=<s> mu_where=<function>` on every live slot, beside
 the scheduler's own `phase=<sub-phase> slot=<index>`.
 

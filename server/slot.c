@@ -27,13 +27,28 @@ static void slot_unlock(mynah_asr_slot *s) {
     pthread_mutex_unlock(&s->mu);
 }
 /* A cond_wait releases the mutex while it waits, so the trace must say so or a
- * dump would name a thread that is not holding anything. */
+ * dump would name a thread that is not holding anything -- and the thread most
+ * likely to be named wrongly is the one waiting in mynah_asr_slot_wait_done at
+ * the end of a stream, which is exactly the moment the stall under
+ * investigation occurs. Both waits are wrapped for that reason. */
 static void slot_cond_wait(mynah_asr_slot *s, pthread_cond_t *cv, const char *where) {
     atomic_store_explicit(&s->mu_owner, 0ul, memory_order_relaxed);
     pthread_cond_wait(cv, &s->mu);
     atomic_store_explicit(&s->mu_owner, slot_self(), memory_order_relaxed);
     atomic_store_explicit(&s->mu_since, mynah_asr_now(), memory_order_relaxed);
     atomic_store_explicit(&s->mu_where, where, memory_order_relaxed);
+}
+
+static int slot_cond_timedwait(mynah_asr_slot *s, pthread_cond_t *cv,
+                               const struct timespec *dl, const char *where) {
+    atomic_store_explicit(&s->mu_owner, 0ul, memory_order_relaxed);
+    const int rc = pthread_cond_timedwait(cv, &s->mu, dl);
+    /* The owner is restored on EVERY return, timeout included: a timed wait
+     * that expires still comes back holding the mutex. */
+    atomic_store_explicit(&s->mu_owner, slot_self(), memory_order_relaxed);
+    atomic_store_explicit(&s->mu_since, mynah_asr_now(), memory_order_relaxed);
+    atomic_store_explicit(&s->mu_where, where, memory_order_relaxed);
+    return rc;
 }
 
 void mynah_asr_slot_set_notify(void (*notify)(void)) { g_notify = notify; }
@@ -287,7 +302,8 @@ int mynah_asr_slot_wait_done(mynah_asr_slot *s, int timeout_ms) {
 
     slot_lock(s, "mynah_asr_slot_wait_done");
     while (s->state != MYNAH_ASR_SLOT_DONE && s->state != MYNAH_ASR_SLOT_FREE) {
-        if (pthread_cond_timedwait(&s->space, &s->mu, &dl) != 0) break;
+        if (slot_cond_timedwait(s, &s->space, &dl, "mynah_asr_slot_wait_done") != 0)
+            break;
     }
     const int done = s->state == MYNAH_ASR_SLOT_DONE || s->state == MYNAH_ASR_SLOT_FREE;
     slot_unlock(s);
