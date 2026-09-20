@@ -2,7 +2,6 @@ models_local
 models
 build
 .claude
-.git
 __pycache__
 *.o
 *.a
