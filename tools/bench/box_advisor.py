@@ -245,8 +245,14 @@ def calibrate(binary_dir: str, model_dir: str, threads: int | None) -> dict:
     """Run the real step table and fit a and b.
 
     This is the whole idea: the numbers come from the serving path on this machine, not
-    from a coefficient carried in from another one. B=1 is DISCARDED -- it is the first
-    step and pays the first touch of the weights, and including it bends the line."""
+    from a coefficient carried in from another one.
+
+    B=1 used to be discarded here as "warm-up". That was wrong and it hid a defect for
+    days: a ready set of one took the single path, which runs each encoder frame as its
+    own [1, d] GEMV instead of the chunk as one [R, d] GEMM, and cost 86.7 ms against
+    16.8 (24 Neoverse-V2 cores, 2026-09-20). The row was not warm-up, it was a slow path.
+    So B=1 is FITTED now -- and when it still looks like the old shape, that is reported
+    as the defect it is rather than smoothed away."""
     exe = os.path.join(binary_dir, "tests", "test_stream_batch")
     if not os.path.exists(exe):
         return {"ok": False, "reason": f"{exe} not built (make tests/test_stream_batch)"}
@@ -263,7 +269,14 @@ def calibrate(binary_dir: str, model_dir: str, threads: int | None) -> dict:
         mt = STEP_RE.match(line)
         if mt:
             rows.append((int(mt.group(1)), float(mt.group(3))))   # (B, batched ms)
-    fit_rows = [(b, ms) for b, ms in rows if b >= 2]
+    # Is B=1 on the slow path? A lone chunk through the stacked GEMM costs a little
+    # LESS than a pair, so B=1 above the B=2 row means the solo-group path is off --
+    # an old binary, or MYNAH_ASR_STACK_SOLO=0. Naming it is worth more than the fit.
+    by_b = dict(rows)
+    solo_defect = None
+    if 1 in by_b and 2 in by_b and by_b[1] > by_b[2]:
+        solo_defect = (by_b[1], by_b[2])
+    fit_rows = [(b, ms) for b, ms in rows if b >= (2 if solo_defect else 1)]
     if len(fit_rows) < 3:
         return {"ok": False, "reason": f"step table gave {len(fit_rows)} usable rows "
                                        f"(need 3 at B>=2); output was {len(rows)} rows",
@@ -277,6 +290,7 @@ def calibrate(binary_dir: str, model_dir: str, threads: int | None) -> dict:
     resid = [v - (a_coef + b_coef * b) for b, v in fit_rows]
     worst = max(abs(r) for r in resid)
     return {"ok": True, "a_ms": a_coef, "b_ms": b_coef, "rows": rows,
+            "solo_defect": solo_defect,
             "fit_rows": fit_rows, "worst_resid_ms": worst,
             "resid_pct": 100.0 * worst / my if my else None, "max_b": max(b for b, _ in fit_rows)}
 
@@ -307,11 +321,38 @@ def predict_table(model: dict, cal: dict, rho: float) -> list:
     return out
 
 
+# How much worse the step is INSIDE THE SERVER than on the bench.
+#
+# The bench step runs alone. The serving step shares the machine with the ingest
+# threads, the writers, the per-delta JSON and the sockets, and its per-stream term is
+# the one that pays for that. Measured on the Axion on 2026-09-20 by fitting
+# mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count -- the step AS THE SCHEDULER
+# CALLS IT -- against the bench table taken the same hour:
+#
+#     bench          b = 4.58 ms/stream
+#     serving c=16   b = 8.57 ms/stream      (1.87x)
+#     serving c=24   b = 10.13 ms/stream     (2.21x, and still climbing)
+#
+# So a prediction from the bench alone is optimistic by about two, which is exactly the
+# size of the gap that went unexplained all morning (predicted 45, measured 16). One
+# machine, one model: it is a correction with provenance, not a constant of nature, and
+# it is applied to the SERVER estimate only -- the compute ceiling is still reported raw.
+SERVING_B_FACTOR = 1.9
+SERVING_B_FACTOR_SOURCE = ("Axion Neoverse-V2, 24 cpus, Nemotron int8, 2026-09-20: "
+                           "serving b 8.57 at c=16 and 10.13 at c=24 against a bench b of 4.58")
+
+
 def topologies(cpus: int) -> list:
-    """Candidate W x T, WIDE FIRST. Not a ranking by preference alone: the cost model says
-    every worker re-pays `a`, so capacity is W*(rho*P - a)/b, which grows as W shrinks --
-    right up to the point where one worker can no longer keep its threads busy. That is a
-    prediction, and the sweep is what falsifies it."""
+    """Candidate W x T, WIDE FIRST -- and now with a measurement behind the ordering.
+
+    The cost model says every worker re-pays `a`, so capacity is W*(rho*P - a)/b, which
+    grows as W shrinks. The 2026-09-20 sweep on a 24-cpu Neoverse-V2 agrees, but only
+    once a lost stream counts as a failure: as first scored, 8x3 looked twice as good as
+    1x24 while quietly dropping one to four streams a rung. Re-scored, 1x24 held c=16
+    with zero losses and the narrow shapes held c=8.
+
+    So wide first, and the sweep still decides -- but it now starts from a result rather
+    than from the arithmetic alone."""
     out = []
     for w in (1, 2, 4, 8, 16):
         if w > cpus or cpus % w:

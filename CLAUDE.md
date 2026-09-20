@@ -26,6 +26,9 @@ the development machine and its numbers are development signals.
 - `reference/<model>/` — configs and headers extracted from checkpoints.
 - `models/` — downloaded weights, gitignored. `samples/` — committed FLEURS
   clips (CC-BY 4.0) used by the CER gate and the load bank.
+- `docs/serving-findings.md` is FROZEN: serving facts that later work may not
+  silently revert, each with its evidence and its label (FACT / HYPOTHESIS /
+  RESULT / DECISION). Read it before proposing a serving optimisation.
 - `docs/nemotron-arch.md` is THE architecture reference for the v1 target;
   `docs/models.md` the model catalogue; `docs/benchmarks.md` durable numbers.
 - `.work/` — one note per board item; see `.work/README.md`.
