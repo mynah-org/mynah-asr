@@ -417,11 +417,30 @@ int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
 #endif
         } else if ((pfd.revents & POLLIN) != 0) {
             /* The portable half. Readable means either the peer sent something
-             * (a control message the ingest side will read) or it closed. Only
-             * a zero-length peek tells the two apart, and it cannot block
-             * because poll() just said the socket is readable. */
+             * (a control message the ingest side will read) or it closed, and
+             * only a zero-length peek tells the two apart.
+             *
+             * MSG_DONTWAIT is load-bearing, and the comment that used to stand
+             * here -- "it cannot block because poll() just said the socket is
+             * readable" -- was wrong for a reason the code makes plain a few
+             * lines up in main.c: this socket has TWO readers. The ingest thread
+             * holds a dup() of the same connection and is reading frames from it
+             * continuously. So the sequence poll() -> (ingest drains the socket)
+             * -> recv() finds nothing, and on a blocking descriptor with no
+             * SO_RCVTIMEO the scheduler thread then waits for the client to send
+             * again -- while holding this ring's mutex AND the scheduler loop.
+             *
+             * Measured on the Axion, 2026-09-20: the scheduler froze in
+             * phase=cancel on one slot for 25.9 s, with that slot's out_owner
+             * naming the scheduler itself inside this function for 25.9 s, every
+             * other stream on the worker stopped behind it, and the episode
+             * ending only when the clients gave up. Two runs, same shape.
+             *
+             * With MSG_DONTWAIT an EAGAIN means "the other reader got there
+             * first", which is not a hangup and is not an error: the answer is
+             * simply "not gone", and the next pass asks again. */
             char probe;
-            const ssize_t n = recv(fd, &probe, 1, MSG_PEEK);
+            const ssize_t n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n == 0) {
                 gone = 1;
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
