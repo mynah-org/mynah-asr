@@ -472,3 +472,55 @@ visible in `htop` during these runs are **reserved by the harness**
 (`taskset -c 0-23` for the server, `24-31` for the generator). They are
 experimental design, not a server defect: a generator sharing the server's cores
 measures the generator.
+
+---
+
+## F17 — The fix, verified: before/after on the same reproducer and two 600 s soaks
+
+**EVIDENCE**, Axion, commit `2ebf087`, load generator pinned off the server cores.
+
+**The reproducer that caught it** (c=16, `--repeat 6` on a 4.3 s clip, high session
+turnover, SIGUSR1 every 2 s):
+
+| | rungs | utterances offered | lost | freeze episodes |
+|---|---|---|---|---|
+| before | 11 | 1056 | 2 | 2 |
+| **after** | **22** | **2112** | **0** | **0** |
+
+Emission lag p95 steady at 433-479 ms across all 22 rungs.
+
+**600 s soaks**, same commit, same corpus, same client placement:
+
+| | 1x24, c=16 | 2x12, c=24 |
+|---|---|---|
+| utterances | 242/242 | **1243/1243** |
+| **lost** | **0** | **0** |
+| emission lag p95 | 87 ms | 153 ms (limit 320) |
+| finalization p95 | 324 ms | 277 ms (limit 500) |
+| backlog max | 0.484 s | 0.484 s (limit 0.640) |
+| steady drift / trend | 36 % / −14 % | **10 % / −9 %** |
+| **useful audio per wall second** | **12.63** | **20.36** |
+
+The same 2x12 c=24 configuration before the fix: **13 streams lost**, emission lag
+p95 **24 363 ms**, backlog **60.2 s**. The multi-second freeze was never a
+property of the model's capacity — it was a blocking `recv()` in the control
+path that stopped the scheduler outright.
+
+**FACT**: 2x12 at c=24 delivers **61 % more useful audio per wall second** than
+1x24 at c=16, with zero losses in ten minutes and every envelope line inside.
+
+**FACT about the gate, not the server**: the 20 % drift threshold discriminates
+between these two runs *after* ramp and drain windows are excluded — 2x12 reads
+10 % and passes, 1x24 reads 36 % and does not, and 1x24's steady windows really
+do vary more (74-116 ms around a pooled 87) than 2x12's (144-168 around 153).
+The threshold was contaminated, not too tight, and it has not been changed.
+
+**NOT YET PROMOTED.** One soak is not a qualification: the profile requires a
+second independent long soak at the same operating point, and the cause of
+1x24's wider steady spread is unexplained. 2x12 c=24 remains the CANDIDATE.
+
+**HYPOTHESIS for why 2x12 wins, explicitly not selected**: duplication of a
+serial bottleneck, temporal hole-filling between independent domains, different
+ready-set dynamics, different step widths, reduced rendezvous, cache effects, or
+a combination. The execution-duty experiment exists to separate them, and no
+number here chooses one.
