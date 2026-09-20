@@ -475,21 +475,25 @@ def default_thresholds(chunk_ms):
         "emission_lag_p95_ms": chunk_ms,
         "finalization_p95_ms": 500.0,
         "backlog_max_s": 2.0 * chunk_ms / 1000.0,
-        # Spread of a p95 ACROSS WINDOWS, and the direction it moves.
+        # Spread of a p95 ACROSS STEADY WINDOWS, and the direction it moves.
         #
-        # 20 % was inherited, not derived, and it is too tight for a tail
-        # statistic: a p95 over ~1800 samples has far more sampling variance
-        # than a median, so a healthy run wanders. The sibling engine landed on
-        # the same split from its own measurements -- 30 % for a p95, 20 % for a
-        # p50 -- and the reason is statistical rather than a matter of taste.
+        # 20 % stays. It was inherited rather than derived, and a p95 over ~1800
+        # samples genuinely has more sampling variance than a median -- but
+        # "inherited" is not "wrong", and the moment to change a threshold is not
+        # while looking at the first run that fails it. The number to replace it
+        # with should come from the distribution of healthy runs, not from a
+        # sibling project's choice for a different metric.
         #
-        # The pair is what makes this strict rather than lax. A soak on
-        # 2026-09-20 (1x24, c=16, 600 s, zero losses, pooled lag p95 87 ms
-        # against a 320 ms envelope) read 192 % under the old rule, 36 % spread
-        # with a trend of -14 % under this one: wandering, and improving. A run
-        # that wandered the same amount while CLIMBING fails on the trend line,
-        # which no spread threshold would have caught.
-        "max_drift_pct": 30.0,
+        # Frozen here as the evidence that will decide it, from the 1x24 c=16
+        # 600 s soak of 2026-09-20 (zero losses, pooled lag p95 87 ms against a
+        # 320 ms envelope, backlog 0.484 of 0.640):
+        #
+        #     old metric     192 %   contaminated by ramp and drain windows
+        #     steady spread   36 %   ramp/drain excluded
+        #     steady trend   -14 %   improving, not degrading
+        #
+        # One healthy run is not a distribution. Collect more soaks first.
+        "max_drift_pct": 20.0,
         "max_trend_pct": 15.0,
         "marginal_factor": 1.5,
         # Quality, not cadence. A PLACEHOLDER until a measured baseline exists: the CER
