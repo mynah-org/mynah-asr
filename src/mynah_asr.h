@@ -313,6 +313,13 @@ int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b);
  * single path — the visible-fallback rule of ENGINEERING.md §6. */
 unsigned long long mynah_asr_stream_batch_rows_stacked(void);
 
+/* Rows that took the shared relative-position projection, against all rows
+ * stacked. Sharing needs two streams of the pass to be at the same K, and K
+ * stops moving only once a stream's left cache is full -- so this ratio is how
+ * much of the batch's saving a workload of short utterances actually gets. */
+void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
+                                    unsigned long long *total);
+
 void mynah_asr_stream_close(mynah_asr_stream *s);
 
 #ifdef __cplusplus

@@ -555,6 +555,19 @@ void mynah_asr_obs_dump(void) {
                     st.dly_sel_start_ms[0], st.dly_sel_start_ms[1], st.dly_sel_start_ms[2],
                     st.dly_ready_start_ms[0], st.dly_ready_start_ms[1], st.dly_ready_start_ms[2],
                     st.dly_samples);
+        if (st.share_total > 0)
+            OBS_ADD("[DUMP] worker=%d seq=%lu relpos_share rows=%llu of %llu (%.3f)\n",
+                    widx, n, st.share_rows, st.share_total,
+                    (double)st.share_rows / (double)st.share_total);
+        for (int i = 0; i < 41; i++) {
+            if (st.pos_rows[i] == 0) continue;
+            const double r = (double)st.pos_rows[i];
+            OBS_ADD("[DUMP] worker=%d seq=%lu bypos step=%-2d rows=%-8lu "
+                    "step_ms=%6.2f dly_ms=%7.2f meanB=%5.2f\n",
+                    widx, n, i, st.pos_rows[i],
+                    1e3 * st.pos_step_s[i] / r, 1e3 * st.pos_dly_s[i] / r,
+                    (double)st.pos_bsum[i] / r);
+        }
         if (st.pred_passes > 0)
             OBS_ADD("[DUMP] worker=%d seq=%lu ready_audit passes=%lu bad_passes=%lu "
                     "false_ready=%lu false_not_ready=%lu diag_sum=%lu real_sum=%lu\n",

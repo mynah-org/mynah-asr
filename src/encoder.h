@@ -175,6 +175,13 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
  * overrides it. */
 int mynah_asr_enc_batch_f32_ok(void);
 
+/* Rows that took the SHARED rel-pos projection, against every row stacked.
+ * A ratio near zero means the batch is paying the projection per stream, which
+ * happens whenever the streams of a pass are at different K -- i.e. while their
+ * left caches are still filling. */
+void mynah_asr_enc_batch_share_stats(unsigned long long *shared,
+                                 unsigned long long *total);
+
 /* ------------------------------------------- rel-pos projection sharing (S1-7)
  * `rk = pe @ relk_wR` depends only on (layer, K) with K = cache_valid + q, so
  * every stream of a batched pass that is at the same K computes the SAME matrix.

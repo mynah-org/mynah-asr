@@ -1093,6 +1093,15 @@ int mynah_asr_enc_batch_f32_ok(void) {
     return cached;
 }
 
+/* Rows that took the shared rel-pos projection, against all rows stacked. */
+static _Atomic unsigned long long g_share_rows, g_share_total;
+
+void mynah_asr_enc_batch_share_stats(unsigned long long *shared,
+                                 unsigned long long *total) {
+    if (shared) *shared = atomic_load_explicit(&g_share_rows, memory_order_relaxed);
+    if (total) *total = atomic_load_explicit(&g_share_total, memory_order_relaxed);
+}
+
 int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                 mynah_asr_enc_stream *const *ess, int B,
                                 const float *const *mel, const int *n_mel, int n_mels,
@@ -1139,6 +1148,17 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
      * (it is sized for max_left + max_q + 2 — a defensive check, not a policy) */
     const int P_sh = 2 * k_sh - 1;
     const int share = k_sh_n >= 2 && P_sh <= bb->max_p;
+
+    /* How often the pass actually gets to share, and over how many rows.
+     * Sharing needs two streams at the SAME K, and K = cache_valid + Q is not
+     * the same until a stream's left cache has filled -- so a fleet of short
+     * utterances, each of which restarts its encoder stream, can spend its
+     * whole life with every row on the private projection. Counting it is the
+     * difference between knowing that and assuming it. */
+    atomic_fetch_add_explicit(&g_share_rows, (unsigned long long)(share ? k_sh_n : 0),
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_share_total, (unsigned long long)B,
+                              memory_order_relaxed);
 
     const size_t nd = (size_t)R * (size_t)d;
     float *xs = bb->xs, *tmp = bb->tmp, *tmp2 = bb->tmp2, *xn = bb->xn;

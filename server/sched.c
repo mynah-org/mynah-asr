@@ -22,6 +22,18 @@
  * one overflow bucket. 290 buckets, 2.3 KiB per histogram per worker. */
 #define SCHED_DLY_BUCKETS 290
 
+/* Cost and delay as a function of WHERE a row is inside its own utterance,
+ * one bin per step (one chunk) for the first 40, then an overflow.
+ *
+ * This exists because a 7 s corpus and a 24 s corpus differ in two ways at
+ * once -- how often the fixed finalization is paid, and how far a stream gets
+ * from its own start -- and an aggregate cannot tell them apart. Position is
+ * counted in STEPS, not seconds, because the chunk period is config-driven
+ * (rule 1) and a seconds axis would bake the lookahead preset into the
+ * instrumentation. s->steps is reset with the stream, so this is position
+ * inside an utterance, which is the scale the encoder's left cache lives on. */
+#define SCHED_POS_BINS 41
+
 static int sched_dly_bucket(double sec) {
     const double us = sec * 1e6;
     if (!(us > 0.0)) return 0;
@@ -92,6 +104,11 @@ static struct {
      * 100 ms up to 10 s (a stall). A log histogram would report the knee's
      * p95 to the nearest factor of two, which is the difference between
      * "inside the envelope" and "outside it". */
+    unsigned long pos_rows[SCHED_POS_BINS];
+    double pos_step_s[SCHED_POS_BINS];   /* this row's fair share of the step */
+    double pos_dly_s[SCHED_POS_BINS];    /* ready -> model start, same rows    */
+    unsigned long pos_bsum[SCHED_POS_BINS];
+    int *b_pos;                          /* per staged row: its step index     */
     unsigned long h_ready_sel[SCHED_DLY_BUCKETS];
     unsigned long h_sel_start[SCHED_DLY_BUCKETS];
     unsigned long h_ready_start[SCHED_DLY_BUCKETS];
@@ -502,6 +519,9 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     }
     g.b_ready[B] = t_rdy;
     g.b_sel[B] = s->t_last_step;
+    /* s->steps was incremented just above, so this row is step index steps-1
+     * of its utterance: the first chunk after a reset is 0. */
+    g.b_pos[B] = (int)(s->steps > 0 ? s->steps - 1 : 0);
     atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
                               memory_order_relaxed);
@@ -623,6 +643,22 @@ static void sched_step_batch(int B) {
                                   memory_order_relaxed);
     g.rows_seen = rows;
 
+    /* The step's wall, split evenly over its rows. Evenly is the only honest
+     * split available: the rows go through the stacked layers together and
+     * there is no per-row wall to read. It is exact for the mean of a bin once
+     * rows of many widths have landed in it, which is what the bin reports. */
+    if (B > 0) {
+        const double per = (double)us * 1e-6 / (double)B;
+        for (int j = 0; j < B; j++) {
+            const int pb = g.b_pos[j] < SCHED_POS_BINS - 1 ? g.b_pos[j]
+                                                           : SCHED_POS_BINS - 1;
+            g.pos_rows[pb]++;
+            g.pos_step_s[pb] += per;
+            g.pos_bsum[pb] += (unsigned long)B;
+            if (g.b_ready[j] > 0.0 && t0 >= g.b_ready[j])
+                g.pos_dly_s[pb] += t0 - g.b_ready[j];
+        }
+    }
     atomic_fetch_add_explicit(&g.batched_steps, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.ready_sum, (unsigned long)B, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.step_wall_us, us, memory_order_relaxed);
@@ -1082,6 +1118,7 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     g.b_ud = calloc((size_t)g.n_slots, sizeof(*g.b_ud));
     g.b_ready = calloc((size_t)g.n_slots, sizeof(*g.b_ready));
     g.b_sel = calloc((size_t)g.n_slots, sizeof(*g.b_sel));
+    g.b_pos = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.was_real = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.was_diag = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.b_slot = calloc((size_t)g.n_slots, sizeof(*g.b_slot));
@@ -1244,6 +1281,13 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->w_runnable_idle = g.w_runnable_idle;
     out->w_no_work = g.w_no_work;
     out->w_model_solo = g.w_model_solo;
+    for (int i = 0; i < SCHED_POS_BINS; i++) {
+        out->pos_rows[i] = g.pos_rows[i];
+        out->pos_step_s[i] = g.pos_step_s[i];
+        out->pos_dly_s[i] = g.pos_dly_s[i];
+        out->pos_bsum[i] = g.pos_bsum[i];
+    }
+    mynah_asr_stream_batch_share_stats(&out->share_rows, &out->share_total);
     out->dly_ready_sel_ms[0] = sched_dly_pct(g.h_ready_sel, 0.50);
     out->dly_ready_sel_ms[1] = sched_dly_pct(g.h_ready_sel, 0.95);
     out->dly_ready_sel_ms[2] = sched_dly_pct(g.h_ready_sel, 0.99);

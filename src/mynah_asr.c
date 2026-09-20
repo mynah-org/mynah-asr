@@ -1064,6 +1064,11 @@ unsigned long long mynah_asr_stream_batch_rows_stacked(void) {
     return atomic_load_explicit(&g_batch_rows, memory_order_relaxed);
 }
 
+void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
+                                    unsigned long long *total) {
+    mynah_asr_enc_batch_share_stats(shared, total);
+}
+
 /* The batch scratch belongs to the model: one scheduler thread owns a model, so
  * one scratch per model is exactly the lifetime the server wants, and it is
  * carved once instead of per step. */

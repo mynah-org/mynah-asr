@@ -212,6 +212,16 @@ typedef struct {
      * finding it; selected->model_start is the rest of the set being staged;
      * ready->model_start is the sum, which is the part of a stream's emission
      * lag that belongs to the server rather than to the client's pacing. */
+    /* Per-position accounting: index i is step i of an utterance (bin 40 is
+     * everything from step 40 on). Together these say whether a stream gets
+     * more expensive the longer it runs -- and if it does, whether the cost is
+     * in the model step or in waiting to be scheduled. */
+    unsigned long pos_rows[41];
+    double pos_step_s[41];
+    double pos_dly_s[41];
+    unsigned long pos_bsum[41];
+    /* rows that took the shared rel-pos projection, against all rows stacked */
+    unsigned long long share_rows, share_total;
     double dly_ready_sel_ms[3];
     double dly_sel_start_ms[3];
     double dly_ready_start_ms[3];
