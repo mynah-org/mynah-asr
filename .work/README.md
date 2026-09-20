@@ -54,4 +54,5 @@ applied to one task at a time.
 | [cpu-kernels-arm-x86.md](cpu-kernels-arm-x86.md) | S5 — batched int8 for the stream step (SMMLA/VNNI), KleidiAI, own sgemm, dispatch report and ISA guard |
 | [axion-first-run.md](axion-first-run.md) | Campaign — first build and baseline on the 32-core Neoverse-V2 box |
 | [repo-hygiene.md](repo-hygiene.md) | Small integrity items the checkers found |
+| [serving-audit-metrics-tests-hotpath.md](serving-audit-metrics-tests-hotpath.md) | Audit of 2026-09-20: what the hot path wastes beyond F27, what the harness measures and misses, quality as a regression system, the three test tiers, what the sibling still teaches |
 | `private/archive-2026-07-v1-plan.md`, `private/archive-2026-07-v1-todo.md` | The v1 plan and TODO (Italian, July 2026), local untracked history; superseded by the board |
