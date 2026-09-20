@@ -834,3 +834,85 @@ the instrumentation, because nothing here measures the instrumentation's cost.
 It is the reason both sides of the BEFORE/AFTER must be this build.
 
 **DECISION**: this table, not F18, is the baseline the optimisation must move.
+
+---
+
+## F23 — The cadence law for 3x8, fitted and validated: it predicts the measured knee
+
+**EVIDENCE**, Axion, commit `a48d443`, the F22 ladder's own dumps. Every worker
+of every rung reports the mean ready set it stepped over and the mean wall that
+step took, so each (worker, rung) is one point of `T_step(B) = a + b·B`. The
+three workers of a rung sit at different B — they are independent domains fed by
+independent clients — so the fit is not purely a restatement of load.
+
+**FACT**: over 36 points, `T_step(B) = 14.52 + 19.00·B` ms, **R² = 0.9994**.
+
+Per-row cost falls from 30.6 ms at B = 1.0 to 19.7 ms at B = 17, exactly as a
+fixed cost amortised over a widening set.
+
+**VALIDATION — the law was not tuned to the answer.** Put the fitted constants
+into the cadence budget `N·(a/B + b + finalize) ≤ P` with `P = 320 ms` and the
+mean batch each rung actually ran:
+
+| at the batch of | a/B | b | finalize | per stream per period | predicted N |
+|---|---|---|---|---|---|
+| C = 32 (B = 2.17) | 6.69 | 19.00 | 3.86 | 29.55 ms | **32 streams** |
+| C = 36 (B = 3.26) | 4.45 | 19.00 | 3.86 | 27.31 ms | **35 streams** |
+| C = 40 (B = 4.77) | 3.05 | 19.00 | 3.86 | 25.90 ms | **37 streams** |
+
+Measured: C_safe **32**, knee **36**. The law lands on both. This is the first
+capacity prediction in this repo that matches the measurement without being
+fitted to it.
+
+**FACT — where the cost actually is**, at the knee's B = 3.26:
+
+| component | ms per stream per period | share |
+|---|---|---|
+| **b — the model itself, 8 threads** | **19.00** | **70 %** |
+| a/B — fixed step cost, amortised | 4.45 | 16 % |
+| finalization tail, alone at B = 1 | 3.86 | 14 % |
+
+**This ranks the levers, and it retires a hope.** Widening the ready set can
+return at most the 16 %, and only by waiting — 40 ms of collection window is
+12.5 % of the 320 ms budget, so the window roughly pays for itself and no more.
+That is the same conclusion the pre-F15 window A/B reached by measurement, and
+the fitted law now explains *why* it was right even though the run that produced
+it was contaminated.
+
+**PREDICTION, recorded before the change is written** (and it confirms F20's,
+which was a hand-wave; this one has constants):
+
+| finalization | per stream per period | knee moves to |
+|---|---|---|
+| as today, alone at B = 1 | 27.31 ms | 35 streams |
+| **batched at the marginal cost** | **24.56 ms** | **39 streams** |
+| free (an upper bound nothing can beat) | 23.45 ms | 41 streams |
+
+So **batching the tail is predicted to move the knee from ~35 to ~39, and to
+leave C = 40 just outside.** Making C = 40 healthy needs a second lever as well.
+If the measurement lands far from 39, the law is wrong and that is worth more
+than the optimisation.
+
+**OPEN, and now the largest single item on this box**: `b` is 70 % of the cost
+and it is pure model compute on 8 threads. This profile's own hardware section
+records `bf16`, `sve` and `sve2` as present on this Neoverse-V2 and **idle** —
+the binary issues none of them. A 20 % reduction in `b` is worth as much as
+batching finalization, and nothing here has measured whether it is available.
+That is a kernel question, not a serving question, and it is recorded so it
+stops being invisible.
+
+**NOT TRANSFERABLE**: a and b are functions of how many cores walk the weights.
+These are 8-thread constants. The 1x24 constants in the profile (`a = 39.5`,
+`b = 8.57`) are a different function and the two must never be mixed; that 3
+workers at `b = 19.0` beat 1 worker at `b = 8.57` by about 35 % in rows per ms
+is the same fact the domain study reported as 0.826 against 0.537 audio-s per
+cpu.
+
+**METHOD NOTE, because the first attempt at this fit was wrong.** `rows_stacked
+/ steps` is NOT the mean ready set: it is the encoder's own row counter and
+counts rows per internal call, reading 23 rows per step at C = 40 where the
+ready set was 5.8. Fitting on it gave `b = 4.75` — a law four times too flat,
+which would have predicted about 100 concurrent streams on a box that knees at
+36. The field to use is `ready_mean`, and both it and the step mean must be
+multiplied back by their step counts before being differenced, because a mean
+cannot be subtracted.
