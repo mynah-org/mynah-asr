@@ -201,6 +201,8 @@ typedef struct {
      * and at least one slot holds a whole chunk, whatever the scheduler is
      * doing at the time. */
     double w_model, w_runnable_idle, w_no_work;
+    /* the avoidable idle, attributed to the phase that consumed it */
+    double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
     unsigned long park_idle;      /* parked with nothing buffered anywhere      */
     unsigned long park_partial;   /* parked with audio buffered, none a chunk   */
     unsigned long park_ready;     /* parked with a READY slot: a defect if > 0  */

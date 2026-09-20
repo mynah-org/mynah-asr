@@ -83,6 +83,7 @@ static struct {
      * the wall is model execution, how much is the scheduler's own serial work,
      * and how much is parking with nothing to do -- which is not waste. */
     double w_model, w_runnable_idle, w_no_work;
+    double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
     double phase_wall_s[MYNAH_ASR_SCHED_PHASES];
     unsigned long phase_calls[MYNAH_ASR_SCHED_PHASES];
     /* Parks split by whether work existed. A park with a ready slot behind it
@@ -150,8 +151,16 @@ static struct {
          * can spend its time in slot-poll, stage, finalize or cancel while a \
          * chunk sits ready, and that interval is avoidable idle just the same. */ \
         if (prev_ == 4) g.w_model += d_; \
-        else if (mynah_asr_slot_ready_count() > 0) g.w_runnable_idle += d_; \
-        else g.w_no_work += d_; \
+        else if (mynah_asr_slot_ready_count() > 0) { \
+            g.w_runnable_idle += d_; \
+            /* WHICH phase is holding the model off work that is ready. The \
+             * aggregate says 12-19 % of wall is avoidable idle and the phase \
+             * table says finalize is 13-17 % of wall; those are two aggregates \
+             * that happen to be close, which is a reason to measure and not a \
+             * result. This attributes the interval to the phase that consumed \
+             * it, and then the claim is a measurement. */ \
+            g.w_idle_by_phase[prev_] += d_; \
+        } else g.w_no_work += d_; \
     } \
     atomic_store_explicit(&g.phase, (p), memory_order_relaxed); \
     atomic_store_explicit(&g.phase_slot, (at), memory_order_relaxed); \
@@ -1099,6 +1108,8 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->w_model = g.w_model;
     out->w_runnable_idle = g.w_runnable_idle;
     out->w_no_work = g.w_no_work;
+    for (int i = 0; i < MYNAH_ASR_SCHED_PHASES; i++)
+        out->w_idle_by_phase[i] = g.w_idle_by_phase[i];
     out->park_idle = g.park_idle;
     out->park_ready = g.park_ready;
     out->park_partial = g.park_partial;
