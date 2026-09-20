@@ -497,6 +497,21 @@ def envelope_verdict(summary, thr):
         lines.append({"line": name, "value": value, "limit": limit, "unit": unit, "status": st})
 
     m = summary["metrics"]
+    # Streams that never finished, as an envelope line with a limit of zero.
+    #
+    # This used to be worth a MARGINAL beside the percentiles, on the reasoning
+    # that a handful of errors in a long run is noise. It is not: a stream whose
+    # reader timed out is a stream a caller lost, and a run that loses four
+    # utterances out of sixty-four has not "held with no headroom" -- it has
+    # dropped four sessions. A W x T sweep on 2026-09-20 read as 8x3 holding
+    # twice what 1x24 held, and every winning rung was losing three to four
+    # streams to `reader: timed out` while the verdict said MARGINAL.
+    #
+    # A 503 is NOT counted here and stays a MARGINAL below: a refusal is the
+    # admission ladder working, and the whole design says a full machine must
+    # refuse. Being refused at the door and being dropped mid-sentence are
+    # different outcomes and must not share a verdict.
+    line("utterances lost", c["errors"], 0, "")
     line("TTFP p95", m["ttfp_ms"]["p95"], thr["ttfp_p95_ms"], "ms")
     # TTFB has no envelope limit and is printed as a FACT beside TTFP: the two together
     # say whether a wait is transport or model, and inventing a limit for it would be a
@@ -522,7 +537,7 @@ def envelope_verdict(summary, thr):
         verdict = "NOT STREAMABLE"
     elif any(l["status"] == "FAIL" for l in quality_lines):
         verdict = "DEGRADED"
-    elif any(l["status"] == "MARGINAL" for l in lines) or c["rejected"] > 0 or c["errors"] > 0:
+    elif any(l["status"] == "MARGINAL" for l in lines) or c["rejected"] > 0:
         verdict = "MARGINAL"
     elif all(l["status"] == "NO DATA" for l in lines):
         verdict = "INVALID"
