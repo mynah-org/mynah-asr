@@ -50,9 +50,13 @@ admission ladder working as designed, the second is a session a caller lost.
 | 8x3 | c=32 | c=8 |
 | 2x12 | c=8 | c=0 |
 
-**This is not yet a recommendation of one wide worker.** It is a statement that
-no prefork topology has demonstrated a loss-free ceiling here. Prefork is
-**suspect**, not a tuning target, until F8 is explained.
+**Updated the same day by a later RESULT**: with the singleton fix and the
+corrected gate, **2x12 held c=24 with zero losses at every rung** (79/130/192 ms
+at c=8/16/24) and 1x24 held c=16, while 4x6 and 8x3 still lost streams. So a
+prefork topology HAS now reached a ladder ceiling loss-free — and F12 explains
+why that is not enough to promote it.
+
+Prefork remains **suspect**, not a tuning target, until F11 is explained.
 
 ## F4 — The batch collection window widened the ready set and did not move the ceiling
 
@@ -182,8 +186,10 @@ The experiment is a step table at T = 2, 4, 8, 12, 16, 24 per B.
 Never at c=12; about one run in three at c=16.
 
 **FACT**, from the server's own counters at a stall: `lag_ms max=29960`, and that
-histogram measures *sample received to delta emitted*. The audio was inside the
-server. Not the socket, not the writer, not the network.
+histogram measures *sample received to delta emitted*. So the audio was inside
+the server when the delta was finally produced. That bounds where to look; it
+does **not** by itself exonerate the socket, the writer or backpressure, because
+a blocked output path can hold the ring and stop the ingest that feeds it.
 
 **FACT**: `pool inline=0` at the same moment — the thread pool never degraded to
 serial, which rules out the single-slot trylock fallback the sibling engine
@@ -192,8 +198,49 @@ flagged.
 **FALSIFIED HYPOTHESIS**: "a rung fails when it asks for more streams than that
 server has ever held". The increase rung passed and the identical repeat failed.
 
+**FACT**, from the 600 s soak at 2x12, c=24 (1105/1118 utterances, 13 lost):
+degradation is **strongly non-uniform and episodic**. Median service stays
+healthy throughout while the tail and the backlog explode for minutes, new
+streams still start, and the system recovers without a restart.
+
+```
+  window        p50 / p95 ms
+  0-240 s       59-69 / 153-163      healthy
+  240-420 s     94-95 / 36647-55509  episode, three minutes
+  420-600 s     70-71 / 158-165      recovered by itself
+  660-720 s     22164 / 55981        again
+  [PASS] drift ttfp_ms p95 8%      [FAIL] backlog max 60.2 s
+```
+
+**HYPOTHESIS, under test and NOT yet a fact**: a subset of established slots is
+being starved of scheduler/model service. `tools/bench/stall_timeline.py` and the
+per-slot SIGUSR1 dump exist to separate that from the alternatives, which are
+equally live until the evidence lands:
+
+| class | shape | what it would mean |
+|---|---|---|
+| A | ring full, ready, visible, no model progress | scheduler/model-service starvation |
+| B | ring full, ready, NOT scheduler-visible | readiness/bookkeeping bug |
+| C | ring empty, RX stopped | ingest/transport/backpressure — not the scheduler |
+| D | ring has data, never reaches the step requirement | chunk accounting |
+| E | no slot on the worker progresses | worker/model execution stall |
+| F | every slot degrades together | capacity or a global execution problem |
+
 **Not yet explained.** Until it is, prefork is not promoted in any profile and
 the timeout value is not raised.
+
+## F12 — A short ladder cannot qualify a topology
+
+**DECISION**, forced by the soak. 2x12 passed every rung of a screening ladder
+at c=8, 16, 24 with zero losses and the best latency of any topology measured,
+and then lost 13 established streams in a ten-minute soak at its own best rung.
+A ladder rung is twenty seconds; the episodes are three minutes long, so a
+ladder cannot see them at all.
+
+So: **a prefork topology is not promoted into a profile on ladder evidence.** It
+needs a long soak with zero lost established streams. 2x12 is the current best
+CANDIDATE on this box and is deliberately not in
+`configs/perf/axion-c4a-highcpu32-nemotron-streaming.json`.
 
 ---
 

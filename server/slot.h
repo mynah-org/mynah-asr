@@ -106,6 +106,10 @@ typedef struct mynah_asr_slot {
     int needs_reset;               /* a finalize without close: reset on next audio */
     double t_open, t_first_delta;
     double last_arrival;           /* of the newest sample the scheduler took */
+    /* When the model last served this slot. `steps` says how many times; this
+     * says how long ago, which is the only one of the two that can distinguish
+     * a stream being starved right now from one that was simply admitted late. */
+    double t_last_step;
     double lag_sum_ms, lag_max_ms;
     /* Emission lag of this session, as a fixed histogram so the `done` frame can
      * carry a median without keeping every sample: bucket = 8 ms, last bucket is

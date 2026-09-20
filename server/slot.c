@@ -104,6 +104,7 @@ int mynah_asr_slot_claim(mynah_asr_slot *s, const char *lang, int lookahead,
     s->t_open = now;
     s->t_first_delta = 0.0;
     s->last_arrival = 0.0;
+    s->t_last_step = 0.0;   /* a pooled slot must not inherit the last session's */
     s->lag_sum_ms = s->lag_max_ms = 0.0;
     s->deltas = s->eous = s->steps = 0;
     memset(s->lag_hist, 0, sizeof(s->lag_hist));

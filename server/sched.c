@@ -350,6 +350,7 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     else c->arrival = s->last_arrival;
 
     s->steps++;
+    s->t_last_step = mynah_asr_now();
     atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
                               memory_order_relaxed);
@@ -947,6 +948,8 @@ int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max) {
         v->need_samples = s->stream ? mynah_asr_stream_need_samples(s->stream) : 0;
         v->age_s = s->t_open > 0.0 ? now - s->t_open : -1.0;
         v->since_arrival_s = s->last_arrival > 0.0 ? now - s->last_arrival : -1.0;
+        v->since_step_s = s->t_last_step > 0.0 ? now - s->t_last_step : -1.0;
+        v->ready = s->stream && v->need_samples > 0 && avail >= v->need_samples;
         v->lag_max_ms = s->lag_max_ms;
     }
     return n;

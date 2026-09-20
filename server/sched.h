@@ -203,6 +203,8 @@ typedef struct {
     size_t need_samples;        /* what one step of this stream wants           */
     double age_s;               /* since the slot was claimed                   */
     double since_arrival_s;     /* since the last audio arrived (-1 = never)    */
+    double since_step_s;        /* since the model last served it (-1 = never)  */
+    int ready;                  /* the ring holds a whole chunk for this stream  */
     double lag_max_ms;
 } mynah_asr_sched_slot_view;
 

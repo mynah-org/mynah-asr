@@ -541,17 +541,18 @@ void mynah_asr_obs_dump(void) {
          * them (`out=0` is a slot it skips by design, mid-handshake). A stream
          * whose ring is full while its neighbours step is starved; one whose
          * ring is empty is simply not being fed. */
-        mynah_asr_sched_slot_view sv[16];
-        const int nv = mynah_asr_sched_slots_view(sv, 16);
+        mynah_asr_sched_slot_view sv[32];
+        const int nv = mynah_asr_sched_slots_view(sv, 32);
         for (int i = 0; i < nv; i++)
             OBS_ADD("[DUMP] worker=%d seq=%lu slot id=%d state=%d out=%d stream=%d "
-                    "la=%d steps=%lu deltas=%lu ring_s=%.1f need_s=%.2f age_s=%.1f "
-                    "since_rx_s=%.1f lag_max_ms=%.0f\n",
+                    "la=%d ready=%d steps=%lu deltas=%lu ring_s=%.1f need_s=%.2f "
+                    "age_s=%.1f since_rx_s=%.1f since_step_s=%.1f lag_max_ms=%.0f\n",
                     widx, n, sv[i].id, sv[i].state, sv[i].has_out, sv[i].has_stream,
-                    sv[i].lookahead, sv[i].steps, sv[i].deltas,
+                    sv[i].lookahead, sv[i].ready, sv[i].steps, sv[i].deltas,
                     (double)sv[i].ring_samples / 16000.0,
                     (double)sv[i].need_samples / 16000.0,
-                    sv[i].age_s, sv[i].since_arrival_s, sv[i].lag_max_ms);
+                    sv[i].age_s, sv[i].since_arrival_s, sv[i].since_step_s,
+                    sv[i].lag_max_ms);
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
