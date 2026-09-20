@@ -250,8 +250,73 @@ equally live until the evidence lands:
 | E | no slot on the worker progresses | worker/model execution stall |
 | F | every slot degrades together | capacity or a global execution problem |
 
-**Not yet explained.** Until it is, prefork is not promoted in any profile and
-the timeout value is not raised.
+## F13 — The stall is the scheduler thread blocking inside its own poll pass
+
+**RESULT**, 2026-09-20, twelve rungs at c=16 with SIGUSR1 every 5 s through each
+rung. Two episodes captured, both identical in shape.
+
+Per-slot, at the moment of the episode:
+
+```
+  seq  out rdy  steps  ring_s  need_s  since_rx  since_step  lag_max
+   18    1   0     17     0.1    0.32       0.2         0.2      433
+   19    1   0     23     0.1    0.32       3.3         3.3      433   onset
+   24    1   0     23     0.1    0.32      28.3        28.3      433
+   25    1   0     12     0.0    0.32       0.1         0.1      214   slot RE-CLAIMED
+```
+
+**CLASS E** by `tools/bench/stall_timeline.py`: all sixteen live slots stopped
+together while work was runnable — one of them held 4.9 s of audio with
+`ready=1, out=1`, unserved for 26 s. Execution stopped; it was not starved of
+work.
+
+And the scheduler's own liveness names the place:
+
+```
+  seq 18  loops=4726 phase=poll phase_s=1.2
+  seq 19  loops=4726 phase=poll phase_s=6.2
+  seq 23  loops=4726 phase=poll phase_s=26.2
+  seq 24  loops=4730 phase=step phase_s=0.2      <- released
+```
+
+The loop counter is **frozen** and the phase is **poll**. That is pass (1) of
+`sched_main`, and it excludes the three alternatives by construction:
+
+| if it were | the dump would say |
+|---|---|
+| a lost wakeup | `phase=park`, loops frozen |
+| a livelock in the passes | loops **climbing**, nothing staged |
+| a step that will not end | `phase=step`, loops frozen |
+
+It says none of those. The scheduler is **blocked on a lock inside the poll
+pass**, for 26 s, while every stream on the worker waits behind it.
+
+**FACT, from reading the code rather than measuring it**: pass (1) can only
+block on a mutex. `mynah_asr_stream_out_peer_gone()` polls with a **zero**
+timeout and cannot block on the socket, and `mynah_asr_stream_out_enqueue()`
+cancels the stream on ring overflow rather than blocking — the failure mode the
+sibling engine measured at 66.5 s does not exist here. That leaves the slot lock
+`s->mu` and the output-ring lock `o->mu`.
+
+**HYPOTHESIS, not yet proven**: the holder is the ingest thread, which takes
+`s->mu` and then rings the scheduler's doorbell — `mynah_asr_slot_push()` calls
+`g_notify()` **while still holding `s->mu`**, and `g_notify` takes `g.mu`. That
+is a lock order (`s->mu` then `g.mu`) opposite to nothing the scheduler does
+today, so it is not yet an ABBA proof; it is the first place to look.
+
+**EXPERIMENT, ready and not yet run** (the box was handed to another campaign):
+the phase marker now records the SLOT INDEX and splits pass (1) into slot-poll,
+take-requests and the cancel/peer-check block. The next episode says which
+stream's lock, and a lock has an owner.
+
+**Recovery is not self-healing.** At seq 25 the slot's `steps` counter goes
+BACKWARDS, 23 to 12: the slot was released and re-claimed by the next rung's
+stream. The episode ends when the clients give up, not when the server recovers.
+The earlier reading of the 600 s soak as "recovers without a restart" was the
+turnover of streams, and is corrected here.
+
+**Not yet explained at the level of the responsible line.** Until it is, prefork
+is not promoted in any profile and the timeout value is not raised.
 
 ## F12 — A short ladder cannot qualify a topology
 
