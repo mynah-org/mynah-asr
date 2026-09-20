@@ -60,6 +60,20 @@ static struct {
     int *fin;
     int *fin_flag;                 /* who must not be made to wait (window) */
     int batch_reserved;            /* the scratch the library pre-carved, or 0 */
+    /* Where the scheduler thread IS, and how long it has been there.
+     *
+     * A stall on 2026-09-20 froze sixteen slots for 28 s with runnable work
+     * available, and the per-slot dump could say that execution had stopped but
+     * not WHERE. The candidates are not close together -- parked on the condvar
+     * with a lost wakeup, looping through the passes staging nothing, inside a
+     * long step, or blocked in the offline path -- and they need different
+     * fixes. A loop counter plus a phase marker separates them in one dump:
+     * a static loop count with phase=park is a lost wakeup, a climbing one is a
+     * livelock, and a static count with phase=step is the model. */
+    _Atomic unsigned long loops;
+    _Atomic int phase;
+    _Atomic double phase_since;
+
     _Atomic unsigned long window_entered, window_filled;
     _Atomic unsigned long window_wait_us;
     unsigned long long rows_seen;  /* last mynah_asr_stream_batch_rows_stacked() */
@@ -96,6 +110,13 @@ static struct {
 } g;
 
 /* ------------------------------------------------------- cancel buckets */
+
+/* One store each, relaxed: this runs on every pass of the scheduler loop and
+ * must not become a synchronisation point of its own. */
+#define SCHED_PHASE(p) do { \
+    atomic_store_explicit(&g.phase, (p), memory_order_relaxed); \
+    atomic_store_explicit(&g.phase_since, mynah_asr_now(), memory_order_relaxed); \
+} while (0)
 
 static const char *const CANCEL_BUCKET_NAME[MYNAH_ASR_SCHED_CANCEL__COUNT] = {
     "idle_timeout", "peer_gone", "frame_too_large", "protocol_error",
@@ -626,6 +647,8 @@ static void *sched_main(void *arg) {
         pthread_mutex_unlock(&g.mu);
 
         int did = 0;
+        atomic_fetch_add_explicit(&g.loops, 1, memory_order_relaxed);
+        SCHED_PHASE(1);
 
         /* (1) Cancellation, before any other policy. A slot the client has
          * abandoned must not pay for a finish it will never read. */
@@ -662,6 +685,7 @@ static void *sched_main(void *arg) {
             }
         }
 
+        SCHED_PHASE(2);
         /* (2) Resets, so the feed pass below sees a stream in the state the
          * client asked for. */
         for (int i = 0; i < g.n_slots; i++) {
@@ -699,6 +723,7 @@ static void *sched_main(void *arg) {
             sched_collect(g.fin_flag);
         }
 
+        SCHED_PHASE(3);
         int B = 0, n_fin = 0;
         for (int k = 0; k < g.n_slots; k++) {
             const int i = (rr + k) % g.n_slots;
@@ -745,8 +770,10 @@ static void *sched_main(void *arg) {
         }
 
         /* (4) ONE batched step over the ready set. */
+        SCHED_PHASE(4);
         if (B > 0) sched_step_batch(B);
 
+        SCHED_PHASE(5);
         /* (5) Finalize: the short last piece, then the tail through
          * mynah_asr_stream_finish, per slot and never through the batch. */
         for (int t = 0; t < n_fin; t++) {
@@ -772,10 +799,12 @@ static void *sched_main(void *arg) {
         /* (6) Offline REST work, at most one batched call per step. It stalls
          * the streams on this worker for its duration; v2.0 accepts that and
          * says so in the banner (S2-6 splits the groups). */
+        SCHED_PHASE(6);
         if (sched_run_jobs()) did = 1;
 
         /* (7) Nothing ready and nothing queued: park. Never a fixed tick -- the
          * first chunk of a new stream runs the moment it lands. */
+        SCHED_PHASE(7);
         pthread_mutex_lock(&g.mu);
         while (!did && !g.woken && g.q_head == NULL &&
                !atomic_load_explicit(&g.stop, memory_order_acquire))
@@ -984,6 +1013,12 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->step_wall_ms_sum =
         (double)atomic_load_explicit(&g.step_wall_us, memory_order_relaxed) / 1000.0;
     out->step_wall_count = out->batched_steps;
+    out->loops = atomic_load_explicit(&g.loops, memory_order_relaxed);
+    out->phase = atomic_load_explicit(&g.phase, memory_order_relaxed);
+    {
+        const double since = atomic_load_explicit(&g.phase_since, memory_order_relaxed);
+        out->phase_s = since > 0.0 ? mynah_asr_now() - since : -1.0;
+    }
     out->window_entered = atomic_load_explicit(&g.window_entered, memory_order_relaxed);
     out->window_filled = atomic_load_explicit(&g.window_filled, memory_order_relaxed);
     out->window_wait_ms_sum =

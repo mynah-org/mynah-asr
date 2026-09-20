@@ -84,10 +84,24 @@ def classify(rows, peers):
     peers_stalled = peers and all(p["step"] > STALL_S for p in peers)
 
     if peers_stalled:
+        # E and F are not told apart by how many slots are involved -- that was
+        # the first version of this rule and it mislabelled the 2026-09-20
+        # episode, in which sixteen slots froze together while one of them held
+        # 4.6 s of audio it was ready to have stepped. What separates them is
+        # whether RUNNABLE WORK EXISTED while nothing ran. Nothing running with
+        # nothing to run is a quiet server; nothing running with a ready slot is
+        # an execution stall.
         n_live = len({p["id"] for p in peers}) + 1
-        return ("F" if n_live > 2 else "E",
-                f"no slot made progress in this window ({n_live} live): this is not "
-                f"selective starvation")
+        runnable = [p for p in peers if p["ready"]] + [r for r in rows if r["ready"]]
+        if runnable:
+            most = max(runnable, key=lambda p: p["ring"])
+            return "E", (f"all {n_live} live slots stopped together, and work was "
+                         f"RUNNABLE while nothing ran: slot {most['id']} held "
+                         f"{most['ring']:.1f}s of audio, ready=1, out=1, unserved for "
+                         f"{most['step']:.1f}s. Execution stopped; it was not starved of work")
+        return "F", (f"all {n_live} live slots stopped together and NONE was ready: "
+                     f"no runnable work existed, so this window is not evidence of a "
+                     f"scheduling defect")
     if rx_stopped and ring < need:
         return "C", (f"the ring is {ring:.1f}s against {need:.2f}s needed and no audio "
                      f"arrived for {min(r['rx'] for r in rows):.1f}s: the stream stopped "

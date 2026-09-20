@@ -183,6 +183,14 @@ typedef struct {
      * than because it ran out of time. A window that always times out is too
      * long or the streams are not on a common cadence; one that always fills is
      * free. Both are readable only as a pair. */
+    /* The scheduler thread's own liveness: how many times the loop has gone
+     * round, which phase it is in, and for how long. Static loops with phase 7
+     * is a lost wakeup; climbing loops that stage nothing is a livelock; static
+     * loops with phase 4 is a step that will not end. */
+    unsigned long loops;
+    int phase;                  /* 1 poll 2 reset 3 stage 4 step 5 finalize
+                                   6 offline 7 park */
+    double phase_s;
     unsigned long window_entered, window_filled;
     double window_wait_ms_sum;
 } mynah_asr_sched_stats;
