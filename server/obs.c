@@ -399,6 +399,41 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "mynah_asr_step_wall_ms_count{worker=\"%s\"} %lu\n",
         wl, st.step_wall_ms_sum, wl, st.step_wall_count);
 
+    /* Step cost BY READY-SET WIDTH. The capacity law T_step(B) = a + b*B prices
+     * one step serving B streams, and its whole economy is that `a` is paid
+     * once and amortised over B. Two servers with the same mean step time can
+     * therefore have completely different capacity: one stepping B=16 once, one
+     * stepping B=2 eight times. Only this pair of series tells them apart, and
+     * it is what turns a + b*B from a bench model into a reading taken on the
+     * serving path -- the bench measures the step, this measures the step AS
+     * THE SCHEDULER ACTUALLY CALLS IT.
+     *
+     * Measured on 24 Neoverse-V2 cores (2026-09-20): with 16 streams in flight
+     * the mean ready set was 3.73, so the worker paid `a` four times a period
+     * and served a third of the predicted capacity. That gap was invisible in
+     * every other counter on this page.
+     *
+     * Emitted per width with a `b` label rather than as a histogram: the widths
+     * are not cumulative buckets, they are distinct step shapes, and a reader
+     * must be able to take the mean of one without taking it apart from
+     * another. The last bucket is a saturating ">=" for widths past the table. */
+    for (int i = 1; i < MYNAH_ASR_SCHED_B_BUCKETS; i++) {
+        if (st.step_b_count[i] == 0) continue;
+        const int last = (i == MYNAH_ASR_SCHED_B_BUCKETS - 1);
+        if (i == 1)
+            mynah_asr_metrics_addf(b,
+                "# HELP mynah_asr_step_b_count steps whose ready set had this width.\n"
+                "# TYPE mynah_asr_step_b_count counter\n"
+                "# HELP mynah_asr_step_b_wall_ms_sum milliseconds spent in steps of\n"
+                "# that width; divided by the count it is T_step(B) as served.\n"
+                "# TYPE mynah_asr_step_b_wall_ms_sum counter\n");
+        mynah_asr_metrics_addf(b,
+            "mynah_asr_step_b_count{worker=\"%s\",b=\"%s%d\"} %lu\n"
+            "mynah_asr_step_b_wall_ms_sum{worker=\"%s\",b=\"%s%d\"} %.3f\n",
+            wl, last ? ">=" : "", i, st.step_b_count[i],
+            wl, last ? ">=" : "", i, st.step_b_wall_ms[i]);
+    }
+
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_slots_active stream slots this worker is holding now.\n"
         "# TYPE mynah_asr_slots_active gauge\n"
