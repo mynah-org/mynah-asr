@@ -1097,12 +1097,35 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
     if (!streams || !samples || !n_samples || B < 0) return -1;
     if (B == 0) return 0;
     if (B > MYNAH_ASR_STREAM_BATCH_MAX) return -1;
-    /* B == 1 is the single path, verbatim */
-    if (B == 1)
+    mynah_asr_model *m = streams[0]->m;
+    /* B == 1 used to take the single path verbatim, on the reasoning that one
+     * stream cannot be stacked with anything and the two are the same work.
+     * They are not the same work: the single path runs each encoder frame of
+     * the chunk as its own [1, d] GEMV, while the stacked path runs the whole
+     * chunk as one [R, d] GEMM. Measured on 24 Neoverse-V2 cores, int8, the
+     * same model and the same chunk:
+     *
+     *     B=1 through the single path   86.7 ms   (86.7 ms per stream)
+     *     B=2 through the stacked path  38.4 ms   (19.2 ms per stream)
+     *
+     * A lone stream cost 4.5x per step what the same stream costs inside a pair
+     * — and two streams together cost less in absolute terms than one alone.
+     * The step table has carried that B=1 row since it was written and the note
+     * beside it called the cost warm-up; it is not warm-up, it is a GEMM run as
+     * a sequence of GEMVs. It lands on exactly the deployments that can least
+     * afford it: a single stream on a quiet box spends 27 % of its 320 ms
+     * period in the encoder where 6 % would do.
+     *
+     * So B == 1 takes the stacked path too when the model has it, and keeps the
+     * single path only where the stacked one is unavailable (an f32 pack whose
+     * BLAS is not row-stable, or a model whose batch scratch could not be
+     * reserved). Rule 4 applies unchanged and is what makes this safe to do:
+     * tests/test_stream_batch compares B=1 against the single path and the
+     * comparison was vacuous while this early-out existed. */
+    if (B == 1 && !(batch_path_allowed(m) && model_batch_ready(m, 1) == 0))
         return mynah_asr_stream_feed(streams[0], samples[0], n_samples[0], cb,
                                  userdata ? userdata[0] : NULL);
 
-    mynah_asr_model *m = streams[0]->m;
     for (int i = 1; i < B; i++)
         if (streams[i]->m != m) return -1;      /* a batch is drawn from one model */
 
@@ -1143,7 +1166,14 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
                 ready[done + g] = t;
                 g++;
             }
-            if (batched && g > 1) {
+            /* `g > 0`, not `g > 1`: a group of one goes through the stacked
+             * path too. A lone row is still a [1, d] GEMM rather than a chain
+             * of GEMVs, and that is worth 4.5x per step (86.7 ms against 19.2
+             * per stream, 24 Neoverse-V2 cores, int8). This arm is reached far
+             * more often than "B == 1" suggests: the group is per LOOKAHEAD
+             * PRESET, so eight streams on eight different presets are eight
+             * groups of one. */
+            if (batched && g > 0) {
                 for (int j = 0; j < g; j++) {
                     mynah_asr_stream *s = streams[ready[done + j]];
                     ess[j] = &s->es;
