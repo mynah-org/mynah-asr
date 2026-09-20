@@ -114,3 +114,8 @@ void mynah_asr_stream_out_get_stats(const mynah_asr_stream_out *o,
                                     mynah_asr_stream_out_stats *s);
 
 #endif
+
+/* Who holds this ring's mutex, where it was taken and for how long (-1 when
+ * free). Diagnostic only: three relaxed loads, no lock taken to ask. */
+void mynah_asr_stream_out_owner(mynah_asr_stream_out *o, unsigned long *owner,
+                                double *held_s, const char **where);

@@ -556,14 +556,17 @@ void mynah_asr_obs_dump(void) {
             OBS_ADD("[DUMP] worker=%d seq=%lu slot id=%d state=%d out=%d stream=%d "
                     "la=%d ready=%d steps=%lu deltas=%lu ring_s=%.1f need_s=%.2f "
                     "age_s=%.1f since_rx_s=%.1f since_step_s=%.1f lag_max_ms=%.0f "
-                    "mu_owner=%lx mu_held_s=%.1f mu_where=%s\n",
+                    "mu_owner=%lx mu_held_s=%.1f mu_where=%s "
+                    "out_owner=%lx out_held_s=%.1f out_where=%s\n",
                     widx, n, sv[i].id, sv[i].state, sv[i].has_out, sv[i].has_stream,
                     sv[i].lookahead, sv[i].ready, sv[i].steps, sv[i].deltas,
                     (double)sv[i].ring_samples / 16000.0,
                     (double)sv[i].need_samples / 16000.0,
                     sv[i].age_s, sv[i].since_arrival_s, sv[i].since_step_s,
                     sv[i].lag_max_ms, sv[i].mu_owner, sv[i].mu_held_s,
-                    sv[i].mu_where ? sv[i].mu_where : "-");
+                    sv[i].mu_where ? sv[i].mu_where : "-",
+                    sv[i].out_owner, sv[i].out_held_s,
+                    sv[i].out_where ? sv[i].out_where : "-");
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);

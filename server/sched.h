@@ -223,6 +223,11 @@ typedef struct {
     unsigned long mu_owner;
     double mu_held_s;
     const char *mu_where;
+    /* the same three for the stream's OUTPUT ring, which the cancel block
+       reaches into through peer_gone, enqueue and finish */
+    unsigned long out_owner;
+    double out_held_s;
+    const char *out_where;
 } mynah_asr_sched_slot_view;
 
 /* Fills up to `max` views, returns how many slots were live. Safe from any

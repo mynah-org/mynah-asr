@@ -999,6 +999,7 @@ int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max) {
             v->mu_held_s = v->mu_owner ? now - since : -1.0;
         }
         v->mu_where = atomic_load_explicit(&s->mu_where, memory_order_relaxed);
+        mynah_asr_stream_out_owner(o, &v->out_owner, &v->out_held_s, &v->out_where);
     }
     return n;
 }

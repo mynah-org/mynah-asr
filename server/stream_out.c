@@ -55,6 +55,13 @@ struct mynah_asr_stream_out {
     int send_timeout_ms;
 
     pthread_mutex_t mu;
+    /* Who holds this ring's mutex, where and since when. The 2026-09-20 stall
+     * freezes the scheduler inside its cancel block -- which reaches into this
+     * lock through peer_gone, enqueue and finish -- for 26 s, with no slot
+     * mutex held by anyone. If the holder is here, this is what names it. */
+    _Atomic unsigned long mu_owner;
+    _Atomic double mu_since;
+    const char *_Atomic mu_where;
     pthread_cond_t cv;
 
     /* Guarded by mu. */
@@ -87,6 +94,36 @@ static size_t stream_out_capacity_bytes(size_t requested) {
     if (requested < STREAM_OUT_MIN_BYTES) return STREAM_OUT_MIN_BYTES;
     if (requested > STREAM_OUT_MAX_BYTES) return STREAM_OUT_MAX_BYTES;
     return requested;
+}
+
+/* A local clock rather than the runtime's: this file already includes <time.h>
+ * and must not gain a dependency on the model API for a diagnostic field. */
+static double so_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static unsigned long so_self(void) {
+    return (unsigned long)(uintptr_t)pthread_self();
+}
+static void so_lock(mynah_asr_stream_out *o, const char *where) {
+    pthread_mutex_lock(&o->mu);
+    atomic_store_explicit(&o->mu_owner, so_self(), memory_order_relaxed);
+    atomic_store_explicit(&o->mu_since, so_now(), memory_order_relaxed);
+    atomic_store_explicit(&o->mu_where, where, memory_order_relaxed);
+}
+static void so_unlock(mynah_asr_stream_out *o) {
+    atomic_store_explicit(&o->mu_owner, 0ul, memory_order_relaxed);
+    pthread_mutex_unlock(&o->mu);
+}
+/* Releases the mutex while it waits, so the owner must be cleared or a dump
+ * would accuse the writer thread of holding what it has just given up. */
+static void so_cond_wait(mynah_asr_stream_out *o, const char *where) {
+    atomic_store_explicit(&o->mu_owner, 0ul, memory_order_relaxed);
+    pthread_cond_wait(&o->cv, &o->mu);
+    atomic_store_explicit(&o->mu_owner, so_self(), memory_order_relaxed);
+    atomic_store_explicit(&o->mu_since, so_now(), memory_order_relaxed);
+    atomic_store_explicit(&o->mu_where, where, memory_order_relaxed);
 }
 
 static int stream_out_timeout_ms(int requested) {
@@ -192,35 +229,35 @@ static void *stream_out_writer_main(void *arg) {
     stream_out_name_thread(o->fd);
 
     for (;;) {
-        pthread_mutex_lock(&o->mu);
+        so_lock(o, "stream_out_writer_main");
         while (o->queued == 0 && !o->producer_done &&
                !atomic_load_explicit(&o->failed, memory_order_relaxed)) {
-            pthread_cond_wait(&o->cv, &o->mu);
+            so_cond_wait(o, "stream_out_writer_main");
         }
         if (atomic_load_explicit(&o->failed, memory_order_relaxed)) {
-            pthread_mutex_unlock(&o->mu);
+            so_unlock(o);
             break;
         }
-        if (o->queued == 0) { pthread_mutex_unlock(&o->mu); break; }
+        if (o->queued == 0) { so_unlock(o); break; }
         /* Only the span up to the ring's end; a wrap becomes a second write. */
         size_t span = o->queued;
         if (span > o->capacity - o->head) span = o->capacity - o->head;
         const size_t offset = o->head;
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
 
         if (write_all_or_gone(o->fd, o->ring + offset, span) != 0) {
             const int err = errno;
-            pthread_mutex_lock(&o->mu);
+            so_lock(o, "stream_out_writer_main");
             mark_failed_locked(o, err);
-            pthread_mutex_unlock(&o->mu);
+            so_unlock(o);
             break;
         }
 
-        pthread_mutex_lock(&o->mu);
+        so_lock(o, "stream_out_writer_main");
         o->head = (o->head + span) % o->capacity;
         o->queued -= span;
         o->written_bytes += span;
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
     }
 
     /* Closed under the mutex, and the field retired to -1 in the same critical
@@ -230,20 +267,20 @@ static void *stream_out_writer_main(void *arg) {
      * or entirely after (and its poll ran on a descriptor that was still ours).
      * Without the lock the number could be reissued by accept() between the
      * two, and the poll would be asking about a stranger's connection. */
-    pthread_mutex_lock(&o->mu);
+    so_lock(o, "stream_out_writer_main");
     const int doomed = o->fd;
     o->fd = -1;
     if (doomed >= 0) close(doomed);
-    pthread_mutex_unlock(&o->mu);
+    so_unlock(o);
 
     /* A stream that stops early must never be silent: a truncated message
      * sequence is otherwise indistinguishable from a short utterance. */
     if (atomic_load(&o->failed)) {
         mynah_asr_stream_out_stats st;
         mynah_asr_stream_out_get_stats(o, &st);
-        pthread_mutex_lock(&o->mu);
+        so_lock(o, "stream_out_writer_main");
         const int err = o->failure_errno;
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
         fprintf(stderr,
                 "stream aborted after %zu bytes: %s "
                 "(ring %zu peak, msgs=%zu, refused=%zu)\n",
@@ -304,10 +341,10 @@ mynah_asr_stream_out *mynah_asr_stream_out_start(int fd, size_t ring_bytes,
 int mynah_asr_stream_out_enqueue(mynah_asr_stream_out *o, const void *msg, size_t len) {
     if (o == NULL || msg == NULL || len == 0) return -1;
 
-    pthread_mutex_lock(&o->mu);
+    so_lock(o, "mynah_asr_stream_out_enqueue");
     if (atomic_load_explicit(&o->failed, memory_order_relaxed) || o->producer_done) {
         ++o->failed_enqueues;
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
         return -1;
     }
     if (len > o->capacity - o->queued) {
@@ -315,7 +352,7 @@ int mynah_asr_stream_out_enqueue(mynah_asr_stream_out *o, const void *msg, size_
          * own stream rather than holding the scheduler hostage. */
         ++o->failed_enqueues;
         mark_failed_locked(o, 0);
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
         return -1;
     }
 
@@ -330,7 +367,7 @@ int mynah_asr_stream_out_enqueue(mynah_asr_stream_out *o, const void *msg, size_
     ++o->enqueued_msgs;
     o->enqueued_bytes += len;
     pthread_cond_signal(&o->cv);
-    pthread_mutex_unlock(&o->mu);
+    so_unlock(o);
     return 0;
 }
 
@@ -342,7 +379,7 @@ int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o) {
 int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
     if (o == NULL) return 1;
 
-    pthread_mutex_lock(&o->mu);
+    so_lock(o, "mynah_asr_stream_out_peer_gone");
     /* Already failed. The answer comes from WHY, not from the socket: by the
      * time a write has returned EPIPE the descriptor may already be closed, and
      * in practice the writer usually discovers the hangup before this poll does
@@ -351,11 +388,11 @@ int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
      * under "timed out". */
     if (atomic_load_explicit(&o->failed, memory_order_relaxed)) {
         const int gone = o->peer_gone;
-        pthread_mutex_unlock(&o->mu);
+        so_unlock(o);
         return gone;
     }
     const int fd = o->fd;
-    if (fd < 0) { pthread_mutex_unlock(&o->mu); return 1; }
+    if (fd < 0) { so_unlock(o); return 1; }
 
     struct pollfd pfd;
     pfd.fd = fd;
@@ -399,16 +436,16 @@ int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
      * wakes it to close and go. The decoder is untouched -- it learns at its
      * own step boundary, through the server's cancellation callback. */
     if (gone) mark_failed_locked(o, EPIPE);
-    pthread_mutex_unlock(&o->mu);
+    so_unlock(o);
     return gone;
 }
 
 void mynah_asr_stream_out_finish(mynah_asr_stream_out *o) {
     if (o == NULL) return;
-    pthread_mutex_lock(&o->mu);
+    so_lock(o, "mynah_asr_stream_out_finish");
     o->producer_done = 1;
     pthread_cond_broadcast(&o->cv);
-    pthread_mutex_unlock(&o->mu);
+    so_unlock(o);
 }
 
 void mynah_asr_stream_out_get_stats(const mynah_asr_stream_out *o,
@@ -428,4 +465,22 @@ void mynah_asr_stream_out_get_stats(const mynah_asr_stream_out *o,
     s->peer_gone       = m->peer_gone;
     s->send_timeout    = m->send_timeout;
     pthread_mutex_unlock(&m->mu);
+}
+
+void mynah_asr_stream_out_owner(mynah_asr_stream_out *o, unsigned long *owner,
+                                double *held_s, const char **where) {
+    if (owner) *owner = 0;
+    if (held_s) *held_s = -1.0;
+    if (where) *where = "-";
+    if (o == NULL) return;
+    const unsigned long ow = atomic_load_explicit(&o->mu_owner, memory_order_relaxed);
+    if (owner) *owner = ow;
+    if (ow != 0) {
+        const double since = atomic_load_explicit(&o->mu_since, memory_order_relaxed);
+        if (held_s) *held_s = so_now() - since;
+        if (where) {
+            const char *w = atomic_load_explicit(&o->mu_where, memory_order_relaxed);
+            *where = w ? w : "-";
+        }
+    }
 }
