@@ -168,11 +168,35 @@ seven cores of work spread over twenty-four, while the envelope breaks.
 not of the machine. Any statement of the form "this box holds N streams" is
 provisional until utilisation is accounted for.
 
-**HYPOTHESIS, under test**: with `ready_mean = 2.13`, a step is a two-row GEMM
-handed to 24 threads, so the cost is rendezvous rather than arithmetic — the
-pool meter over the same run reports 389 197 dispatches in 146 s at 81% spin
-wins. If true, T should be sized to the batch width and not to the core count.
-The experiment is a step table at T = 2, 4, 8, 12, 16, 24 per B.
+**That hypothesis is FALSIFIED.** It was: "a step is a two-row GEMM handed to 24
+threads, so the cost is rendezvous rather than arithmetic; T should be sized to
+the batch width". The experiment was a step table at T = 2, 4, 8, 12, 16, 24 for
+each B, on the idle box.
+
+**RESULT** — the step scales to 24 threads at every width, B=1 included:
+
+```
+         T=2     T=4     T=8    T=12    T=16    T=24    T*
+  B=1   80.0    46.3    27.8    22.6    18.4    16.7    24
+  B=2  103.2    61.0    38.9    32.6    27.7    25.5    16
+  B=4  144.8    85.4    55.6    48.1    41.6    40.2    16
+  B=8  245.4   146.5    97.9    84.8    75.0    73.3    16
+```
+
+T* (the smallest T within 10% of the best) is 16-24, not 4 or 8. **The machine
+is used effectively while a step is executing**, and the extra threads are work,
+not rendezvous.
+
+**FACT, and this is what the 30% actually is**: from one run's own counters,
+`batch steps=1276` at `step_wall_ms_mean=31.4` over `uptime 146.8 s` is 40 s of
+model execution in 147 s of wall — an **execution duty cycle of about 27%**. The
+low average CPU is a DUTY-CYCLE observation, not evidence of poor intra-step
+scaling.
+
+**Do not resurrect the rendezvous explanation** without a measurement that
+contradicts this table. And note what the 27% does NOT yet say: idle time is
+only waste if runnable work existed during it, and that has not been measured —
+a stream with less than a chunk of audio is not runnable work.
 
 ## F11 — `reader: timed out` is concurrency-dependent, probabilistic, and inside the server
 
