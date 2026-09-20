@@ -137,7 +137,13 @@ start_server() {   # $1 = model dir, $2 = extra args
 stop_server() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
 trap 'stop_server' EXIT INT TERM
 
-CLIPS="samples/en/fleurs_1521.wav samples/en/fleurs_1534.wav samples/en/fleurs_long.wav tests/audio/test_en.wav"
+# Two corpora, because the two phases ask different questions. A WAVE rung is
+# paced at real time, so its wall clock is the LONGEST clip in it: one 94 s
+# utterance turns an eight-rung ladder into half an hour of waiting for a
+# screening result. The long clip belongs in the soak, where the duration is
+# fixed and a long utterance is the point (it is the "long" bank class).
+WAVE_CLIPS="samples/en/fleurs_1521.wav samples/en/fleurs_1534.wav tests/audio/test_en.wav"
+SOAK_CLIPS="samples/en/fleurs_1521.wav samples/en/fleurs_1534.wav samples/en/fleurs_long.wav tests/audio/test_en.wav"
 verdict_of() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['envelope']['verdict'])" "$1" 2>/dev/null || echo UNREADABLE; }
 
 # ------------------------------------------------------ P4 the streaming ladder
@@ -161,7 +167,7 @@ print(n)")
         say ""
         say "  ======== WAVE c=$C ========"
         lrun python3 tools/bench/stream_load.py --mode wave --streams "$C" --repeat 2 \
-            --clips $CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
+            --clips $WAVE_CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
             --json "$RUN/wave-c$C.json" > "$RUN/wave-c$C.txt" 2>&1
         grep -E '^\s+(wall|utterances|\[|verdict|rejections)' "$RUN/wave-c$C.txt" \
             | sed 's/^/  /' | tee -a "$RUN/session.log"
@@ -191,7 +197,7 @@ print(n)")
     start_server "$MODEL" "--threads $SRV_THREADS --cap $((SOAK_C + 8))" || exit 3
     lrun python3 tools/bench/stream_load.py --mode soak --streams "$SOAK_C" \
         --duration "$SOAK_S" --warmup 20 --window 30 \
-        --clips $CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
+        --clips $SOAK_CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
         --json "$RUN/soak-c$SOAK_C.json" > "$RUN/soak-c$SOAK_C.txt" 2>&1
     grep -E '^\s+(wall|utterances|audio|\[|verdict|per-window|\s+\[)' "$RUN/soak-c$SOAK_C.txt" \
         | sed 's/^/  /' | tee -a "$RUN/session.log"
@@ -207,7 +213,7 @@ if [ -n "$PARAKEET" ] && [ -f "$PARAKEET/mynah.json" ] && ! over_budget; then
     [ -n "$WHY" ] && say "  streaming refused by the runtime: $WHY"
     say "  so the question is throughput, not real-time streams."
     start_server "$PARAKEET" "--threads $(nproc)" || exit 3
-    lrun python3 tools/bench/rest_load.py --port "$PORT" --clips $CLIPS --lang en \
+    lrun python3 tools/bench/rest_load.py --port "$PORT" --clips $WAVE_CLIPS --lang en \
         --ladder "1,2,4,8,16,32,64" --requests-per-stream 2 \
         --json "$RUN/parakeet-rest.json" 2>&1 | tee -a "$RUN/session.log"
     stop_server
