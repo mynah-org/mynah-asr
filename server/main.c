@@ -1488,6 +1488,11 @@ static void usage(void) {
         "                            T threads each (default: cpus/W), C stream slots per\n"
         "                            worker before it refuses 503 (default: --threads)\n"
         "       --prefork-plan       print the machine's topology and the W/T sweep, exit\n"
+        "       [--batch-window-ms N]  a step may wait up to N ms for more streams\n"
+        "                            to become ready, so its fixed cost is amortised over\n"
+        "                            the set it was priced for (0 = step as soon as\n"
+        "                            anything is ready). Never waits for a stream's first\n"
+        "                            chunk or for one that is finalizing\n"
         "       [--idle-ms 60000]    a stream silent for this long is cancelled (idle_timeout)\n"
         "       [--ping-ms 20000]    server-side WebSocket ping period (0 = never)\n"
         "       [--max-audio-seconds 14400]  audio one stream may send (0 = no cap)\n"
@@ -1521,6 +1526,7 @@ int main(int argc, char **argv) {
 
     const char *model_dir = NULL, *lid_dir = NULL, *default_name = NULL;
     int port = 8090, n_threads = 4;
+    int batch_window_ms = 0;   /* --batch-window-ms: 0 = step the moment anything is ready */
     int prefork_workers = 0, prefork_threads = 0, cap = 0, plan_only = 0;
     int metrics_port = 0;
     const char *metrics_bind = "127.0.0.1";
@@ -1550,6 +1556,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prefork") == 0 && i + 1 < argc) prefork_workers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--prefork-threads") == 0 && i + 1 < argc) prefork_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cap") == 0 && i + 1 < argc) cap = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--batch-window-ms") == 0 && i + 1 < argc)
+            batch_window_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--idle-ms") == 0 && i + 1 < argc) g_idle_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ping-ms") == 0 && i + 1 < argc) g_ping_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--max-audio-seconds") == 0 && i + 1 < argc)
@@ -1901,6 +1909,7 @@ int main(int argc, char **argv) {
     sc.ring_seconds = g_ring_seconds;
     sc.max_batch = g_max_batch;
     sc.max_pending = g_max_pending;
+    sc.batch_window_ms = batch_window_ms;
     if (mynah_asr_sched_start(&sc) != 0) {
         fprintf(stderr, "mynah-asr-server: the scheduler failed to start\n");
         return 1;
@@ -1985,10 +1994,12 @@ int main(int argc, char **argv) {
          * admission ladder to print it beside, and it is the first limit a
          * burst of connections meets. */
         fprintf(stderr, "mynah-asr-server %s: listening on :%d (%d http threads, "
-                        "%d stream slots, batch %d, backlog %d, streaming %s)\n"
+                        "%d stream slots, batch %d, backlog %d, batch-window %d ms, "
+                        "streaming %s)\n"
                         "  one scheduler thread owns the model; offline jobs share its steps\n"
                         "  POST /v1/audio/transcriptions | GET /v1/audio/stream (WS) | /v1/models | /v1/health\n",
                 mynah_asr_version(), port, n_threads, cap, g_max_batch, backlog,
+                batch_window_ms,
                 mynah_asr_sched_streaming() ? "yes" : "no (offline-only model)");
 
     /* Where a connection comes from is the ONLY difference between the single

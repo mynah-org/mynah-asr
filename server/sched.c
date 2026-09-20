@@ -1,6 +1,7 @@
 /* The scheduler thread. See sched.h for why there is exactly one of it. */
 #include "sched.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -57,7 +58,10 @@ static struct {
     void **b_ud;
     mynah_asr_slot **b_slot;
     int *fin;
+    int *fin_flag;                 /* who must not be made to wait (window) */
     int batch_reserved;            /* the scratch the library pre-carved, or 0 */
+    _Atomic unsigned long window_entered, window_filled;
+    _Atomic unsigned long window_wait_us;
     unsigned long long rows_seen;  /* last mynah_asr_stream_batch_rows_stacked() */
 
     /* The one mutex in this module: offline job queue + the wake flag. */
@@ -357,6 +361,84 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     return 1;
 }
 
+/* Wait, briefly and boundedly, for more streams to become ready.
+ *
+ * The step is priced as a + b*B and `a` is paid per STEP, not per stream, so a
+ * ready set of two costs almost as much as a ready set of sixteen. Clients push
+ * their audio on independent phases, so on any given wake only the one or two
+ * slots that have just crossed a whole chunk are stageable and the rest are a
+ * few tens of milliseconds short. Measured on 24 Neoverse-V2 cores: mean ready
+ * set 2.11 at c=8 and 3.73 at c=16, which is the fixed cost paid four times per
+ * chunk period instead of once.
+ *
+ * Three exemptions, and they are what keep this from being a latency tax:
+ *   - a stream that has never stepped: its first chunk is what TTFP measures,
+ *     and it must never wait behind someone else's cadence;
+ *   - a finalizing stream: it is asking to end, not to be batched;
+ *   - a set that is already complete: if everyone live is ready there is
+ *     nothing to wait for.
+ * It also returns the moment the set fills, so on a machine whose streams share
+ * a cadence the window costs nothing at all — it is a deadline, not a delay.
+ *
+ * Refreshes g.req_avail[] as it goes, because availability is what it is
+ * waiting on. Returns the number of ready slots it ends up seeing. */
+static int sched_collect(const int *finalizing) {
+    const int win_ms = g.cfg.batch_window_ms;
+    if (win_ms <= 0) return -1;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long)win_ms * 1000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    const double t0 = mynah_asr_now();
+    int entered = 0, ready = 0;
+    for (;;) {
+        int live = 0, exempt = 0;
+        ready = 0;
+        for (int i = 0; i < g.n_slots; i++) {
+            if (!g.req_live[i]) continue;
+            mynah_asr_slot *s = &g.slots[i];
+            live++;
+            if (finalizing[i] || s->stream == NULL || s->needs_reset || s->steps == 0) {
+                exempt = 1;
+                continue;
+            }
+            size_t need = mynah_asr_stream_need_samples(s->stream);
+            if (need == 0) need = 1;
+            g.req_avail[i] = mynah_asr_slot_available(s);
+            if (g.req_avail[i] >= need) ready++;
+        }
+        /* Nothing to gather, nothing to gather FOR, or someone here must not be
+         * made to wait: step now. */
+        if (exempt || ready == 0 || ready >= live) break;
+
+        if (!entered) {
+            entered = 1;
+            atomic_fetch_add_explicit(&g.window_entered, 1, memory_order_relaxed);
+        }
+        pthread_mutex_lock(&g.mu);
+        g.woken = 0;
+        const int rc = pthread_cond_timedwait(&g.wake, &g.mu, &deadline);
+        pthread_mutex_unlock(&g.mu);
+        if (atomic_load_explicit(&g.stop, memory_order_acquire)) break;
+        if (rc == ETIMEDOUT) break;
+    }
+    if (entered) {
+        atomic_fetch_add_explicit(&g.window_wait_us,
+                                  (unsigned long)((mynah_asr_now() - t0) * 1e6 + 0.5),
+                                  memory_order_relaxed);
+        /* "Filled" means it ended because the set was complete, not because the
+         * clock ran out. The two are the whole diagnosis of the window. */
+        int live = 0;
+        for (int i = 0; i < g.n_slots; i++) if (g.req_live[i]) live++;
+        if (ready >= live && live > 0)
+            atomic_fetch_add_explicit(&g.window_filled, 1, memory_order_relaxed);
+    }
+    return ready;
+}
+
 /* ONE call for the whole ready set. B == 1 takes the library's single path
  * verbatim, so a lone stream runs exactly the code it ran before S2-2b.
  *
@@ -605,6 +687,17 @@ static void *sched_main(void *arg) {
          * call below. A slot that is finalizing with less than a chunk left is
          * put aside for the per-slot tail path, which runs after the batch so
          * the order of a slot's own deltas is unchanged. */
+        /* (2b) The collection window, when one is configured: a bounded wait
+         * for the rest of the cadence's streams, so the step's fixed cost is
+         * amortised over the set it was priced for. */
+        if (g.cfg.batch_window_ms > 0) {
+            for (int i = 0; i < g.n_slots; i++)
+                g.fin_flag[i] = g.req_live[i] &&
+                    (g.req[i] & (MYNAH_ASR_SLOT_REQ_FINALIZE |
+                                 MYNAH_ASR_SLOT_REQ_CLOSE)) != 0;
+            sched_collect(g.fin_flag);
+        }
+
         int B = 0, n_fin = 0;
         for (int k = 0; k < g.n_slots; k++) {
             const int i = (rr + k) % g.n_slots;
@@ -612,7 +705,11 @@ static void *sched_main(void *arg) {
             mynah_asr_slot *s = &g.slots[i];
             const int finalize = (g.req[i] & (MYNAH_ASR_SLOT_REQ_FINALIZE |
                                               MYNAH_ASR_SLOT_REQ_CLOSE)) != 0;
-            size_t avail = g.req_avail[i];
+            /* Availability is re-read rather than trusted from the poll in
+             * pass (1): the collection window may have waited, and audio that
+             * arrived during the wait is exactly what it was waiting for. */
+            size_t avail = g.cfg.batch_window_ms > 0 ? mynah_asr_slot_available(s)
+                                                     : g.req_avail[i];
             if (avail == 0 && !finalize) continue;
 
             if (s->stream == NULL || s->needs_reset ||
@@ -746,9 +843,10 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     g.b_ud = calloc((size_t)g.n_slots, sizeof(*g.b_ud));
     g.b_slot = calloc((size_t)g.n_slots, sizeof(*g.b_slot));
     g.fin = (int *)calloc((size_t)g.n_slots, sizeof(int));
+    g.fin_flag = (int *)calloc((size_t)g.n_slots, sizeof(int));
     if (!g.slots || !g.req || !g.req_lang || !g.req_reason || !g.req_out ||
         !g.req_avail || !g.req_live || !g.b_ctx || !g.b_stream || !g.b_samples ||
-        !g.b_n || !g.b_ud || !g.b_slot || !g.fin)
+        !g.b_n || !g.b_ud || !g.b_slot || !g.fin || !g.fin_flag)
         return -1;
 
     const size_t ring = (size_t)g.cfg.ring_seconds * (size_t)g.sample_rate;
@@ -856,6 +954,10 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->step_wall_ms_sum =
         (double)atomic_load_explicit(&g.step_wall_us, memory_order_relaxed) / 1000.0;
     out->step_wall_count = out->batched_steps;
+    out->window_entered = atomic_load_explicit(&g.window_entered, memory_order_relaxed);
+    out->window_filled = atomic_load_explicit(&g.window_filled, memory_order_relaxed);
+    out->window_wait_ms_sum =
+        (double)atomic_load_explicit(&g.window_wait_us, memory_order_relaxed) / 1000.0;
     for (int i = 0; i < MYNAH_ASR_SCHED_B_BUCKETS; i++) {
         out->step_b_count[i] =
             atomic_load_explicit(&g.step_b_count[i], memory_order_relaxed);
@@ -996,7 +1098,7 @@ void mynah_asr_sched_stop(void) {
     g.req = NULL; g.req_lang = NULL; g.req_reason = NULL;
     g.req_out = NULL; g.req_avail = NULL; g.req_live = NULL;
     free(g.b_ctx); free(g.b_stream); free(g.b_samples); free(g.b_n);
-    free(g.b_ud); free(g.b_slot); free(g.fin);
+    free(g.b_ud); free(g.b_slot); free(g.fin); free(g.fin_flag);
     g.b_ctx = NULL; g.b_stream = NULL; g.b_samples = NULL; g.b_n = NULL;
     g.b_ud = NULL; g.b_slot = NULL; g.fin = NULL;
     g.n_slots = 0;

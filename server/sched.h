@@ -38,6 +38,22 @@ typedef struct {
     int max_pending;             /* --max-pending: offline jobs queued */
     size_t out_ring_bytes;       /* per-connection output ring */
     int send_timeout_ms;         /* SO_SNDTIMEO on a stream's socket */
+    /* --batch-window-ms: how long a step may WAIT for more streams to become
+     * ready before it runs. 0 keeps the historical behaviour (step the moment
+     * anything is ready).
+     *
+     * The capacity law T_step(B) = a + b*B prices ONE step serving B streams,
+     * and its whole economy is that the fixed cost `a` is paid once and
+     * amortised over B. Clients push audio on their own phase, so a scheduler
+     * that steps on every arrival sees a ready set of two or three where B
+     * should be sixteen: measured on 24 Neoverse-V2 cores, mean ready set 3.73
+     * at c=16, i.e. `a` paid four times per chunk period.
+     *
+     * This does NOT change the chunk (repo rule 5: load never enters the chunk
+     * size). It changes when the step runs, by a bounded amount, and it is
+     * skipped entirely for a stream's first chunk and for a finalizing stream,
+     * so neither first-partial latency nor a close pays for it. */
+    int batch_window_ms;
 } mynah_asr_sched_config;
 
 typedef enum {
@@ -162,6 +178,13 @@ typedef struct {
     unsigned long step_wall_count;          /* = batched_steps */
     unsigned long step_b_count[MYNAH_ASR_SCHED_B_BUCKETS];
     double step_b_wall_ms[MYNAH_ASR_SCHED_B_BUCKETS];
+    /* The collection window: how often it was entered, how long it waited in
+     * total, and how often it ended because every live stream was ready rather
+     * than because it ran out of time. A window that always times out is too
+     * long or the streams are not on a common cadence; one that always fills is
+     * free. Both are readable only as a pair. */
+    unsigned long window_entered, window_filled;
+    double window_wait_ms_sum;
 } mynah_asr_sched_stats;
 
 void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out);

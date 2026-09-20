@@ -399,6 +399,26 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "mynah_asr_step_wall_ms_count{worker=\"%s\"} %lu\n",
         wl, st.step_wall_ms_sum, wl, st.step_wall_count);
 
+    /* The collection window, as a pair. `entered` alone says nothing: a window
+     * that always fills is free (the streams share a cadence and it is a
+     * deadline, never a delay) and one that always times out is either too long
+     * or waiting for streams that are not coming. Only entered-vs-filled tells
+     * them apart, and the wait sum prices it. */
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_batch_window_entered_total steps that waited for a wider\n"
+        "# ready set (0 when --batch-window-ms is 0, which is the default).\n"
+        "# TYPE mynah_asr_batch_window_entered_total counter\n"
+        "mynah_asr_batch_window_entered_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_batch_window_filled_total windows that ended because every\n"
+        "# live stream was ready, rather than because the deadline passed.\n"
+        "# TYPE mynah_asr_batch_window_filled_total counter\n"
+        "mynah_asr_batch_window_filled_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_batch_window_wait_ms_sum milliseconds spent waiting in those\n"
+        "# windows. Divided by entered it is what a step actually paid to be wider.\n"
+        "# TYPE mynah_asr_batch_window_wait_ms_sum counter\n"
+        "mynah_asr_batch_window_wait_ms_sum{worker=\"%s\"} %.3f\n",
+        wl, st.window_entered, wl, st.window_filled, wl, st.window_wait_ms_sum);
+
     /* Step cost BY READY-SET WIDTH. The capacity law T_step(B) = a + b*B prices
      * one step serving B streams, and its whole economy is that `a` is paid
      * once and amortised over B. Two servers with the same mean step time can
