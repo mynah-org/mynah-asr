@@ -106,6 +106,14 @@ static const mynah_asr_flag g_flags[] = {
      " OpenBLAS, where it is unverified; int8 never consults it, its per-row dot is exact by construction",
      NULL, NULL},
 
+    {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
+     "1/0: whether a ready set of ONE goes through the stacked encoder path."
+     " The group is per lookahead preset, so this is not only B==1: eight streams on eight"
+     " presets are eight groups of one. On, a lone chunk is one [R, d] GEMM; off, it is a chain"
+     " of [1, d] GEMVs, which measured 86.7 ms against 16.8 on a 24-core Neoverse-V2."
+     " Off is the pre-2026-09-20 behaviour and exists so the A/B is one binary",
+     NULL, NULL},
+
     {"MYNAH_ASR_SGEMM_PROFILE", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
      "src/sgemm.c: record every f32 GEMM shape AS EXECUTED (family, tasks asked of the pool, wall)"
      " and print the table at exit; off it costs one relaxed load per GEMM call",

@@ -1087,6 +1087,20 @@ int mynah_asr_stream_batch_reserve(mynah_asr_model *m, int max_b) {
 
 /* Is the stacked encoder path usable for this model at all? f32 depends on the
  * BLAS being row-stable in M, which is measured, not assumed. */
+/* Does a group of ONE go through the stacked path? Measured 5.2x on the step
+ * (86.7 -> 16.8 ms for a lone stream, 24 Neoverse-V2 cores), so the default is
+ * yes -- but the flag exists because the A/B must be ONE binary on ONE box with
+ * everything else identical, and because a change this deep in the step should
+ * be switchable from a running server when a ladder disagrees with a bench. */
+int mynah_asr_stack_solo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYNAH_ASR_STACK_SOLO");
+        cached = e ? (e[0] == '1') : 1;
+    }
+    return cached;
+}
+
 static int batch_path_allowed(const mynah_asr_model *m) {
     return m->enc.layers[0].ff1_w1.qtype != MYNAH_ASR_Q_F32 || mynah_asr_enc_batch_f32_ok();
 }
@@ -1122,7 +1136,8 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
      * reserved). Rule 4 applies unchanged and is what makes this safe to do:
      * tests/test_stream_batch compares B=1 against the single path and the
      * comparison was vacuous while this early-out existed. */
-    if (B == 1 && !(batch_path_allowed(m) && model_batch_ready(m, 1) == 0))
+    if (B == 1 && !(mynah_asr_stack_solo() && batch_path_allowed(m) &&
+                    model_batch_ready(m, 1) == 0))
         return mynah_asr_stream_feed(streams[0], samples[0], n_samples[0], cb,
                                  userdata ? userdata[0] : NULL);
 
@@ -1173,7 +1188,7 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
              * more often than "B == 1" suggests: the group is per LOOKAHEAD
              * PRESET, so eight streams on eight different presets are eight
              * groups of one. */
-            if (batched && g > 0) {
+            if (batched && (g > 1 || mynah_asr_stack_solo())) {
                 for (int j = 0; j < g; j++) {
                     mynah_asr_stream *s = streams[ready[done + j]];
                     ess[j] = &s->es;

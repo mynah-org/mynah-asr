@@ -225,6 +225,11 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
  * in a refusal body. */
 const char *mynah_asr_stream_unsupported(const mynah_asr_model *m);
 
+/* MYNAH_ASR_STACK_SOLO: whether a ready set of one takes the stacked encoder
+ * path (default 1). Exposed so the flag registry and the tests can read the
+ * same answer the step does. */
+int mynah_asr_stack_solo(void);
+
 /* Feed float32 16 kHz mono samples; the callback receives the text deltas. */
 int mynah_asr_stream_feed(mynah_asr_stream *s, const float *samples, size_t n,
                       mynah_asr_result_cb cb, void *userdata);
