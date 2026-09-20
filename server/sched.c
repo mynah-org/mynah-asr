@@ -18,6 +18,41 @@
  * belongs to, and when the last sample it consumed arrived. The batched call
  * gets one of these per row as its userdata, so lag is charged per SLOT and is
  * the same number a per-slot feed would have charged. */
+/* Delay histogram: 100 us steps to 10 ms, 10 ms to 1 s, 100 ms to 10 s, then
+ * one overflow bucket. 290 buckets, 2.3 KiB per histogram per worker. */
+#define SCHED_DLY_BUCKETS 290
+
+static int sched_dly_bucket(double sec) {
+    const double us = sec * 1e6;
+    if (!(us > 0.0)) return 0;
+    if (us < 10000.0) return (int)(us / 100.0);
+    if (us < 1000000.0) return 100 + (int)((us - 10000.0) / 10000.0);
+    if (us < 10000000.0) return 199 + (int)((us - 1000000.0) / 100000.0);
+    return SCHED_DLY_BUCKETS - 1;
+}
+
+/* The upper edge of a bucket, in ms: a percentile read off a histogram is
+ * reported as the worst value the bucket can hold, never the best. */
+static double sched_dly_upper_ms(int b) {
+    if (b < 100) return (double)(b + 1) * 0.1;
+    if (b < 199) return 10.0 + (double)(b - 100 + 1) * 10.0;
+    if (b < SCHED_DLY_BUCKETS - 1) return 1000.0 + (double)(b - 199 + 1) * 100.0;
+    return 10000.0;
+}
+
+static double sched_dly_pct(const unsigned long *h, double q) {
+    unsigned long n = 0;
+    for (int i = 0; i < SCHED_DLY_BUCKETS; i++) n += h[i];
+    if (n == 0) return 0.0;
+    const double want = q * (double)n;
+    unsigned long c = 0;
+    for (int i = 0; i < SCHED_DLY_BUCKETS; i++) {
+        c += h[i];
+        if ((double)c >= want) return sched_dly_upper_ms(i);
+    }
+    return sched_dly_upper_ms(SCHED_DLY_BUCKETS - 1);
+}
+
 typedef struct {
     mynah_asr_slot *slot;
     double arrival;    /* when the last sample consumed by this feed landed */
@@ -51,6 +86,26 @@ static struct {
      * pointer stores and never a malloc; `b_slot` keeps the owner of each row
      * so a failed pass can cancel exactly the sessions that were in it, and
      * `fin` lists the slots whose turn is the per-slot finalize path. */
+    /* ready -> execution, bucketed. Three linear tiers rather than a log, so
+     * the numbers a reader cares about keep their resolution: 100 us up to
+     * 10 ms (a scheduler pass), 10 ms up to 1 s (a chunk period is 320), then
+     * 100 ms up to 10 s (a stall). A log histogram would report the knee's
+     * p95 to the nearest factor of two, which is the difference between
+     * "inside the envelope" and "outside it". */
+    unsigned long h_ready_sel[SCHED_DLY_BUCKETS];
+    unsigned long h_sel_start[SCHED_DLY_BUCKETS];
+    unsigned long h_ready_start[SCHED_DLY_BUCKETS];
+    unsigned long dly_samples;
+    double *b_ready, *b_sel;   /* per staged row: when it became ready/selected */
+    /* The readiness predicate, audited against the scheduler's own answer.
+     * The three-way split of wall time classifies an idle interval by asking
+     * mynah_asr_slot_ready_count() > 0. If that predicate disagrees with what
+     * the scheduler actually considers runnable, every conclusion drawn from
+     * `runnable_idle` inherits the error, so it is checked rather than
+     * trusted. */
+    unsigned long pred_passes, pred_false_ready, pred_false_not_ready;
+    unsigned long pred_diag_sum, pred_real_sum, pred_bad_passes;
+    int *was_real, *was_diag;
     emit_ctx *b_ctx;
     mynah_asr_stream **b_stream;
     const float **b_samples;
@@ -419,6 +474,10 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     emit_ctx *c = &g.b_ctx[B];
     c->slot = s;
     c->arrival = 0.0;
+    /* Sampled BEFORE the take: the take itself re-stamps ready_since when it
+     * leaves another whole chunk behind, so reading it afterwards would
+     * measure zero on exactly the backlogged slots this is meant to expose. */
+    const double t_rdy = mynah_asr_slot_ready_since(s);
     const size_t got = mynah_asr_slot_take(s, s->take, want, &c->arrival);
     if (got == 0) return 0;
     if (c->arrival > 0.0) s->last_arrival = c->arrival;
@@ -426,6 +485,12 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
 
     s->steps++;
     s->t_last_step = mynah_asr_now();
+    if (t_rdy > 0.0 && s->t_last_step >= t_rdy) {
+        g.h_ready_sel[sched_dly_bucket(s->t_last_step - t_rdy)]++;
+        g.dly_samples++;
+    }
+    g.b_ready[B] = t_rdy;
+    g.b_sel[B] = s->t_last_step;
     atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
                               memory_order_relaxed);
@@ -524,6 +589,16 @@ static int sched_collect(const int *finalizing) {
 static void sched_step_batch(int B) {
     mynah_asr_sched_assert_thread("mynah_asr_stream_step_batch");
     const double t0 = mynah_asr_now();
+    /* The model starts now, for every row in this set at once. A row staged
+     * early in the pass has been waiting for the rest of the set; the last
+     * row has not. Both are charged, because what a stream experiences is the
+     * whole interval from the instant its chunk was executable. */
+    for (int j = 0; j < B; j++) {
+        if (g.b_sel[j] > 0.0 && t0 >= g.b_sel[j])
+            g.h_sel_start[sched_dly_bucket(t0 - g.b_sel[j])]++;
+        if (g.b_ready[j] > 0.0 && t0 >= g.b_ready[j])
+            g.h_ready_start[sched_dly_bucket(t0 - g.b_ready[j])]++;
+    }
     const int rc = mynah_asr_stream_step_batch(g.b_stream, B, g.b_samples, g.b_n,
                                                sched_on_result, g.b_ud);
     const unsigned long us = (unsigned long)((mynah_asr_now() - t0) * 1e6 + 0.5);
@@ -795,6 +870,16 @@ static void *sched_main(void *arg) {
         }
 
         SCHED_PHASE(3);
+        /* Snapshot the diagnostic predicate BEFORE this pass takes anything:
+         * a slot that was ready and got staged is not ready afterwards, and
+         * comparing the two sides at different instants would manufacture a
+         * disagreement that does not exist. */
+        int diag_ready = 0;
+        for (int i = 0; i < g.n_slots; i++) {
+            g.was_diag[i] = mynah_asr_slot_is_ready(&g.slots[i]);
+            g.was_real[i] = 0;
+            diag_ready += g.was_diag[i];
+        }
         int B = 0, n_fin = 0;
         for (int k = 0; k < g.n_slots; k++) {
             const int i = (rr + k) % g.n_slots;
@@ -824,6 +909,7 @@ static void *sched_main(void *arg) {
             if (sched_stage(s, avail, B)) {
                 B++;
                 did = 1;
+                g.was_real[i] = 1;
                 /* Keep the finalize pending: the tail runs when the ring is
                  * empty, on a later pass. */
                 if (finalize) mynah_asr_slot_request(s, g.req[i] &
@@ -837,7 +923,29 @@ static void *sched_main(void *arg) {
                 }
                 continue;
             }
-            if (finalize) g.fin[n_fin++] = i;
+            if (finalize) { g.fin[n_fin++] = i; g.was_real[i] = 1; }
+        }
+
+        /* The readiness predicate, audited against the scheduler's own answer.
+         * Compared PER SLOT, not as two totals: two counts can agree while
+         * naming different slots, and it is the slots that matter. A
+         * false-not-ready files runnable time under `no_work`, which would
+         * make the avoidable idle look smaller than it is; a false-ready does
+         * the opposite. Neither is acceptable in a number used to choose what
+         * to optimise, so the size of both is reported next to it. */
+        {
+            int real = 0, fr = 0, fnr = 0;
+            for (int i = 0; i < g.n_slots; i++) {
+                real += g.was_real[i];
+                if (g.was_diag[i] && !g.was_real[i]) fr++;
+                else if (!g.was_diag[i] && g.was_real[i]) fnr++;
+            }
+            g.pred_passes++;
+            g.pred_diag_sum += (unsigned long)diag_ready;
+            g.pred_real_sum += (unsigned long)real;
+            g.pred_false_ready += (unsigned long)fr;
+            g.pred_false_not_ready += (unsigned long)fnr;
+            if (fr || fnr) g.pred_bad_passes++;
         }
 
         /* (4) ONE batched step over the ready set. */
@@ -961,6 +1069,10 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     g.b_samples = calloc((size_t)g.n_slots, sizeof(*g.b_samples));
     g.b_n = calloc((size_t)g.n_slots, sizeof(*g.b_n));
     g.b_ud = calloc((size_t)g.n_slots, sizeof(*g.b_ud));
+    g.b_ready = calloc((size_t)g.n_slots, sizeof(*g.b_ready));
+    g.b_sel = calloc((size_t)g.n_slots, sizeof(*g.b_sel));
+    g.was_real = (int *)calloc((size_t)g.n_slots, sizeof(int));
+    g.was_diag = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.b_slot = calloc((size_t)g.n_slots, sizeof(*g.b_slot));
     g.fin = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.fin_flag = (int *)calloc((size_t)g.n_slots, sizeof(int));
@@ -1120,6 +1232,22 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->w_model = g.w_model;
     out->w_runnable_idle = g.w_runnable_idle;
     out->w_no_work = g.w_no_work;
+    out->dly_ready_sel_ms[0] = sched_dly_pct(g.h_ready_sel, 0.50);
+    out->dly_ready_sel_ms[1] = sched_dly_pct(g.h_ready_sel, 0.95);
+    out->dly_ready_sel_ms[2] = sched_dly_pct(g.h_ready_sel, 0.99);
+    out->dly_sel_start_ms[0] = sched_dly_pct(g.h_sel_start, 0.50);
+    out->dly_sel_start_ms[1] = sched_dly_pct(g.h_sel_start, 0.95);
+    out->dly_sel_start_ms[2] = sched_dly_pct(g.h_sel_start, 0.99);
+    out->dly_ready_start_ms[0] = sched_dly_pct(g.h_ready_start, 0.50);
+    out->dly_ready_start_ms[1] = sched_dly_pct(g.h_ready_start, 0.95);
+    out->dly_ready_start_ms[2] = sched_dly_pct(g.h_ready_start, 0.99);
+    out->dly_samples = g.dly_samples;
+    out->pred_passes = g.pred_passes;
+    out->pred_bad_passes = g.pred_bad_passes;
+    out->pred_false_ready = g.pred_false_ready;
+    out->pred_false_not_ready = g.pred_false_not_ready;
+    out->pred_diag_sum = g.pred_diag_sum;
+    out->pred_real_sum = g.pred_real_sum;
     out->fin_model_s = g.fin_model_s;
     out->fin_rest_s = g.fin_rest_s;
     out->fin_calls = g.fin_calls;

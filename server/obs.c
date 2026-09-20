@@ -536,6 +536,20 @@ void mynah_asr_obs_dump(void) {
                 widx, n, st.w_model, three > 0 ? st.w_model / three : 0.0,
                 st.w_runnable_idle, three > 0 ? st.w_runnable_idle / three : 0.0,
                 st.w_no_work, three > 0 ? st.w_no_work / three : 0.0);
+        if (st.dly_samples > 0)
+            OBS_ADD("[DUMP] worker=%d seq=%lu delay_ms ready_sel=%.1f/%.1f/%.1f "
+                    "sel_start=%.1f/%.1f/%.1f ready_start=%.1f/%.1f/%.1f n=%lu\n",
+                    widx, n,
+                    st.dly_ready_sel_ms[0], st.dly_ready_sel_ms[1], st.dly_ready_sel_ms[2],
+                    st.dly_sel_start_ms[0], st.dly_sel_start_ms[1], st.dly_sel_start_ms[2],
+                    st.dly_ready_start_ms[0], st.dly_ready_start_ms[1], st.dly_ready_start_ms[2],
+                    st.dly_samples);
+        if (st.pred_passes > 0)
+            OBS_ADD("[DUMP] worker=%d seq=%lu ready_audit passes=%lu bad_passes=%lu "
+                    "false_ready=%lu false_not_ready=%lu diag_sum=%lu real_sum=%lu\n",
+                    widx, n, st.pred_passes, st.pred_bad_passes,
+                    st.pred_false_ready, st.pred_false_not_ready,
+                    st.pred_diag_sum, st.pred_real_sum);
         if (st.fin_calls > 0)
             OBS_ADD("[DUMP] worker=%d seq=%lu finalize model_s=%.2f rest_s=%.2f "
                     "calls=%lu model_mean_ms=%.1f rest_mean_ms=%.1f\n",

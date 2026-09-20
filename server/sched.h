@@ -203,6 +203,21 @@ typedef struct {
     double w_model, w_runnable_idle, w_no_work;
     /* the avoidable idle, attributed to the phase that consumed it */
     double w_idle_by_phase[MYNAH_ASR_SCHED_PHASES];
+    /* How long a chunk waits between being EXECUTABLE and the model starting
+     * on it, in ms, as p50 / p95 / p99. ready->selected is the scheduler
+     * finding it; selected->model_start is the rest of the set being staged;
+     * ready->model_start is the sum, which is the part of a stream's emission
+     * lag that belongs to the server rather than to the client's pacing. */
+    double dly_ready_sel_ms[3];
+    double dly_sel_start_ms[3];
+    double dly_ready_start_ms[3];
+    unsigned long dly_samples;
+    /* The readiness predicate, audited per slot against what the scheduler
+     * actually ran. Non-zero false_not_ready means `runnable_idle` below is an
+     * UNDERSTATEMENT; non-zero false_ready means it is an overstatement. */
+    unsigned long pred_passes, pred_bad_passes;
+    unsigned long pred_false_ready, pred_false_not_ready;
+    unsigned long pred_diag_sum, pred_real_sum;
     /* finalization, split: the model's tail against the teardown */
     double fin_model_s, fin_rest_s;
     unsigned long fin_calls;

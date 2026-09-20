@@ -66,7 +66,20 @@ static void slot_refresh_ready_locked(mynah_asr_slot *s) {
     const int had = atomic_load_explicit(&s->ready_flag, memory_order_relaxed);
     if (want == had) return;
     atomic_store_explicit(&s->ready_flag, want, memory_order_relaxed);
+    /* The rising edge only. This function returns early when the flag does not
+     * change, so a slot that stays ready ACROSS a take is not re-stamped here
+     * -- the take path does that itself, for the reason written there. */
+    if (want)
+        atomic_store_explicit(&s->ready_since, mynah_asr_now(), memory_order_relaxed);
     atomic_fetch_add_explicit(&g_ready_slots, want ? 1 : -1, memory_order_relaxed);
+}
+
+int mynah_asr_slot_is_ready(const mynah_asr_slot *s) {
+    return atomic_load_explicit(&s->ready_flag, memory_order_relaxed);
+}
+
+double mynah_asr_slot_ready_since(const mynah_asr_slot *s) {
+    return atomic_load_explicit(&s->ready_since, memory_order_relaxed);
 }
 
 void mynah_asr_slot_set_need(mynah_asr_slot *s, size_t need_samples) {
@@ -301,6 +314,17 @@ size_t mynah_asr_slot_take(mynah_asr_slot *s, float *dst, size_t n, double *arri
 
     pthread_cond_broadcast(&s->space);
     slot_refresh_ready_locked(s);
+    /* Still ready after the drain: the NEXT chunk is executable from this
+     * instant and has waited nothing yet, so its clock starts now. Without
+     * this the stamp keeps the moment the slot FIRST went ready and never
+     * moves while the slot stays behind, so ready->selected would report the
+     * backlog instead of the delay the scheduler added -- the backlog counted
+     * a second time, under a name that suggests a scheduler defect. Caught by
+     * a 3-stream smoke that read a 2.5 s p95 where the true value is near
+     * zero; it would have read as a scheduling stall on a nearly idle box. */
+    if (atomic_load_explicit(&s->ready_flag, memory_order_relaxed))
+        atomic_store_explicit(&s->ready_since, mynah_asr_now(),
+                              memory_order_relaxed);
     slot_unlock(s);
     return n;
 }

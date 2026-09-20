@@ -145,6 +145,12 @@ typedef struct mynah_asr_slot {
      * a ready slot would answer a much weaker question. */
     _Atomic size_t need_hint;
     _Atomic int ready_flag;
+    /* When this slot last became EXECUTABLE: stamped on the not-ready -> ready
+     * edge, which is either the push that completed a chunk or the take that
+     * left a whole one behind it. Read just before a take, it gives the delay
+     * the SCHEDULER added, with the client's own pacing already excluded --
+     * which is the only part of the wait a scheduler change can move. */
+    _Atomic double ready_since;
 
     size_t take_cap;
 } mynah_asr_slot;
@@ -227,6 +233,10 @@ double mynah_asr_now(void);
 /* How many slots currently hold a whole chunk for their stream. One relaxed
  * load; the flags behind it are maintained under each slot's own mutex. */
 int mynah_asr_slot_ready_count(void);
+/* This slot's own readiness, and when it acquired it. The count above is the
+ * fleet's; these two are what an audit of the predicate needs per slot. */
+int mynah_asr_slot_is_ready(const mynah_asr_slot *s);
+double mynah_asr_slot_ready_since(const mynah_asr_slot *s);
 
 /* The scheduler publishes what one step of this stream wants, so the push and
  * take paths can keep the readiness flag without knowing about streams. */
