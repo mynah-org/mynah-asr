@@ -2,6 +2,13 @@
 
 #include "backend.h"   /* mynah_asr_gemm_provider(): who owns the other pool */
 
+#if defined(__linux__)
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE
+#  endif
+#  include <sched.h>
+#endif
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -11,11 +18,36 @@
 
 #define PF_MAX_THREADS 64
 
+/* How many cpus this PROCESS may actually run on.
+ *
+ * Not the same question as how many the machine has, and the difference is not
+ * academic: `taskset -c 0-23` on a 32-cpu box, a cpuset cgroup, a Kubernetes
+ * cpu limit and a pinned prefork worker all leave _SC_NPROCESSORS_ONLN saying
+ * 32 while the scheduler will only ever place this process on its slice. A pool
+ * sized from the machine then oversubscribes its own slice, and because every
+ * parallel region ends at its SLOWEST worker, the extra threads do not add
+ * throughput — they add a straggler to every step.
+ *
+ * Measured on the Neoverse-V2 box (2026-09-20): a server pinned to 24 cpus
+ * built a 32-thread pool, and the streaming envelope broke between 8 and 16
+ * concurrent streams. The affinity mask is the honest denominator. */
+static long cpus_available(void) {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    return sysconf(_SC_NPROCESSORS_ONLN);
+}
+
 int mynah_asr_num_threads(void) {
     static int nth = 0;
     if (nth == 0) {
         const char *env = getenv("MYNAH_ASR_THREADS");
-        long n = env ? atol(env) : sysconf(_SC_NPROCESSORS_ONLN);
+        long n = env ? atol(env) : cpus_available();
         if (n < 1) n = 1;
         if (n > PF_MAX_THREADS) n = PF_MAX_THREADS;
         nth = (int)n;

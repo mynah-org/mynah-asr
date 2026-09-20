@@ -101,8 +101,18 @@ cat "$RUN/dispatch-map.txt" | tee -a "$RUN/session.log"
 
 # ---------------------------------------------------------------- P3 calibrate
 say ""; say "---- P3 the box's own step table, and the prediction that follows"
+# Read the weights once before timing anything. On a freshly booted box the
+# model file is not in the page cache, and the first pass through it pays
+# disk instead of DRAM -- which lands entirely in `a`, the fixed cost, and
+# makes a cold box look like a slow one. This is also why the calibration
+# runs on the SERVER's cpu slice: `a` and `b` are functions of how many
+# cores walk the weights, so fitting them on the generator's slice
+# describes the generator.
+CACHED_BEFORE=$(awk "/^Cached:/{print \$2}" /proc/meminfo 2>/dev/null)
+cat "$MODEL"/* > /dev/null 2>&1
+say "  page cache warmed: Cached $CACHED_BEFORE kB -> $(awk '/^Cached:/{print $2}' /proc/meminfo 2>/dev/null) kB"
 if [ -f tools/bench/box_advisor.py ]; then
-    lrun python3 tools/bench/box_advisor.py --model "$MODEL" \
+    srun python3 tools/bench/box_advisor.py --model "$MODEL" \
         --json "$RUN/advisor.json" > "$RUN/advisor.txt" 2>&1 || true
     tail -40 "$RUN/advisor.txt" | tee -a "$RUN/session.log"
 fi
@@ -152,14 +162,15 @@ STREAMS_OK=0
 if [ -n "$(./mynah-asr stream -m "$MODEL" -i tests/audio/test_en.wav --lang en 2>&1 | grep 'offline-only')" ]; then
     say "  $MODEL is offline-only (no cache-aware streaming): no WAVE for it."
 else
-    SRV_THREADS=$(nproc 2>/dev/null || echo 8)
-    [ -n "$SRV_CPUS" ] && SRV_THREADS=$(python3 -c "
-s='$SRV_CPUS';n=0
-for p in s.split(','):
-    a,_,b=p.partition('-');n+= (int(b)-int(a)+1) if b else 1
-print(n)")
+    # --threads is the server's HTTP thread pool and a WebSocket stream holds one
+    # for its whole life (server/main.c: "one slot per HTTP thread"), so it is the
+    # CONCURRENCY ceiling -- not the compute width. The compute pool sizes itself
+    # from this process's affinity mask, which is what --server-cpus sets. Asking
+    # for a rung above --threads measures the accept path, not the model.
     CAP=$(python3 -c "print(max([int(x) for x in '$LADDER'.split()]) + 8)")
-    say "  server: --threads $SRV_THREADS --cap $CAP --quant $QUANT, cpus ${SRV_CPUS:-all}"
+    SRV_THREADS=$CAP
+    say "  server: --threads $SRV_THREADS (HTTP/concurrency ceiling) --cap $CAP --quant $QUANT"
+    say "          compute pool: from the affinity mask of cpus ${SRV_CPUS:-all}"
     say "  load:   cpus ${LOAD_CPUS:-all}, lookahead $LOOKAHEAD requested per stream"
     start_server "$MODEL" "--threads $SRV_THREADS --cap $CAP" || exit 3
     for C in $LADDER; do
@@ -187,14 +198,7 @@ say "  ladder result: the highest concurrency whose envelope held is c=$STREAMS_
 [ "$SOAK_C" -gt 0 ] || SOAK_C=$STREAMS_OK
 if [ "$SOAK_C" -gt 0 ] && ! over_budget; then
     say ""; say "---- P5 SOAK ${SOAK_S}s at c=$SOAK_C (closed loop: this one can promote)"
-    SRV_THREADS=$(python3 -c "
-s='${SRV_CPUS:-}';n=0
-if not s: import os;n=os.cpu_count()
-else:
-    for p in s.split(','):
-        a,_,b=p.partition('-');n+= (int(b)-int(a)+1) if b else 1
-print(n)")
-    start_server "$MODEL" "--threads $SRV_THREADS --cap $((SOAK_C + 8))" || exit 3
+    start_server "$MODEL" "--threads $((SOAK_C + 8)) --cap $((SOAK_C + 8))" || exit 3
     lrun python3 tools/bench/stream_load.py --mode soak --streams "$SOAK_C" \
         --duration "$SOAK_S" --warmup 20 --window 30 \
         --clips $SOAK_CLIPS --port "$PORT" --lang en --lookahead "$LOOKAHEAD" \
@@ -212,7 +216,7 @@ if [ -n "$PARAKEET" ] && [ -f "$PARAKEET/mynah.json" ] && ! over_budget; then
     WHY=$(./mynah-asr stream -m "$PARAKEET" -i tests/audio/test_en.wav --lang en 2>&1 | grep -i 'offline-only\|does not' | head -1)
     [ -n "$WHY" ] && say "  streaming refused by the runtime: $WHY"
     say "  so the question is throughput, not real-time streams."
-    start_server "$PARAKEET" "--threads $(nproc)" || exit 3
+    start_server "$PARAKEET" "--threads 72" || exit 3
     lrun python3 tools/bench/rest_load.py --port "$PORT" --clips $WAVE_CLIPS --lang en \
         --ladder "1,2,4,8,16,32,64" --requests-per-stream 2 \
         --json "$RUN/parakeet-rest.json" 2>&1 | tee -a "$RUN/session.log"

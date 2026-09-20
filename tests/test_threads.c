@@ -9,6 +9,13 @@
  * MYNAH_ASR_THREADS is pinned so the expected values do not depend on the host's
  * core count (num_threads caches on first call, so it must be set before any).
  * Exit: 0 ok, 1 fail. */
+#if defined(__linux__)
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE
+#  endif
+#  include <sched.h>
+#endif
+
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +163,44 @@ int main(void) {
           "a child that calls threadpool_after_fork dispatches again (spin off)");
     CHECK(pool_child("50", "8", 1) == 0,
           "and with the spin on");
+
+    /* The pool must size itself from the cpus this process may RUN on, not from
+     * the cpus the machine has. A server pinned to a slice (taskset, a cpuset
+     * cgroup, a Kubernetes cpu limit, a prefork worker) that builds a pool for
+     * the whole box oversubscribes its own slice, and since a parallel region
+     * ends at its slowest worker the extra threads buy a straggler, not
+     * throughput. Measured on a 32-cpu Neoverse-V2 pinned to 24: a 32-thread
+     * pool. The check runs in a CHILD because num_threads caches on first call
+     * and this process has already called it. */
+#if defined(__linux__)
+    {
+        const pid_t pid = fork();
+        if (pid == 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(0, &set);
+            if (sched_getaffinity(0, sizeof(set), &set) != 0)
+                _exit(77);                       /* cannot ask: skip, do not fail */
+            const int have = CPU_COUNT(&set);
+            if (have < 2) _exit(77);             /* nothing to narrow */
+            cpu_set_t one;
+            CPU_ZERO(&one);
+            for (int c = 0, put = 0; c < CPU_SETSIZE && put < 1; c++)
+                if (CPU_ISSET(c, &set)) { CPU_SET(c, &one); put++; }
+            if (sched_setaffinity(0, sizeof(one), &one) != 0) _exit(77);
+            unsetenv("MYNAH_ASR_THREADS");       /* the env wins by design */
+            _exit(mynah_asr_num_threads() == 1 ? 0 : 1);
+        }
+        int st = 0;
+        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
+            if (WEXITSTATUS(st) == 77)
+                printf("threads SKIP: affinity cannot be narrowed here\n");
+            else
+                CHECK(WEXITSTATUS(st) == 0,
+                      "a process pinned to one cpu builds a pool of one thread");
+        }
+    }
+#endif
 
     printf("test_threads: %s\n", failures ? "FAIL" : "OK");
     return failures;
