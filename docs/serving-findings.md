@@ -1053,3 +1053,71 @@ labelled as one.
 things are owed instead — a corpus with a reference manifest so transcripts can
 be scored, and a measurement of where the 1545 ms floor is spent. Until both
 exist, C = 32 stays `measured_short_run_safe`.
+
+---
+
+## F26 — The step, split by component: attention dominates, but the first reading was confounded
+
+**EVIDENCE**, Axion, commit `4badd67`, 3x8, cpus 0-23 / generator 24-31, 120 s
+rungs, mixed corpus, seed 42. Three concurrencies on purpose: the stacked
+per-row linears read the weights once for the whole set so their per-row cost
+falls as B grows, while anything that loops per stream cannot amortise.
+
+| component | C=16, B=1.07 | C=32, B=2.16 | C=40, B=5.74 |
+|---|---|---|---|
+| **attn+cache** | **15.188 (54.2 %)** | **10.252 (43.8 %)** | **7.503 (38.4 %)** |
+| ffn2 | 3.724 (13.3 %) | 3.278 (14.0 %) | 2.932 (15.0 %) |
+| ffn1 | 3.648 (13.0 %) | 3.219 (13.8 %) | 2.892 (14.8 %) |
+| relpos (shared) | 0.371 (1.3 %) | 2.239 (9.6 %) | 2.205 (11.3 %) |
+| conv | 1.938 (6.9 %) | 1.766 (7.5 %) | 1.620 (8.3 %) |
+| qkv | 1.322 (4.7 %) | 1.051 (4.5 %) | 0.935 (4.8 %) |
+| subsample | 0.964 (3.4 %) | 0.939 (4.0 %) | 0.915 (4.7 %) |
+| o_proj | 0.668 (2.4 %) | 0.463 (2.0 %) | 0.365 (1.9 %) |
+| tail | 0.206 (0.7 %) | 0.195 (0.8 %) | 0.179 (0.9 %) |
+| **encoder total** | **28.03 ms/row** | **23.40** | **19.55** |
+
+**FACT**: `attn+cache` is the largest component at every batch width, 38-54 % of
+the encoder step. At the operating point that matters — C = 32, where the ladder
+also measured B = 2.17 — it is **10.25 ms of 23.40 ms per row**, larger than the
+finalization tail and the amortised fixed cost put together.
+
+**CROSS-CHECK, and it holds.** The fitted law (F23) says `T_step(B)/B = a/B + b`
+= 21.5 ms/row at B = 5.74; the encoder components sum to 19.55. The ~2 ms
+difference is the decoder, the emission and the rest of
+`mynah_asr_stream_step_batch`, which are outside the encoder call. Two
+independent instruments agree to within 10 %.
+
+**RESULT NOT YET ATTRIBUTABLE — the first reading of this table was wrong, and
+the table says so itself.** Two columns move in ways a per-stream loop cannot:
+`attn+cache` halves as B grows (15.19 -> 7.50) while `relpos` rises sixfold
+(0.37 -> 2.21) and then stops amortising. Both are one mechanism. Inside
+`stream_attention_core`:
+
+```c
+if (rk_in) { relpos_count(MYNAH_ASR_RELPOS_SHARED); }
+else       { matmul_wt(pe, L->relk_w, es->sa_rk, P, d, d);   /* PRIVATE */
+             relpos_count(MYNAH_ASR_RELPOS_PRIVATE); }
+```
+
+When no other stream in the pass shares a stream's K, that stream computes the
+projection **itself, inside the attention**. So the work was never shrinking as
+the batch widened — it was **migrating from `attn` to `relpos`**. Reading the
+fall in `attn` as "attention parallelises with B" would have pointed an
+optimisation at the wrong component entirely.
+
+**DECISION**: the projection is now timed where it happens and subtracted from
+the attention, so the two names stop trading cost, and the private/shared/group
+call counts are reported beside the table. `attn` is then attention, and the
+question "how much of the 19 ms/row is the rel-pos projection" becomes a
+measurement rather than a subtraction between two runs.
+
+**METHOD NOTE**: the split of `attn` from the k/v cache shift is timed INSIDE
+the original loop, not by splitting the loop in two. A stream's attention and
+its own cache update run back to back over the same cache lines; splitting the
+loop to get a clean timer boundary would have changed the locality of the thing
+being measured. `tests/test_stream_batch` stays IDENTICAL OK, so rule 4 holds.
+
+**STILL OPEN, and not to be guessed at**: how much of the marginal per-row cost
+`b` is attention arithmetic, how much is moving `left x d` floats of k/v cache
+per layer per stream, and how much is the private projection. The next run
+answers all three. No optimisation is chosen before it lands.

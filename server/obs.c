@@ -561,8 +561,8 @@ void mynah_asr_obs_dump(void) {
                     (double)st.share_rows / (double)st.share_total);
         if (st.comp_rows > 0) {
             unsigned long long tot = 0;
-            for (int i = 0; i < 9; i++) tot += st.comp_ns[i];
-            for (int i = 0; i < 9; i++)
+            for (int i = 0; i < 11; i++) tot += st.comp_ns[i];
+            for (int i = 0; i < 11; i++)
                 OBS_ADD("[DUMP] worker=%d seq=%lu component %-11s ns=%llu "
                         "ns_per_row=%8.0f share=%.3f\n",
                         widx, n, mynah_asr_stream_step_component_name(i), st.comp_ns[i],
@@ -572,6 +572,9 @@ void mynah_asr_obs_dump(void) {
                     "ns_per_row=%8.0f rows=%llu frames=%llu steps=%llu\n",
                     widx, n, tot, (double)tot / (double)st.comp_rows,
                     st.comp_rows, st.comp_frames, st.comp_steps);
+            OBS_ADD("[DUMP] worker=%d seq=%lu relpos_calls private=%llu shared=%llu "
+                    "group=%llu\n", widx, n, st.relpos_priv, st.relpos_shared,
+                    st.relpos_group);
         }
         for (int i = 0; i < 41; i++) {
             if (st.pos_rows[i] == 0) continue;

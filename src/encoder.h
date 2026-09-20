@@ -186,10 +186,12 @@ void mynah_asr_enc_batch_share_stats(unsigned long long *shared,
  * subsample, ffn1, qkv, relpos, attn+cache, o_proj, conv, ffn2, tail.
  * Nanoseconds each, plus the rows and steps they were accumulated over, so a
  * reader can turn them into ns per row. 9 slots. */
-#define MYNAH_ASR_ENC_PROFILE_SLOTS 9
+#define MYNAH_ASR_ENC_PROFILE_SLOTS 11
 void mynah_asr_enc_profile(unsigned long long *ns, int n, unsigned long long *rows,
                        unsigned long long *frames, unsigned long long *steps);
 const char *mynah_asr_enc_profile_name(int i);
+void mynah_asr_enc_relpos_all(unsigned long long *priv, unsigned long long *shared,
+                          unsigned long long *group);
 
 /* ------------------------------------------- rel-pos projection sharing (S1-7)
  * `rk = pe @ relk_wR` depends only on (layer, K) with K = cache_valid + q, so

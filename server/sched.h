@@ -223,7 +223,8 @@ typedef struct {
     /* rows that took the shared rel-pos projection, against all rows stacked */
     unsigned long long share_rows, share_total;
     /* the batched step split by component, ns, with its rows and steps */
-    unsigned long long comp_ns[9], comp_rows, comp_frames, comp_steps;
+    unsigned long long comp_ns[11], comp_rows, comp_frames, comp_steps;
+    unsigned long long relpos_priv, relpos_shared, relpos_group;
     double dly_ready_sel_ms[3];
     double dly_sel_start_ms[3];
     double dly_ready_start_ms[3];

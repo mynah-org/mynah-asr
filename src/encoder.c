@@ -733,6 +733,66 @@ int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
  * One relaxed atomic per attention core (24 per stream per step): negligible
  * next to the GEMMs, and it is the only way a run can PROVE that the sharing
  * below actually happened instead of quietly degrading (ENGINEERING.md §6). */
+/* ---------------------------------------------------- where a row's time goes
+ * The fitted cadence law for 3x8 says T_step(B) = 14.5 + 19.0*B ms, so the
+ * marginal cost of a row -- 19 ms -- is about 70 % of what a stream costs per
+ * chunk period, and it is the largest single item on this box. "It is the model"
+ * is not an optimisation target; a component is. These counters split the
+ * batched encoder step into pieces that could be attacked separately, so that
+ * choice rests on a measurement instead of on which kernel is famous.
+ *
+ * One clock read per boundary: seven inside the layer loop, two outside, about
+ * 170 reads against a step that runs for tens of milliseconds. Always on,
+ * because gating it behind a flag would make the profiled build and the serving
+ * build different binaries, and this repo has been burned by that before. */
+enum { EP_SUB, EP_FFN1, EP_QKV, EP_RELPOS, EP_RELPOS_PRIV, EP_ATTN, EP_KVCACHE,
+       EP_OPROJ, EP_CONV, EP_FFN2, EP_TAIL, EP_N };
+
+static _Atomic unsigned long long g_ep_ns[EP_N];
+/* rows = STREAM rows, so ns/row is directly comparable to the `b` of the
+ * fitted cadence law. frames = the encoder frames those rows carried
+ * (sum of q_i), which is the dimension the GEMMs actually see -- the two
+ * differ by the frames per chunk and confusing them would put the
+ * component table on a different axis from every capacity number here. */
+static _Atomic unsigned long long g_ep_rows, g_ep_frames, g_ep_steps;
+
+static inline unsigned long long ep_ns(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+#define EP_ADD(slot) do { const unsigned long long u_ = ep_ns(); \
+    atomic_fetch_add_explicit(&g_ep_ns[slot], u_ - t_, memory_order_relaxed); \
+    t_ = u_; } while (0)
+
+void mynah_asr_enc_relpos_all(unsigned long long *priv, unsigned long long *shared,
+                          unsigned long long *group) {
+    if (priv) *priv = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_PRIVATE);
+    if (shared) *shared = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_SHARED);
+    if (group) *group = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_GROUP);
+}
+
+void mynah_asr_enc_profile(unsigned long long *ns, int n, unsigned long long *rows,
+                       unsigned long long *frames, unsigned long long *steps) {
+    for (int i = 0; i < n && i < EP_N; i++)
+        ns[i] = atomic_load_explicit(&g_ep_ns[i], memory_order_relaxed);
+    if (rows) *rows = atomic_load_explicit(&g_ep_rows, memory_order_relaxed);
+    if (frames) *frames = atomic_load_explicit(&g_ep_frames, memory_order_relaxed);
+    if (steps) *steps = atomic_load_explicit(&g_ep_steps, memory_order_relaxed);
+}
+
+const char *mynah_asr_enc_profile_name(int i) {
+    static const char *const N[EP_N] = {"subsample", "ffn1", "qkv", "relpos",
+                                        "relpos_priv", "attn", "kv_cache",
+                                        "o_proj", "conv", "ffn2", "tail"};
+    return (i >= 0 && i < EP_N) ? N[i] : "?";
+}
+
 static _Atomic unsigned long long g_relpos[MYNAH_ASR_RELPOS__N];
 static void relpos_count(int which) {
     atomic_fetch_add_explicit(&g_relpos[which], 1ull, memory_order_relaxed);
@@ -787,7 +847,16 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
         if (rk_in) {
             relpos_count(MYNAH_ASR_RELPOS_SHARED);
         } else {
+            /* The projection a stream computes for itself because nobody in
+             * this pass shares its K. It sits INSIDE the attention, which is
+             * why "attn+cache" appeared to get cheaper as the batch widened --
+             * the work was not shrinking, it was migrating to the shared
+             * projection. Timed here and subtracted from the attention by the
+             * caller, so the two names stop trading cost with each other. */
+            const unsigned long long p0_ = ep_ns();
             matmul_wt(pe, L->relk_w, es->sa_rk, P, d, d);
+            atomic_fetch_add_explicit(&g_ep_ns[EP_RELPOS_PRIV], ep_ns() - p0_,
+                                      memory_order_relaxed);
             relpos_count(MYNAH_ASR_RELPOS_PRIVATE);
         }
 
@@ -1094,58 +1163,6 @@ int mynah_asr_enc_batch_f32_ok(void) {
     return cached;
 }
 
-/* ---------------------------------------------------- where a row's time goes
- * The fitted cadence law for 3x8 says T_step(B) = 14.5 + 19.0*B ms, so the
- * marginal cost of a row -- 19 ms -- is about 70 % of what a stream costs per
- * chunk period, and it is the largest single item on this box. "It is the model"
- * is not an optimisation target; a component is. These counters split the
- * batched encoder step into pieces that could be attacked separately, so that
- * choice rests on a measurement instead of on which kernel is famous.
- *
- * One clock read per boundary: seven inside the layer loop, two outside, about
- * 170 reads against a step that runs for tens of milliseconds. Always on,
- * because gating it behind a flag would make the profiled build and the serving
- * build different binaries, and this repo has been burned by that before. */
-enum { EP_SUB, EP_FFN1, EP_QKV, EP_RELPOS, EP_ATTN, EP_OPROJ, EP_CONV, EP_FFN2,
-       EP_TAIL, EP_N };
-
-static _Atomic unsigned long long g_ep_ns[EP_N];
-/* rows = STREAM rows, so ns/row is directly comparable to the `b` of the
- * fitted cadence law. frames = the encoder frames those rows carried
- * (sum of q_i), which is the dimension the GEMMs actually see -- the two
- * differ by the frames per chunk and confusing them would put the
- * component table on a different axis from every capacity number here. */
-static _Atomic unsigned long long g_ep_rows, g_ep_frames, g_ep_steps;
-
-static inline unsigned long long ep_ns(void) {
-    struct timespec ts;
-#if defined(CLOCK_MONOTONIC)
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-#else
-    clock_gettime(CLOCK_REALTIME, &ts);
-#endif
-    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
-}
-
-#define EP_ADD(slot) do { const unsigned long long u_ = ep_ns(); \
-    atomic_fetch_add_explicit(&g_ep_ns[slot], u_ - t_, memory_order_relaxed); \
-    t_ = u_; } while (0)
-
-void mynah_asr_enc_profile(unsigned long long *ns, int n, unsigned long long *rows,
-                       unsigned long long *frames, unsigned long long *steps) {
-    for (int i = 0; i < n && i < EP_N; i++)
-        ns[i] = atomic_load_explicit(&g_ep_ns[i], memory_order_relaxed);
-    if (rows) *rows = atomic_load_explicit(&g_ep_rows, memory_order_relaxed);
-    if (frames) *frames = atomic_load_explicit(&g_ep_frames, memory_order_relaxed);
-    if (steps) *steps = atomic_load_explicit(&g_ep_steps, memory_order_relaxed);
-}
-
-const char *mynah_asr_enc_profile_name(int i) {
-    static const char *const N[EP_N] = {"subsample", "ffn1", "qkv", "relpos",
-                                        "attn+cache", "o_proj", "conv", "ffn2",
-                                        "tail"};
-    return (i >= 0 && i < EP_N) ? N[i] : "?";
-}
 
 /* Rows that took the shared rel-pos projection, against all rows stacked. */
 static _Atomic unsigned long long g_share_rows, g_share_total;
@@ -1256,19 +1273,38 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             rk_sh = bb->rk_sh;
         }
         EP_ADD(EP_RELPOS);
+        /* The attention and the shift of the k/v cache it feeds are timed
+         * apart INSIDE the original loop, not by splitting it in two. They are
+         * 38-54 % of the step together and they call for opposite fixes -- one
+         * is arithmetic, the other moves left*d floats per layer per stream --
+         * but a stream's attention and its own cache update run back to back
+         * and share the cache lines they touch. Splitting the loop to get a
+         * clean timer boundary would have changed the locality of the thing
+         * being measured, which is how a profiler ends up measuring itself. */
+        unsigned long long attn_ns_ = 0, kv_ns_ = 0;
         for (int i = 0; i < B; i++) {
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
             const int Q = bb->qq[i];
             float *kc = es->k_cache + (size_t)li * (size_t)es->left * (size_t)d;
             float *vc = es->v_cache + (size_t)li * (size_t)es->left * (size_t)d;
+            const unsigned long long a_ = ep_ns();
+            const unsigned long long rp0_ =
+                atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);
             stream_attention_core(es, L, bb->qs + off, kn + off, vn + off, es->sa_pe,
                                   bb->ctxs + off, Q, kc, vc, es->cache_valid,
                                   bb->kks[i] == k_sh ? rk_sh : NULL);
+            const unsigned long long b_ = ep_ns();
+            const unsigned long long rp1_ =
+                atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);
             update_kv_cache(kc, kn + off, es->cache_valid, Q, es->left, d);
             update_kv_cache(vc, vn + off, es->cache_valid, Q, es->left, d);
+            const unsigned long long c_ = ep_ns();
+            attn_ns_ += (b_ - a_) - (rp1_ - rp0_); kv_ns_ += c_ - b_;
         }
-        EP_ADD(EP_ATTN);
+        atomic_fetch_add_explicit(&g_ep_ns[EP_ATTN], attn_ns_, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_ep_ns[EP_KVCACHE], kv_ns_, memory_order_relaxed);
+        t_ = ep_ns();
         mynah_asr_qmat_mul_rows(&L->o_w, bb->ctxs, tmp, R, qx, sx);
         for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
         EP_ADD(EP_OPROJ);

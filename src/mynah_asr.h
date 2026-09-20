@@ -325,10 +325,14 @@ void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
  * The fitted cadence law makes the marginal per-row cost about 70 % of what a
  * stream costs per chunk period, so "the model is expensive" needs a component
  * before it can become a change. */
-#define MYNAH_ASR_STEP_COMPONENTS 9
+#define MYNAH_ASR_STEP_COMPONENTS 11
 void mynah_asr_stream_step_profile(unsigned long long *ns, int n, unsigned long long *rows,
                                unsigned long long *frames, unsigned long long *steps);
 const char *mynah_asr_stream_step_component_name(int i);
+/* attention cores that computed their own rel-pos projection, that read a
+ * group's, and projections computed once for a group. */
+void mynah_asr_stream_relpos_counts(unsigned long long *priv, unsigned long long *shared,
+                                unsigned long long *group);
 
 void mynah_asr_stream_close(mynah_asr_stream *s);
 

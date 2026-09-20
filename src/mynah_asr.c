@@ -1078,6 +1078,11 @@ const char *mynah_asr_stream_step_component_name(int i) {
     return mynah_asr_enc_profile_name(i);
 }
 
+void mynah_asr_stream_relpos_counts(unsigned long long *priv, unsigned long long *shared,
+                                unsigned long long *group) {
+    mynah_asr_enc_relpos_all(priv, shared, group);
+}
+
 /* The batch scratch belongs to the model: one scheduler thread owns a model, so
  * one scratch per model is exactly the lifetime the server wants, and it is
  * carved once instead of per step. */
