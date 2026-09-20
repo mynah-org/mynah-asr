@@ -180,3 +180,115 @@ Evidence: `~/ladder2/` (the ladder and its per-rung metrics), `~/sweep/m-*.txt`
 Conclusion: the streaming ceiling on 24 Neoverse-V2 cores is **c=16 today**, and
 the gap to the predicted 45 is a scheduling gap, not a compute gap.
 Next action: the W x T sweep (running), then a collection window with a measured W.
+
+---
+
+## 6. The collection window: it widened the batch and did not move the ceiling
+
+`--batch-window-ms N` lets a step wait, boundedly, for more streams to become
+ready — exempting a stream's first chunk, a finalizing stream, and a set that is
+already complete. Same ladder, three widths, 24 cpus:
+
+| window | mean ready set at c=16 | emission lag p95 | ceiling |
+|---|---|---|---|
+| 0 ms | 3.69 | 288 ms | c=16 |
+| 40 ms | **5.85** | 302 ms | c=16 |
+| 80 ms | **7.98** | 370 ms | c=8 |
+
+The ready set nearly doubled and the ceiling did not move a rung. **So the fixed
+cost `a` is not what limits this server**, and §5's diagnosis — right about the
+ready set being small — was wrong about why it mattered. This is the falsifier
+`.work/where-to-attack.md` §A3 asked for, arriving for the batch width instead
+of for W, and it is worth more than a win would have been: it retires an
+explanation that was about to justify a week of work on `a`.
+
+The window stays in the tree at default 0, with its counters, because it is the
+mechanism §7 needs — not because it buys capacity.
+
+## 7. What the serving path actually costs, read from the server
+
+With the per-width step cost exported (`mynah_asr_step_b_wall_ms_sum` over
+`mynah_asr_step_b_count`), `T_step(B)` can be fitted from the step AS THE
+SCHEDULER CALLS IT rather than from a bench:
+
+| where | a | b per stream |
+|---|---|---|
+| bench, isolated, 24 cpus | 30.8 ms | 4.58 ms |
+| serving path at c=16 | 39.5 ms | **8.57 ms** |
+| serving path at c=24 | 31.4 ms | **10.13 ms** |
+
+`b` on the serving path is roughly twice the bench figure **and it degrades with
+load**. That is why widening B does nothing: the marginal per-stream term
+dominates and it is the term that gets worse. Feeding the serving constants back
+into the law gives `B_max = (0.8·320 − 39.5)/8.57 = 25` against a measured
+ceiling of 16 with 20 breaking — the first time the prediction and the
+measurement have been in the same neighbourhood. The bench `b` was optimistic by
+1.8x because the bench step does not share the machine with ingest threads,
+writers, delta JSON and sockets.
+
+**S8-4 is closed by this**: predicted 45, measured 16, and the gap is now
+attributed rather than noted.
+
+## 8. B=1 was never warm-up: a GEMM run as a sequence of GEMVs
+
+The step table, on an idle box, past any first touch:
+
+```
+B |  single ms | batched ms | ms/stream
+1 |      88.44 |      86.72 |   86.72
+2 |     158.68 |      38.36 |   19.18
+8 |     566.41 |      71.89 |    8.99
+```
+
+A lone stream costs **4.5x per step** what the same stream costs inside a pair,
+and two streams together cost less in absolute terms than one alone. The cause
+is two exits in `mynah_asr_stream_step_batch`: `B == 1` returned to the single
+path "verbatim", and inside the round loop `if (batched && g > 1)` sent a preset
+group of one to the same place. The single path runs each encoder frame of the
+chunk as its own `[1, d]` GEMV; the stacked path runs the chunk as one `[R, d]`
+GEMM.
+
+Two things about this are worth keeping separately from the fix.
+
+**The note beside that table said "B=1 carries the warm-up and is not part of any
+fit", and it was wrong.** The row was excluded from every calibration for days
+on the strength of a plausible explanation nobody checked. What refuted it was
+not a better bench but the server: B=1 steps in a long-running process, hours
+past any warm-up, still cost 93 ms.
+
+**The identity gate could not have caught it.** `tests/test_stream_batch`
+compares B=1 against the single path — and B=1 *was* the single path, so the
+comparison was vacuous by construction and had been green since it was written.
+Removing the exit is what gave that gate something to say; it now reports
+IDENTICAL with the work visibly moved (`dot 4173 → 333`, `dot_rows 0 → 3840`).
+
+The second exit is the one that generalises: the group is per **lookahead
+preset**, so eight streams on eight different presets are eight groups of one,
+each on the GEMV path, at any concurrency. A fleet serving mixed presets was
+paying this everywhere, not only at B=1.
+
+## 9. The W x T sweep, and the gate that made it lie
+
+| topology | as scored that morning | re-scored with losses counted |
+|---|---|---|
+| **1x24** | c=16 | **c=16, zero losses at every rung** |
+| 4x6 | c=24 | c=8 (c=16 lost 3 of 32) |
+| 8x3 | c=32 | c=8 (c=16 lost 1 of 32) |
+| 2x12 | c=8 | c=0 (c=8 lost 7 of 16) |
+
+The harness scored an utterance whose reader timed out as a MARGINAL beside the
+percentiles. It is not a warning: it is a session the caller lost. With losses
+as an envelope line with a limit of zero, the table reverses and the wide worker
+wins — `.work/where-to-attack.md` §A3 stands, and the narrow topologies were
+never serving more streams, they were dropping some of them.
+
+The residue is a lead rather than a conclusion: **every prefork topology lost
+streams and 1x24 lost none.** The stall of §1 correlates with prefork.
+
+Evidence: `~/window_ab/` (the A/B and its per-width metrics), `~/sweep/`,
+`~/ladder2/`, `configs/perf/axion-c4a-highcpu32-nemotron-streaming.json`.
+Conclusion: the ceiling on 24 Neoverse-V2 cores is c=16 today; the cost is the
+per-stream term, not the fixed one; and a lone stream was paying 4.5x for a
+reason that had been written down as warm-up.
+Next action: measure the B=1 fix on the box, then a soak at c=16 to move the
+profile from `screened` to `qualified`.

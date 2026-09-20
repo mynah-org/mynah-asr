@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-highcpu32-nemotron-streaming",
+    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, Nemotron 3.5 streaming 0.6B, int8, cache-aware streaming over WebSocket. One wide worker on a 24-cpu slice, the remaining 8 cpus reserved for whatever generates the load. Screened, not qualified: a ladder found the ceiling, no soak has held it yet.",
+    "status": "screened",
+    "objective": {
+      "primary": "concurrent_realtime_streams",
+      "secondary": "emission_lag_p95",
+      "concurrency_range": [1, 16],
+      "preferred_concurrency": 16,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_model": "Arm Neoverse-V2 (Google Axion)",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 80,
+    "ram_gib": 62,
+    "isa_features_used": ["asimd", "asimddp", "i8mm"],
+    "isa_features_idle": ["bf16", "sve", "sve2"],
+    "smt_policy": "OFF; one thread per physical core",
+    "notes": "bf16/sve/sve2 are present and the binary issues none of them. That is three unspent levers, not a defect, and --dispatch-map prints them as IDLE so the gap stays visible."
+  },
+  "build": {
+    "blas": "none",
+    "simd_expected": "neon+dotprod+i8mm",
+    "command": "make",
+    "notes": "No OpenBLAS on this host, so gemm.f32 resolves to our own sgemm. That is what a clean clone gets here."
+  },
+  "dispatch_required": {
+    "kernel.int8_rows": "neon-smmla",
+    "kernel.int8_dot": "neon-sdot",
+    "gemm.f32": "own",
+    "gemm.f32_kernel": "neon",
+    "threads.pool": 24
+  },
+  "server": {
+    "prefork_workers": 1,
+    "threads_per_worker": 24,
+    "http_threads": 64,
+    "cap": 24,
+    "quant": "int8",
+    "lookahead": 3,
+    "chunk_period_ms": 320,
+    "batch_window_ms": 0,
+    "server_cpus": "0-23",
+    "reserved_cpus": "24-31",
+    "notes": [
+      "prefork_workers is 1 ON PURPOSE and it is the measured answer, not the lazy one. The 2026-09-20 W x T sweep, re-scored once lost streams counted as failures, reads: 1x24 holds c=16 with zero losses at every rung; 4x6 and 8x3 hold c=8; 2x12 holds nothing. The narrow topologies looked better only while dropped streams were scored MARGINAL.",
+      "http_threads is NOT the compute width. It is the server's HTTP thread pool and a WebSocket stream holds one for its whole life, so it is the concurrency ceiling; the compute pool sizes itself from the process's affinity mask, which is what server_cpus sets.",
+      "batch_window_ms is 0 because widening the ready set did not move the ceiling: 40 ms took the mean ready set from 3.69 to 5.85 at c=16 and the ceiling stayed at 16, and 80 ms took it to 7.98 and cost a rung. Kept at 0 until something makes the fixed cost matter again."
+    ]
+  },
+  "runtime": {
+    "environment": {
+      "MYNAH_ASR_THREADS": {
+        "value": null,
+        "why": "must be ABSENT: the pool sizes itself from sched_getaffinity, which is what makes server_cpus mean anything. Setting it silently overrides the slice."
+      },
+      "MYNAH_ASR_CAPS": {
+        "value": null,
+        "why": "must be ABSENT: the runtime probe must choose the kernel, and dispatch_required is what checks it chose right."
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "must be ABSENT: no OpenBLAS is linked here, and a variable that does nothing is a variable someone will later believe did something."
+      },
+      "MYNAH_ASR_POOL_SPIN_US": {
+        "value": null,
+        "why": "must be ABSENT: the default spin has never been swept on this box. The sibling engine found a 16x longer spin budget on aarch64 worth measurable p95; that sweep is owed here and this line is the record that it has not been done."
+      }
+    }
+  },
+  "gates": {
+    "emission_lag_p95_ms": 320,
+    "finalization_p95_ms": 500,
+    "backlog_max_s": 0.64,
+    "utterances_lost": 0,
+    "ttfp_p95_ms": null,
+    "notes": "ttfp is deliberately null. The committed English clips start speaking at 0.18 s, 0.64 s and 0.02 s and samples/en/fleurs_long.wav does not start until 23.2 s, so TTFP measured from stream open is measuring leading silence: it was flat at 1660-1760 ms across a ladder whose emission lag tripled. A TTFP gate needs a corpus trimmed to speech onset first."
+  },
+  "measured": {
+    "date": "2026-09-20",
+    "ceiling_concurrency": 16,
+    "ladder": [
+      {"c": 8,  "emission_lag_p95_ms": 176, "finalization_p95_ms": 378, "lost": 0, "verdict": "MARGINAL"},
+      {"c": 12, "emission_lag_p95_ms": 223, "finalization_p95_ms": 387, "lost": 0, "verdict": "MARGINAL"},
+      {"c": 16, "emission_lag_p95_ms": 296, "finalization_p95_ms": 707, "lost": 0, "verdict": "MARGINAL"},
+      {"c": 20, "emission_lag_p95_ms": 500, "finalization_p95_ms": 887, "lost": 0, "verdict": "NOT STREAMABLE"}
+    ],
+    "c20_reproduced": "3 of 3 clean servers: 500, 529, 688 ms",
+    "cost_model_on_the_serving_path": {
+      "a_ms": 39.5,
+      "b_ms_per_stream": 8.57,
+      "at_concurrency": 16,
+      "b_ms_per_stream_at_c24": 10.13,
+      "note": "Fitted from mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count, i.e. the step AS THE SCHEDULER CALLS IT. The bench in isolation says b = 4.58; the serving path is roughly twice that and gets worse with load. B_max = (0.8*320 - 39.5)/8.57 = 25, against a ceiling of 16-20 observed -- the first time the prediction and the measurement have been in the same neighbourhood."
+    },
+    "soak": null
+  },
+  "provenance": {
+    "measured_on": "gabrielemastrapasqua@c4a-highcpu-32, Linux 7.0.0-1011-gcp, loadavg < 0.5 at start",
+    "commit": "15de486 (ladder), 0f8db50 (window A/B)",
+    "harness": "tools/bench/stream_load.py --mode wave --repeat 2, generator pinned to cpus 24-31, one process per stream",
+    "corpus": "samples/en/fleurs_1521.wav, samples/en/fleurs_1534.wav, tests/audio/test_en.wav",
+    "notes": [
+      "The capacity stated is for the 24-cpu SLICE, not for the 32-cpu box, and it is not scaled up. The load generator is one process per stream and shares the machine; the 8 reserved cpus are what keeps it out of the measurement.",
+      "status stays `screened` until a soak of at least 10 minutes holds c=16 with transcripts checked. A WAVE may disqualify a rung; it never promotes one.",
+      "OPEN DEFECT, not reproduced: a stall in which every stream receives a first partial and then nothing for tens of seconds, seen once at c=8 and once at c=16 on used servers and never on 5 clean repeats. It correlates with prefork -- every prefork topology in the sweep lost streams to it and 1x24 lost none."
+    ]
+  }
+}

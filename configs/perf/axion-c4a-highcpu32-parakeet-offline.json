@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-highcpu32-parakeet-offline",
+    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, parakeet-tdt_ctc-110m, OFFLINE (REST) only. This runtime refuses to stream this model, so the question is throughput and not concurrent real-time streams. Nothing here has been measured yet.",
+    "status": "unmeasured",
+    "objective": {
+      "primary": "throughput_xrt",
+      "secondary": "request_latency_p95",
+      "concurrency_range": [1, 64],
+      "preferred_concurrency": null,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_model": "Arm Neoverse-V2 (Google Axion)",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 80,
+    "ram_gib": 62
+  },
+  "build": {
+    "blas": "none",
+    "simd_expected": "neon+dotprod+i8mm"
+  },
+  "dispatch_required": {
+    "gemm.f32": "own",
+    "gemm.f32_kernel": "neon"
+  },
+  "server": {
+    "prefork_workers": 1,
+    "threads_per_worker": 32,
+    "http_threads": 72,
+    "cap": 72,
+    "quant": "int8",
+    "lookahead": 0,
+    "streaming": false,
+    "why_not_streaming": "mynah_asr_stream_unsupported() refuses this pack on three counts read from the weights and the config: it has linear biases (use_bias), it folds a batch_norm into the conv module where the streaming step applies layer_norm, and it uses symmetric conv padding where the streaming step is causal-only. The server asks the same function before the WebSocket upgrade and declines with that reason. This is not a tuning gap."
+  },
+  "runtime": {
+    "environment": {
+      "MYNAH_ASR_THREADS": {
+        "value": null,
+        "why": "must be ABSENT: the pool sizes itself from the affinity mask."
+      },
+      "MYNAH_ASR_CAPS": {
+        "value": null,
+        "why": "must be ABSENT: the runtime probe chooses the kernel and dispatch_required checks it."
+      }
+    }
+  },
+  "gates": {
+    "emission_lag_p95_ms": null,
+    "finalization_p95_ms": null,
+    "utterances_lost": 0,
+    "notes": "The streaming gates do not apply to a model that cannot stream. The offline gates are xRT against a stated wall and per-request p95; neither has a threshold yet because neither has a measurement."
+  },
+  "measured": null,
+  "provenance": {
+    "measured_on": null,
+    "commit": null,
+    "harness": "tools/bench/rest_load.py (ladder on POST /v1/audio/transcriptions)",
+    "notes": [
+      "An earlier REST ladder on this box reported ~19 xRT for this profile and it is WITHDRAWN: the server it measured was the Nemotron one from the previous phase, which had never been killed and still held the port. No valid Parakeet number exists on this host.",
+      "The only honest datum so far is offline RTF 0.024 for this pack on the development Mac against 0.682 for Nemotron int8 -- a development signal, and a ratio rather than a capacity.",
+      "Expected shape, to be confirmed rather than assumed: 98.0 M encoder MACs per frame against Nemotron's 553.6 M (5.65x less) and a joint head 12.8x cheaper. Where that lands on an Arm box with our own f32 GEMM is exactly what has not been measured."
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "title": "mynah-asr serving profile",
+  "what_this_is": [
+    "One question: given THIS box and THIS objective, how should the server be run?",
+    "A profile is a contract, not a recommendation. It states the topology, the",
+    "settings, the dispatch rows the binary must resolve, the gates a run must",
+    "pass, and what was actually measured -- with the date and the conditions.",
+    "tools/perf_profile.py turns it into a command line and REFUSES when the world",
+    "disagrees with it: a different machine, a dispatch row that resolved to",
+    "something else, an environment variable the profile says must be absent.",
+    "",
+    "Why it refuses rather than warns: every capacity number in this repo between",
+    "2026-09-18 and 2026-09-20 was taken with the topology typed by hand, and one",
+    "of those runs measured a server that had exited on a bad flag while another",
+    "measured the wrong model entirely. A configuration that lives in shell",
+    "history cannot be compared with itself a week later."
+  ],
+  "required_keys": {
+    "profile": ["id", "description", "status", "objective"],
+    "hardware": ["architecture", "cpu_model", "logical_cpus", "physical_cores", "l3_mib", "ram_gib"],
+    "build": ["blas", "simd_expected"],
+    "dispatch_required": "map of --dispatch-map feature -> the value it MUST resolve to",
+    "server": ["prefork_workers", "threads_per_worker", "http_threads", "cap", "quant", "lookahead"],
+    "runtime": ["environment"],
+    "gates": ["emission_lag_p95_ms", "finalization_p95_ms", "utterances_lost"],
+    "measured": "what was actually seen, with date and conditions; null until it is",
+    "provenance": ["measured_on", "commit", "harness", "notes"]
+  },
+  "status_values": {
+    "unmeasured": "written from arithmetic or from another box. Nothing was run.",
+    "screened": "a WAVE ladder found a ceiling. Screening may disqualify, it never promotes.",
+    "qualified": "a SOAK of at least 10 minutes held at the operating point, with transcripts checked."
+  },
+  "environment_convention": {
+    "value": "the string the variable must have, or null meaning it must be ABSENT",
+    "why": "one line. A flag with no reason is a flag nobody can remove later."
+  },
+  "notes": [
+    "A profile belongs to ONE box shape and ONE model. `a` and `b` are functions of",
+    "how many cores walk the weights, so a profile does not transfer to a machine",
+    "of a different size -- box_advisor refuses to carry constants across a 1.5x",
+    "cpu-count difference for the same reason.",
+    "Adapted from qwen-tts configs/perf, whose discipline (value+why per variable,",
+    "preflight that refuses, status that cannot be claimed) is the part worth copying."
+  ]
+}
