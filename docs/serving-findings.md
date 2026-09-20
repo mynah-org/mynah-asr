@@ -391,3 +391,84 @@ the scheduler's own `phase=<sub-phase> slot=<index>`.
 The next episode therefore answers three questions in one dump: which lock the
 scheduler is waiting for, who owns it, and since when. **No scheduler behaviour
 is changed until those three agree with the graph above.**
+
+---
+
+## F15 — The stall, explained: a blocking peek on a socket that has two readers
+
+**FACT.** `mynah_asr_stream_out_peer_gone()` polls the connection and, on
+`POLLIN`, peeks one byte to tell a control message from a hangup. The comment
+beside that peek claimed it could not block because `poll()` had just reported
+the socket readable.
+
+**That invariant is false in this server**, and the reason is three lines away in
+`server/main.c`: the connection is `dup()`ed. The ingest thread reads WebSocket
+frames from `rfd` continuously; `stream_out` owns `fd`. **One socket, two
+readers.** So:
+
+```
+  poll() reports POLLIN
+  -> the ingest thread drains the socket
+  -> recv(fd, MSG_PEEK) finds nothing
+  -> blocking descriptor, no SO_RCVTIMEO on this dup
+  -> the scheduler waits for the client to send again
+```
+
+and it waits **holding that ring's mutex and the scheduler loop**, so every
+stream on the worker stops behind it.
+
+**EVIDENCE** (Axion, commit `fb74287`, c=16, `--repeat 6` on a 4.3 s clip to
+raise session turnover, SIGUSR1 every 2 s):
+
+```
+  sched  loops=7857  phase=cancel  slot=15  phase_s=0.9 → 25.9   (loop frozen)
+  slot15 out_owner=f2d20e339160  out_held_s=25.9
+         out_where=mynah_asr_stream_out_peer_gone
+         mu_owner=0                       (no slot mutex held by anyone)
+```
+
+`out_held_s` and `phase_s` grow in lockstep, and the owner is **the scheduler
+thread itself**. It is not waiting for another thread's lock: it is inside the
+function, blocked in a syscall, holding the lock. Four captures across three
+runs, same shape; the episode always ends when the clients give up.
+
+**DECISION — the minimal fix**: `MSG_PEEK | MSG_DONTWAIT`. The `EAGAIN` branch
+below already meant "not gone", which is exactly right: the other reader got
+there first, so ask again next pass. No timeout was raised, no buffer grown, no
+retry added.
+
+**RETIRED by this result:**
+
+- *"a subset of established slots is being starved"* — the scheduler was not
+  choosing badly, it was not running at all.
+- *"the ingest thread holds the slot lock"* — `mu_owner=0` on every slot, in
+  every capture after the slot mutex was instrumented.
+- *"the output path cancels rather than blocks, so it cannot hold the
+  scheduler"* — true of `enqueue`, false of `peer_gone`, which is in the same
+  file and was cleared by the same reading. **Reading one function does not
+  clear its neighbours.**
+
+## F16 — What the per-thread CPU numbers do and do not say
+
+**FACT**, `/proc/<pid>/task/*/stat` over one c=16 run: the scheduler thread
+accumulated **174.8 s** of CPU, every pool worker **94.5 s**.
+
+**NOT ESTABLISHED, and previously overstated here**: that this decomposes into
+"94.5 s parallel plus 80 s serial". CPU time accumulated by different threads
+cannot be partitioned that way without knowing which phases each thread
+participated in and when. The scheduler thread also runs work inside parallel
+regions as the calling thread, so part of its excess is parallel work, not
+serial.
+
+**And the explanation of 1x24 vs 2x12 is a HYPOTHESIS, not a measurement.**
+"Two workers duplicate a serial bottleneck" is one candidate among several:
+temporal hole-filling between independent domains, different ready-set dynamics,
+different batch widths, reduced rendezvous, cache/scheduling effects, or a
+combination. §3 and §4 of the campaign plan exist to separate them, and nothing
+here selects one.
+
+Related **FACT** worth keeping separate from all of that: the eight idle cpus
+visible in `htop` during these runs are **reserved by the harness**
+(`taskset -c 0-23` for the server, `24-31` for the generator). They are
+experimental design, not a server defect: a generator sharing the server's cores
+measures the generator.
