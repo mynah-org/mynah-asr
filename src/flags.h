@@ -80,6 +80,15 @@ const char *mynah_asr_flag_str(const char *name, const char *dflt);
  * lines stay token-separated. */
 void mynah_asr_flags_print(FILE *out);
 
+/* The WHOLE registry: one line per flag, `name scope default description`, whether it is
+ * set or not, with the inert reason when this build on this host cannot honour it.
+ *
+ * `mynah_asr_flags_print` answers "what was this run given"; this answers "what can it be
+ * given". The two are different questions and a document that restates the second by hand
+ * goes stale the first time someone adds a flag -- so the serving guide points at this
+ * instead of copying it. */
+void mynah_asr_flags_print_all(FILE *out);
+
 /* The build's f32 GEMM provider and compiled SIMD profile, as printed above.
  * The provider is not decided here: this forwards mynah_asr_gemm_provider()
  * from src/backend.c, which owns the branch, so the banner and the dispatch

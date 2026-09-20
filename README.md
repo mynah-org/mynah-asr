@@ -273,6 +273,22 @@ mynah-asr quantize -m <model_dir> --quant int8|int4
 mynah-asr --version
 ```
 
+## Serving on CPU
+
+Production is **Linux x86-64 and ARM64**. The operator's guide is
+[docs/cpu-serving.md](docs/cpu-serving.md): what to run on a new box, in what
+order, and what to set. Three tools, three verbs —
+
+```sh
+make box-doctor                                 # DESCRIBE the machine (refuses if it is busy)
+make box-advise MODEL_DIR=models/<pack>         # PREDICT capacity, print a command line
+tools/bench/box_qualify.sh -m models/<pack> …   # MEASURE; only a SOAK promotes
+```
+
+The advisor calibrates on the machine in front of it — it runs the real step
+table and fits the two coefficients of `T_step(B) = a + b*B` — and labels every
+figure with its provenance, from `[MEASURED]` down to `[UNKNOWN]`.
+
 ## Server (REST + WebSocket, OpenAI-compatible)
 
 ```sh

@@ -90,9 +90,12 @@ STEP_TABLE_MAX_B = 8   # what tests/test_stream_batch measures; beyond is extrap
 # Transferred constants: measured elsewhere, applied here unchanged, and named so a reader
 # can see which machine's physics is being borrowed.
 TRANSFERRED = {
-    "axion": {"a_ms": 31.7, "b_ms": 4.58, "cpus": 32,
-              "where": "Neoverse-V2 32c, int8, one 32-thread process, unpinned, "
-                       "box not verified idle (2026-09-19)"},
+    "axion": {"a_ms": 31.2, "b_ms": 4.54, "cpus": 32,
+              "where": "Neoverse-V2 32c (SMT absent, 32 physical), int8, one 32-thread "
+                       "process, calibrated by this tool on an IDLE box (loadavg 0.01, "
+                       "2026-09-19). A run earlier the same day on the same machine while "
+                       "it was busy gave 31.7 / 4.58 -- under 2 % apart, so these "
+                       "constants reproduce"},
     "m1":    {"a_ms": 42.4, "b_ms": 12.00, "cpus": 8,
               "where": "Apple M1 8 threads, int8, Accelerate f32 GEMM, calibrated by this "
                        "tool 2026-09-19 (fit over B=2..8, worst residual 3.6 ms = 4 %). "
@@ -118,7 +121,8 @@ TRANSFER_CPU_RATIO_MAX = 1.5
 CAL_POINTS = [
     # (machine, topology, predicted B_max, measured B_max, note)
     ("Neoverse-V2 32c", "1x32 int8 la3", 49, None,
-     "no WAVE run: unverified"),
+     "no WAVE run: unverified. a and b reproduced within 2 % across a busy and an idle "
+     "run of the same box, so the CALIBRATION is stable; the capacity is not verified"),
     ("Apple M1 8c", "1x8 int8 la3", 18, None,
      "the only server evidence is 8 streams at emission lag p95 258 ms, inside the "
      "320 ms gate (2026-09-18) -- so >= 8, ceiling unknown. 18 is likely optimistic: "
@@ -470,6 +474,12 @@ def main() -> int:
     w, t = cands[0] if cands else (1, cpus)
     fleet = chosen["b_max"] * w
     cap = max(1, int(chosen["b_max"] * 0.9))
+    if w == 1:
+        print(f"   NOTE      the cost model optimises CAPACITY, not availability. It picks")
+        print(f"             W=1 because one worker pays `a` once -- but one worker is also")
+        print(f"             one crash away from losing every stream, and it cannot be")
+        print(f"             restarted under load. If the box serves anything that matters,")
+        print(f"             run the W sweep in step (c) and take 2xN if it costs little.")
     print(f"   topology  {w}x{t}  (W workers x T threads)  — WIDE FIRST, and this is the")
     print(f"             model's own prediction: every worker re-pays a = {cal['a_ms']:.1f} ms,")
     print(f"             so {w} worker{'' if w == 1 else 's'} spend{'s' if w == 1 else ''} "

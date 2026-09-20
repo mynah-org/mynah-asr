@@ -300,6 +300,26 @@ static void sanitize(char *s) {
         if (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') *s = '_';
 }
 
+void mynah_asr_flags_print_all(FILE *out) {
+    if (!out) return;
+    const int n = mynah_asr_flags_count();
+    fprintf(out, "[FLAG-REGISTRY] v=1 count=%d\n", n);
+    fprintf(out, "%-28s %-8s %-38s %s\n", "NAME", "SCOPE", "DEFAULT", "DESCRIPTION");
+    for (int i = 0; i < n; i++) {
+        const mynah_asr_flag *f = mynah_asr_flags_get(i);
+        if (!f) continue;
+        const char *inert = f->inert ? f->inert() : NULL;
+        const char *set = getenv(f->name);
+        fprintf(out, "%-28s %-8s %-38s %s\n", f->name,
+                mynah_asr_flag_scope_name(f->scope), f->dflt ? f->dflt : "-",
+                f->desc ? f->desc : "");
+        if (inert)
+            fprintf(out, "%-28s %-8s IGNORED HERE: %s\n", "", "", inert);
+        if (set)
+            fprintf(out, "%-28s %-8s SET IN THIS ENVIRONMENT: %s\n", "", "", set);
+    }
+}
+
 void mynah_asr_flags_print(FILE *out) {
     if (out == NULL) out = stderr;
 

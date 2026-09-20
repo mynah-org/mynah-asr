@@ -483,7 +483,10 @@ int main(int argc, char **argv) {
         return mynah_asr_dispatch_print(stdout, json) < 0 ? 1 : 0;
     }
     if (argc >= 2 && strcmp(argv[1], "--flags") == 0) {
-        mynah_asr_flags_print(stdout);
+        /* `--flags` says what THIS run was given; `--flags --all` says what a run CAN be
+         * given. docs/cpu-serving.md points at the second rather than restating it. */
+        if (argc >= 3 && strcmp(argv[2], "--all") == 0) mynah_asr_flags_print_all(stdout);
+        else mynah_asr_flags_print(stdout);
         return 0;
     }
     /* ENGINEERING.md §5: a run that is going to be measured prints the
