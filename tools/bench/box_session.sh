@@ -118,10 +118,33 @@ if [ -f tools/bench/box_advisor.py ]; then
 fi
 
 # ------------------------------------------------------- the server, and proof
+PHASE=0
 start_server() {   # $1 = model dir, $2 = extra args
-    SRV_LOG="$RUN/server-$(basename "$1").log"
-    srun ./mynah-asr-server -m "$1" -p "$PORT" --quant "$QUANT" \
-        --metrics-port "$METRICS" $2 > "$SRV_LOG" 2>&1 &
+    PHASE=$((PHASE + 1))
+    SRV_LOG="$RUN/server-$PHASE-$(basename "$1").log"
+    # The port must be free BEFORE we start, or the new server exits on bind and
+    # the probe below happily finds the OLD one still answering. That is not a
+    # hypothetical: it happened twice in one morning and silently pointed a
+    # Parakeet phase at a Nemotron process.
+    i=0
+    while curl -fsS --max-time 1 "http://localhost:$PORT/v1/health" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ $i -gt 20 ]; then
+            say "REFUSED: something is still serving on port $PORT after 20 s."
+            return 1
+        fi
+        sleep 1
+    done
+    # Background the COMMAND, never a shell function: `f &` where f is a function
+    # backgrounds a SUBSHELL, $! is that subshell, and taskset's child survives
+    # the kill. The server then holds the port for every phase that follows.
+    if [ -n "$SRV_CPUS" ]; then
+        taskset -c "$SRV_CPUS" ./mynah-asr-server -m "$1" -p "$PORT" --quant "$QUANT" \
+            --metrics-port "$METRICS" $2 > "$SRV_LOG" 2>&1 &
+    else
+        ./mynah-asr-server -m "$1" -p "$PORT" --quant "$QUANT" \
+            --metrics-port "$METRICS" $2 > "$SRV_LOG" 2>&1 &
+    fi
     SRV=$!
     # The probe that yesterday's run did not have. A server that died on a bad
     # flag answers nothing, and a ladder against a dead port produces five
@@ -134,7 +157,18 @@ start_server() {   # $1 = model dir, $2 = extra args
             return 1
         fi
         if curl -fsS --max-time 2 "http://localhost:$PORT/v1/health" > "$RUN/health-up.json" 2>/dev/null; then
-            say "  server up after ${i}s: $(head -c 200 "$RUN/health-up.json")"
+            # "Something answers" is not "my server answers". A fresh process has
+            # served nothing; one with sessions behind it is somebody else's, and
+            # a phase measured against it is measuring the wrong model or a
+            # process that has already been beaten up by the previous rung.
+            SESS=$(python3 -c "import json;print(json.load(open('$RUN/health-up.json')).get('sessions',-1))" 2>/dev/null || echo -1)
+            if [ "$SESS" != "0" ]; then
+                say "REFUSED: the server on port $PORT reports sessions=$SESS — it is not the one just started."
+                sed 's/^/    | /' "$SRV_LOG" | head -20 | tee -a "$RUN/session.log"
+                kill "$SRV" 2>/dev/null
+                return 1
+            fi
+            say "  server up after ${i}s (fresh: sessions=0, pid $SRV)"
             return 0
         fi
         i=$((i + 1)); sleep 1
@@ -144,7 +178,18 @@ start_server() {   # $1 = model dir, $2 = extra args
     kill "$SRV" 2>/dev/null
     return 1
 }
-stop_server() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
+stop_server() {
+    [ -n "${SRV:-}" ] || return 0
+    kill "$SRV" 2>/dev/null
+    wait "$SRV" 2>/dev/null
+    # and do not return until the port is actually free, so the next phase does
+    # not race a socket still in the kernel's hands
+    i=0
+    while curl -fsS --max-time 1 "http://localhost:$PORT/v1/health" >/dev/null 2>&1 && [ $i -lt 15 ]; do
+        i=$((i + 1)); sleep 1
+    done
+    SRV=""
+}
 trap 'stop_server' EXIT INT TERM
 
 # Two corpora, because the two phases ask different questions. A WAVE rung is
