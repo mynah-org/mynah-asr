@@ -559,6 +559,20 @@ void mynah_asr_obs_dump(void) {
             OBS_ADD("[DUMP] worker=%d seq=%lu relpos_share rows=%llu of %llu (%.3f)\n",
                     widx, n, st.share_rows, st.share_total,
                     (double)st.share_rows / (double)st.share_total);
+        if (st.comp_rows > 0) {
+            unsigned long long tot = 0;
+            for (int i = 0; i < 9; i++) tot += st.comp_ns[i];
+            for (int i = 0; i < 9; i++)
+                OBS_ADD("[DUMP] worker=%d seq=%lu component %-11s ns=%llu "
+                        "ns_per_row=%8.0f share=%.3f\n",
+                        widx, n, mynah_asr_stream_step_component_name(i), st.comp_ns[i],
+                        (double)st.comp_ns[i] / (double)st.comp_rows,
+                        tot ? (double)st.comp_ns[i] / (double)tot : 0.0);
+            OBS_ADD("[DUMP] worker=%d seq=%lu component TOTAL       ns=%llu "
+                    "ns_per_row=%8.0f rows=%llu frames=%llu steps=%llu\n",
+                    widx, n, tot, (double)tot / (double)st.comp_rows,
+                    st.comp_rows, st.comp_frames, st.comp_steps);
+        }
         for (int i = 0; i < 41; i++) {
             if (st.pos_rows[i] == 0) continue;
             const double r = (double)st.pos_rows[i];

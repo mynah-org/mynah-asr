@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1093,6 +1094,59 @@ int mynah_asr_enc_batch_f32_ok(void) {
     return cached;
 }
 
+/* ---------------------------------------------------- where a row's time goes
+ * The fitted cadence law for 3x8 says T_step(B) = 14.5 + 19.0*B ms, so the
+ * marginal cost of a row -- 19 ms -- is about 70 % of what a stream costs per
+ * chunk period, and it is the largest single item on this box. "It is the model"
+ * is not an optimisation target; a component is. These counters split the
+ * batched encoder step into pieces that could be attacked separately, so that
+ * choice rests on a measurement instead of on which kernel is famous.
+ *
+ * One clock read per boundary: seven inside the layer loop, two outside, about
+ * 170 reads against a step that runs for tens of milliseconds. Always on,
+ * because gating it behind a flag would make the profiled build and the serving
+ * build different binaries, and this repo has been burned by that before. */
+enum { EP_SUB, EP_FFN1, EP_QKV, EP_RELPOS, EP_ATTN, EP_OPROJ, EP_CONV, EP_FFN2,
+       EP_TAIL, EP_N };
+
+static _Atomic unsigned long long g_ep_ns[EP_N];
+/* rows = STREAM rows, so ns/row is directly comparable to the `b` of the
+ * fitted cadence law. frames = the encoder frames those rows carried
+ * (sum of q_i), which is the dimension the GEMMs actually see -- the two
+ * differ by the frames per chunk and confusing them would put the
+ * component table on a different axis from every capacity number here. */
+static _Atomic unsigned long long g_ep_rows, g_ep_frames, g_ep_steps;
+
+static inline unsigned long long ep_ns(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+#define EP_ADD(slot) do { const unsigned long long u_ = ep_ns(); \
+    atomic_fetch_add_explicit(&g_ep_ns[slot], u_ - t_, memory_order_relaxed); \
+    t_ = u_; } while (0)
+
+void mynah_asr_enc_profile(unsigned long long *ns, int n, unsigned long long *rows,
+                       unsigned long long *frames, unsigned long long *steps) {
+    for (int i = 0; i < n && i < EP_N; i++)
+        ns[i] = atomic_load_explicit(&g_ep_ns[i], memory_order_relaxed);
+    if (rows) *rows = atomic_load_explicit(&g_ep_rows, memory_order_relaxed);
+    if (frames) *frames = atomic_load_explicit(&g_ep_frames, memory_order_relaxed);
+    if (steps) *steps = atomic_load_explicit(&g_ep_steps, memory_order_relaxed);
+}
+
+const char *mynah_asr_enc_profile_name(int i) {
+    static const char *const N[EP_N] = {"subsample", "ffn1", "qkv", "relpos",
+                                        "attn+cache", "o_proj", "conv", "ffn2",
+                                        "tail"};
+    return (i >= 0 && i < EP_N) ? N[i] : "?";
+}
+
 /* Rows that took the shared rel-pos projection, against all rows stacked. */
 static _Atomic unsigned long long g_share_rows, g_share_total;
 
@@ -1110,6 +1164,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
     const mynah_asr_encoder *enc = bb->enc;
     const int d = enc->d_model, ffn = enc->ffn_dim, ck = enc->conv_k;
 
+    unsigned long long t_ = ep_ns();
     /* 1. subsampling + pos-emb, per stream; the frames land stacked in xs */
     int R = 0;
     for (int i = 0; i < B; i++) {
@@ -1160,6 +1215,11 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
     atomic_fetch_add_explicit(&g_share_total, (unsigned long long)B,
                               memory_order_relaxed);
 
+    EP_ADD(EP_SUB);
+    atomic_fetch_add_explicit(&g_ep_rows, (unsigned long long)B, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_ep_frames, (unsigned long long)R, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_ep_steps, 1ull, memory_order_relaxed);
+
     const size_t nd = (size_t)R * (size_t)d;
     float *xs = bb->xs, *tmp = bb->tmp, *tmp2 = bb->tmp2, *xn = bb->xn;
     float *kn = bb->kn, *vn = bb->kn + nd;
@@ -1178,6 +1238,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                (size_t)bb->qq[i] * (size_t)ffn, ess[i]->ssilu);
         mynah_asr_qmat_mul_rows(&L->ff1_w2, tmp2, tmp, R, qx, sx);
         for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
+        EP_ADD(EP_FFN1);
 
         /* MHSA — q/k/v/o stacked, the cache and the rel-pos softmax per stream */
         layer_norm_f(xs, L->ln_att_w, L->ln_att_b, xn, R, d);
@@ -1187,12 +1248,14 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         /* the group's rel-pos projection, once for this layer (S1-7). ess[lead]
          * is at K = k_sh, so its sa_pe holds pos_emb(k_sh) — the same bytes every
          * other member of the group would have fed to the same matmul_wt. */
+        EP_ADD(EP_QKV);
         const float *rk_sh = NULL;
         if (share) {
             matmul_wt(ess[lead]->sa_pe, L->relk_w, bb->rk_sh, P_sh, d, d);
             relpos_count(MYNAH_ASR_RELPOS_GROUP);
             rk_sh = bb->rk_sh;
         }
+        EP_ADD(EP_RELPOS);
         for (int i = 0; i < B; i++) {
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
@@ -1205,8 +1268,10 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             update_kv_cache(kc, kn + off, es->cache_valid, Q, es->left, d);
             update_kv_cache(vc, vn + off, es->cache_valid, Q, es->left, d);
         }
+        EP_ADD(EP_ATTN);
         mynah_asr_qmat_mul_rows(&L->o_w, bb->ctxs, tmp, R, qx, sx);
         for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
+        EP_ADD(EP_OPROJ);
 
         /* Conv — the two pointwise convolutions stacked, the cached depthwise
          * per stream. tmp2 holds the stacked pointwise_conv1 output [R, 2d]. */
@@ -1220,6 +1285,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         }
         mynah_asr_qmat_mul_rows(&L->pw2_w, bb->cin, tmp, R, qx, sx);
         for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
+        EP_ADD(EP_CONV);
 
         /* ½ FFN2 + output LN — stacked */
         layer_norm_f(xs, L->ln_ff2_w, L->ln_ff2_b, tmp, R, d);
@@ -1231,9 +1297,11 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
         layer_norm_f(xs, L->ln_out_w, L->ln_out_b, xn, R, d);
         memcpy(xs, xn, nd * sizeof(float));
+        EP_ADD(EP_FFN2);
     }
 
     /* 3. cache bookkeeping and the per-stream prompt + projector */
+    /* everything from here to the return is EP_TAIL; charged at the return */
     for (int i = 0; i < B; i++) {
         mynah_asr_enc_stream *es = ess[i];
         const int Q = bb->qq[i];
@@ -1241,6 +1309,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         mynah_asr_encoder_post_scratch(enc, xs + (size_t)bb->offs[i] * (size_t)d, Q,
                                    prompt_id[i], out[i], es->spost);
     }
+    EP_ADD(EP_TAIL);
     return 0;
 }
 

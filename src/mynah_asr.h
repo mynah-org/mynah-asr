@@ -320,6 +320,16 @@ unsigned long long mynah_asr_stream_batch_rows_stacked(void);
 void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
                                     unsigned long long *total);
 
+/* The batched encoder step split by component, in nanoseconds, with the rows
+ * and steps behind them. 9 slots; mynah_asr_stream_step_component_name names them.
+ * The fitted cadence law makes the marginal per-row cost about 70 % of what a
+ * stream costs per chunk period, so "the model is expensive" needs a component
+ * before it can become a change. */
+#define MYNAH_ASR_STEP_COMPONENTS 9
+void mynah_asr_stream_step_profile(unsigned long long *ns, int n, unsigned long long *rows,
+                               unsigned long long *frames, unsigned long long *steps);
+const char *mynah_asr_stream_step_component_name(int i);
+
 void mynah_asr_stream_close(mynah_asr_stream *s);
 
 #ifdef __cplusplus

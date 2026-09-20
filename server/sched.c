@@ -1288,6 +1288,8 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
         out->pos_bsum[i] = g.pos_bsum[i];
     }
     mynah_asr_stream_batch_share_stats(&out->share_rows, &out->share_total);
+    mynah_asr_stream_step_profile(out->comp_ns, 9, &out->comp_rows,
+                          &out->comp_frames, &out->comp_steps);
     out->dly_ready_sel_ms[0] = sched_dly_pct(g.h_ready_sel, 0.50);
     out->dly_ready_sel_ms[1] = sched_dly_pct(g.h_ready_sel, 0.95);
     out->dly_ready_sel_ms[2] = sched_dly_pct(g.h_ready_sel, 0.99);

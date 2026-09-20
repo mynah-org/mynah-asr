@@ -1069,6 +1069,15 @@ void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
     mynah_asr_enc_batch_share_stats(shared, total);
 }
 
+void mynah_asr_stream_step_profile(unsigned long long *ns, int n, unsigned long long *rows,
+                               unsigned long long *frames, unsigned long long *steps) {
+    mynah_asr_enc_profile(ns, n, rows, frames, steps);
+}
+
+const char *mynah_asr_stream_step_component_name(int i) {
+    return mynah_asr_enc_profile_name(i);
+}
+
 /* The batch scratch belongs to the model: one scheduler thread owns a model, so
  * one scratch per model is exactly the lifetime the server wants, and it is
  * carved once instead of per step. */
