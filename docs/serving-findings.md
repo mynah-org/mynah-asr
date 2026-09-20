@@ -1121,3 +1121,79 @@ being measured. `tests/test_stream_batch` stays IDENTICAL OK, so rule 4 holds.
 `b` is attention arithmetic, how much is moving `left x d` floats of k/v cache
 per layer per stream, and how much is the private projection. The next run
 answers all three. No optimisation is chosen before it lands.
+
+---
+
+## F27 — The dominant cost is a projection recomputed per stream that depends on neither
+
+**EVIDENCE**, Axion, commit `68ad60b` (gate `tests/test_stream_batch`: IDENTICAL
+OK, int8 and f32, B = 1..8), 3x8, 120 s rungs, mixed corpus, seed 42.
+
+| component | C=16, B=1.07 | C=32, B=2.12 | C=40, B=5.61 |
+|---|---|---|---|
+| **relpos_priv** | **14.383 (50.1 %)** | **9.562 (39.5 %)** | **6.818 (33.4 %)** |
+| ffn2 | 3.696 (12.9 %) | 3.268 (13.5 %) | 2.925 (14.3 %) |
+| ffn1 | 3.625 (12.6 %) | 3.208 (13.3 %) | 2.884 (14.1 %) |
+| relpos (shared) | 0.376 (1.3 %) | 2.187 (9.0 %) | 2.240 (11.0 %) |
+| conv | 1.911 (6.7 %) | 1.757 (7.3 %) | 1.615 (7.9 %) |
+| **attn** | **1.418 (4.9 %)** | **1.425 (5.9 %)** | **1.429 (7.0 %)** |
+| qkv | 1.285 (4.5 %) | 1.034 (4.3 %) | 0.923 (4.5 %) |
+| subsample | 0.962 (3.4 %) | 0.944 (3.9 %) | 0.916 (4.5 %) |
+| o_proj | 0.664 (2.3 %) | 0.468 (1.9 %) | 0.365 (1.8 %) |
+| tail | 0.203 (0.7 %) | 0.192 (0.8 %) | 0.177 (0.9 %) |
+| **kv_cache** | **0.161 (0.6 %)** | **0.140 (0.6 %)** | **0.134 (0.7 %)** |
+| encoder total | 28.69 ms/row | 24.19 | 20.43 |
+| attention cores computing their own projection | 93.6 % | 70.5 % | 55.6 % |
+
+**FACT — the attention is not the cost.** `stream_attention_core`, once the
+projection is timed out of it, is **1.42 ms/row and FLAT** across all three batch
+widths (1.418 / 1.425 / 1.429). The k/v cache shift, which looked like a
+plausible memory-bound suspect, is **0.14 ms/row — six tenths of one percent**.
+F26's "attn+cache dominates" was entirely the projection hiding inside it.
+
+**FACT — the dominant cost is the relative-position projection.** At the
+operating point C = 32, `relpos_priv` + `relpos` is **11.75 ms of 24.19 ms per
+row: 48.6 % of the whole encoder step.** Per projection the cost is ~0.542 ms
+private and ~0.805 ms shared (the shared one covers a larger P, since the K most
+streams agree on is the saturated one), and at C = 32 a row pays ~17.7 private
+projections of the 24 layers it passes through.
+
+**FACT — it is recomputed, not computed.** From `encoder.c`, `rk = pe @ relk_w`
+where `pe = mynah_asr_pos_emb(enc, K)`. It depends on **(encoder, layer, K) and on
+nothing else** — not on the stream, not on the audio, not on the cache contents.
+`pe` is already memoised per stream (`if (pe_K != es->sa_pe_K)`), `relk_w` is a
+constant layer weight, and at steady state every stream's left cache is full so
+K is the same constant for all of them. The projection is nevertheless rebuilt
+from scratch on every step by every stream that does not happen to share it.
+
+**HYPOTHESIS, with its prediction stated before any code is written.** Memoise
+`rk` per (layer, K) at the model level rather than sharing it per pass. Sharing
+within a pass can only divide the cost by the group size — at B = 2.12 a group of
+two halves it, which is why `relpos` does not amortise in the table above.
+Memoising across steps removes it entirely at steady state.
+
+- Arithmetic unchanged (same inputs, same deterministic matmul), so rule 4 is
+  satisfiable by construction and must still be proven by the gate.
+- Memory: `rk` is `[2K-1, d]` floats per layer. At K ≈ 74 and d = 512 that is
+  ~300 KiB per layer, **~7 MiB per model** for the one saturated K, shared by
+  every stream of the worker. Warm-up Ks need a small bounded set, not one entry
+  per stream.
+- Predicted effect at C = 32: the encoder step falls from 24.19 to ~12.4 ms/row.
+  Through the cadence law (F23) the per-stream cost per period goes from
+  ~29.6 ms to ~17.8 ms, moving the predicted knee from **35 to about 54
+  streams**.
+
+**That number is deliberately recorded before the change exists.** It is far
+larger than anything else measured today — batching finalization was worth 35 ->
+39 — and a prediction that large is exactly the kind that turns out to be wrong.
+If the ladder does not move, the law or the reasoning above is broken and that
+is the finding.
+
+**This also explains F24 without contradicting it.** Doubling the *share* ratio
+bought nothing measurable there, and here sharing is confirmed to be the weak
+lever: it divides by the group size, and groups are small at the batch widths
+this box actually runs. Memoisation is a different mechanism, not a stronger
+version of the same one.
+
+**NOT AN ISA QUESTION.** No SVE, SVE2 or bf16 is involved. The largest single
+item in this serving path is work that does not need doing at all.
