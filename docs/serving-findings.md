@@ -916,3 +916,77 @@ which would have predicted about 100 concurrent streams on a box that knees at
 36. The field to use is `ready_mean`, and both it and the step mean must be
 multiplied back by their step counts before being differenced, because a mean
 cannot be subtracted.
+
+---
+
+## F24 — Cost by position: no growth with history, and the long-clip benefit is finalization, not the step
+
+**WHY THIS RUN EXISTS.** The 7 s / 24 s / 94 s probe varies two things at once —
+how often the fixed finalization is paid, and how far a stream gets from its own
+start. If later steps of a long stream got progressively more expensive (the
+failure mode the sibling TTS engine had, where a growing cache makes every step
+dearer), then "long clips serve better" would be the opposite of the truth and
+optimising finalization would be chasing the wrong sign.
+
+**EVIDENCE**, Axion, commit `d0c36f4`, 3x8, cpus 0-23 / generator 24-31, 120 s
+rungs, three corpora at C = 32 and 40. The scheduler charges every batched row to
+its step index inside its own utterance and reports rows, the row's fair share
+of the step wall, its ready-to-model-start delay and the batch it travelled in.
+`mix` is the control for synchronisation: its clips are 4.3/7.4/11.9 s and
+desynchronise the fleet by themselves (measured start-time spread p50 43.5 s),
+while `s07` and `s24` are equal-length slices of one file and hold it in phase.
+
+**Step cost by position, C = 32, ms per row:**
+
+| step | 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20 | 22 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mix | 20.9 | 21.8 | 23.6 | 25.7 | 27.8 | 29.1 | 29.9 | 27.9 | 25.9 | 28.5 | 27.1 | 28.2 |
+| s24 | 15.9 | 18.9 | 22.9 | 25.3 | 27.9 | 27.9 | 28.9 | 26.6 | 25.9 | 27.3 | 26.9 | 28.6 |
+| s07 | 18.5 | 19.9 | 22.5 | 25.6 | 28.7 | 30.0 | 30.5 | 28.4 | 27.0 | 27.0 | 24.8 | — |
+
+**FACT — the duration pathology is excluded.** Cost rises over the first ~12
+steps (3.8 s) from about 17 ms to about 29 ms and is then FLAT: to step 36
+(11.5 s) in the server data, and to 24 s in the client's own per-position lag
+(F-probe: 80/199/100/99/102/103/106/103 at C = 32). It is the bounded left
+context filling and then saturating, which is what a cache-aware model is
+designed to do. Nothing grows with stream history.
+
+**FACT — the profile is the same in all three corpora**, within 1-2 ms at every
+position, at two concurrencies, with contents ranging from near-silence to
+continuous speech. It is a property of the stream, not of the corpus, the clip
+length, or whether the fleet is in phase.
+
+**FACT — utterance length does not change the mean cost of a row.** Row-weighted
+over a whole utterance: **25.99** ms (s07, 7 s), **26.31** (mix, 6.8 s mean),
+**26.64** (s24, 24 s) at C = 32; 22.37 / 22.41 / 22.64 at C = 40. Within 2 %.
+**So the benefit of long clips is not in the model step at all.**
+
+**FACT, and it kills a hypothesis of mine before it became code.** The shared
+relative-position projection was the proposed mechanism: while a stream's left
+cache is filling, its K differs from everyone else's and the batch cannot share
+the projection, so short utterances — which restart the encoder stream every
+time — would pay it privately for their whole life. The share does move exactly
+as predicted, **0.316 (s07) -> 0.661 (s24) at C = 32, and 0.440 -> 0.821 at
+C = 40** — and the mean step cost does not move with it (25.99 -> 26.64). **The
+mechanism is real and buys nothing measurable. It is not a lever.** Also note
+the warm-up region is the CHEAP part (16-21 ms against a 27 ms plateau), so the
+earlier guess that short utterances suffer by living inside it had the sign
+backwards.
+
+**FACT — where the corpora actually differ is QUEUEING.** Mean
+ready-to-model-start, same rungs: **28.4** ms (s07), 37.1 (mix), **22.1** (s24)
+at C = 32; **82.3** / 106.1 / **42.6** at C = 40. At C = 40 a mixed-corpus row
+waits 106 ms of a 320 ms budget; the 24 s corpus waits 43.
+
+**CONCLUSION — the decomposition asked for.** Of the improvement from 7 s to
+24 s utterances, essentially **all** of it is finalization amortised. Per-row
+model cost is unchanged, rel-pos sharing doubles and returns nothing, and the
+only cost that scales with utterance rate is the 82 ms tail — 3.86 ms per stream
+per period at a 6.8 s mean utterance against 1.09 ms at 24 s (F23). That
+difference reappears as queueing delay, which is what the client sees as
+emission lag.
+
+**DECISION**: finalization is confirmed as the target, on evidence rather than
+on its size in a profile. F23's prediction stands unchanged and unhedged —
+batching the tail moves the knee from about 35 to about 39, and leaves C = 40
+just outside.
