@@ -967,8 +967,9 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
      * are indistinguishable from outside, and they have different owners: one
      * is the checkpoint, the other is our publishing rule. */
     if (getenv("MYNAH_ASR_TRACE_RNNT"))
-        fprintf(stderr, "[RNNT] emit q=%d tokens_added=%d chars=%zu chars_emitted=%zu%s\n",
-                q, added, text ? strlen(text) : (size_t)0, s->chars_emitted,
+        fprintf(stderr, "[RNNT] emit q=%d audio_s=%.4f tokens_added=%d chars=%zu chars_emitted=%zu%s\n",
+                q, (double)s->samples_fed / (double)m->feat.sample_rate,
+                added, text ? strlen(text) : (size_t)0, s->chars_emitted,
                 (added > 0 && text && strlen(text) <= s->chars_emitted)
                     ? "  <-- DECODED A TOKEN, PUBLISHED NOTHING" : "");
     s->n_tokens += added;

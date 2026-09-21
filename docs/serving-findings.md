@@ -1532,10 +1532,21 @@ From the lightest load to the knee, **emission lag p95 grows 16x and backlog
 latency at the knee is **+92 ms at p50 and +171 ms at p95** on a floor of
 734 / 955 ms.
 
-**FACT — the evidence requirement is load-independent.** The audio the model
-consumes after onset before its first non-blank has a median of **0.716 s at
-C=8, C=32 and C=65 alike**. It is a property of the audio and the checkpoint,
-not of the machine, and it does not degrade under pressure.
+**FACT — the measurement.** The audio the model consumes after onset before its
+first non-blank has a median of **0.716 s at C=8, C=32 and C=65 alike** under
+this workload.
+
+**INTERPRETATION, consistent with the evidence and not independently
+established.** That this is a property of the audio and the checkpoint rather
+than of the machine. It is what one would expect, and nothing here rules out a
+workload where it moves. Do not carry it forward as a causal fact.
+
+**Three quantities, deliberately not merged.** `speech_consumed_at_first_nonblank`
+is how much speech the model needed. `TTFP-speech` is the wall clock from onset
+to visible text. `TTFP-open` adds the leading silence. At the knee the first
+stays at 0.716 s while the second moves 734 -> 826 ms: the model needs the same
+audio and the machine takes longer to get there. **That divergence is the
+signal, not noise, and the word "floor" must never be used to cover all three.**
 
 **FACT — where the extra milliseconds go under load.** Mean spans, C=1 -> C=65:
 `compute` 49.9 -> 395.2 ms (bigger, slower batched steps), `chunk` 240.1 ->

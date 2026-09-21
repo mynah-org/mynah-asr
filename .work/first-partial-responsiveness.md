@@ -486,8 +486,12 @@ Three experiments, then the box was powered off. Full numbers in
   **0.08-0.10 ms**. The output path is not a candidate for anything.
 - **R-6's diagnostic half is done.** Steady-state TTFP p95 goes 1535 -> 1719 ms
   from C=1 to the knee while emission lag p95 goes 17 -> 268 ms. The audio the
-  model needs after onset is **0.716 s at C=8, 32 and 65 alike**: the evidence
-  requirement does not degrade under load.
+  model needs after onset has the same median, **0.716 s at C=8, 32 and 65**,
+  under this workload. Read that as consistent with a checkpoint/input-dependent
+  requirement rather than a load-dependent one — it is not an independently
+  established causal fact. Keep `speech_consumed_at_first_nonblank`,
+  `TTFP-speech` and `TTFP-open` apart: at the knee the first holds while the
+  second moves 734 -> 826 ms, and that gap is the load's contribution.
 - **The pairing had a real defect** and it was caught by its own causality
   check, not by taste: one mispaired row at C=32 and one at C=65 produced a
   negative publication delay. Pairs are now gated on clip duration, delta count
@@ -501,6 +505,136 @@ of that size exists at these concurrencies.
 
 **Not claimed either.** That 0.72 s of speech is an architectural bound. It is
 a model-and-configuration floor under `[56,3]`, int8, greedy argmax.
+
+## Q-2B: the stability rule, fixed BEFORE the aggregate was computed
+
+Written 2026-09-21 on the development host, before any corpus-wide result was
+looked at, so that the classification cannot be tuned to flatter a conclusion.
+
+For every RNNT decision from speech onset to the first emitted lexical token,
+the trace gives the blank score, the best non-blank score, their margin and the
+best non-blank token id. Each utterance's pre-crossing trajectory is one of:
+
+- **STABLE-CORRECT** — the best non-blank token id is UNCHANGED for at least
+  **N = 3 consecutive encoder frames ending at the crossing frame**, and its
+  detokenised text, NFKC-normalised and case-folded with the SentencePiece word
+  mark stripped, is a prefix of the reference's first word (or the reference's
+  first word is a prefix of it).
+- **STABLE-WRONG** — the same stability, but the text is not reference-compatible.
+- **UNSTABLE** — the best non-blank id changes within those N frames.
+- **NO-EARLY-SIGNAL** — fewer than N decisions exist between onset and crossing,
+  so earliness cannot be claimed either way.
+
+`N = 3` is 240 ms at this preset, which is one chunk period minus one frame: the
+smallest window that cannot be satisfied inside a single encoder step. **The
+result is reported for N = 2 and N = 4 as well, and if the conclusion moves
+materially with N, the conclusion is that it is N-sensitive and nothing more.**
+
+Headroom, for STABLE-CORRECT utterances only:
+
+    potential_headroom = speech consumed at the actual emission
+                       - speech consumed at the FIRST decision of the stable run
+
+This is a measurement of when correct evidence first existed, not a promise that
+it can be used: using it needs an emission rule that does not also fire on the
+STABLE-WRONG and UNSTABLE cases, and those are counted for exactly that reason.
+
+The oracle is the corpus ground truth in `samples/manifest.json`, never the
+model's own offline output. Reference, streaming final and offline final are
+kept as three separate columns: F29's gate already caught one int8 es-ES clip
+where streaming is right and offline is wrong.
+
+## Q-2 RESULT (2026-09-21, development host, 21 utterances)
+
+`tools/eval/rnnt_earliness.py`, the whole committed FLEURS corpus minus the two
+languages the pack does not support, oracle = `samples/manifest.json`, never the
+model's own offline output. Evidence: `.work/evidence/q2-earliness-2026-09-21/`.
+
+### The classification is N-sensitive, and the rule said to say so
+
+| | N=2 | N=3 (pre-registered) | N=4 |
+|---|---|---|---|
+| STABLE-CORRECT | 13 (61.9 %) | 9 (42.9 %) | 4 (19.0 %) |
+| STABLE-WRONG | 3 (14.3 %) | 3 (14.3 %) | 2 (9.5 %) |
+| UNSTABLE | 5 (23.8 %) | 9 (42.9 %) | 15 (71.4 %) |
+| **wrong / all stable** | **19 %** | **25 %** | **33 %** |
+
+The absolute shares move a great deal with N, so **no single share may be
+quoted as the result**. One thing does not move in the helpful direction: the
+fraction of stable runner-ups that are WRONG **rises** as the stability
+requirement is tightened. Demanding more persistence does not purify the signal.
+
+### Correct evidence does exist earlier — sometimes
+
+For STABLE-CORRECT utterances the median headroom is **300 ms** and p95 700 ms.
+
+**That number is quantised and must be read as "one chunk".** All q frames of an
+encoder step are decided after the same consumed audio, so headroom can only be
+a multiple of the 320 ms chunk period. "300 ms" means the correct token was
+already the best non-blank one chunk before blank lost; 700 ms means two.
+
+### Why this does NOT justify an emission-decision experiment
+
+**A stably wrong runner-up is exactly as early and exactly as stable.**
+STABLE-WRONG has the same median headroom (300 ms) and the same p95 (700 ms) as
+STABLE-CORRECT. Any rule that emits on persistence fires on both.
+
+**And the margin does not separate them either** (Q-2D, medians):
+
+| class | 3 before | 2 before | 1 before | at crossing | monotone down |
+|---|---|---|---|---|---|
+| STABLE-CORRECT | +4.95 | +3.00 | +2.44 | -2.79 | 4/9 |
+| STABLE-WRONG | +4.33 | +1.78 | +1.58 | -4.62 | 2/3 |
+| UNSTABLE | +7.41 | +7.70 | +4.63 | -1.65 | 2/9 |
+
+The two stable classes are indistinguishable. **No observable in the current
+trace tells a correct early runner-up from a wrong one.**
+
+One observation, too small to build on: 2 of the 3 STABLE-WRONG tokens are the
+bare SentencePiece word mark `▁`, which is not a lexical token at all. A rule
+that refused degenerate tokens would have excluded two of the three. With n=3
+that is a hypothesis for a larger corpus, not a design.
+
+### Q-2A — the oracle, and a crack in it
+
+CER against the reference is recorded per clip for streaming and offline
+separately. **7 of 21 final transcripts differ between the two paths**, and the
+disagreement is not one-sided: on pt/1521 streaming is much better (CER 0.185 vs
+0.272), on de/1534 offline is (0.023 vs 0.078). A responsiveness A/B judged
+against "the offline output" would be judged against a moving target; the
+corpus reference is the only oracle.
+
+Still missing from Q-2 before any R-5: first-correct-lexical-token latency,
+partial revisions, and false non-blanks inside leading silence. The trace can
+answer the last one already and it was not asked here.
+
+### The decision table
+
+| class | n (N=3) | median headroom | wrong-first-token risk | implication |
+|---|---|---|---|---|
+| STABLE-CORRECT | 9 (43 %) | 300 ms (one chunk) | — | a real target exists |
+| STABLE-WRONG | 3 (14 %) | 300 ms | **fires identically** | any persistence rule emits a wrong first word here |
+| UNSTABLE | 9 (43 %) | n/a | rule does not fire | no early evidence to use |
+
+**Among the 12 utterances where a stable pre-crossing runner-up exists, 3 are
+wrong: one first word in four.** For an interactive transcript that revises
+nothing — Nemotron marks every delta `final:true` — that is not a trade, it is a
+defect.
+
+### Therefore: R-5 family B, not family A
+
+**Family A (emission decision) is NOT justified by this evidence.** It would
+need a discriminator, and neither persistence nor margin is one.
+
+**Family B (context and cadence) is where the evidence points**, with the cost
+F29 measured attached to it: preset `[56,0]` removes 240 ms of right context and
+takes the chunk period from 320 ms to 80 ms, which moves the cadence budget that
+set the knee at 65. That is one experiment, run alone, with the quality gate
+green — and it is a capacity/responsiveness trade to be priced, not a free win.
+
+A third possibility is worth naming rather than assuming away: **accept that
+~0.7 s of speech is what this checkpoint at this preset requires**, and spend
+the effort on the cold start instead, which is 3.26 s and fully attributed.
 
 ## Acceptance philosophy
 
