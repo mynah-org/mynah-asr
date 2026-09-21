@@ -722,7 +722,36 @@ at all.
 
 ## Next action
 
-R-3F, offline: the quality baseline that any emission change must be judged against —
-premature or wrong first token, partial instability, final CER/WER, and
-hallucination in leading silence. Q-2 is its vehicle and it now blocks R-5.
-No optimisation before it exists.
+Two, in this order, both on the development host and neither started.
+
+**R-7 — OPEN / UNPROVEN. Mid-stream lookahead transition, with a correctness
+gate written before the code.** The hypothesis is that the fast cadence need be
+paid only until the first useful partial exists, not for the whole utterance.
+Nothing about it is established: today a lookahead change closes and reopens the
+stream and loses the caches, and even a switch that kept them would mix frames
+computed under two different attention windows.
+
+The gate comes first, and it is not a latency measurement:
+
+- a stream opened at `[56,3]` whose `right` is changed mid-utterance WITHOUT
+  reopening must produce a defensible transcript, compared against both
+  fixed-preset references on the same audio;
+- the K/V and conv caches must be shown to carry the same meaning across the
+  switch, or the switch must be shown to be safe despite them — rule 4 asks for
+  a gate, not an argument;
+- the scratch and the rel-pos table must be proved large enough for both
+  regimes from the sizes in `mynah_asr_enc_stream_init`, not from inspection of
+  one run;
+- a switch UP (q=1 -> q=4) is the dangerous direction and must be covered even
+  if only the DOWN direction is wanted.
+
+If the transcript is not defensible at the library level, there is no serving
+change to design and R-7 closes there.
+
+**R-3F / Q-2's remaining half.** The quality baseline any emission change would
+be judged against: premature or wrong first token, partial instability, final
+CER/WER, hallucination in leading silence. Q-2 answered the earliness question
+and left these three. It still blocks R-5.
+
+Separately and independently: cold start is fully attributed (F30) and its fix
+is mechanical. It does not belong to this note.
