@@ -21,10 +21,12 @@ and a `--verify-below` probe re-runs one rung below the first failure.  A
 disagreement is reported, not smoothed: it means the predicate is noisy at this
 operating point and the bisection result is not a capacity claim.
 
-WAVE, NEVER SOAK.  Every probe here is a screening wave.  This tool NEVER
-promotes an operating point: it says where to point the soak.  `ENGINEERING.md`
-§8 and `docs/serving.md` own that distinction, and the JSON carries
-`"is_qualification": false` so no reader can mistake the two.
+SCREENING, NEVER QUALIFICATION.  A probe is a short closed-loop run with its
+opening ramp excluded, which is the shape of a soak and not its length: it
+SCREENS.  This tool never promotes an operating point, it says where to point
+the qualifying soak.  `ENGINEERING.md` §8 and `docs/serving.md` own that
+distinction, and the JSON carries `"is_qualification": false` so no reader can
+mistake a 75-second probe for a 600-second certification.
 
 The verdict of a probe is the envelope verdict computed by
 `tools/bench/streaming_metrics.py` through `tools/bench/stream_load.py`.  This
@@ -55,11 +57,22 @@ INVALID = ("INVALID",)
 def probe(a, c, tag):
     """One wave at concurrency c against the already-running server."""
     out_json = os.path.join(a.out, f"probe-c{c:03d}-{tag}.json")
-    cmd = [sys.executable, STREAM_LOAD, "--mode", "wave",
+    cmd = [sys.executable, STREAM_LOAD, "--mode", a.mode,
            "--host", a.host, "--port", str(a.port),
-           "--streams", str(c), "--repeat", str(a.repeat),
+           "--streams", str(c),
            "--lookahead", str(a.lookahead), "--json", out_json,
            "--clips", *a.clips]
+    if a.mode == "soak":
+        # A probe judges STEADY STATE. C streams opening at once put a ramp at
+        # the head of the run whose TTFP is several seconds and has nothing to
+        # do with the concurrency being tested: measured at C=32, p95 TTFP was
+        # 4.5 s over a 60 s run with a 15 s warm-up and 1.7 s over a 600 s run
+        # with 30 s. Excluding the ramp is what the qualifying soaks already do.
+        cmd += ["--duration", str(a.duration), "--warmup", str(a.warmup),
+                "--window", str(a.window), "--bank", "short,medium",
+                "--seed", str(a.seed)]
+    else:
+        cmd += ["--repeat", str(a.repeat)]
     if a.lang:
         cmd += ["--lang", a.lang]
     if a.model:
@@ -141,7 +154,14 @@ def main():
     ap.add_argument("--transcripts", help="bank manifest, so every probe also scores CER")
     ap.add_argument("--lookahead", type=int, default=3)
     ap.add_argument("--repeat", type=int, default=2,
-                    help="utterances per stream per probe (the rung's length)")
+                    help="wave mode: utterances per stream per probe")
+    ap.add_argument("--mode", choices=("soak", "wave"), default="soak",
+                    help="soak excludes the opening ramp and is the default; "
+                         "wave is cheaper but judges the ramp with the run")
+    ap.add_argument("--duration", type=int, default=75, help="soak probe seconds")
+    ap.add_argument("--warmup", type=int, default=25, help="soak seconds excluded")
+    ap.add_argument("--window", type=int, default=25, help="soak drift window")
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--lo", type=int, default=4, help="a concurrency believed to hold")
     ap.add_argument("--hi", type=int, default=64, help="a concurrency believed to break")
     ap.add_argument("--resolution", type=int, default=4,
@@ -157,8 +177,10 @@ def main():
         return 2
     os.makedirs(a.out, exist_ok=True)
 
+    probe_desc = (f"{a.duration}s soak, {a.warmup}s warm-up excluded"
+                  if a.mode == "soak" else f"{a.repeat} utterance(s) per stream")
     print(f"knee search: C in [{a.lo}, {a.hi}], resolution {a.resolution}, "
-          f"{a.repeat} utterance(s) per stream per probe, one warm server")
+          f"{probe_desc}, one warm server")
     print("  a probe SCREENS. This tool never promotes an operating point.")
     probes = []
 
