@@ -61,11 +61,11 @@ def one(url, fields, path, blob, timeout):
         return {"ok": False, "ms": (time.monotonic() - t0) * 1e3,
                 "refused": False, "code": 0, "error": f"{type(e).__name__}: {e}"}
 
-def pct(xs, p):
-    if not xs: return None
-    s = sorted(xs)
-    i = min(len(s) - 1, max(0, int(round((p / 100.0) * (len(s) - 1)))))
-    return s[i]
+# One percentile definition for the whole repo. This file used to round a
+# linear rank while the streaming harness took the nearest rank: two numbers,
+# both called p95, on the same latencies.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from streaming_metrics import pct  # noqa: E402,F401
 
 def rung(a, clips, blobs, secs, c):
     """One concurrency rung: c threads, each sending --requests-per-stream

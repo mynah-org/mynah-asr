@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
-import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -31,24 +29,22 @@ ADAPTATION_TIER = {"el-GR", "lt-LT", "lv-LV", "mt-MT", "sl-SI", "he-IL", "th-TH"
 VARIANTS = {"en-GB": "en-US", "es-US": "es-ES", "fr-CA": "fr-FR", "pt-PT": "pt-BR"}
 
 
-def normalize(s: str) -> str:
-    s = re.sub(r"<[^<>]{1,12}>", " ", s)   # language tag spelled out by the model
-    s = unicodedata.normalize("NFKC", s).lower()
-    s = "".join(c for c in s if not unicodedata.category(c).startswith("P"))
-    return re.sub(r"\s+", " ", s).strip()
+# The CER, the normaliser and the edit distance are defined once, in the
+# streaming harness's metrics module, and imported here. This file used to carry
+# its own pair: same names, different rules (that one dropped every Unicode
+# punctuation mark, the other a fixed list that was missing the guillemets), so
+# the same audio scored differently depending on which tool ran it.
+sys.path.insert(0, str(ROOT / "tools" / "bench"))
+from streaming_metrics import cer as _cer, normalise as normalize  # noqa: E402
 
 
 def cer(ref: str, hyp: str) -> float:
-    r, h = normalize(ref), normalize(hyp)
-    if not r:
-        return 0.0 if not h else 1.0
-    prev = list(range(len(h) + 1))
-    for i, rc in enumerate(r, 1):
-        cur = [i] + [0] * len(h)
-        for j, hc in enumerate(h, 1):
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (rc != hc))
-        prev = cur
-    return prev[-1] / len(r)
+    """Reference first, hypothesis second -- the argument order this suite has
+    always used; streaming_metrics.cer takes them the other way round."""
+    v = _cer(hyp, ref)
+    if v is None:                       # an empty reference: no rate exists
+        return 0.0 if not normalize(hyp) else 1.0
+    return v
 
 
 def main() -> None:

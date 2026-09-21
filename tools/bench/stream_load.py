@@ -141,23 +141,29 @@ def load_transcripts(path):
 
     Accepts either a plain {clip: text} map or a bank manifest in the shape this repo
     already uses (samples/manifest.json: a "samples" list whose entries carry "file" and
-    "text"). Keys are stored BOTH as given and as the bare basename, because the harness
-    plays a clip by whatever path the caller passed on the command line and the manifest
-    knows it by its path inside the bank."""
+    "text"). Keys are stored as given, and ALSO under the bare file name -- but only
+    when that name belongs to one clip. Eleven languages of samples/manifest.json share
+    `fleurs_1521.wav`; registering it would make every one of them score against
+    whichever language the manifest listed last. Matching is by path suffix
+    (streaming_metrics.reference_for), so `it/fleurs_1521.wav` still answers for
+    `samples/it/fleurs_1521.wav` without any basename key at all."""
     with open(path) as f:
         doc = json.load(f)
-    out = {}
+    out, by_base = {}, {}
     if isinstance(doc, dict) and isinstance(doc.get("samples"), list):
-        for e in doc["samples"]:
-            fn, txt = e.get("file"), e.get("text")
+        pairs = [(e.get("file"), e.get("text")) for e in doc["samples"]]
+    elif isinstance(doc, dict):
+        pairs = [(k, v) for k, v in doc.items() if isinstance(v, str)]
+    else:
+        pairs = None
+    if pairs is not None:
+        for fn, txt in pairs:
             if fn and txt:
                 out[fn] = txt
-                out[os.path.basename(fn)] = txt
-    elif isinstance(doc, dict):
-        for k, v in doc.items():
-            if isinstance(v, str):
-                out[k] = v
-                out[os.path.basename(k)] = v
+                by_base.setdefault(os.path.basename(fn), set()).add(txt)
+        for base, texts in by_base.items():
+            if len(texts) == 1 and base not in out:
+                out[base] = next(iter(texts))
     else:
         raise SystemExit(f"--transcripts {path}: expected a manifest or a {{clip: text}} map")
     if not out:

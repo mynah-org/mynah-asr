@@ -79,17 +79,23 @@ then a percentile over utterances).  They answer different questions and are nev
 Drift: the same metric recomputed over wall-clock windows; the gate is the largest
 relative distance between a window p95 and the pooled p95.
 
-Normalise (CER only): lowercase, drop the punctuation in PUNCT, collapse runs of
-whitespace, strip. Defined HERE and nowhere else, because a CER computed with a different
-normaliser is a different number wearing the same name. It is deliberately minimal -- no
-number expansion, no spelling map -- so it measures the engine and not a text pipeline.
+Normalise (CER only): NFKC, strip a written-out language tag, lowercase, turn every
+Unicode punctuation mark into a space, collapse runs of whitespace, strip. Defined HERE
+and nowhere else, because a CER computed with a different normaliser is a different number
+wearing the same name -- and this repo had two of them, one of which dropped the
+guillemets the Spanish and German references use and one of which did not. It is
+deliberately minimal beyond that -- no number expansion, no spelling map -- so it measures
+the engine and not a text pipeline. `reference_for` is the matching rule that goes with
+it: path suffixes, never an ambiguous bare file name.
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import math
+import re
 import sys
+import unicodedata
 
 EPS = 1e-9
 
@@ -97,19 +103,32 @@ EPS = 1e-9
 
 
 def pct(xs, p):
-    """Percentile by nearest rank, 1-based: index = ceil(p/100 * n), clamped to [1, n]."""
+    """Percentile by nearest rank, 1-based: index = ceil(p/100 * n), clamped to [1, n].
+
+    The rank is computed as `p * n / 100` and not as `(p / 100) * n`, with a
+    guard below the ceiling. A fractional percentile makes the difference
+    visible: 99.9 / 100 is not representable, so `(99.9 / 100) * 1000` is
+    999.0000000000001, whose ceiling is 1000 — the p99.9 of a thousand samples
+    silently became the maximum. Integer percentiles never showed it, which is
+    why it survived until p99.9 had a caller."""
     ys = sorted(x for x in xs if x == x)          # NaN is not a sample
     if not ys:
         return None
-    k = int(math.ceil(p / 100.0 * len(ys)))
+    k = int(math.ceil(p * len(ys) / 100.0 - 1e-9))
     return ys[min(max(k, 1), len(ys)) - 1]
 
 
 def stat(xs, basis, unit="ms", reported=True, label="MEASURED"):
-    """One metric's aggregate.  Percentiles only when the data can support them."""
+    """One metric's aggregate.  Percentiles only when the data can support them.
+
+    p99 and p99.9 appear only once the sample count can carry them. At nearest
+    rank a p99 of 50 samples IS the maximum, and a p99.9 of 500 is too: printing
+    them anyway invents a tail that was never observed. The thresholds are the
+    smallest n for which the percentile names a rank below the top one."""
     xs = [x for x in xs if x is not None and x == x]
     out = {"n": len(xs), "unit": unit, "basis": basis, "reported": bool(reported),
-           "label": label, "p50": None, "p95": None, "max": None, "samples": None}
+           "label": label, "p50": None, "p95": None, "p99": None, "p999": None,
+           "max": None, "samples": None}
     if not xs:
         return out
     out["max"] = max(xs)
@@ -118,6 +137,10 @@ def stat(xs, basis, unit="ms", reported=True, label="MEASURED"):
         return out
     out["p50"] = pct(xs, 50)
     out["p95"] = pct(xs, 95)
+    if len(xs) >= 100:
+        out["p99"] = pct(xs, 99)
+    if len(xs) >= 1000:
+        out["p999"] = pct(xs, 99.9)
     return out
 
 
@@ -134,7 +157,12 @@ def fmt_stat(s):
     if s["p50"] is None:
         return " / ".join(_num(v, u) for v in s["samples"]) + f"  ({s['n']} sample)"
     tag = "" if s["reported"] else "   DIAGNOSTIC"
-    return (f"{_num(s['p50'], u)} / {_num(s['p95'], u)}  "
+    tail = ""
+    if s.get("p99") is not None:
+        tail = f" / {_num(s['p99'], u)}"
+        if s.get("p999") is not None:
+            tail += f" / {_num(s['p999'], u)}"
+    return (f"{_num(s['p50'], u)} / {_num(s['p95'], u)}{tail}  "
             f"(max {_num(s['max'], u)}, n={s['n']}){tag}")
 
 
@@ -177,11 +205,28 @@ def audio_sent_at(sends, t):
 
 PUNCT = ".,;:!?\u00bf\u00a1\"'`()[]{}<>\u2013\u2014-\u2026\u201c\u201d\u2018\u2019"
 
+# Written-out language tag: some packs emit one at the head of the text.
+_TAG_RE = re.compile(r"<[^<>]{1,12}>")
+
 
 def normalise(text):
-    """The CER normaliser. See the note at the top: minimal on purpose."""
-    t = (text or "").lower()
-    t = "".join(" " if ch in PUNCT else ch for ch in t)
+    """The CER normaliser, and the only one in this repo.
+
+    NFKC first, so that a reference typed with composed characters and a
+    hypothesis that spells them out are the same string; then lowercase; then
+    every Unicode punctuation mark becomes a space, rather than the fixed list
+    PUNCT once held -- that list was missing the guillemets and the low quote,
+    which are exactly the marks the Spanish and German references use, so the
+    same audio scored differently depending on which of this repo's two CER
+    implementations ran. PUNCT is kept as the documented floor: a character in
+    it is dropped even if a future Unicode table disagrees.
+
+    Deliberately minimal beyond that -- no number expansion, no spelling map --
+    so it measures the engine and not a text pipeline."""
+    t = unicodedata.normalize("NFKC", text or "")
+    t = _TAG_RE.sub(" ", t).lower()
+    t = "".join(" " if (ch in PUNCT or unicodedata.category(ch).startswith("P")) else ch
+                for ch in t)
     return " ".join(t.split())
 
 
@@ -200,6 +245,42 @@ def edit_distance(a, b):
             cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
         prev = cur
     return prev[-1]
+
+
+def reference_for(transcripts, clip):
+    """The human reference for a clip path, or None.
+
+    A manifest keys a clip by its path INSIDE the bank ("it/fleurs_1521.wav")
+    while the harness plays it by whatever path the caller typed on the command
+    line ("samples/it/fleurs_1521.wav"), so the match walks path suffixes. It
+    never falls back to the bare file name when that name is ambiguous: eleven
+    languages of this repo's own sample bank share `fleurs_1521.wav`, and a
+    basename match scored every one of them against whichever language the
+    manifest happened to list last. None is the right answer there -- an
+    utterance with no reference is reported as having none, which is a fact,
+    while a CER against the wrong language is a number that looks like one."""
+    if not transcripts or not clip:
+        return None
+    hit = transcripts.get(clip)
+    if hit is not None:
+        return hit
+    parts = str(clip).replace("\\", "/").split("/")
+    for i in range(1, len(parts) + 1):
+        hit = transcripts.get("/".join(parts[-i:]))
+        if hit is not None:
+            return hit
+    return None
+
+
+def wer(hyp, ref):
+    """Word error rate over the same normalised text as `cer`. Words are what a
+    reader counts; characters are what a CJK or agglutinative reference needs.
+    Reporting both costs one edit distance and stops the argument."""
+    r = normalise(ref).split()
+    h = normalise(hyp).split()
+    if not r:
+        return None
+    return edit_distance(h, r) / len(r)
 
 
 def cer(hyp, ref):
@@ -228,6 +309,11 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
         "backlog_max_s": None, "max_late_ms": max(late) if late else 0.0,
         "p95_late_ms": pct(late, 95) if late else None,
         "paced": True, "t_end": None,
+        # The two a latency table alone cannot show: the wait for the END of an
+        # utterance, and the longest silence INSIDE one. An utterance can hold a
+        # fine p95 while one gap of two seconds sat in the middle of it, and a
+        # listener feels that gap and not the percentile.
+        "eou_ms": None, "max_gap_ms": None,
     }
     half_frame = frame_ms / 2.0
     out["paced"] = (out["max_late_ms"] <= half_frame + EPS) and abs(pace - 1.0) < EPS
@@ -235,6 +321,8 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
     first_delta_t = None
     first_frame_t = None
     texts = []
+    eou_lat = []
+    delta_ts = []
     for ev in events:
         t = ev.get("t")
         kind = ev.get("type")
@@ -242,12 +330,18 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
             first_frame_t = t   # ANY frame: delta, eou, done or error
         if kind == "eou":
             out["eous"] += 1
+            if t is not None and sends and ev.get("audio_s") is not None:
+                # end-of-utterance latency: the eou frame's arrival against the
+                # moment the audio it closes was SENT, not against the run start
+                eou_lat.append((t - send_time_for_audio(sends, float(ev["audio_s"]))) * 1000.0)
         if ev.get("lag_ms") is not None and kind in ("delta", "eou"):
             out["server_lag_marks"].append([t, float(ev["lag_ms"])])
         text = ev.get("text") or ""
         if kind != "delta" or not text:
             continue
         texts.append(text)
+        if t is not None:
+            delta_ts.append(t)
         if first_delta_t is None:
             first_delta_t = t
         consumed = ev.get("audio_s")
@@ -258,6 +352,11 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
 
     out["deltas"] = len(texts)
     out["text"] = "".join(texts)
+    if eou_lat:
+        out["eou_ms"] = max(eou_lat)
+    if len(delta_ts) >= 2:
+        ds = sorted(delta_ts)
+        out["max_gap_ms"] = max((b - a) * 1000.0 for a, b in zip(ds, ds[1:]))
     if out["backlog_marks"]:
         out["backlog_max_s"] = max(m[1] for m in out["backlog_marks"])
     if first_frame_t is not None and sends:
@@ -418,9 +517,7 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
     if transcripts:
         for u in ok:
             clip = u.get("clip") or ""
-            ref = transcripts.get(clip)
-            if ref is None:
-                ref = transcripts.get(clip.rsplit("/", 1)[-1])
+            ref = reference_for(transcripts, clip)
             if ref is None:
                 continue
             v = cer(u["text"], ref)
@@ -440,6 +537,36 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
 
     audio_s = sum(u["audio_s"] for u in ok)
     span = max([u["t_end"] for u in counted if u.get("t_end") is not None], default=t0) - t0
+
+    # Throughput as a unit of WORK: audio seconds carried per wall second. A rate
+    # of requests says nothing when the clips differ in length, and this is the
+    # number that answers "how many real-time streams does this host carry".
+    m["audio_per_wall"] = stat([audio_s / span] if span > EPS and audio_s > 0 else [],
+                               "run", "x", True, "MEASURED")
+    m["eou_ms"] = stat([u["eou_ms"] for u in ok if u.get("eou_ms") is not None],
+                       "per utterance", "ms", rep, lbl)
+    m["max_delta_gap_ms"] = stat([u["max_gap_ms"] for u in ok if u.get("max_gap_ms") is not None],
+                                 "per utterance (longest silence in each)", "ms", rep, lbl)
+
+    # Fairness. A fleet p95 hides one starved stream among thirty healthy ones,
+    # and a starved stream is a person hearing nothing. Per stream, the p95 of
+    # its own deltas; then the WORST stream against the MEDIAN stream. A ratio
+    # of 1 is a fleet that treats its streams alike; the run-level p95 cannot
+    # tell 1 from 5.
+    per_stream = {}
+    for u in ok:
+        sid = u.get("stream")
+        if sid is None or len(u["lag_marks"]) < 2:
+            continue
+        per_stream.setdefault(sid, []).extend(v for _, v in u["lag_marks"])
+    stream_p95 = sorted(p for p in (pct(v, 95) for v in per_stream.values()) if p is not None)
+    fairness = None
+    if len(stream_p95) >= 2:
+        med = pct(stream_p95, 50)
+        fairness = {"streams": len(stream_p95), "median_p95_ms": med,
+                    "worst_p95_ms": stream_p95[-1], "best_p95_ms": stream_p95[0],
+                    "worst_over_median": (stream_p95[-1] / med) if med and med > EPS else None}
+    # (fairness is not a stat dict: it goes in its own key of the summary)
     return {
         "counts": {"utterances": len(counted), "ok": len(ok), "errors": len(errored),
                    "rejected": len(rejected), "warmup_excluded": warm,
@@ -449,6 +576,7 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
                    "paced": paced,
                    "verdict": "PACED" if paced else "NOT PACED (cadence is DIAGNOSTIC)"},
         "metrics": m,
+        "fairness": fairness,
         "drift": dr,
         "text_groups": groups,
         "identity_fail": identity_fail,
@@ -617,6 +745,9 @@ def format_summary(summary, env=None, indent="  "):
                        ("finalization_lag_ms", "finalization lag"),
                        ("backlog_max_s", "backlog max"),
                        ("cer", "CER vs reference"),
+                       ("eou_ms", "end-of-utterance lag"),
+                       ("max_delta_gap_ms", "longest gap in a stream"),
+                       ("audio_per_wall", "audio per wall second"),
                        ("pacing_late_ms", "pacing lateness")):
         s = m[key]
         if s["n"] == 0:
@@ -693,6 +824,8 @@ def self_test():
     #  [1..6]: p50 -> ceil(3.0)=3 -> 3 ; p95 -> ceil(5.7)=6 -> 6 ; p0 -> rank 1 ; p100 -> 6
     for p, want in ((50, 3), (95, 6), (0, 1), (100, 6)):
         bad += not _eq(pct([4, 1, 6, 3, 5, 2], p), want, f"pct([1..6], {p})")
+    #  the rank is p*n/100, not (p/100)*n: 99.9 of 1..1000 is 999, not the maximum
+    bad += not _eq(pct(list(range(1, 1001)), 99.9), 999, "fractional rank does not round up")
     #  [1..4]: p50 -> ceil(2.0)=2 -> 2 ; p25 -> ceil(1.0)=1 -> 1 ; p75 -> ceil(3.0)=3 -> 3
     for p, want in ((50, 2), (25, 1), (75, 3)):
         bad += not _eq(pct([1, 2, 3, 4], p), want, f"pct([1..4], {p})")
@@ -781,6 +914,51 @@ def self_test():
     bad += not _eq(cer("the cat sat", "The cat sat."), 0.0, "CER ignores case and stops", 1e-12)
     bad += not _eq(cer("the bat sat", "the cat sat"), 1.0 / 11.0, "one substitution in 11", 1e-12)
     bad += not _eq(cer("anything", ""), None, "an empty reference has no rate")
+    # The marks the old fixed list missed, which is why there were two CER numbers.
+    bad += not _eq(normalise("«casa» „Haus“ ¿qué?"),
+                   "casa haus qué", "normalise drops guillemets and the low quote")
+    bad += not _eq(normalise("<it> Ciao"), "ciao", "normalise strips a written-out tag")
+    bad += not _eq(normalise("ﬁn"), "fin", "normalise applies NFKC")
+
+    print("tails, throughput and fairness")
+    #   p99 at nearest rank needs 100 samples to name a rank below the maximum
+    small, big = list(range(1, 51)), list(range(1, 1001))
+    bad += not _eq(stat(small, "t")["p99"], None, "p99 withheld below 100 samples")
+    bad += not _eq(stat(big, "t")["p99"], 990, "p99 of 1..1000 is 990")
+    bad += not _eq(stat(big, "t")["p999"], 999, "p999 of 1..1000 is 999")
+    bad += not _eq(stat(small, "t")["p999"], None, "p999 withheld below 1000 samples")
+    bad += not _eq(wer("the cat sat", "The cat sat."), 0.0, "WER folds case and stops", 1e-12)
+    bad += not _eq(wer("the bat sat", "the cat sat"), 1.0 / 3.0, "one word of three", 1e-12)
+    bad += not _eq(wer("x", ""), None, "an empty reference has no word rate")
+
+    #   one starved stream among healthy ones: the fleet p95 cannot see it, the ratio can
+    def _st(stream, lag_ms, t0):
+        snd = [[t0 + 0.1 * i, 0.1 * (i + 1)] for i in range(12)]
+        evs = [_ev(t0 + 0.1 * i + lag_ms / 1000.0, 0.1 * (i + 1), "w ") for i in range(12)]
+        r = _mk("c.wav", snd, evs, t0 + 1.3, t_start=t0)
+        r["stream"] = stream
+        return analyze_utterance(r, frame_ms=100.0)
+
+    ag = aggregate([_st(0, 10.0, 0.0), _st(1, 10.0, 2.0), _st(2, 300.0, 4.0)],
+                   frame_ms=100.0, pace=1.0)
+    fr = ag["fairness"]
+    bad += not _eq(float(fr["streams"]), 3.0, "three streams got their own p95")
+    bad += not _eq(fr["median_p95_ms"], 10.0, "the median stream is healthy", 1e-6)
+    bad += not _eq(fr["worst_p95_ms"], 300.0, "the worst stream is not", 1e-6)
+    bad += not _eq(fr["worst_over_median"], 30.0, "worst over median names the starvation", 1e-6)
+    bad += not _eq(ag["metrics"]["max_delta_gap_ms"]["max"], 100.0,
+                   "the longest gap inside an utterance", 1e-6)
+
+    print("quality: a reference is matched by path suffix, never by an ambiguous name")
+    tr = {"it/fleurs_1521.wav": "ciao", "de/fleurs_1521.wav": "hallo", "solo.wav": "alone"}
+    bad += not _eq(reference_for(tr, "samples/it/fleurs_1521.wav"), "ciao",
+                   "a longer played path matches the manifest key")
+    bad += not _eq(reference_for(tr, "de/fleurs_1521.wav"), "hallo", "an exact key matches")
+    bad += not _eq(reference_for(tr, "somewhere/fleurs_1521.wav"), None,
+                   "an ambiguous bare name scores nothing rather than the wrong language")
+    bad += not _eq(reference_for(tr, "bank/solo.wav"), "alone",
+                   "an unambiguous bare name still matches")
+    bad += not _eq(reference_for(None, "a.wav"), None, "no manifest, no reference")
 
     print("quality: CER reaches the verdict, and only when a reference exists")
     snd_q = [[20.0, 0.1], [20.1, 0.2]]
