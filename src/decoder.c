@@ -180,7 +180,11 @@ static int greedy_decode_tdt(const mynah_asr_decoder *dec, mynah_asr_dec_state *
 
 size_t mynah_asr_greedy_scratch_floats(const mynah_asr_decoder *dec) {
     return (size_t)DEC_BMAX * (size_t)dec->hidden
-         + (size_t)DEC_BMAX * (size_t)(dec->vocab + dec->n_durations);
+         + (size_t)DEC_BMAX * (size_t)(dec->vocab + dec->n_durations)
+         /* S10-2: the quantised activations and their scales for the weight-
+          * stationary joint head. int8 rounded up to whole floats. */
+         + (((size_t)DEC_BMAX * (size_t)dec->hidden + sizeof(float) - 1) / sizeof(float))
+         + (size_t)DEC_BMAX;
 }
 
 int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
@@ -197,6 +201,10 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
     float *logits = owned ? malloc((size_t)DEC_BMAX * (size_t)V * sizeof(float))
                           : scratch + (size_t)DEC_BMAX * (size_t)H;
     if (!jin || !logits) { if (owned) { free(jin); free(logits); } return 0; }
+    /* S10-2 scratch for the weight-stationary head; NULL when the caller owns
+     * nothing, and mynah_asr_qmat_mul_rows then takes its per-row path. */
+    float *hsx = owned ? NULL : logits + (size_t)DEC_BMAX * (size_t)V;
+    int8_t *hqx = hsx ? (int8_t *)(hsx + DEC_BMAX) : NULL;
     int n_out = 0;
 
     /* The head as an f32 matrix for a direct BLAS GEMM (CPU: deterministic across
@@ -228,7 +236,15 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
             mynah_asr_gemm_f32(0, 1, Bc, V, H,
                                1.0f, jin, H, W, H, 0.0f, logits, V);
         else
-            mynah_asr_qmat_mul(&dec->head, jin, logits, Bc);
+            /* S10-2: Bc is at most 4, which put this through the T <= 16 branch
+             * of mynah_asr_qmat_mul: a loop that quantises one row, then walks
+             * the whole head computing one dot per output. The head is 8.4 MiB
+             * of int8, so it was re-read from memory once per FRAME, four times
+             * per step per stream, on the scheduler thread with the pool idle.
+             * The rows entry point is weight-stationary and exact by the same
+             * per-row-dot construction (S1-4, qmat.h): the head is read once
+             * for the block. */
+            mynah_asr_qmat_mul_rows(&dec->head, jin, logits, Bc, hqx, hsx);
 
         int first = -1, best = -1;
         for (int b = 0; b < Bc; b++) {
