@@ -104,6 +104,40 @@ static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int 
 /* argmax of (logits + bias) on the fly: same float arithmetic as summing into a
  * buffer and then searching for the maximum (v computed once per k), without the
  * V float writes/re-reads per row. */
+/* ------------------------------------------------- R-3B: why a step is blank
+ *
+ * MYNAH_ASR_TRACE_RNNT=1 prints, for every encoder frame the greedy loop looks
+ * at, the blank score, the best NON-blank score and their margin. R-2 proved
+ * the wait before the first word is spent in blanks; a blank is an observed
+ * output, not a cause, and the margin is what separates "the checkpoint is far
+ * from emitting" from "a numerical hair decided it".
+ *
+ * Diagnostic only: it reads the same logits the decision reads and changes no
+ * decision. Off, it costs one relaxed load per block. */
+static int dec_trace(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_TRACE_RNNT");
+        v = (e != NULL && *e != '\0' && *e != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+/* Best score over the vocabulary excluding `skip`, with the head bias applied,
+ * exactly as argmax_bias sees it. */
+static int best_excluding(const float *lg, const float *bias, int V, int skip,
+                          float *score) {
+    int best = -1;
+    float bv = 0.0f;
+    for (int k = 0; k < V; k++) {
+        if (k == skip) continue;
+        const float v = lg[k] + bias[k];
+        if (best < 0 || v > bv) { bv = v; best = k; }
+    }
+    *score = bv;
+    return best;
+}
+
 static int argmax_bias(const float *lg, const float *bias, int V) {
     int best = 0;
     float bv = lg[0] + bias[0];
@@ -248,7 +282,18 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
 
         int first = -1, best = -1;
         for (int b = 0; b < Bc; b++) {
-            const int am = argmax_bias(logits + (size_t)b * (size_t)V, dec->head_b, V);
+            const float *lb = logits + (size_t)b * (size_t)V;
+            const int am = argmax_bias(lb, dec->head_b, V);
+            if (dec_trace()) {
+                float nb_score = 0.0f;
+                const int nb = best_excluding(lb, dec->head_b, V, dec->blank, &nb_score);
+                const float blank_score = lb[dec->blank] + dec->head_b[dec->blank];
+                fprintf(stderr,
+                        "[RNNT] frame=%ld blank=%.4f best_nonblank=%d:%.4f "
+                        "margin=%.4f chose=%s\n",
+                        (long)(s->t_abs + t + b), blank_score, nb, nb_score,
+                        blank_score - nb_score, am == dec->blank ? "blank" : "TOKEN");
+            }
             if (am != dec->blank) { first = b; best = am; break; }
         }
         if (first < 0) {                                   /* all-blank run */

@@ -961,6 +961,16 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
     char lang_tmp[16] = "";
     const char *text = mynah_asr_detok_append(&s->detok, &m->tok,
                                           s->tokens + s->n_tokens, added, lang_tmp);
+    /* R-3B: a step can decode a NON-BLANK and still publish nothing, because the
+     * language tag is lifted out of the text by the detokeniser and `total >
+     * chars_emitted` is what gates the delta. Without this line the two cases
+     * are indistinguishable from outside, and they have different owners: one
+     * is the checkpoint, the other is our publishing rule. */
+    if (getenv("MYNAH_ASR_TRACE_RNNT"))
+        fprintf(stderr, "[RNNT] emit q=%d tokens_added=%d chars=%zu chars_emitted=%zu%s\n",
+                q, added, text ? strlen(text) : (size_t)0, s->chars_emitted,
+                (added > 0 && text && strlen(text) <= s->chars_emitted)
+                    ? "  <-- DECODED A TOKEN, PUBLISHED NOTHING" : "");
     s->n_tokens += added;
     if (!text) return -1;
     if (lang_tmp[0]) memcpy(s->lang, lang_tmp, sizeof(s->lang));

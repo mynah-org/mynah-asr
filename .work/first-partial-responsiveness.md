@@ -325,9 +325,14 @@ against a 320 ms period. A cold server pays 1236 ms on its first step.
 
 **INFERENCE (follows from the above, not separately measured).** TTFP-speech at
 C=1 is, to within one step wall, exactly the audio the RNNT consumes after
-speech onset. Lowering it therefore means changing what the decoder waits for,
-not making anything faster. The 2.6 s seen on the Axion at C=60 is this floor
-plus load; how much of it is load is not established by this run.
+speech onset. **This locates the wait; it does not explain it.** A blank is an
+observed output, not a root cause, and "the RNNT emitted blank" is not the same
+claim as "the decoder deliberately waited". Which of the checkpoint, the
+lookahead and cache semantics, the predictor/joiner, the blank policy,
+`max_symbols_per_step` or our own publishing rule owns those steps is exactly
+what R-3 has to separate, and nothing here decides it. The 2.6 s seen on the
+Axion at C=60 is this floor plus load; how much of it is load is not
+established by this run.
 
 **UNKNOWN.** Whether 0.5-1.0 s of speech is inherent to this checkpoint or a
 consequence of our blank policy, `max_symbols_per_step`, or the emit rule
@@ -337,6 +342,135 @@ first call. What any of these become under load (R-6).
 
 **The largest removable component is not yet identified**, and the largest
 component is not obviously removable: it is the model declining to commit.
+
+## R-3 RESULT (2026-09-21, source inspection + local diagnostics)
+
+Three clips traced frame by frame with `MYNAH_ASR_TRACE_RNNT=1` (onsets 0.18,
+1.04, 3.45 s), on top of R-2's eight at chunk level. Axion stayed off.
+
+### R-3B — there is no decoding policy to blame
+
+**FACT, from source.** `mynah_asr_greedy_decode_scratch` (`src/decoder.c:190`)
+is a plain greedy argmax: `argmax_bias(logits, head_b, V)`, blank if it wins.
+There is **no blank threshold, no temperature, no suppression, no commit rule
+and no confidence gate** anywhere on the path. `max_symbols_per_step` (10) is
+checked only *after* an emission, so it cannot delay a first token.
+
+**FACT — the publishing rule never fired.** The one suspect our side owned was
+`total > s->chars_emitted` in `stream_decode_emit`: the detokeniser lifts a
+language tag out of the text, so a step could decode a non-blank and publish
+nothing. Instrumented, that case occurred **0 times in 3 clips**. Every token
+the decoder produced became visible text.
+
+**FACT — the first steps are STRONGLY blank, and the crossing is
+NEAR-BOUNDARY.** In silence the blank margin is ~+100 (median +99 to +102 over
+2, 12 and 43 silent frames). From speech onset it falls to ~+9 and decays to
+the crossing:
+
+    en/1521  onset 0.18s   +9.45 +7.72 +4.95 +4.47 +2.44  -1.56  TOKEN
+    es/1534  onset 1.04s   +9.02 +9.76 +4.19 +2.55 +3.78  -2.61  TOKEN
+    de/1521  onset 3.45s   +8.13 +8.34 +7.69 +7.91 +4.61 +4.74 +5.13 +5.83 +1.17  -0.45  TOKEN
+
+The decay is not strictly monotonic. The crossing itself is a hair (-0.45 to
+-2.61) and the frame before it is close (+1.17 to +3.78), but the five to eight
+frames before *that* are not: +4 to +9. **Moving emission one frame earlier is a
+small policy change; moving it three frames earlier is a large one.**
+
+### R-3C — the lookahead is inside the number, not beside it
+
+**FACT.** Preset `[56, 3]` means each encoder output attends 3 frames ahead, and
+`q = right + 1 = 4` frames come out per step. So the decision taken "at encoder
+frame f" consumed source audio through frame `f+3`: **240 ms more than the frame
+index suggests**, and the token cannot exist earlier. It is then published
+immediately (R-2: 0.2 ms).
+
+This retires an attractive wrong reading. The first non-blank of en/1521 lands
+on frame 8 (0.64 s by frame index) but is decided on audio through 0.96 s, which
+is what the harness reports. **There is no publication delay to recover here.**
+256 ms remains *earliest first-chunk eligibility only* and is NOT a model floor.
+
+### R-3D — the wait tracks speech, not silence
+
+**FACT.** Leading silence spans 0.18 to 3.45 s across the traced clips — a 19x
+range — and the audio consumed after onset before the first non-blank is
+**+0.46, +0.56, +0.79 s**. Over R-2's eight clips the same quantity is
+**0.496 to 0.966 s**. It is approximately fixed after onset and does not track
+the silence in front of it. Blank steps DO track silence (2 to 13) because
+silence costs steps, not because it costs evidence.
+
+**Not generalised further.** Eight FLEURS clips, read speech, six languages. A
+corpus with breaths, hesitations or a quiet first word could behave differently
+and nothing here says it would not.
+
+### R-3E — cold start: UNKNOWN, and not reproducible on demand
+
+**FACT.** Three fresh server processes, identical command, same clip: the first
+model step cost **49.4 ms, 1010.6 ms, 43.8 ms**. The 1236 ms seen in R-2 is real
+but **1 in 3, not deterministic**, which rules out the tidiest hypothesis: the
+thread pool is built under `pthread_once` inside the first dispatch
+(`src/threads.c:353`) and would therefore cost the same in every process.
+
+**UNKNOWN.** First-touch page faults on the weights, memory pressure, or a lazy
+initialisation elsewhere. Classified `COLD-START`, held apart from warm TTFP,
+and deliberately NOT fixed: a warm-up that hides an unattributed second is worse
+than the second.
+
+**The smallest experiment that would decide it** (Linux, where the counters are
+honest, and `getrusage` is already in `[DUMP]`): N fresh processes, minor and
+major fault counts read immediately before and after the first step, crossed
+with (a) page cache purged vs warm and (b) one synthetic dispatch before the
+first stream. If the slow runs are the ones taking major faults, it is paging
+and warm-up is the answer; if not, something is lazily initialised and the
+counter will say where.
+
+### R-3A — the exit table (warm C=1)
+
+| component | measured | classification | evidence | removable | confidence |
+|---|---|---|---|---|---|
+| first chunk's audio | 245-249 ms | REAL-TIME INPUT REQUIREMENT | `enc_stream_need` = 25 mel frames | no: the audio does not exist yet | high |
+| onset to first non-blank | 0.50-0.97 s | MODEL ARCHITECTURE / CHECKPOINT | blank margin +9 decaying to the crossing | only by changing what wins the argmax | high |
+| of which right context | 240 ms | MODEL ARCHITECTURE (preset `[56,3]`) | `q = right+1`, att_context semantics | only with a different preset | high |
+| step compute | 30-46 ms per 320 ms period | OUR IMPLEMENTATION | trace; idles 270-291 ms between steps | yes, but it buys no TTFP at C=1 | high |
+| publication | 0.12-0.23 ms | OUR IMPLEMENTATION | R-2 | nothing to remove | high |
+| first step, fresh process | 43.8 / 49.4 / 1010.6 ms | COLD-START | 3 fresh processes | unknown | low |
+| blank logit outliers | -870 to -882, margin +100 | UNKNOWN | isolated frames | never changes a decision | low |
+
+### Why does the first non-blank need 0.50-0.97 s of speech?
+
+**Because a greedy argmax over this checkpoint keeps blank ahead of the best
+token for six to ten encoder frames after onset, and each of those frames
+already carries 240 ms of right context.** No threshold, suppression or
+publishing rule participates: there are none in the code, and the one gate that
+could have suppressed a token never did.
+
+This is an answer about *these eight clips on this checkpoint*. It does not say
+the checkpoint is right to wait, only that nothing between the argmax and the
+socket is making it wait.
+
+### What R-3 does NOT license
+
+The two candidate levers are now named and both are numerics changes, not
+latency tweaks: **a lower lookahead preset** (`[56,0]` exists) would cut the
+240 ms of right context and shrink the chunk period from 320 ms to 80 ms, which
+would also destroy the cadence budget F29 measured; **anything that lets a
+non-blank win earlier** is a decoding change worth +1 to +4 of margin.
+
+**And the baseline has an existing crack to close first.** Running the batched
+gate for this work, `tests/test_stream_batch` reported, on int8 es-ES:
+
+    off: Blavos dias, la reunion empieza a las VUELVE en la sala grande.
+    one: Blavos dias, la reunion empieza a las NUEVE en la sala grande.
+
+Streaming is right and offline is wrong, the test labels it pre-existing and not
+a batching effect, and both paths mangle the first word. A responsiveness A/B
+judged against a baseline that already disagrees with itself between the two
+code paths would prove nothing. This belongs to Q-2.
+
+Neither may be attempted before R-3F: a quality baseline able to detect a
+premature or wrong first token, partial instability, final CER/WER regression,
+and hallucination during leading silence. `configs/quality/` and
+`tools/eval/cer_offline.py` cover the third only. **Q-2 is now a blocker for
+R-5, not an independent item.**
 
 ## Acceptance philosophy
 
@@ -360,7 +494,7 @@ at all.
 
 ## Next action
 
-R-3: classify the 0.5-1.0 s of speech the RNNT consumes before its first
-non-blank. It is a decoding-semantics question — blank policy, max_symbols,
-the emit rule — and it is answered by reading code and by the oracle, not by a
-latency experiment. Nothing is optimised until that classification exists.
+R-3F: the quality baseline that any emission change must be judged against —
+premature or wrong first token, partial instability, final CER/WER, and
+hallucination in leading silence. Q-2 is its vehicle and it now blocks R-5.
+No optimisation before it exists.

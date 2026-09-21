@@ -171,6 +171,16 @@ static const mynah_asr_flag g_flags[] = {
      "1 prints the [FLAGS] and [EFFECTIVE-CONFIG] lines on stderr before a run",
      NULL, NULL},
 
+    {"MYNAH_ASR_TRACE_RNNT", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "src/decoder.c and src/mynah_asr.c: for every encoder frame the greedy RNNT looks at,"
+     " print the blank score, the best non-blank score and their margin, and for every chunk"
+     " print how many tokens were decoded against how many characters were published."
+     " Answers why the first steps of a stream emit nothing: a checkpoint far from emitting,"
+     " a decision on a numerical hair, or a token that WAS decoded and that our publishing"
+     " rule dropped. Diagnostic only -- it reads the logits the decision reads and changes"
+     " no decision",
+     NULL, NULL},
+
     {"MYNAH_ASR_TRACE_TTFP", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
      "server/sched.c: trace the first N steps of every stream on stderr -- consumed audio,"
      " arrival, ready, selected, model start and end, and whether that step emitted anything --"
