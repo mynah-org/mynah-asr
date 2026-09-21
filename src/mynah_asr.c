@@ -365,6 +365,18 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
             }
         }
     }
+
+    /* S10-1: the rel-pos projection for every K this model can reach, built
+     * once here so that the server forks with it already resident and every
+     * worker shares the pages. A streaming model only; a failure (no memory,
+     * or a GEMM whose rows are not independent) is not fatal — the per-K
+     * projection is still there and still correct. */
+    if (m->n_lookaheads > 0 && m->left_ctx >= 0) {
+        int max_q = 1;
+        for (int i = 0; i < m->n_lookaheads; i++)
+            if (m->lookaheads[i] + 1 > max_q) max_q = m->lookaheads[i] + 1;
+        mynah_asr_enc_relpos_table_init(&m->enc, m->left_ctx + max_q + 2);
+    }
     return m;
 
 fail:

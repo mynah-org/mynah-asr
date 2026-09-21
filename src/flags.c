@@ -106,6 +106,16 @@ static const mynah_asr_flag g_flags[] = {
      " OpenBLAS, where it is unverified; int8 never consults it, its per-row dot is exact by construction",
      NULL, NULL},
 
+    {"MYNAH_ASR_RELPOS_TABLE", MYNAH_ASR_FLAG_KERNEL, "1 (on, when the model streams)",
+     "1/0: whether the rel-pos projection comes from the per-layer table built at load."
+     " rk = pe(K) @ relk_w^T depends on neither the stream nor the audio nor the cache contents,"
+     " and pe(K)[p] depends only on pos = K-1-p, so one table per layer is a window away from"
+     " every K. Off, every stream projects for itself every step, which is what the S1-7 group"
+     " sharing was trying to soften. The two arms must be byte-identical: that is what"
+     " tests/test_stream_batch gates, and the table refuses to install itself at load if a"
+     " probe window does not match a direct projection byte for byte",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"

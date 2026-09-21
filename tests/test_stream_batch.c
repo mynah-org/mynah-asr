@@ -292,10 +292,19 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
         memcpy(cA + (size_t)i * ccache_floats(&e), es[i].conv_cache, ccache_floats(&e) * sizeof(float));
     }
 
+    /* S10-1: the table is built HERE, between the two passes, on purpose. Pass
+     * 1 above projected per stream per step, the way the encoder always did;
+     * pass 2 below reads the load-time table. So the float comparison that
+     * follows is not only "batched == single", it is "batched reading one
+     * table built once == single projecting for itself every step", which is
+     * the whole claim of S10-1 and the only place it is proved on real
+     * activations rather than on a transcript. */
+    const int tab_rc = mynah_asr_enc_relpos_table_init(&e.enc, e.left + q + 2);
+
     /* pass 2: the same chunks, batched */
     mynah_asr_enc_batch *bb = mynah_asr_enc_batch_new(&e.enc, B, q, e.left);
     if (!bb) return -1;
-    mynah_asr_enc_relpos_counters_reset();       /* S1-7: shared vs private rk */
+    mynah_asr_enc_relpos_counters_reset();       /* S1-7 / S10-1: where rk came from */
     for (int i = 0; i < B; i++) { mynah_asr_enc_stream_reset(&es[i]); pos[i] = 0; }
     int used_batched = 0;
     for (int step = 0; step < nsteps; step++) {
@@ -352,14 +361,18 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
     const unsigned long long rp_sh = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_SHARED);
     const unsigned long long rp_pv = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_PRIVATE);
     const unsigned long long rp_gr = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_GROUP);
-    const int shared_ok = rp_sh > 0;
+    const unsigned long long rp_tb = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_TABLE);
+    /* the treatment has to have run: a table that silently failed to build
+     * would make this pass by doing exactly what pass 1 did */
+    const int src_ok = tab_rc == 0 ? rp_tb > 0 : rp_sh > 0;
 
-    const int ok = !qdiff && diff_floats == 0 && cdiff == 0 && used_batched && shared_ok;
+    const int ok = !qdiff && diff_floats == 0 && cdiff == 0 && used_batched && src_ok;
     printf("  [%s] encoder bit-exact B=%d: %d steps, %zu floats compared, %zu differ, "
-           "%zu/%d caches differ%s | rel-pos shared %llu private %llu group %llu%s | %s\n",
+           "%zu/%d caches differ%s | rel-pos table %llu shared %llu private %llu group %llu%s | %s\n",
            quantize ? "int8" : "f32", B, nsteps, cmp_floats, diff_floats, cdiff, 3 * B,
-           qdiff ? ", FRAME COUNT DIFFERS" : "", rp_sh, rp_pv, rp_gr,
-           shared_ok ? "" : " NO SHARING", ok ? "EXACT OK" : "FAIL");
+           qdiff ? ", FRAME COUNT DIFFERS" : "", rp_tb, rp_sh, rp_pv, rp_gr,
+           src_ok ? "" : (tab_rc == 0 ? " TABLE NOT READ" : " NO SHARING"),
+           ok ? "EXACT OK" : "FAIL");
 
     mynah_asr_enc_batch_free(bb);
     for (int i = 0; i < B; i++) { mynah_asr_enc_stream_free(&es[i]); free(feats[i]); }
@@ -490,8 +503,9 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
         const unsigned long long rp_sh = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_SHARED);
         const unsigned long long rp_pv = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_PRIVATE);
         const unsigned long long rp_gr = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_GROUP);
+        const unsigned long long rp_tb = mynah_asr_enc_relpos_counter(MYNAH_ASR_RELPOS_TABLE);
         printf("  [%s] B=%d: %2ld steps, %4llu stacked rows | dot %llu  dot_rows %llu  "
-               "f32 %llu  generic %llu  qgemm %llu  DEQUANT %llu | relpos sh %llu pv %llu "
+               "f32 %llu  generic %llu  qgemm %llu  DEQUANT %llu | relpos tb %llu sh %llu pv %llu "
                "gr %llu | %s\n",
                quant_name(quant), B, steps, rows,
                mynah_asr_qmat_counter(MYNAH_ASR_QC_DOT),
@@ -500,16 +514,19 @@ static int gate_identity(const char *dir, int quant, clip *cs, int n_clips) {
                mynah_asr_qmat_counter(MYNAH_ASR_QC_GENERIC),
                mynah_asr_qmat_counter(MYNAH_ASR_QC_QGEMM),
                mynah_asr_qmat_counter(MYNAH_ASR_QC_DEQUANT),
-               rp_sh, rp_pv, rp_gr,
+               rp_tb, rp_sh, rp_pv, rp_gr,
                ok ? "IDENTICAL OK" : "DIFFERENT FAIL");
         if (!ok) fail = 1;
-        /* S1-7: at B > 1 the streams reach a common K within a few steps, so a
-         * run that took the stacked path and never shared means the sharing
-         * silently stopped working. (rows == 0 = the whole batched path
+        /* The projection has to come from somewhere NAMED, or this gate goes
+         * green on a path nobody chose. S10-1 makes that the load-time table;
+         * with MYNAH_ASR_RELPOS_TABLE=0 it falls back to the S1-7 group
+         * sharing, which at B > 1 must happen because the streams reach a
+         * common K within a few steps. Neither = a silent regression to a
+         * per-stream projection. (rows == 0 = the whole batched path
          * degraded — an f32 build with MYNAH_ASR_BATCH_F32=0 — and the line
          * above already reports that.) */
-        if (B > 1 && rows > 0 && rp_sh == 0) {
-            printf("  [%s] B=%d: the rel-pos projection was never shared FAIL\n",
+        if (B > 1 && rows > 0 && rp_tb == 0 && rp_sh == 0) {
+            printf("  [%s] B=%d: the rel-pos projection was neither tabled nor shared FAIL\n",
                    quant_name(quant), B);
             fail = 1;
         }

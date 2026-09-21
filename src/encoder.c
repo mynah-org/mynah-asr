@@ -189,8 +189,11 @@ void mynah_asr_encoder_free(mynah_asr_encoder *enc) {
     }
     free(enc->layers);
     free(enc->bn_fold);
+    free(enc->relpos_tab);
     enc->layers = NULL;
     enc->bn_fold = NULL;
+    enc->relpos_tab = NULL;
+    enc->relpos_kmax = 0;
 }
 
 /* --------------------------------------------------------------- pos emb */
@@ -806,6 +809,69 @@ void mynah_asr_enc_relpos_counters_reset(void) {
         atomic_store_explicit(&g_relpos[i], 0ull, memory_order_relaxed);
 }
 
+/* ------------------------------------------------- the rel-pos table (S10-1)
+ * See encoder.h for why one table per layer serves every K. Built once, read
+ * by every stream of every worker, never written again. */
+const float *mynah_asr_enc_relpos_rows(const mynah_asr_encoder *enc, int li, int K) {
+    if (!enc || !enc->relpos_tab || K < 1 || K > enc->relpos_kmax) return NULL;
+    if (li < 0 || li >= enc->n_layers) return NULL;
+    const size_t P = (size_t)(2 * enc->relpos_kmax - 1), d = (size_t)enc->d_model;
+    return enc->relpos_tab + ((size_t)li * P + (size_t)(enc->relpos_kmax - K)) * d;
+}
+
+int mynah_asr_enc_relpos_table_init(mynah_asr_encoder *enc, int kmax) {
+    if (!enc || enc->n_layers < 1 || enc->d_model < 1 || kmax < 2) return -1;
+    if (enc->relpos_tab && enc->relpos_kmax >= kmax) return 0;
+    {   /* the A/B arm: off, every stream projects for itself, as before S10-1 */
+        const char *e = getenv("MYNAH_ASR_RELPOS_TABLE");
+        if (e && e[0] == '0') return -1;
+    }
+    for (int li = 0; li < enc->n_layers; li++)
+        if (!enc->layers[li].relk_w) return -1;
+
+    const size_t d = (size_t)enc->d_model;
+    const size_t P = (size_t)(2 * kmax - 1);
+    const size_t rows = (size_t)enc->n_layers * P;
+    if (rows > (size_t)1 << 28) return -1;              /* absurd kmax: refuse */
+
+    float *pe = malloc(P * d * sizeof(float));
+    float *tab = malloc(rows * d * sizeof(float));
+    if (!pe || !tab) { free(pe); free(tab); return -1; }
+
+    mynah_asr_pos_emb(enc, kmax, pe);
+    for (int li = 0; li < enc->n_layers; li++)
+        matmul_wt(pe, enc->layers[li].relk_w, tab + (size_t)li * P * d, (int)P, (int)d, (int)d);
+
+    /* The identity this table claims, CHECKED rather than trusted: for a K
+     * below kmax, the window must be byte for byte what the per-K projection
+     * produces. It is the row independence of the DOT family (sgemm.h), and on
+     * a provider where that does not hold the table is simply refused. Two
+     * probes: the largest K below kmax and a small one, on the last layer,
+     * which is the one a partial build would leave wrong. */
+    int ok = 1;
+    const int probes[2] = { kmax - 1, kmax > 4 ? 3 : 2 };
+    float *ref = malloc((size_t)(2 * kmax - 1) * d * sizeof(float));
+    if (!ref) ok = 0;
+    for (int pi = 0; ok && pi < 2; pi++) {
+        const int K = probes[pi];
+        if (K < 1 || K > kmax) continue;
+        const int li = enc->n_layers - 1;
+        const int Pk = 2 * K - 1;
+        mynah_asr_pos_emb(enc, K, pe);
+        matmul_wt(pe, enc->layers[li].relk_w, ref, Pk, (int)d, (int)d);
+        const float *win = tab + ((size_t)li * P + (size_t)(kmax - K)) * d;
+        if (memcmp(ref, win, (size_t)Pk * d * sizeof(float)) != 0) ok = 0;
+    }
+    free(ref);
+    free(pe);
+    if (!ok) { free(tab); return -1; }
+
+    free(enc->relpos_tab);
+    enc->relpos_tab = tab;
+    enc->relpos_kmax = kmax;
+    return 0;
+}
+
 /* Streaming attention, WITHOUT the q and o projections: they are plain per-row
  * linears, so the batched step hoists them out and runs them over every stream's
  * rows at once (S1-4). Everything left here is per stream: the K/V cache, the
@@ -825,10 +891,16 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
                                   const float *q, const float *kn, const float *vn,
                                   const float *pe, float *ctx, int Q,
                                   const float *k_cache, const float *v_cache, int valid,
-                                  const float *rk_in) {
+                                  const float *rk_in, int rk_kind) {
     const mynah_asr_encoder *enc = es->enc;
     const int d = enc->d_model, H = enc->n_heads, dk = enc->d_head;
-    const int K = valid + Q, P = 2 * K - 1;
+    const int K = valid + Q;
+    /* The rel_shift below reads brow[base + j] with base = K-1-valid-t = Q-1-t
+     * (t < Q) and j < K, so the rows it can ever touch are [0, K+Q-1) — barely
+     * half of the P = 2K-1 the projection and the bd GEMM used to produce
+     * (77 of 147 at K=74, Q=4). Everything past that was computed and thrown
+     * away on every stream, every layer, every step. */
+    const int Pu = K + Q - 1;
     const float scaling = 1.0f / sqrtf((float)dk);
 
     const float *rk = rk_in ? rk_in : es->sa_rk;
@@ -845,7 +917,7 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
         memcpy(vv + (size_t)valid * (size_t)d, vn, (size_t)Q * (size_t)d * sizeof(float));
 
         if (rk_in) {
-            relpos_count(MYNAH_ASR_RELPOS_SHARED);
+            relpos_count(rk_kind);
         } else {
             /* The projection a stream computes for itself because nobody in
              * this pass shares its K. It sits INSIDE the attention, which is
@@ -854,7 +926,7 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
              * projection. Timed here and subtracted from the attention by the
              * caller, so the two names stop trading cost with each other. */
             const unsigned long long p0_ = ep_ns();
-            matmul_wt(pe, L->relk_w, es->sa_rk, P, d, d);
+            matmul_wt(pe, L->relk_w, es->sa_rk, Pu, d, d);
             atomic_fetch_add_explicit(&g_ep_ns[EP_RELPOS_PRIV], ep_ns() - p0_,
                                       memory_order_relaxed);
             relpos_count(MYNAH_ASR_RELPOS_PRIVATE);
@@ -866,8 +938,8 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
                 for (int i = 0; i < dk; i++)
                     qb[(size_t)t * (size_t)dk + (size_t)i] =
                         q[(size_t)t * (size_t)d + ho + (size_t)i] + L->bias_v[ho + (size_t)i];
-            mynah_asr_gemm_f32(0, 1, Q, P, dk,
-                               1.0f, qb, dk, rk + ho, d, 0.0f, bd, P);
+            mynah_asr_gemm_f32(0, 1, Q, Pu, dk,
+                               1.0f, qb, dk, rk + ho, d, 0.0f, bd, Pu);
 
             for (int t = 0; t < Q; t++)
                 for (int i = 0; i < dk; i++)
@@ -878,7 +950,7 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
 
             for (int t = 0; t < Q; t++) {
                 float *srow = scores + (size_t)t * (size_t)K;
-                const float *brow = bd + (size_t)t * (size_t)P;
+                const float *brow = bd + (size_t)t * (size_t)Pu;
                 /* rel_shift: p = (K-1) - (valid + t) + j, j in [0, K) */
                 const int base = K - 1 - valid - t;
                 float maxv = -3.0e38f;
@@ -903,14 +975,17 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
 
 /* Single-stream attention: the two hoisted linears around the core, in the same
  * order as before the split. */
-static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L,
+static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L, int li,
                              const float *x, const float *kn, const float *vn,
                              const float *pe, float *out, int Q,
                              const float *k_cache, const float *v_cache, int valid) {
     mynah_asr_qmat_mul(&L->q_w, x, es->sa_q, Q);
-    /* NULL: the single path always computes its own rk — unchanged by S1-7 */
+    /* S1-7 never touched the single path; S10-1 does, because the table is not
+     * about the streams of one pass but about the model. NULL when there is no
+     * table and the core projects for itself, exactly as before. */
+    const float *rk_tab = mynah_asr_enc_relpos_rows(es->enc, li, valid + Q);
     stream_attention_core(es, L, es->sa_q, kn, vn, pe, es->sa_ctx, Q,
-                          k_cache, v_cache, valid, NULL);
+                          k_cache, v_cache, valid, rk_tab, MYNAH_ASR_RELPOS_TABLE);
     mynah_asr_qmat_mul(&L->o_w, es->sa_ctx, out, Q);
 }
 
@@ -1009,7 +1084,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         layer_norm_f(x, L->ln_att_w, L->ln_att_b, xn, Q, d);
         mynah_asr_qmat_mul(&L->k_w, xn, kn, Q);
         mynah_asr_qmat_mul(&L->v_w, xn, kn + nd, Q);
-        stream_attention(es, L, xn, kn, kn + nd, es->sa_pe, tmp, Q, kc, vc,
+        stream_attention(es, L, li, xn, kn, kn + nd, es->sa_pe, tmp, Q, kc, vc,
                          es->cache_valid);
         update_kv_cache(kc, kn, es->cache_valid, Q, es->left, d);
         update_kv_cache(vc, kn + nd, es->cache_valid, Q, es->left, d);
@@ -1196,7 +1271,12 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         q_out[i] = Q;
         R += Q;
         const int pe_K = es->cache_valid + Q;
-        if (pe_K != es->sa_pe_K) {
+        /* With the table there is no projection to feed, so there is no
+         * position embedding to build either: `mynah_asr_pos_emb` is 2K-1 rows
+         * of double pow/sin/cos and it ran on every step of every stream whose
+         * left cache was still filling, and again after every reset — which in
+         * a server is once per utterance. */
+        if (pe_K != es->sa_pe_K && !mynah_asr_enc_relpos_rows(enc, 0, pe_K)) {
             mynah_asr_pos_emb(enc, pe_K, es->sa_pe);
             es->sa_pe_K = pe_K;
         }
@@ -1267,7 +1347,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
          * other member of the group would have fed to the same matmul_wt. */
         EP_ADD(EP_QKV);
         const float *rk_sh = NULL;
-        if (share) {
+        if (share && !enc->relpos_tab) {
             matmul_wt(ess[lead]->sa_pe, L->relk_w, bb->rk_sh, P_sh, d, d);
             relpos_count(MYNAH_ASR_RELPOS_GROUP);
             rk_sh = bb->rk_sh;
@@ -1291,9 +1371,11 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             const unsigned long long a_ = ep_ns();
             const unsigned long long rp0_ =
                 atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);
+            const float *rk_tab = mynah_asr_enc_relpos_rows(enc, li, bb->kks[i]);
             stream_attention_core(es, L, bb->qs + off, kn + off, vn + off, es->sa_pe,
                                   bb->ctxs + off, Q, kc, vc, es->cache_valid,
-                                  bb->kks[i] == k_sh ? rk_sh : NULL);
+                                  rk_tab ? rk_tab : (bb->kks[i] == k_sh ? rk_sh : NULL),
+                                  rk_tab ? MYNAH_ASR_RELPOS_TABLE : MYNAH_ASR_RELPOS_SHARED);
             const unsigned long long b_ = ep_ns();
             const unsigned long long rp1_ =
                 atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);

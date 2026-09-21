@@ -43,6 +43,11 @@ typedef struct {
     const float *prompt_l1_w, *prompt_l1_b, *prompt_l2_w, *prompt_l2_b;
     const float *encproj_w, *encproj_b;
     int num_prompts, prompt_inter, d_out;
+    /* S10-1: the rel-pos projection for EVERY K, as one table per layer. See
+     * mynah_asr_enc_relpos_table_init. NULL when the model does not stream, the
+     * table did not fit, or the build-time identity check refused it. */
+    float *relpos_tab;      /* [n_layers][2*relpos_kmax-1, d_model] */
+    int relpos_kmax;        /* largest K the table serves (0 = no table) */
 } mynah_asr_encoder;
 
 /* quantize != 0: per-row INT8 on the large linears (FFN, attn q/k/v/o, pointwise
@@ -206,9 +211,37 @@ enum {
     MYNAH_ASR_RELPOS_PRIVATE = 0, /* attention core that computed its own rk     */
     MYNAH_ASR_RELPOS_SHARED,      /* attention core that read a group's rk       */
     MYNAH_ASR_RELPOS_GROUP,       /* rk computed once for a group (layer x pass) */
+    MYNAH_ASR_RELPOS_TABLE,       /* attention core that read the load-time table */
     MYNAH_ASR_RELPOS__N
 };
 unsigned long long mynah_asr_enc_relpos_counter(int which);
 void mynah_asr_enc_relpos_counters_reset(void);
+
+/* ------------------------------------------------- the rel-pos table (S10-1)
+ * S1-7 above shares `rk` between the streams of ONE pass that happen to sit at
+ * the same K. It is the right idea one step too late: `rk = pe(K) @ relk_w^T`
+ * depends on neither the stream, the audio nor the cache CONTENTS, and
+ * `pe(K)[p]` depends only on `pos = K-1-p`. So the projections for two
+ * different K are the same rows read at two different offsets:
+ *
+ *     rk(K)[p] == RK[p + (kmax - K)]   with   RK = pe(kmax) @ relk_w^T
+ *
+ * One table per layer, built once at load, serves every K <= kmax and every
+ * stream for the life of the process. Bit-exactness is a property of the GEMM:
+ * `x @ W^T` is the DOT family of src/sgemm.c, where each output row is one dot
+ * product over the whole of k and nothing depends on the number of rows — the
+ * same property S1-4 already rests on. It is CHECKED at build time rather than
+ * trusted (a window is compared byte for byte against a direct projection); a
+ * provider that fails the check gets no table and the per-K path unchanged.
+ *
+ * kmax is the largest K a stream of this model can reach: left + q + 2, the
+ * same bound mynah_asr_enc_stream_init carves its scratch for.
+ * Cost: n_layers * (2*kmax-1) * d_model floats, ~14 MiB for Nemotron 0.6B,
+ * built before the server forks and therefore shared by every worker. */
+int mynah_asr_enc_relpos_table_init(mynah_asr_encoder *enc, int kmax);
+
+/* The projection rows for this layer at this K, or NULL when there is no table
+ * (K above kmax, or no table at all) and the caller must project for itself. */
+const float *mynah_asr_enc_relpos_rows(const mynah_asr_encoder *enc, int li, int K);
 
 #endif
