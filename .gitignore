@@ -77,3 +77,8 @@ models_local/
 
 # agent worktrees
 .claude/worktrees/
+
+# run evidence: tier.sh, knee.py and the load harness write here. Measurements
+# belong in docs/serving-findings.md and configs/perf/, never as raw output in
+# the tree (repo rule 6).
+tier-evidence/
