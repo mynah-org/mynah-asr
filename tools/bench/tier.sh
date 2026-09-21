@@ -182,7 +182,6 @@ for c in clips:
     p = os.path.join(run, "ref-" + os.path.basename(c)[:-4] + ".txt")
     if os.path.exists(p):
         out[c] = open(p).read().strip()
-json.dump(out, open(os.devnull, "w"))
 print(json.dumps(out, ensure_ascii=False))
 PY
     say "  $(python3 -c "import json;print(len(json.load(open('$REFJSON'))))" ) reference transcript(s) cached"
@@ -192,11 +191,14 @@ PY
     start_server "$MODEL" "--threads 8 --cap 8 $SERVER_ARGS" || exit 3
     EXTRA=""
     [ -n "$BANK_MANIFEST" ] && EXTRA="--transcripts $BANK_MANIFEST"
+    # Capture the status BEFORE piping: `cmd | tee | tail` reports tail's status,
+    # which is always 0, and a gate that cannot fail is not a gate.
     python3 tools/bench/stream_load.py --mode wave --streams 4 --repeat 1 \
         --port "$PORT" --lookahead "$LOOKAHEAD" --clips $CLIPS_SHORT \
-        --reference "$REFJSON" $EXTRA --json "$RUN/t0-wave.json" 2>&1 | tee -a "$LOG" | tail -14
+        --reference "$REFJSON" $EXTRA --json "$RUN/t0-wave.json" > "$RUN/t0-wave.txt" 2>&1
     T0RC=$?
-    [ "$T0RC" = "0" ] || note_fail "the 4-stream wave did not pass its envelope"
+    tail -14 "$RUN/t0-wave.txt" | tee -a "$LOG"
+    [ "$T0RC" = "0" ] || note_fail "the 4-stream wave did not pass its envelope (rc=$T0RC)"
 
     say ""
     say "-- REST agrees with the CLI --"
@@ -243,8 +245,10 @@ PY
         start_server "$PARAKEET" "--threads 8 --cap 8" || exit 3
         python3 tools/bench/rest_load.py --host 127.0.0.1 --port "$PORT" \
             --ladder 1,4 --requests-per-stream 2 --clips $CLIPS_SHORT \
-            --json "$RUN/t0-parakeet-rest.json" 2>&1 | tee -a "$LOG" | tail -8 \
-            || note_fail "the Parakeet REST probe"
+            --json "$RUN/t0-parakeet-rest.json" > "$RUN/t0-parakeet.txt" 2>&1
+        PRC=$?
+        tail -8 "$RUN/t0-parakeet.txt" | tee -a "$LOG"
+        [ "$PRC" = "0" ] || note_fail "the Parakeet REST probe (rc=$PRC)"
         stop_server
     fi
 }
@@ -254,9 +258,14 @@ tier1() {
     say ""
     say "-- quality first, on an idle box: a CER measured under load is two questions --"
     if [ -n "$BANK_MANIFEST" ]; then
+        BASE="configs/quality/$(basename "$MODEL")-$QUANT-offline.json"
+        [ -f "$BASE" ] && BASE_ARG="--baseline $BASE" || BASE_ARG=""
         python3 tools/eval/cer_offline.py --model "$MODEL" --quant "$QUANT" \
-            --manifest "$BANK_MANIFEST" --limit 12 --json "$RUN/t1-cer.json" 2>&1 \
-            | tee -a "$LOG" | tail -6 || note_fail "the offline CER pass"
+            --manifest "$BANK_MANIFEST" --json "$RUN/t1-cer.json" $BASE_ARG \
+            > "$RUN/t1-cer.txt" 2>&1
+        CRC=$?
+        tail -8 "$RUN/t1-cer.txt" | tee -a "$LOG"
+        [ "$CRC" = "0" ] || note_fail "the offline CER pass (rc=$CRC; a regression, or no reference)"
     else
         say "  skipped: no manifest"
     fi
@@ -272,8 +281,9 @@ print(max(16, min(128, n * 3)))")
     [ -n "$BANK_MANIFEST" ] && EXTRA="--transcripts $BANK_MANIFEST"
     python3 tools/bench/knee.py --port "$PORT" --lookahead "$LOOKAHEAD" \
         --clips $BANK_CLIPS --lo 4 --hi "$HI" --resolution 4 --repeat 2 \
-        --out "$RUN/probes" --json "$RUN/knee.json" $EXTRA 2>&1 | tee -a "$LOG"
+        --out "$RUN/probes" --json "$RUN/knee.json" $EXTRA > "$RUN/knee.txt" 2>&1
     KRC=$?
+    cat "$RUN/knee.txt" | tee -a "$LOG"
     stop_server
     survivors_check
     [ "$KRC" = "0" ] || { note_fail "no knee was found (see $RUN/knee.json)"; return; }
@@ -300,17 +310,22 @@ tier2() {
         python3 tools/bench/stream_load.py --mode soak --streams "$CONC" \
             --duration "$SOAK_S" --warmup 30 --window 60 --seed 42 \
             --port "$PORT" --lookahead "$LOOKAHEAD" --clips $BANK_CLIPS \
-            --transcripts "$BANK_MANIFEST" --json "$RUN/soak-$rep.json" 2>&1 \
-            | tee -a "$LOG" | tail -24
-        [ "$?" = "0" ] || note_fail "soak $rep did not pass its envelope"
+            --transcripts "$BANK_MANIFEST" --json "$RUN/soak-$rep.json" \
+            > "$RUN/soak-$rep.txt" 2>&1
+        SRC=$?
+        tail -24 "$RUN/soak-$rep.txt" | tee -a "$LOG"
+        [ "$SRC" = "0" ] || note_fail "soak $rep did not pass its envelope (rc=$SRC)"
     done
     stop_server
     survivors_check
 
     say ""
     say "-- do the two runs agree? --"
-    python3 tools/bench/compare_runs.py "$RUN/soak-1.json" "$RUN/soak-2.json" 2>&1 \
-        | tee -a "$LOG" || note_fail "the two soaks did not agree"
+    python3 tools/bench/compare_runs.py "$RUN/soak-1.json" "$RUN/soak-2.json" \
+        --json "$RUN/agreement.json" > "$RUN/compare.txt" 2>&1
+    ARC=$?
+    cat "$RUN/compare.txt" | tee -a "$LOG"
+    [ "$ARC" = "0" ] || note_fail "the two soaks did not agree (rc=$ARC)"
 }
 
 case "$TIER" in
