@@ -147,6 +147,105 @@ its absence from production acceptance. Two SLO families, named and kept apart:
 
 F29 is the proof that one can move a very long way without touching the other.
 
+## R-1 RESULT (2026-09-21, from code on the development host)
+
+Every timestamp on the path, read from the source rather than from its name.
+Nothing below was measured on a server; it is what the code does.
+
+### The two clocks, and the one that was wrong
+
+The server stamps everything with `mynah_asr_now()` (`server/slot.c:99`):
+`clock_gettime(CLOCK_MONOTONIC)`. The harness stamped everything with
+`time.monotonic()`. On Linux those are the same call. **On macOS they are not**:
+`time.get_clock_info("monotonic")` reports `mach_absolute_time()`, which
+excludes the time the machine spent asleep, while Darwin's `CLOCK_MONOTONIC`
+includes it. Measured on this host, three samples, the C reading never landed
+inside the Python window and the offset was **4.63 days**.
+
+Durations inside one process are unaffected, so no number in F29 changes. A
+client mark minus a server mark would have been nonsense, and R-2 is built
+entirely out of such differences. `tools/bench/stream_load.py` now takes every
+mark from `time.clock_gettime(time.CLOCK_MONOTONIC)` (`mono()`), which was
+verified to land inside a window bracketing a C `clock_gettime` call, three
+times out of three. On the box this is a no-op.
+
+### What each mark actually means
+
+| name | where | clock | what it really is |
+|---|---|---|---|
+| `t_start` | `stream_load.py`, `run_utterance` | client | **before** `ws_connect`: includes TCP connect and the WebSocket upgrade |
+| `sends[i][0]` | same, after `ws_send` returns | client | the write of frame `i` **completed locally**; not server receipt |
+| `sends[i][1]` | same | — | cumulative audio seconds handed to the socket, `(i+1)*frame/32000` |
+| arrival | `server/main.c:968`, `last_activity` | server | after the whole WS frame was read **and unmasked**: a faithful "audio received" |
+| per-sample arrival | `slot_record_arrival_locked`, `server/slot.c:249` | server | the same instant, recorded against the ring index so a chunk can be dated later |
+| ready | `slot_refresh_ready_locked`, `server/slot.c:63` | server | the rising edge of "this slot holds a whole chunk"; re-stamped by `slot_take` when a whole chunk is still left behind |
+| selected | `s->t_last_step`, `server/sched.c` `sched_stage` | server | the chunk was staged into the batch |
+| model start | `t0` in `sched_step_batch` | server | the whole ready set enters the model together |
+| result | `now` in `sched_on_result` | server | the model's callback fired — **before** framing, queueing and the socket |
+| `lag_ms` on the wire | `server/sched.c:377` | server | `result − arrival of the last sample consumed`. It stops at the callback: framing, the output ring and the socket write are **not** in it |
+| `audio_s` / `t1` on the wire | `src/mynah_asr.c`, `stream_decode_emit` | — | `samples_fed / sample_rate`: audio the model had **consumed** when it produced this text |
+| `ev["t"]` | `stream_load.py`, reader thread | client | after `ws_recv` returned a complete message, before `json.loads` |
+
+### The three TTFPs, as implemented
+
+    ttfb_ms            = first ANY frame            − sends[0][0]
+    ttfp_ms            = first delta with non-empty text − sends[0][0]
+    ttfp_from_onset_ms = the same first delta − send time of the frame carrying the onset sample
+
+So today's TTFP is **neither** open-relative nor speech-relative: it is relative
+to the completion of the first audio write, which excludes connect and upgrade
+and includes everything after. That is a defensible zero, and it is not what the
+name says. `ttfp_from_onset_ms` is speech-relative but measured from when the
+CLIENT sent the onset, which equals real time only while `paced` is true —
+`analyze_utterance` already records `paced`, so the condition is checkable per
+run rather than assumed.
+
+A delta is emitted only when `total > s->chars_emitted`: a step that produces
+only blanks emits nothing. Therefore `first_delta_audio_s`, already recorded by
+the harness and never yet read, **is** `audio_seconds_consumed_at_first_nonblank`.
+
+### What is NOT instrumented
+
+Between "audio received" and "client sees text" the server publishes exactly
+three instants: arrival, the result callback, and `lag_ms` which is their
+difference. There is no timestamp for first feature frame, first encoder
+admission, first encoder completion, first decoder emission, the framing, the
+enqueue, or the socket write. **`publication_delay` (R-4) cannot be computed
+from anything the server emits today.** It has to be instrumented.
+
+`s->t_first_delta` (`server/slot.c:107`, set at `server/sched.c:403`) is
+written on every stream and **read by nothing**. The server already knows when
+it first spoke and throws it away.
+
+### What the pipeline is NOT doing
+
+Three suspects checked and cleared, so R-2 does not have to carry them:
+
+- **The batch window does not delay a first chunk.** `sched_collect`
+  (`server/sched.c:576`) sets `exempt` and breaks out of the wait when any live
+  slot has `steps == 0`. `steps` is zeroed on slot open and on reset, and the
+  harness opens a new socket per utterance, so every utterance's first chunk is
+  exempt. The comment claims it; the code does it.
+- **The scheduler has no tick.** Its idle wait is a plain `pthread_cond_wait`
+  with no timeout (`server/sched.c:1054`), woken by the push doorbell.
+- **Nagle is off on both sides** (`server/main.c:1190`, `stream_load.py`), and
+  the writer signals its condvar on enqueue. No 40 ms ACK wait is hiding here.
+
+### The model floor, derived (to be confirmed by measurement in R-2)
+
+From `mynah.json`: `hop 160`, `n_fft 512`, `sub_factor 8`, default preset
+`[56, 3]`. From `mynah_asr_enc_stream_need` (`src/encoder.c:729`) the first
+chunk wants `1 + sub*right = 25` mel frames against `sub*(right+1) = 32`
+afterwards, and `mynah_asr_mel_stream_samples_until` (`src/features.c:283`)
+turns frame 24 into `24*160 + 512/2 = 4096` samples:
+
+    first chunk      4096 samples = 256.0 ms of audio
+    every chunk after                320.0 ms  (= P, the cadence period)
+
+**The first admission needs 256 ms of audio, not 320.** Whether the RNNT
+commits a character on that first step is exactly the open question, and
+`first_delta_audio_s` answers it from a run that has already been instrumented.
+
 ## Acceptance philosophy
 
 No target invented from the current implementation. First establish the
@@ -169,4 +268,7 @@ at all.
 
 ## Next action
 
-R-1 and R-2 on the development host, at C=1, with no paid machine running.
+R-2: one stream, C=1, on the development host. The clock is now common to
+both processes, so the waterfall can cross the process boundary — but the
+server publishes only three instants on that path, so R-2 begins by adding the
+missing ones, starting with the one the server already computes and discards.

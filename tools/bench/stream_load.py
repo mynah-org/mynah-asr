@@ -48,6 +48,22 @@ import wave
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import streaming_metrics as M          # noqa: E402  (the single definition of every metric)
 
+# ------------------------------------------------------------------------ the clock
+#
+# CLOCK_MONOTONIC explicitly, never `time.monotonic()`, because the server stamps
+# every arrival and every emission with `clock_gettime(CLOCK_MONOTONIC)`
+# (`mynah_asr_now`, server/slot.c) and a waterfall that crosses the process
+# boundary has to subtract two readings of ONE clock.
+#
+# On Linux the two are the same call and this changes nothing. On macOS
+# `time.monotonic()` is `mach_absolute_time()`, which excludes the time the
+# machine spent asleep, while `CLOCK_MONOTONIC` includes it: measured on this
+# development host the two differ by 4.6 days. Durations inside one process are
+# unaffected either way; a client mark minus a server mark is not.
+def mono() -> float:
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
 # ---------------------------------------------------------------- websocket framing (client)
 
 
@@ -218,13 +234,13 @@ def stratified_schedule(bank, classes, seed, n):
 def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
     """One utterance, recorded in the input format of `streaming_metrics`.
 
-    Nothing is aggregated here: the record is raw marks.  `time.monotonic()` is system-wide
-    on Linux (CLOCK_MONOTONIC) and macOS (mach_absolute_time), so marks taken in different
-    stream processes share one timeline and can be windowed together by the parent."""
+    Nothing is aggregated here: the record is raw marks.  `mono()` is CLOCK_MONOTONIC, which is
+    system-wide, so marks taken in different stream processes share one timeline and can be
+    windowed together by the parent -- and share it with the server's own stamps."""
     frame_bytes = int(16000 * a.frame_ms / 1000) * 2
     n_frames = max(1, (len(pcm) + frame_bytes - 1) // frame_bytes)
     rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
-           "events": [], "done_t": None, "t_start": time.monotonic(), "error": None,
+           "events": [], "done_t": None, "t_start": mono(), "error": None,
            "rejected": False, "status": None, "lang": None, "retry_after": None}
     # `model=` names a WORKER GROUP in a multi-model fleet (S2-6). Sent only when
     # asked for, so a single-model server sees exactly the query it always saw.
@@ -250,7 +266,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
         try:
             while not stop.is_set():
                 op, payload = ws_recv(sock)
-                now = time.monotonic()
+                now = mono()
                 if op == 0x8:
                     break
                 if op != 0x1:
@@ -281,15 +297,15 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
     th = threading.Thread(target=reader, daemon=True)
     th.start()
     period = a.frame_ms / 1000.0 / a.pace
-    t0 = time.monotonic()
+    t0 = mono()
     try:
         for i in range(n_frames):
             due = t0 + i * period
-            now = time.monotonic()
+            now = mono()
             if due > now:
                 time.sleep(due - now)              # the schedule, never a spin
             ws_send(sock, 0x2, pcm[i * frame_bytes:(i + 1) * frame_bytes])
-            t_sent = time.monotonic()
+            t_sent = mono()
             rec["sends"].append([t_sent, min((i + 1) * frame_bytes, len(pcm)) / 32000.0])
             rec["late_ms"].append(max(0.0, (t_sent - due) * 1000.0))
         ws_send(sock, 0x8, b"")                    # close = finalize, then `done`
@@ -318,7 +334,7 @@ def stream_main(a, idx: int, schedule, classes_of, q) -> None:
     while True:
         if a.mode == "wave" and k >= a.repeat:
             break
-        if deadline is not None and time.monotonic() >= deadline:
+        if deadline is not None and mono() >= deadline:
             break
         clip = schedule[(idx + k * a.streams) % len(schedule)]
         if clip not in pcms:
@@ -451,7 +467,7 @@ def main() -> int:
     thr["marginal_factor"] = a.marginal_factor
 
     health_before = health(a.host, a.port)
-    a._t0 = time.monotonic()
+    a._t0 = mono()
     q: mp.Queue = mp.Queue()
     procs = [mp.Process(target=stream_main, args=(a, i, schedule, classes_of, q), daemon=True)
              for i in range(a.streams)]
@@ -463,7 +479,7 @@ def main() -> int:
     # a blocking get with a timeout: the parent sleeps in the kernel, it never spins
     hard_deadline = a._t0 + (a.duration if a.mode == "soak" else a.repeat * a.done_timeout) \
         + a.done_timeout + 300.0
-    while time.monotonic() < hard_deadline:
+    while mono() < hard_deadline:
         if expected is not None and len(records) >= expected:
             break
         try:
@@ -482,7 +498,7 @@ def main() -> int:
             records.append(q.get_nowait())
         except Exception:                           # noqa: BLE001
             break
-    wall = time.monotonic() - a._t0
+    wall = mono() - a._t0
     health_after = health(a.host, a.port)
 
     utts = [M.analyze_utterance(r, frame_ms=a.frame_ms, pace=a.pace, onsets=onsets)
