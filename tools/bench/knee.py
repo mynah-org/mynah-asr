@@ -64,10 +64,17 @@ def probe(a, c, tag):
            "--clips", *a.clips]
     if a.mode == "soak":
         # A probe judges STEADY STATE. C streams opening at once put a ramp at
-        # the head of the run whose TTFP is several seconds and has nothing to
-        # do with the concurrency being tested: measured at C=32, p95 TTFP was
-        # 4.5 s over a 60 s run with a 15 s warm-up and 1.7 s over a 600 s run
-        # with 30 s. Excluding the ramp is what the qualifying soaks already do.
+        # the head of the run, and the same build at the same concurrency
+        # measured p95 TTFP of 4.5 s over a 60 s run with a 15 s warm-up and
+        # 1.7 s over a 600 s run with 30 s. An opening-ramp artifact is
+        # strongly indicated and the ramp is excluded here, as the qualifying
+        # soaks already exclude it.
+        #
+        # That is a statement about this screen, NOT a verdict on TTFP. The
+        # metric has an unexplained load-independent floor of about 1.5 s
+        # (F25), it has not been decomposed, and it stays a production question
+        # in its own right. Excluding the ramp buys a capacity screen that can
+        # discriminate; it does not make the TTFP line answered.
         cmd += ["--duration", str(a.duration), "--warmup", str(a.warmup),
                 "--window", str(a.window), "--bank", "short,medium",
                 "--seed", str(a.seed)]
