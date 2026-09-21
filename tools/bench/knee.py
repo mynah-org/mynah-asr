@@ -104,14 +104,41 @@ def probe(a, c, tag):
     counts = summ.get("counts") or {}
     m = summ.get("metrics") or {}
 
+    # The predicate the bisection is driven by, stated rather than assumed.
+    # No limit is changed and no line is hidden: named lines are EXCLUDED FROM
+    # THE SEARCH and reported with their real status beside the result. The
+    # reason this exists is TTFP: on a short probe it fails at every
+    # concurrency, including ones where emission lag, backlog, finalization and
+    # losses are all comfortable, so a bisection driven by the whole envelope
+    # finds no knee anywhere and reports a healthy server as unusable. Which
+    # question a run answers is a choice; making it silently is the error.
+    lines = env.get("lines") or []
+    ignored = [l for l in lines
+               if any(k.lower() in str(l.get("line", "")).lower() for k in a.ignore_line)]
+    kept = [l for l in lines if l not in ignored]
+    verdict = env.get("verdict", "INVALID")
+    if ignored and verdict != "INVALID":
+        if any(l.get("status") == "FAIL" for l in kept):
+            verdict = "NOT STREAMABLE"
+        elif any(l.get("status") == "MARGINAL" for l in kept):
+            verdict = "MARGINAL"
+        elif kept and all(l.get("status") == "NO DATA" for l in kept):
+            verdict = "INVALID"
+        else:
+            verdict = "GOOD"
+
     def g(key, field="p95"):
         s = m.get(key) or {}
         return s.get(field)
 
     return {
         "c": c, "tag": tag, "wall_s": wall,
-        "verdict": env.get("verdict", "INVALID"),
-        "failing": [l.get("line") for l in (env.get("lines") or [])
+        "verdict": verdict,
+        "envelope_verdict": env.get("verdict", "INVALID"),
+        "excluded_from_predicate": [{"line": l.get("line"), "status": l.get("status"),
+                                     "value": l.get("value"), "limit": l.get("limit")}
+                                    for l in ignored],
+        "failing": [l.get("line") for l in kept
                     if l.get("status") in ("FAIL", "MARGINAL")],
         "ok": counts.get("ok"), "lost": counts.get("errors"),
         "rejected": counts.get("rejected"),
@@ -146,6 +173,11 @@ def line(p):
         bits.append(f"worst/median={f['worst_over_median']:.1f}")
     if p.get("failing"):
         bits.append("<- " + ",".join(x for x in p["failing"] if x))
+    for ex in p.get("excluded_from_predicate") or []:
+        bits.append(f"[not in predicate: {ex['line']} {ex['status']} "
+                    f"{ex['value']:.0f}/{ex['limit']:.0f}]"
+                    if isinstance(ex.get("value"), (int, float)) else
+                    f"[not in predicate: {ex['line']} {ex['status']}]")
     bits.append(f"[{p['wall_s']:.0f}s]")
     return "  ".join(bits)
 
@@ -169,6 +201,11 @@ def main():
     ap.add_argument("--warmup", type=int, default=25, help="soak seconds excluded")
     ap.add_argument("--window", type=int, default=25, help="soak drift window")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--ignore-line", action="append", default=[], metavar="SUBSTRING",
+                    help="exclude an envelope line from the SEARCH predicate by name "
+                         "(it is still measured, still printed, still in the JSON). "
+                         "Use when a line cannot be supported by a probe of this "
+                         "length and would otherwise refuse every concurrency.")
     ap.add_argument("--lo", type=int, default=4, help="a concurrency believed to hold")
     ap.add_argument("--hi", type=int, default=64, help="a concurrency believed to break")
     ap.add_argument("--resolution", type=int, default=4,
@@ -188,6 +225,9 @@ def main():
                   if a.mode == "soak" else f"{a.repeat} utterance(s) per stream")
     print(f"knee search: C in [{a.lo}, {a.hi}], resolution {a.resolution}, "
           f"{probe_desc}, one warm server")
+    if a.ignore_line:
+        print(f"  predicate EXCLUDES the line(s) named {a.ignore_line}: they are still "
+              f"measured and printed, and they do not choose the next concurrency.")
     print("  a probe SCREENS. This tool never promotes an operating point.")
     probes = []
 
@@ -240,6 +280,9 @@ def main():
                   f"The predicate is noisy here; this is not a capacity claim.")
 
     result = {
+        "predicate": {"excluded_lines": a.ignore_line,
+                      "note": ("an excluded line is measured and reported, it simply does "
+                               "not steer the search; nothing was relaxed")},
         "knee": {"highest_holding": lo, "first_breaking": hi,
                  "resolution": a.resolution,
                  "confirmed": bool(confirm and holds(confirm)) if confirm else None},
