@@ -1429,3 +1429,148 @@ streaming-capacity knee excluding TTFP**, not a production-safe concurrency.
 An opening-ramp artifact is strongly indicated and is not established; TTFP
 remains an unresolved production metric and must stay in the acceptance
 criteria. See `.work/first-partial-responsiveness.md`.
+
+## F30 — First-partial responsiveness on the Axion: the wait is evidence, not queueing
+
+**STATUS: frozen checkpoint for the R mission.** Three experiments on the paid
+box, 2026-09-21, after F29's campaign and on the same machine class. Every
+aggregate below was regenerated from the raw saved artifacts AFTER a defect in
+the pairing was fixed; the pre-fix numbers are not quoted anywhere.
+
+**Provenance.** GCP c4a-highcpu-32, Neoverse-V2, aarch64, `blas=own`,
+`simd=neon+dotprod+i8mm`, `kernel.int8_rows -> neon-smmla`. Commit `8cfb660`.
+Model `nemotron-3.5-asr-streaming-0.6b`, int8, preset `[56, 3]`. Evidence
+`.work/evidence/axion-r3-2026-09-21/r3-session.tgz`, 60 files, sha256
+`c68d187f4946c74dae6a96e3e20bbd4669bf46b9508a120f8e7ba54e7a5cd610`.
+
+### How a client mark may be subtracted from a server mark
+
+Both processes read `CLOCK_MONOTONIC` (`mynah_asr_now`, and the harness since
+`baf628b`). There is no id shared across the boundary, so a pair is established
+by invariants and then PROVED, never assumed: the server must have consumed the
+same clip duration to within 20 ms and emitted exactly the delta count the
+client received, and
+
+    first_audio <= first_result <= first_queued <= first_send <= client_receive
+
+must hold. A violation is impossible inside one stream, so it is a mispairing
+and the sample is rejected and counted. Candidates are assigned globally
+closest-first. Three prefork workers share one stderr, so a torn trace line is
+dropped and counted too.
+
+| C | utterances | paired | unpaired (excluded) | torn lines | server lines unclaimed |
+|---|---|---|---|---|---|
+| 1 | 4 | 4 | 0 | 0 | 2 |
+| 8 | 28 | 23 | 5 | 0 | 18 |
+| 32 | 113 | 106 | 7 | 0 | 71 |
+| 65 | 204 | 200 | 4 | 5 | 127 |
+
+Unclaimed server lines are the warm-up streams the opening exclusion drops.
+**Before this gate the C=32 and C=65 means carried one mispaired row each and
+reported a NEGATIVE publication delay** — physically impossible, and the reason
+the gate exists.
+
+### RESULT — cold start is major page faults, and it is 3.26 s
+
+Twelve fresh server processes, identical command, same clip, six with the page
+cache warm and six with it dropped (`echo 3 > /proc/sys/vm/drop_caches`):
+
+| arm | n | first model step | major faults | minor faults |
+|---|---|---|---|---|
+| page cache DROPPED | 6 | 3260-3270 ms | 6555-6624 | 21538-21902 |
+| page cache WARM | 5 | 36 ms | 0-2 | 17252-21821 |
+| the very first run of the session | 1 | 3263 ms | 6580 | 21821 |
+| **second step, every run** | 12 | **12.6-12.8 ms** | **0** | 90-148 |
+
+The one "warm" run that cost 3.26 s was the first of the whole experiment, when
+the model had not been read yet — so it is a confirmation, not an exception.
+**The first model step of a fresh process pays ~6.5k major faults reading the
+weights from disk.** R-3 had left this UNKNOWN because on the development host
+it appeared 1 time in 3; that was page-cache state, not nondeterminism.
+
+A second, smaller layer survives a warm cache: ~17-21k MINOR faults on the first
+step, 36 ms against 12.7 ms for the second. First touch of pages already
+resident.
+
+**DECISION: not fixed here.** An explicit warm-up is now a justified change
+rather than a guess, but it is a change to startup behaviour and belongs to its
+own item with its own before/after.
+
+### RESULT — the C=1 decomposition reproduces on the production ISA
+
+Eight clips, onsets 0.15-3.45 s, one stream at a time, warm server.
+`publication_delay` = client's first visible partial minus the server's own
+first non-blank: **0.08-0.10 ms** (development host: 0.12-0.23 ms).
+
+| span | mean ms | share | owner |
+|---|---|---|---|
+| further audio the RNNT wanted, at 1x | 1534.0 | 82.7 % | MODEL + CONFIG |
+| the first chunk's 256 ms | 240.0 | 12.9 % | REAL-TIME INPUT |
+| encoder + RNNT wall | 81.1 | 4.4 % | MODEL COMPUTE |
+| framing + output ring + socket | **0.1** | 0.0 % | SERVING |
+
+**FACT — the decision is ISA-independent, as rule 4 requires.** The audio
+consumed after speech onset before the first non-blank, per clip, is
+0.716 / 0.946 / 0.746 / 0.696 / 0.906 / 0.496 / 0.966 / 0.646 s on the Axion —
+**identical to the development host, clip for clip**. Only the compute share
+moves (12.7 ms per step here against ~35 there).
+
+### RESULT — steady-state TTFP barely moves with load; emission lag moves 16x
+
+One warm 3x8 server on cpus 0-23 (the F29 topology), generator on 30-31, 45 s
+soaks with 15 s of warm-up excluded, five clips spanning short and medium:
+
+| C | TTFP-open p95 | TTFP-speech p50 | TTFP-speech p95 | speech at 1st non-blank (median) | emission lag p95 | backlog max |
+|---|---|---|---|---|---|---|
+| 1 | 1535 ms | 734 ms | 955 ms | 0.731 s | 17 ms | 0.004 s |
+| 8 | 1535 ms | 734 ms | 955 ms | 0.716 s | 44 ms | 0.084 s |
+| 32 | 1549 ms | 750 ms | 972 ms | 0.716 s | 62 ms | 0.124 s |
+| 65 | 1719 ms | 826 ms | 1126 ms | **0.716 s** | 268 ms | 0.464 s |
+
+From the lightest load to the knee, **emission lag p95 grows 16x and backlog
+116x while TTFP-open p95 grows 12 %**. The load contribution to first-word
+latency at the knee is **+92 ms at p50 and +171 ms at p95** on a floor of
+734 / 955 ms.
+
+**FACT — the evidence requirement is load-independent.** The audio the model
+consumes after onset before its first non-blank has a median of **0.716 s at
+C=8, C=32 and C=65 alike**. It is a property of the audio and the checkpoint,
+not of the machine, and it does not degrade under pressure.
+
+**FACT — where the extra milliseconds go under load.** Mean spans, C=1 -> C=65:
+`compute` 49.9 -> 395.2 ms (bigger, slower batched steps), `chunk` 240.1 ->
+311.7 ms (the first chunk now waits for a scheduler that is busy), `await`
+844.5 -> 597.8 ms (compute absorbs time that was idle waiting for audio).
+`publish` stays at 0.1-0.2 ms at every concurrency.
+
+### INFERENCE, and its limit
+
+F29's probes read TTFP p95 2.5-4.5 s at every concurrency from 40 to 120. Those
+runs included the synchronised opening; these exclude 15 s of it. The steady
+state at and below the knee is 1.5-1.7 s.
+
+**This is strongly consistent with the earlier values being dominated by
+opening-ramp effects. It does not prove it.** No controlled comparison of the
+same workload with and without a synchronised opening has been run, and until
+one is, "the opening explains F29's TTFP" stays an inference. What IS
+established is the negative: a steady-state, load-dependent TTFP floor of
+2.5-4.5 s does not exist on this machine at these concurrencies.
+
+### What "floor" means here, precisely
+
+The ~0.72 s of speech is a **current model-and-configuration emission floor**
+under preset `[56, 3]`, int8, with a greedy argmax and no emission policy. It is
+not an immutable architectural bound. It decomposes, and the parts have
+different owners:
+
+| component | C=1 | at the knee | owner |
+|---|---|---|---|
+| speech required before the first non-blank | ~0.72 s | ~0.72 s | CHECKPOINT under this preset |
+| right context inside that decision | 240 ms | 240 ms | CONFIG `[56,3]`, `q = right+1` |
+| model compute | 50 ms | 395 ms | IMPLEMENTATION + batching |
+| real-time audio waiting | 845 ms | 598 ms | PHYSICS: the audio does not exist yet |
+| queue and load | 0 | +92 ms p50, +171 p95 | SERVING under pressure |
+| publication | 0.1 ms | 0.1 ms | SERVING |
+
+**The serving path owns a tenth of a millisecond of the first word at every
+concurrency measured.** Further optimisation of the output path cannot pay.

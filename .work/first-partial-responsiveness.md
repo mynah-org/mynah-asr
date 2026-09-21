@@ -472,6 +472,36 @@ and hallucination during leading silence. `configs/quality/` and
 `tools/eval/cer_offline.py` cover the third only. **Q-2 is now a blocker for
 R-5, not an independent item.**
 
+## Axion run, 2026-09-21 — frozen as F30
+
+Three experiments, then the box was powered off. Full numbers in
+`docs/serving-findings.md` F30; what matters for this note:
+
+- **R-3E is closed.** Cold start is major page faults reading the weights:
+  3.26 s and ~6.5k major faults with the page cache dropped, 6 runs of 6; 36 ms
+  and 0-2 major faults warm, 5 of 5. The second step is 12.7 ms in all 12 runs.
+  A warm-up is now justified rather than guessed, and is deliberately NOT
+  implemented here.
+- **R-4 is answered on the production ISA.** `publication_delay` is
+  **0.08-0.10 ms**. The output path is not a candidate for anything.
+- **R-6's diagnostic half is done.** Steady-state TTFP p95 goes 1535 -> 1719 ms
+  from C=1 to the knee while emission lag p95 goes 17 -> 268 ms. The audio the
+  model needs after onset is **0.716 s at C=8, 32 and 65 alike**: the evidence
+  requirement does not degrade under load.
+- **The pairing had a real defect** and it was caught by its own causality
+  check, not by taste: one mispaired row at C=32 and one at C=65 produced a
+  negative publication delay. Pairs are now gated on clip duration, delta count
+  and the full ordering, every rejected sample is counted, and all aggregates
+  were regenerated from the raw artifacts.
+
+**Not claimed.** That the opening wave explains F29's 2.5-4.5 s. It is strongly
+consistent and there is no controlled A/B, so it stays an inference. The
+established claim is the negative one: no steady-state load-dependent TTFP floor
+of that size exists at these concurrencies.
+
+**Not claimed either.** That 0.72 s of speech is an architectural bound. It is
+a model-and-configuration floor under `[56,3]`, int8, greedy argmax.
+
 ## Acceptance philosophy
 
 No target invented from the current implementation. First establish the
@@ -494,7 +524,7 @@ at all.
 
 ## Next action
 
-R-3F: the quality baseline that any emission change must be judged against —
+R-3F, offline: the quality baseline that any emission change must be judged against —
 premature or wrong first token, partial instability, final CER/WER, and
 hallucination in leading silence. Q-2 is its vehicle and it now blocks R-5.
 No optimisation before it exists.
