@@ -303,7 +303,7 @@ def cer(hyp, ref):
     return edit_distance(h, r) / len(r)
 
 
-def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
+def analyze_utterance(rec, frame_ms=100.0, pace=1.0, onsets=None):
     """Every per-utterance metric.  Marks are [t, value] so they can be windowed later."""
     sends = [list(s) for s in rec.get("sends") or []]
     events = rec.get("events") or []
@@ -324,6 +324,16 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
         # fine p95 while one gap of two seconds sat in the middle of it, and a
         # listener feels that gap and not the percentile.
         "eou_ms": None, "max_gap_ms": None,
+        # TTFP decomposed. "4.4 seconds to the first word" is three different
+        # claims wearing one number: how long the audio was silent, how much
+        # SPEECH the model wanted before it would commit to anything, and how
+        # late the server was on top of that. Only the third is a server
+        # latency, and the emission lag beside it is usually two orders smaller.
+        #   ttfp_from_onset_ms  first partial - the moment speech began
+        #   first_delta_audio_s audio the server had CONSUMED when it emitted
+        #   first_delta_lag_ms  the server's own lateness on that first frame
+        "ttfp_from_onset_ms": None, "first_delta_audio_s": None,
+        "first_delta_lag_ms": None, "onset_s": None,
     }
     half_frame = frame_ms / 2.0
     out["paced"] = (out["max_late_ms"] <= half_frame + EPS) and abs(pace - 1.0) < EPS
@@ -354,6 +364,8 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
             delta_ts.append(t)
         if first_delta_t is None:
             first_delta_t = t
+            out["first_delta_audio_s"] = ev.get("audio_s")
+            out["first_delta_lag_ms"] = ev.get("lag_ms")
         consumed = ev.get("audio_s")
         if consumed is not None and sends:
             t_send = send_time_for_audio(sends, float(consumed))
@@ -373,6 +385,17 @@ def analyze_utterance(rec, frame_ms=100.0, pace=1.0):
         out["ttfb_ms"] = (first_frame_t - sends[0][0]) * 1000.0
     if first_delta_t is not None and sends:
         out["ttfp_ms"] = (first_delta_t - sends[0][0]) * 1000.0
+        # From SPEECH ONSET, when the caller knows where the speech starts.
+        # A clip with two seconds of room tone in front of it is not a server
+        # that took two extra seconds, and until this line existed nothing in
+        # the harness could tell the two apart.
+        onset = onsets.get(rec.get("clip")) if onsets else None
+        if onset is None and onsets:
+            onset = reference_for(onsets, rec.get("clip") or "")
+        if onset is not None:
+            out["onset_s"] = float(onset)
+            t_onset = send_time_for_audio(sends, float(onset))
+            out["ttfp_from_onset_ms"] = (first_delta_t - t_onset) * 1000.0
     if rec.get("done_t") is not None and sends:
         out["fin_ms"] = (rec["done_t"] - sends[-1][0]) * 1000.0
     ends = [rec.get("done_t")] + [m[0] for m in out["lag_marks"]] + [s[0] for s in sends]
@@ -554,6 +577,16 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
                                "run", "x", True, "MEASURED")
     m["eou_ms"] = stat([u["eou_ms"] for u in ok if u.get("eou_ms") is not None],
                        "per utterance", "ms", rep, lbl)
+    # The three parts of TTFP, reported apart so the number can be argued with.
+    m["ttfp_from_onset_ms"] = stat(
+        [u["ttfp_from_onset_ms"] for u in ok if u.get("ttfp_from_onset_ms") is not None],
+        "per utterance (from speech onset)", "ms", rep, lbl)
+    m["first_delta_audio_s"] = stat(
+        [u["first_delta_audio_s"] for u in ok if u.get("first_delta_audio_s") is not None],
+        "per utterance (audio the model wanted before it spoke)", "s", True, "MEASURED")
+    m["first_delta_lag_ms"] = stat(
+        [u["first_delta_lag_ms"] for u in ok if u.get("first_delta_lag_ms") is not None],
+        "per utterance (server lateness on the first frame)", "ms", rep, lbl)
     m["max_delta_gap_ms"] = stat([u["max_gap_ms"] for u in ok if u.get("max_gap_ms") is not None],
                                  "per utterance (longest silence in each)", "ms", rep, lbl)
 
@@ -754,6 +787,9 @@ def format_summary(summary, env=None, indent="  "):
                        ("finalization_lag_ms", "finalization lag"),
                        ("backlog_max_s", "backlog max"),
                        ("cer", "CER vs reference"),
+                       ("ttfp_from_onset_ms", "TTFP from speech onset"),
+                       ("first_delta_audio_s", "audio before the first word"),
+                       ("first_delta_lag_ms", "server lag on the first frame"),
                        ("eou_ms", "end-of-utterance lag"),
                        ("max_delta_gap_ms", "longest gap in a stream"),
                        ("audio_per_wall", "audio per wall second"),
@@ -928,6 +964,20 @@ def self_test():
                    "casa haus qué", "normalise drops guillemets and the low quote")
     bad += not _eq(normalise("<it> Ciao"), "ciao", "normalise strips a written-out tag")
     bad += not _eq(normalise("ﬁn"), "fin", "normalise applies NFKC")
+
+    print("TTFP decomposed: silence, evidence, and the server's own lateness")
+    #  two seconds of room tone, the model commits after 3.5 s of audio, and the
+    #  server is 120 ms late on that frame: one number, three different causes
+    snd_d = [[0.1 * i, 0.1 * (i + 1)] for i in range(60)]
+    rec_d = _mk("it/x.wav", snd_d, [_ev(3.62, 3.5, "ciao ", lag_ms=120.0)], 6.2, t_start=0.0)
+    ud = analyze_utterance(rec_d, frame_ms=100.0, onsets={"it/x.wav": 2.0})
+    bad += not _eq(ud["ttfp_ms"], 3620.0, "TTFP from the stream open", 1e-6)
+    bad += not _eq(ud["ttfp_from_onset_ms"], 1720.0, "TTFP from speech onset", 1e-6)
+    bad += not _eq(ud["first_delta_audio_s"], 3.5, "audio the model wanted", 1e-9)
+    bad += not _eq(ud["first_delta_lag_ms"], 120.0, "server lateness on that frame", 1e-9)
+    #  no onset map: the decomposition is absent, never guessed
+    un = analyze_utterance(rec_d, frame_ms=100.0)
+    bad += not _eq(un["ttfp_from_onset_ms"], None, "no onset map, no onset-relative number")
 
     print("tails, throughput and fairness")
     #   p99 at nearest rank needs 100 samples to name a rank below the maximum

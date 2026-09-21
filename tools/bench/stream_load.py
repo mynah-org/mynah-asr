@@ -380,6 +380,10 @@ def build_args():
     ap.add_argument("--done-timeout", type=float, default=60.0)
     ap.add_argument("--json", help="write the manifest, the summary and every utterance here")
     ap.add_argument("--reference", help="JSON {clip: expected_text}; mismatches invalidate the run")
+    ap.add_argument("--onsets", help="JSON {clip: speech_onset_seconds} from "
+                                     "tools/bench/clip_onset.py: makes TTFP measurable "
+                                     "from the moment speech begins, not from the moment "
+                                     "the socket opened")
     ap.add_argument("--transcripts", help="bank manifest (samples/*/manifest.json) or a JSON "
                                           "{clip: human_reference}; gives every utterance a CER "
                                           "and lets the run be judged DEGRADED — cadence held, "
@@ -481,11 +485,17 @@ def main() -> int:
     wall = time.monotonic() - a._t0
     health_after = health(a.host, a.port)
 
-    utts = [M.analyze_utterance(r, frame_ms=a.frame_ms, pace=a.pace) for r in records]
+    utts = [M.analyze_utterance(r, frame_ms=a.frame_ms, pace=a.pace, onsets=onsets)
+            for r in records]
     warmup = a.warmup if a.mode == "soak" else 0.0
     window = a.window if a.mode == "soak" else None
     reference = json.load(open(a.reference)) if a.reference else None
     transcripts = load_transcripts(a.transcripts) if a.transcripts else None
+    onsets = None
+    if a.onsets:
+        with open(a.onsets) as f:
+            onsets = {k: float(v) for k, v in json.load(f).items()
+                      if isinstance(v, (int, float))}
     summary = M.aggregate(utts, frame_ms=a.frame_ms, pace=a.pace, window_s=window,
                           warmup_s=warmup, t0=a._t0, reference=reference,
                           transcripts=transcripts)
