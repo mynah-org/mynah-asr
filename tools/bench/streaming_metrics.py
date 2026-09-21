@@ -145,8 +145,18 @@ def stat(xs, basis, unit="ms", reported=True, label="MEASURED"):
 
 
 def _num(v, unit):
-    """Seconds need decimals; milliseconds and percents do not."""
-    return f"{v:.3f}" if unit == "s" else f"{v:.0f}"
+    """Seconds and unitless ratios need decimals; milliseconds do not.
+
+    A CER carries no unit, and with the old rule it printed through "%.0f":
+    every rate below 0.5 rendered as "0" and every one above as "1". The
+    envelope line read "CER p95 0 (limit 0)" while the measurement was 0.111
+    against a limit of 0.25 -- a quality gate whose output could not show a
+    quality number."""
+    if unit == "s":
+        return f"{v:.3f}"
+    if unit in ("", "x"):
+        return f"{v:.3f}"
+    return f"{v:.0f}"
 
 
 def fmt_stat(s):
@@ -504,9 +514,8 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
     ref_fail = {}
     if reference:
         for c, texts in groups.items():
-            exp = reference.get(c)
-            if exp is None:
-                exp = reference.get(c.rsplit("/", 1)[-1])
+            # same matching rule as the CER path: a bare file name is not a key
+            exp = reference_for(reference, c)
             if exp is not None and texts != [exp]:
                 ref_fail[c] = {"expected": exp, "got": texts}
 

@@ -87,7 +87,13 @@ fi
 # Short clips for cadence, the committed sample bank for references. The stress
 # bank (make fetch-stress-bank) replaces the latter when it exists: until then
 # every CER below rests on a handful of clips and says so.
-CLIPS_SHORT="tests/audio/test_it.wav tests/audio/test_en.wav tests/audio/test_de.wav"
+# Clips that carry a HUMAN REFERENCE, so tier 0's CER is a measurement and not
+# an empty column. tests/audio/test_*.wav are fixtures with no entry in any
+# manifest: four streams of them produce "0 utterances scored", which is exactly
+# the hole this whole audit was about.
+CLIPS_SHORT="samples/nl/fleurs_1521.wav samples/en/fleurs_1521.wav samples/fr/fleurs_1521.wav"
+[ -f samples/en/fleurs_1521.wav ] || \
+    CLIPS_SHORT="tests/audio/test_it.wav tests/audio/test_en.wav tests/audio/test_de.wav"
 BANK_MANIFEST=""
 if [ -f samples/stress-en/manifest.json ]; then
     BANK_MANIFEST=samples/stress-en/manifest.json
@@ -170,16 +176,22 @@ tier0() {
     say "-- the reference transcripts, from the CLI, once --"
     REFJSON="$RUN/cli-reference.json"
     : > "$RUN/refs.txt"
+    # The cache file is named after the WHOLE path with the slashes flattened,
+    # never the bare file name: samples/{nl,en,fr}/fleurs_1521.wav are three
+    # different clips with one basename, and naming them by it made all three
+    # references the last language transcribed. That is the same collision the
+    # Python side had, reproduced here in shell, and it is why this tier exists.
+    refname() { echo "$1" | sed 's|[/. ]|_|g'; }
     for w in $CLIPS_SHORT; do
-        ./mynah-asr transcribe -m "$MODEL" -i "$w" --quant "$QUANT" > "$RUN/ref-$(basename "$w" .wav).txt" 2>/dev/null \
+        ./mynah-asr transcribe -m "$MODEL" -i "$w" --quant "$QUANT" > "$RUN/ref-$(refname "$w").txt" 2>/dev/null \
             || note_fail "CLI transcribe of $w"
     done
     python3 - "$RUN" $CLIPS_SHORT > "$REFJSON" <<'PY'
-import json, os, sys
+import json, os, re, sys
 run, clips = sys.argv[1], sys.argv[2:]
 out = {}
 for c in clips:
-    p = os.path.join(run, "ref-" + os.path.basename(c)[:-4] + ".txt")
+    p = os.path.join(run, "ref-" + re.sub(r"[/. ]", "_", c) + ".txt")
     if os.path.exists(p):
         out[c] = open(p).read().strip()
 print(json.dumps(out, ensure_ascii=False))
@@ -204,9 +216,9 @@ PY
     say "-- REST agrees with the CLI --"
     for w in $CLIPS_SHORT; do
         curl -fsS -X POST "http://localhost:$PORT/v1/audio/transcriptions" \
-            -F "file=@$w" > "$RUN/rest-$(basename "$w" .wav).json" 2>/dev/null || {
+            -F "file=@$w" > "$RUN/rest-$(refname "$w").json" 2>/dev/null || {
             note_fail "REST transcribe of $w"; continue; }
-        python3 - "$RUN/rest-$(basename "$w" .wav).json" "$RUN/ref-$(basename "$w" .wav).txt" <<'PY' || FAIL=1
+        python3 - "$RUN/rest-$(refname "$w").json" "$RUN/ref-$(refname "$w").txt" <<'PY' || FAIL=1
 import json, sys
 got = (json.load(open(sys.argv[1])).get("text") or "").strip()
 want = open(sys.argv[2]).read().strip()
@@ -227,13 +239,17 @@ PY
     grep -c "DUMP" "$SRV_LOG" >/dev/null 2>&1 && say "  SIGUSR1 dump present in the server log"
     python3 - "$RUN/health-after.json" <<'PY' || FAIL=1
 import json, sys
+# the counters live under "batch", not at the top level -- reading them in the
+# wrong place is a gate that fails on a healthy server, which is its own defect
 h = json.load(open(sys.argv[1]))
-b = h.get("batched_steps_total", 0) or 0
-r = h.get("rows_stacked_total", 0) or 0
-if b <= 0 or r <= 0:
-    print(f"  FAIL: the batched path never ran (batched_steps={b}, rows_stacked={r})")
+b = (h.get("batch") or {})
+steps = b.get("batched_steps_total", 0) or 0
+rows = b.get("rows_stacked_total", 0) or 0
+if steps <= 0 or rows <= 0:
+    print(f"  FAIL: the batched path never ran (batched_steps={steps}, rows_stacked={rows})")
     raise SystemExit(1)
-print(f"  batched steps {b}, rows stacked {r} (the stacked path really executed)")
+print(f"  batched steps {steps}, rows stacked {rows}, ready mean "
+      f"{b.get('ready_mean', 0):.2f} (the stacked path really executed)")
 PY
 
     stop_server
