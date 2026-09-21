@@ -1286,3 +1286,146 @@ curve has to move on the same ladder, same corpus, same seed, same affinity.**
 elementwise stages that run on the scheduler thread while seven cores idle, the
 RNNT joint head, the ~300-400 pool barriers per step, and the K/V cache copy.
 See `.work/serving-audit-metrics-tests-hotpath.md`.
+
+## F29 — The Axion campaign of 2026-09-21: the latency knee nearly doubled, raw throughput did not
+
+**STATUS: frozen checkpoint.** This entry records what was measured on the paid
+box on 2026-09-21 and nothing stronger. Two questions it does NOT answer are
+named at the end and must not be quoted from here: the topology, and TTFP.
+Later TTFP work belongs in its own entry, never mixed into this one.
+
+**Provenance.** GCP c4a-highcpu-32, Neoverse-V2, 32 cores, aarch64, one socket,
+no SMT, `BLAS=own`, `simd=neon+dotprod+i8mm`. Model
+`nemotron-3.5-asr-streaming-0.6b`, lookahead 3, `P = (3+1) x 80 = 320 ms`.
+Server 3x8 pinned to cpus 0-23, generator on 24-31 unless a row says otherwise.
+NEW = `5904f89`, OLD = `84641ee`. Raw evidence is untracked by `.work/README.md`
+rule 7: `.work/evidence/axion-2026-09-21/axion-session.tgz`, 110 files,
+sha256 `4f908350a63dee2aa8a6fea71f2aa96b2142d6ae053a2259b9ab0607f0822e22`,
+`provenance.txt` inside it carries the host, both commits, the CPU flags and
+the load average at start.
+
+**FACT — three arms, not two, because `TABLE=0` is not the historical BEFORE.**
+
+| arm | build | `MYNAH_ASR_RELPOS_TABLE` | contains |
+|---|---|---|---|
+| A | OLD `84641ee` | n/a | the F22/F27 baseline: old RNNT head, old rel-pos, full 2K-1 rows |
+| B | NEW `5904f89` | `0` | new RNNT head (S10-2) + dead-row narrowing, S1-7 rel-pos |
+| C | NEW `5904f89` | unset | B plus the per-model rel-pos table (S10-1) |
+
+B minus A is therefore the RNNT joint head **and** the elimination of the dead
+rel-pos rows together, not the RNNT head alone: the narrowing to `K+Q-1` rows is
+in the new build whatever the flag says. C minus B is the table.
+
+**RESULT — the causal screen, 120 s WAVE, identical corpus, seed and affinity.**
+Steady-state emission lag p95, pooled over deltas, client side:
+
+| C | arm A | arm B | arm C |
+|---|---|---|---|
+| 32 | 235 ms | 134 ms | **79 ms** |
+| 40 | **616 ms** | 229 ms | **95 ms** |
+
+Judged on the cadence envelope with TTFP excluded from the predicate (see
+below), arm A holds at C=32 and breaks at C=40 (emission lag p95 616 against
+320, finalization 995 against 500, backlog MARGINAL at 0.864 s); arms B and C
+both hold at C=40. Both changes contribute and they compose: 616 -> 229 -> 95.
+Zero utterances lost, zero rejected, in all six runs.
+
+**FACT — the measurement chain is trustworthy because arm A reproduced F23.**
+Refitting the cadence law on arm A gave `a = 15.40, b = 19.35` against the
+frozen F23 values `a = 14.52, b = 19.00`, R^2 = 0.9994. The apparatus that
+reports the improvement is the same apparatus that reproduces the baseline.
+
+**RESULT — the new knee: 65, confirmed; first clear failure C=70.** Bisection on
+one warm server, 75 s soaks with 25 s of warm-up excluded, C in [40, 120],
+resolution 8, arm C:
+
+| C | verdict | lost | rej | audio/wall | lag p95 | backlog | steered by |
+|---|---|---|---|---|---|---|---|
+| 40 | GOOD | 0 | 0 | 22.52 | 93 ms | 0.444 s | — |
+| 60 | MARGINAL | 0 | 0 | 34.86 | 223 ms | 0.484 s | finalization lag p95 |
+| 65 | MARGINAL | 0 | 0 | 37.22 | 324 ms | 0.684 s | emission, finalization, backlog |
+| 65 (confirm) | MARGINAL | 0 | 0 | 37.42 | 328 ms | 0.584 s | emission, finalization |
+| 70 | NOT STREAMABLE | 0 | 0 | 38.10 | 523 ms | 0.744 s | emission, finalization, backlog |
+| 80 | NOT STREAMABLE | 0 | 0 | 38.23 | 1464 ms | 1.844 s | emission, finalization, backlog |
+| 120 | NOT STREAMABLE | 0 | 0 | 37.64 | 6150 ms | 5.664 s | emission, finalization, backlog |
+
+The knee repeats to within 4 ms on the same rung. Against the F22/F23 knee of
+~36 with the first clear failure at C=40, the first concurrency that breaks the
+envelope moves 40 -> 70.
+
+**DECISION — C=60 is not `C_safe`.** It is MARGINAL: finalization lag p95 is
+604 ms against a 500 ms limit even though emission lag p95 is a comfortable
+237 ms. The clean operating point of the new build lies somewhere in 40..60 and
+was not sampled. Quoting 60 as safe would be exactly the flattering conclusion
+this file exists to prevent.
+
+**FACT — zero stream loss and zero rejection through C=120.** Under the rule 5
+contract the server never shortened a chunk and never dropped an established
+stream; it went late, visibly, and said so. The failure mode at overload is
+latency, not data loss.
+
+**RESULT — the cadence law refitted over a 12.5x span of B.** Three fresh
+servers, one per concurrency, so no counter is shared between points:
+
+| C | offered audio/wall | lag p95 | backlog | mean B | step wall | ready->start p95 | model duty |
+|---|---|---|---|---|---|---|---|
+| 40 | 25.06 | 91.7 ms | 0.344 s | 1.36 | 19.97 ms | 60.0 ms | 0.645 |
+| 60 | 36.27 | 236.6 ms | 0.484 s | 2.73 | 36.50 ms | 120.0 ms | 0.877 |
+| 80 | 41.49 | 1442.5 ms | 1.824 s | 17.04 | 205.70 ms | 456.7 ms | 0.953 |
+
+Paced at all three (worst lateness 0.5 ms), zero lost, zero rejected.
+
+    frozen F23   T(B) = 14.52 + 19.00 B
+    2026-09-21   T(B) =  4.02 + 11.84 B      R^2 = 1.00000, B = 1.36 .. 17.04
+
+Pairwise slopes, no fitting involved: **12.07, 11.85, 11.82 ms/row**. The
+marginal cost of a row is therefore measured, not fitted, across an order of
+magnitude of batch size: `b` falls to 0.62x and `a` to 0.28x. The narrow fit
+over B = 1.23..1.44 had predicted `b = 12.94`, 9 % high; the wide measurement
+retires the worry that the drop was an artifact of an ill-conditioned fit.
+
+**FACT — the saturated throughput ceiling did NOT move.** Arm A and arm C both
+top out at roughly **37-41 audio-seconds per wall-second**. What nearly doubled
+is how many concurrent streams can share that ceiling while staying inside the
+latency envelope. These are two different claims and only the second one is
+ours to make: the engine did not get a second machine's worth of work done, it
+stopped making streams wait for each other. State it this way to a customer.
+
+**RESULT — six of the eight harness cores are recoverable.** With the server
+identical (arm C, 3x8, cpus 0-23, C=40) and only the generator moved:
+
+| generator cpus | started | audio_s | worst lateness | paced | offered vs control |
+|---|---|---|---|---|---|
+| 24-31 (control) | 261 | 2190.9 | 1.1 ms | yes | — |
+| all 32 | 260 | 2183.5 | 3.2 ms | yes | -0.3 % |
+| 28-31 | 260 | 2183.5 | 1.0 ms | yes | -0.3 % |
+| 30-31 | 261 | 2190.9 | 1.7 ms | yes | **+0.0 %** |
+
+The load generator holds its schedule on two cpus. Reserving eight for it was
+not paid for by anything measurable.
+
+**OPEN — the topology question was asked at the wrong concurrency.** 3x8 (24
+server cores), 4x7 (28) and 3x10 (30) were compared at C=56 with the generator
+fixed and the offered audio spread across rows at 0.6 %:
+
+| topology | server cores | audio/wall | per server core | lag p50 | lag p95 | backlog |
+|---|---|---|---|---|---|---|
+| 3x8 | 24 | 35.20 | 1.467 | 48 ms | 167 ms | 0.424 s |
+| 4x7 | 28 | 35.30 | 1.261 | 49 ms | 164 ms | 0.384 s |
+| 3x10 | 30 | 35.33 | 1.178 | 48 ms | 164 ms | 0.484 s |
+
+Nothing discriminates because at C=56 none of the three was the bottleneck: the
+offered load, not the server, set the rate. The comparison has to be redone at
+or above the new knee, and `meanB` and `step_ms` have to be read alongside
+capacity, because more cores can change the cost of a row and not only the
+number of rows. **No topology decision follows from this table.**
+
+**OPEN — TTFP is unresolved and is a separate SLO.** TTFP p95 read 2.5-4.5 s at
+every concurrency from 40 to 120, including rungs whose cadence lines were
+comfortable, while emission lag p95 at C=60 was 223 ms. It was excluded from the
+knee-search predicate (`--ignore-line`, `c4d0491`): the excluded line is still
+measured and printed, and the result is therefore a **steady-state
+streaming-capacity knee excluding TTFP**, not a production-safe concurrency.
+An opening-ramp artifact is strongly indicated and is not established; TTFP
+remains an unresolved production metric and must stay in the acceptance
+criteria. See `.work/first-partial-responsiveness.md`.
