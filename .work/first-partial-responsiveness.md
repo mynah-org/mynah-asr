@@ -246,6 +246,98 @@ turns frame 24 into `24*160 + 512/2 = 4096` samples:
 commits a character on that first step is exactly the open question, and
 `first_delta_audio_s` answers it from a run that has already been instrumented.
 
+## R-2 RESULT (2026-09-21, C=1, development host)
+
+Eight clips, one stream at a time, each its own connection, onsets 0.15-3.45 s.
+`MYNAH_ASR_TRACE_TTFP=14` for the server marks, `stream_load.py` for the client
+marks, both on CLOCK_MONOTONIC. **DIAGNOSTIC (macOS, Accelerate, 8 threads): the
+mechanism transfers, the milliseconds do not.** Evidence:
+`.work/evidence/ttfp-c1-2026-09-21/`.
+
+**The pairing is proved, not assumed.** For every utterance the server's marks
+fall inside the client's own window, in order: client first write -> server
+first audio (0.03-0.07 ms) -> first result -> first queued -> first send ->
+client first partial (0.07-0.17 ms). The residual of the waterfall is an
+algebraic identity and proves nothing; this ordering is the validation.
+
+### Where the wait goes
+
+| span | mean ms | share | owner |
+|---|---|---|---|
+| further audio the RNNT wanted, at 1x | 1350.0 | 68.6 % | MODEL |
+| encoder+RNNT wall (incl. one cold step) | 371.1 | 18.9 % | MODEL |
+| the first chunk's 256 ms of audio | 245.5 | 12.5 % | MODEL |
+| framing + output ring + socket write | **0.07** | 0.0 % | SERVING |
+| loopback, both directions | 0.1 | 0.0 % | CLIENT |
+
+    publication_delay = client_first_partial - server_first_nonblank
+                      = 0.12 .. 0.23 ms over eight utterances
+
+**This is branch B.** Not A: the serving path between the model having something
+to say and the client seeing it is two tenths of a millisecond. There is no hole
+to find there.
+
+### Per utterance
+
+| clip | onset | TTFP-open | TTFP-speech | audio at 1st | speech at 1st | blank steps |
+|---|---|---|---|---|---|---|
+| en/1521 | 0.18 | 1533 | 1366 | 0.896 | 0.716 | 2 |
+| en/1534 | 0.59 | 1572 | 986 | 1.536 | 0.946 | 4 |
+| fr/1521 | 0.15 | 932 | 785 | 0.896 | 0.746 | 2 |
+| de/1534 | 0.52 | 1249 | 742 | 1.216 | 0.696 | 3 |
+| it/1521 | 0.95 | 1888 | 939 | 1.856 | 0.906 | 5 |
+| es/1534 | 1.04 | 1574 | 546 | 1.536 | 0.496 | 4 |
+| de/1521 | 3.45 | 4465 | 1019 | 4.416 | 0.966 | 13 |
+| it/1534 | 1.85 | 2521 | 676 | 2.496 | 0.646 | 7 |
+
+**FACT.** `audio_seconds_consumed_at_first_nonblank` is 0.896-4.416 s, and after
+subtracting the leading silence it is **0.496-0.966 s of speech**, two to three
+chunks. The RNNT emitted nothing on 2 to 13 steps first.
+
+**FACT.** In seven of the eight, `TTFP-open` equals the audio consumed at the
+first non-blank plus one step wall, to within a few ms: 1536+36=1572, 896+36=932,
+1216+33=1249, 1856+32=1888, 1536+38=1574, 4416+49=4465, 2496+25=2521. The eighth
+is the first stream the server ever served (below).
+
+**FACT — the pipeline is not starved, it is waiting for audio.** Between steps
+it idles 270-291 ms and then computes for 30-46 ms, against a 320 ms chunk
+period. Nothing queues behind anything.
+
+    en/1534   step  consumed_s  idle_before_ms  step_ms  emitted
+                 1       0.256           247.0     36.6        0
+                 2       0.576           284.8     46.1        0
+                 3       0.896           270.6     34.0        0
+                 4       1.216           282.8     35.9        0
+                 5       1.536           288.9     45.1        1
+
+**FACT — the first step a fresh server ever runs costs 1236 ms** against 30-46 ms
+warm, and it blocks the two chunks behind it. That is the whole of the first
+utterance's anomaly (compute 1284 ms against 111-539 ms for the rest). The Axion
+soaks measured warm servers, so this is NOT the 2.6 s seen there; it is a real
+first-request cost of its own, and it has never been named.
+
+### The buckets
+
+**FACT (measured here).** Publication is 0.2 ms. The serving path owns none of
+the wait at C=1. The first chunk needs 256 ms of audio. The model consumed
+0.50-0.97 s of speech before its first non-blank. Steady steps cost 30-46 ms
+against a 320 ms period. A cold server pays 1236 ms on its first step.
+
+**INFERENCE (follows from the above, not separately measured).** TTFP-speech at
+C=1 is, to within one step wall, exactly the audio the RNNT consumes after
+speech onset. Lowering it therefore means changing what the decoder waits for,
+not making anything faster. The 2.6 s seen on the Axion at C=60 is this floor
+plus load; how much of it is load is not established by this run.
+
+**UNKNOWN.** Whether 0.5-1.0 s of speech is inherent to this checkpoint or a
+consequence of our blank policy, `max_symbols_per_step`, or the emit rule
+`total > chars_emitted` — that is R-3 and it is a numerics question, not a
+latency one. Whether the cold first step is allocation, page faults or a BLAS
+first call. What any of these become under load (R-6).
+
+**The largest removable component is not yet identified**, and the largest
+component is not obviously removable: it is the model declining to commit.
+
 ## Acceptance philosophy
 
 No target invented from the current implementation. First establish the
@@ -268,7 +360,7 @@ at all.
 
 ## Next action
 
-R-2: one stream, C=1, on the development host. The clock is now common to
-both processes, so the waterfall can cross the process boundary — but the
-server publishes only three instants on that path, so R-2 begins by adding the
-missing ones, starting with the one the server already computes and discards.
+R-3: classify the 0.5-1.0 s of speech the RNNT consumes before its first
+non-blank. It is a decoding-semantics question — blank policy, max_symbols,
+the emit rule — and it is answered by reading code and by the oracle, not by a
+latency experiment. Nothing is optimised until that classification exists.

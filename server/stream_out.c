@@ -84,6 +84,13 @@ struct mynah_asr_stream_out {
      * behind a writer that is busy memcpying. */
     _Atomic int failed;
 
+    /* R-2 (first-partial responsiveness): when the writer's FIRST send() to
+     * this socket completed. The last instant the server can observe on the
+     * path to the client's first visible text; everything after it is the
+     * network and the client's own read loop. Relaxed atomic, written once by
+     * the writer thread and read by the scheduler. */
+    _Atomic double t_first_send;
+
     _Atomic int refs;         /* producer + detached writer */
 };
 
@@ -253,6 +260,12 @@ static void *stream_out_writer_main(void *arg) {
             break;
         }
 
+        /* Stamped OUTSIDE the lock and before taking it again: this is the
+         * moment the bytes left the process, and putting it after the lock
+         * would charge it the writer's own contention. */
+        if (atomic_load_explicit(&o->t_first_send, memory_order_relaxed) == 0.0)
+            atomic_store_explicit(&o->t_first_send, so_now(), memory_order_relaxed);
+
         so_lock(o, "stream_out_writer_main");
         o->head = (o->head + span) % o->capacity;
         o->queued -= span;
@@ -369,6 +382,11 @@ int mynah_asr_stream_out_enqueue(mynah_asr_stream_out *o, const void *msg, size_
     pthread_cond_signal(&o->cv);
     so_unlock(o);
     return 0;
+}
+
+double mynah_asr_stream_out_first_send(const mynah_asr_stream_out *o) {
+    if (o == NULL) return 0.0;
+    return atomic_load_explicit(&o->t_first_send, memory_order_relaxed);
 }
 
 int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o) {

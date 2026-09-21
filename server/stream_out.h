@@ -75,6 +75,13 @@ int mynah_asr_stream_out_enqueue(mynah_asr_stream_out *o, const void *msg, size_
 /* 1 once the stream has been abandoned: peer hangup, socket error, send
  * timeout, or ring overflow. A lock-free atomic read, cheap enough for the
  * scheduler to consult at every step. */
+/* When the writer's first send() to this socket completed, on CLOCK_MONOTONIC,
+ * or 0.0 before it has. The last instant on the path to the client's first
+ * visible text that this process can see: framing and the output ring are
+ * behind it, the network and the client's read loop are in front. Diagnostic
+ * only -- nothing in the serving path reads it. */
+double mynah_asr_stream_out_first_send(const mynah_asr_stream_out *o);
+
 int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o);
 
 /* 1 once the peer has hung up. Answers from the socket itself rather than from

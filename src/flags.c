@@ -171,6 +171,15 @@ static const mynah_asr_flag g_flags[] = {
      "1 prints the [FLAGS] and [EFFECTIVE-CONFIG] lines on stderr before a run",
      NULL, NULL},
 
+    {"MYNAH_ASR_TRACE_TTFP", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "server/sched.c: trace the first N steps of every stream on stderr -- consumed audio,"
+     " arrival, ready, selected, model start and end, and whether that step emitted anything --"
+     " plus one line per stream giving first audio in, first model result, first delta queued"
+     " and the writer's first send. Absolute CLOCK_MONOTONIC seconds, the same clock the load"
+     " harness reads, so a client mark can be subtracted from a server mark. Diagnostic only:"
+     " it changes no decision and no transcript (server only)",
+     NULL, NULL},
+
     {"MYNAH_ASR_PREFORK_QUEUE", MYNAH_ASR_FLAG_SERVER, "the config default",
      "per-worker queue depth, or 'unbounded' (server only)",
      NULL, NULL},

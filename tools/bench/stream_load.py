@@ -501,17 +501,20 @@ def main() -> int:
     wall = mono() - a._t0
     health_after = health(a.host, a.port)
 
+    # The onset map is READ FIRST: analyze_utterance takes it, and until R-2 ran
+    # the harness for real it was loaded after the call that needs it, which made
+    # every --onsets run die with a NameError instead of producing a number.
+    onsets = None
+    if a.onsets:
+        with open(a.onsets) as f:
+            onsets = {k: float(v) for k, v in json.load(f).items()
+                      if isinstance(v, (int, float))}
     utts = [M.analyze_utterance(r, frame_ms=a.frame_ms, pace=a.pace, onsets=onsets)
             for r in records]
     warmup = a.warmup if a.mode == "soak" else 0.0
     window = a.window if a.mode == "soak" else None
     reference = json.load(open(a.reference)) if a.reference else None
     transcripts = load_transcripts(a.transcripts) if a.transcripts else None
-    onsets = None
-    if a.onsets:
-        with open(a.onsets) as f:
-            onsets = {k: float(v) for k, v in json.load(f).items()
-                      if isinstance(v, (int, float))}
     summary = M.aggregate(utts, frame_ms=a.frame_ms, pace=a.pace, window_s=window,
                           warmup_s=warmup, t0=a._t0, reference=reference,
                           transcripts=transcripts)

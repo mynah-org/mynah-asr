@@ -114,6 +114,9 @@ static struct {
     unsigned long h_ready_start[SCHED_DLY_BUCKETS];
     unsigned long dly_samples;
     double *b_ready, *b_sel;   /* per staged row: when it became ready/selected */
+    int *b_d0;                 /* per staged row: its delta count BEFORE the step
+                                * (R-2 trace only; tells a blank step from an
+                                * emitting one, which no counter did before) */
     /* The readiness predicate, audited against the scheduler's own answer.
      * The three-way split of wall time classifies an idle interval by asking
      * mynah_asr_slot_ready_count() > 0. If that predicate disagrees with what
@@ -418,6 +421,10 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
     }
     frame_common(j, s, res->t1, lag_ms);
     sched_send_json(s, j);
+    /* AFTER the framing and the enqueue: what separates this from `now` above
+     * is cJSON's printing and the memcpy into the output ring, which is
+     * exactly the span R-1 found nobody could see. */
+    if (s->t_first_queued == 0.0 && s->deltas > 0) s->t_first_queued = mynah_asr_now();
 }
 
 /* ---------------------------------------------------------- slot lifecycle */
@@ -460,6 +467,30 @@ static void sched_cancel(mynah_asr_slot *s, const char *code, const char *msg) {
     sched_close_session(s);
 }
 
+/* ---------------------------------------------------- R-2 first-partial trace
+ *
+ * MYNAH_ASR_TRACE_TTFP=N traces the first N steps of every stream on stderr.
+ * It exists because of what R-1 found: between audio arriving and text leaving
+ * this process the server published three instants and no more, so the wait in
+ * front of the first word could not be attributed to anything. The trace adds
+ * no work to an untraced run beyond one relaxed load per step, changes no
+ * decision, and prints absolute CLOCK_MONOTONIC seconds so a mark here can be
+ * subtracted from a mark taken in the client (which reads the same clock).
+ *
+ * A step that emits nothing is the point of the exercise: `emitted` is 0 on
+ * every step the RNNT spent in blanks, and the line still carries the audio it
+ * had consumed by then. */
+static int g_trace_steps = -1;
+
+static int sched_trace_steps(void) {
+    if (g_trace_steps < 0) {
+        const char *e = getenv("MYNAH_ASR_TRACE_TTFP");
+        g_trace_steps = (e != NULL && *e != '\0') ? atoi(e) : 0;
+        if (g_trace_steps < 0) g_trace_steps = 0;
+    }
+    return g_trace_steps;
+}
+
 static void sched_emit_done(mynah_asr_slot *s) {
     const char *lang = mynah_asr_stream_lang(s->stream);
     if (lang == NULL || lang[0] == '\0') lang = s->lang;
@@ -476,6 +507,18 @@ static void sched_emit_done(mynah_asr_slot *s) {
     cJSON_AddNumberToObject(j, "audio_seconds", audio_s);   /* v1 field */
     frame_common(j, s, audio_s, 0.0);
     sched_send_json(s, j);
+    if (sched_trace_steps() > 0) {
+        /* The whole server-side chain for this stream, in one line, in the
+         * clock the client also reads. t_first_send is the writer's, so it is
+         * read here rather than stamped here: by `done` the first delta is
+         * long gone. A zero means the stage never happened. */
+        fprintf(stderr,
+                "[TTFP] slot=%d END open=%.6f first_audio=%.6f first_result=%.6f "
+                "first_queued=%.6f first_send=%.6f steps=%d deltas=%d audio_s=%.4f\n",
+                s->id, s->t_open, s->t_first_audio, s->t_first_delta,
+                s->t_first_queued, mynah_asr_stream_out_first_send(s->out),
+                s->steps, s->deltas, audio_s);
+    }
 }
 
 /* --------------------------------------------------------------- one step */
@@ -630,9 +673,29 @@ static void sched_step_batch(int B) {
         if (g.b_ready[j] > 0.0 && t0 >= g.b_ready[j])
             g.h_ready_start[sched_dly_bucket(t0 - g.b_ready[j])]++;
     }
+    /* Before the call, so `emitted` below counts only this step's deltas. */
+    const int trace_n = sched_trace_steps();
+    if (trace_n > 0)
+        for (int j = 0; j < B; j++) g.b_d0[j] = g.b_slot[j]->deltas;
+
     const int rc = mynah_asr_stream_step_batch(g.b_stream, B, g.b_samples, g.b_n,
                                                sched_on_result, g.b_ud);
-    const unsigned long us = (unsigned long)((mynah_asr_now() - t0) * 1e6 + 0.5);
+    const double t_end = mynah_asr_now();
+    const unsigned long us = (unsigned long)((t_end - t0) * 1e6 + 0.5);
+
+    if (trace_n > 0) {
+        for (int j = 0; j < B; j++) {
+            mynah_asr_slot *s = g.b_slot[j];
+            if ((int)s->steps > trace_n) continue;
+            fprintf(stderr,
+                    "[TTFP] slot=%d step=%d B=%d consumed_s=%.4f arrival=%.6f "
+                    "ready=%.6f sel=%.6f mstart=%.6f mend=%.6f emitted=%d\n",
+                    s->id, (int)s->steps, B,
+                    s->stream ? mynah_asr_stream_audio_seconds(s->stream) : 0.0,
+                    g.b_ctx[j].arrival, g.b_ready[j], g.b_sel[j], t0, t_end,
+                    s->deltas - g.b_d0[j]);
+        }
+    }
 
     /* What the library ACTUALLY stacked, taken as a delta so this worker
      * reports its own steps and not a process-wide total. 0 over a run with
@@ -1118,6 +1181,7 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     g.b_ud = calloc((size_t)g.n_slots, sizeof(*g.b_ud));
     g.b_ready = calloc((size_t)g.n_slots, sizeof(*g.b_ready));
     g.b_sel = calloc((size_t)g.n_slots, sizeof(*g.b_sel));
+    g.b_d0 = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.b_pos = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.was_real = (int *)calloc((size_t)g.n_slots, sizeof(int));
     g.was_diag = (int *)calloc((size_t)g.n_slots, sizeof(int));
@@ -1466,6 +1530,13 @@ void mynah_asr_sched_stop(void) {
     g.req_out = NULL; g.req_avail = NULL; g.req_live = NULL;
     free(g.b_ctx); free(g.b_stream); free(g.b_samples); free(g.b_n);
     free(g.b_ud); free(g.b_slot); free(g.fin); free(g.fin_flag);
+    /* The per-row accounting arrays, allocated beside the ones above and until
+     * now not released with them. One-shot at teardown, but `make leaks` should
+     * not have to know that. */
+    free(g.b_ready); free(g.b_sel); free(g.b_pos); free(g.b_d0);
+    free(g.was_real); free(g.was_diag);
+    g.b_ready = NULL; g.b_sel = NULL; g.b_pos = NULL; g.b_d0 = NULL;
+    g.was_real = NULL; g.was_diag = NULL;
     g.b_ctx = NULL; g.b_stream = NULL; g.b_samples = NULL; g.b_n = NULL;
     g.b_ud = NULL; g.b_slot = NULL; g.fin = NULL;
     g.n_slots = 0;

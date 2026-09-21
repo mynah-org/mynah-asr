@@ -105,6 +105,13 @@ typedef struct mynah_asr_slot {
     unsigned seq;
     int needs_reset;               /* a finalize without close: reset on next audio */
     double t_open, t_first_delta;
+    /* R-2 (first-partial responsiveness). The two instants the server could
+     * not name before: when this stream's FIRST audio entered the ring, and
+     * when its first delta was framed and handed to the writer. Together with
+     * t_first_delta (the model callback) and the writer's own first send they
+     * close the path from audio-in to bytes-out. Diagnostic: nothing in the
+     * serving path reads them. */
+    double t_first_audio, t_first_queued;
     double last_arrival;           /* of the newest sample the scheduler took */
     /* When the model last served this slot. `steps` says how many times; this
      * says how long ago, which is the only one of the two that can distinguish
