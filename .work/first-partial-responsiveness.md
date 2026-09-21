@@ -636,6 +636,70 @@ A third possibility is worth naming rather than assuming away: **accept that
 ~0.7 s of speech is what this checkpoint at this preset requires**, and spend
 the effort on the cold start instead, which is 3.26 s and fully attributed.
 
+## R-5 family B, screened on the development host — STOPPED AT PHASE 1
+
+The candidate was priced before any machine was started, because phase 1 is free
+and phase 3 is not. Evidence: `.work/evidence/q2-lookahead0-2026-09-21/`.
+
+### The preset semantics, proved from code and confirmed by measurement
+
+Not carried forward from the plan. `mynah_asr_enc_stream_need` (`src/encoder.c:729`)
+returns `sub * (right + 1)` mel frames per steady chunk and `1 + sub * right` for
+the first one, and `es->q = right_ctx + 1` (`src/encoder.c:647`). With
+`sub = 8` and a 10 ms hop:
+
+| preset | q | first chunk | steady chunk = cadence period P |
+|---|---|---|---|
+| `[56, 3]` | 4 | 25 frames = 256 ms | **320 ms** |
+| `[56, 0]` | 1 | 1 frame = 16 ms | **80 ms** |
+
+Confirmed on the wire: the trace prints `emit q=4` against `emit q=1`. **So the
+4x cadence claim is now established rather than assumed**, and `[56,0]` is the
+only preset below 3 that the pack offers — `[56,6]` and `[56,13]` go the wrong
+way. Family B by preset has exactly one candidate.
+
+### Phase 1 — it fails on quality, so phases 2 and 3 were not run
+
+21 utterances, the whole supported corpus, oracle `samples/manifest.json`.
+
+| | `[56,3]` | `[56,0]` |
+|---|---|---|
+| speech needed before the first non-blank | — | **median -100 ms, mean -129 ms** (13 better, 6 unchanged, 2 worse) |
+| mean CER | 0.0405 | **0.0525** |
+| per clip | — | 4 better, 9 unchanged, **8 worse** |
+| worst regressions | — | uk/1534 +0.117, pt/1521 +0.076, de/1521 +0.051, fr/1534 +0.046 |
+
+**The arm buys about a tenth of a second of evidence and pays roughly 30 %
+relative CER for it, before the capacity tax is even counted.** One clip moves
+the wrong way on BOTH axes: pt/1521 needs 800 ms MORE speech and its CER rises
+0.185 -> 0.261.
+
+Under the standing rule — a candidate is not a win because the first non-blank
+moved earlier, and an arm whose quality clearly regresses is stopped rather than
+capacity-tested — this arm is stopped. **No VM was started.**
+
+### The hybrid: fast start, then normal cadence — NOT proven safe
+
+The idea is the right one and it is not free to try. What the code says today:
+
+- A lookahead change **closes and reopens the stream**
+  (`sched_ensure_stream`, `server/sched.c`), which destroys the K/V and conv
+  caches and would restart the utterance's context from nothing.
+- Dimensionally a switch DOWN would fit: the K/V cache is `[left, d]` per layer
+  and the conv cache is `conv_k-1`, neither depends on `right`; the scratch is
+  sized from `q` so a stream opened at q=4 has room for q=1; the rel-pos table
+  is built for `left + max_q + 2` over all presets.
+- **Semantically it is unproven.** Frames already in the cache were computed
+  under one attention window; frames after the switch would be computed under
+  another. Nothing in the repo gates a mid-stream switch, and rule 4 would
+  require a bit-exactness or oracle gate before one could be trusted.
+
+**Recorded as a hypothesis, not attempted.** The next experiment for it is a
+library-level one on the development host: open a stream at `[56,3]`, switch the
+encoder's `right` mid-utterance without reopening, and compare the transcript
+against both fixed-preset references. If the text is not defensible there, no
+serving change is worth designing.
+
 ## Acceptance philosophy
 
 No target invented from the current implementation. First establish the
