@@ -149,6 +149,20 @@ there; macOS is the development machine, nice to have, never the target.**
 - [x] T-2 Tier 0 (~90 s, one command per model): dispatch map, self-tests, one warm server, 4 WS streams with CLI reference and `samples/` CER, 4 REST, dump, zero survivors. Tier 1 (~8 min): knee by bisection on a warm server with validity-length rungs, cold quality pass, REST rungs for the offline model. Tier 2 (~30 min): two identical 600 s soaks at the profile's C with the stress bank and `--transcripts`, `perf_profile.py promote` — **LANDED 2026-09-21**: `tools/bench/tier.sh` + `make tier0/tier1/tier2`, with `tools/bench/knee.py` (bisection on one warm server), `tools/eval/cer_offline.py` (baseline + margin) and `compare_runs.py`; tier 2 refuses a dirty tree and refuses to run without a reference manifest
 - [ ] T-3 `make fetch-stress-bank` run once and every soak pointed at it (S4-7): until then no soak scores a transcript and no operating point can be promoted
 
+### R — First-partial responsiveness: the other SLO → [`.work/first-partial-responsiveness.md`](.work/first-partial-responsiveness.md)
+
+Opened 2026-09-21 from F29: the steady state moved by nearly a factor of two
+while the wait before the first word did not move at all. The goal is not to
+lower 2.6 s, it is to account for all of it. No optimisation before the C=1
+waterfall reconciles.
+
+- [ ] R-1 Prove from code what every timestamp on the path means and in which clock domain, `stream_open` through `client receives first partial`; name `TTFP-open`, `TTFP-audio` and `TTFP-speech` separately and instrument speech onset rather than substituting stream open for it
+- [ ] R-2 One stream, C=1, a millisecond waterfall that reconciles with the measured first-partial latency; report `audio_seconds_consumed_at_first_nonblank` and `wall_time_of_first_nonblank` explicitly. A concurrency effect must not be allowed to hide a fixed pipeline floor
+- [ ] R-3 Classify every component of that waterfall as REQUIRED BY MODEL / REQUIRED BY CURRENT DECODING SEMANTICS / SERVING OVERHEAD / BENCHMARK ARTIFACT / UNKNOWN. No optimisation proposal is admissible without this classification
+- [ ] R-4 `publication_delay = client_first_partial − model_first_hypothesis`, instrumented as a first-class metric: it is the discriminant that says whether the serving path or the model's own emission policy owns the seconds
+- [ ] R-5 Smallest reversible A/B on the dominant term only, `before → mechanism → after`, same audio and build but the switch, transcript gate green; never trade recognition quality, transcript semantics, established streams or steady-state capacity for it
+- [ ] R-6 Load dependence last: C1 → C8 → C32 → near-knee, then synchronised opening on its own, reporting TTFP-speech p50/p95/p99, TTFP-open p50/p95, model first-hypothesis latency, publication delay, emission lag, backlog, loss, CER and audio/wall together, so responsiveness cannot be bought with capacity
+
 ### Later, not now
 - [ ] L-2 Unstable-tail partials for Nemotron (a decoder change; protocol already has `final`)
 - [ ] L-3 CUDA v2b resident encoder (from the v1 TODO; GPU serving is out of v2 scope)
