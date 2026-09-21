@@ -1,0 +1,220 @@
+{
+ "model": "nemotron-3.5-asr-streaming-0.6b",
+ "quant": "int8",
+ "mode": "transcribe",
+ "lookahead": -1,
+ "manifest": "samples/manifest.json",
+ "clips": 25,
+ "scored": 23,
+ "errors": 0,
+ "unsupported_language": 2,
+ "cer_mean": 0.04457845063226174,
+ "cer_weighted": 0.059708509637987774,
+ "cer_p50": 0.02857142857142857,
+ "cer_p95": 0.1111111111111111,
+ "cer_max": 0.2717391304347826,
+ "wer_mean": 0.10732338679862372,
+ "worst": {
+  "clip": "pt/fleurs_1521.wav",
+  "cer": 0.2717391304347826
+ },
+ "wall_s": 42.87067400012165,
+ "rows": [
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/it/fleurs_1521.wav",
+   "lang": "it",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 87,
+   "hyp": "Il satellite nello spazio riceve il segnale e poi lo rimanda indietro quasi all'istante."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/it/fleurs_1534.wav",
+   "lang": "it",
+   "cer": 0.04838709677419355,
+   "wer": 0.05555555555555555,
+   "ref_chars": 124,
+   "hyp": "Anche in conseguenza della sua relativa inaccessibilità, Teambooktu ha finito per diventare metafora di terra esotica e lontana."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/en/fleurs_1521.wav",
+   "lang": "en",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 84,
+   "hyp": "The satellite in space gets the call and then reflects it back down almost instantly."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/en/fleurs_1534.wav",
+   "lang": "en",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 110,
+   "hyp": "Combined with its relative inaccessibility Timbuktu has come to be used as a metaphor for exotic distant lands."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/de/fleurs_1521.wav",
+   "lang": "de",
+   "cer": 0.05102040816326531,
+   "wer": 0.0625,
+   "ref_chars": 98,
+   "hyp": "Der Satellit im Weltraum empfängt den Anruf und reflektiert ihn dann sofort zurück nach unten."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/de/fleurs_1534.wav",
+   "lang": "de",
+   "cer": 0.023255813953488372,
+   "wer": 0.05555555555555555,
+   "ref_chars": 129,
+   "hyp": "Dies in kombinaziern mit seiner relativen unzugänglichkeit hat Timbuktu zu einer Metapher für exotische ferne Länder werden lassen."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/es/fleurs_1521.wav",
+   "lang": "es",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 98,
+   "hyp": "El satélite en el espacio recibe la llamada y luego la refleja de vuelta casi de forma instantánea."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/es/fleurs_1534.wav",
+   "lang": "es",
+   "cer": 0.037037037037037035,
+   "wer": 0.1111111111111111,
+   "ref_chars": 108,
+   "hyp": "Ello, sumado a que resulta relativamente inaccesible, ha dado a Tombuktu una imagen de tira exótica y lejana."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/fr/fleurs_1521.wav",
+   "lang": "fr",
+   "cer": 0.1111111111111111,
+   "wer": 0.3333333333333333,
+   "ref_chars": 90,
+   "hyp": "Les satellites reçoivent l'appel dans l'espace puis renvoient sur Terre presque instantanément."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/fr/fleurs_1534.wav",
+   "lang": "fr",
+   "cer": 0.02727272727272727,
+   "wer": 0.125,
+   "ref_chars": 110,
+   "hyp": "Combiné à sa relative inaccessibilité, Tombouktu est devenue une métaphore pour les pays lointains et exotiques."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/pt/fleurs_1521.wav",
+   "lang": "pt",
+   "cer": 0.2717391304347826,
+   "wer": 0.4,
+   "ref_chars": 92,
+   "hyp": "Sebia chamada e depois a redireciona de volta quase instantaneamente."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/pt/fleurs_1534.wav",
+   "lang": "pt",
+   "cer": 0.02857142857142857,
+   "wer": 0.09090909090909091,
+   "ref_chars": 140,
+   "hyp": "Chimbuktu passou a ser utilizado como uma metáfora para se referir às terras distantes e exóticas, tendo em vista sua relativa inacessibilidade."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/nl/fleurs_1521.wav",
+   "lang": "nl",
+   "cer": 0.05333333333333334,
+   "wer": 0.2,
+   "ref_chars": 75,
+   "hyp": "Zodra de ruimte saliet de oproep ontvangt, wordt deze meteen teruggezonden."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/nl/fleurs_1534.wav",
+   "lang": "nl",
+   "cer": 0.08,
+   "wer": 0.17647058823529413,
+   "ref_chars": 125,
+   "hyp": "De booktu is relatief slecht toegankelijk en wordt tegenwoordig daarom gebruikt als metafoor voor exotische verre landen."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/pl/fleurs_1521.wav",
+   "lang": "pl",
+   "cer": 0.06862745098039216,
+   "wer": 0.26666666666666666,
+   "ref_chars": 102,
+   "hyp": "Połączenie trafia dostatity w przestrzeni k osmiesznej, po czym niemal natychmiast odbija go z powrotem."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/pl/fleurs_1534.wav",
+   "lang": "pl",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 123,
+   "hyp": "W kontekście swojej stosunkowo trudnej dostępnej lokalizacji Timbuktu stało się metaforą dla krain egzotycznych i odległych."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/ru/fleurs_1521.wav",
+   "lang": "ru",
+   "cer": 0.0,
+   "wer": 0.0,
+   "ref_chars": 84,
+   "hyp": "Спутник в космосе принимает звонок и практически мгновенно отражает его обратно вниз."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/ru/fleurs_1534.wav",
+   "lang": "ru",
+   "cer": 0.010416666666666666,
+   "wer": 0.08333333333333333,
+   "ref_chars": 96,
+   "hyp": "В связи с своей относительной недоступностью Тимбукту стал метафорой экзотической дальней Земли."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/uk/fleurs_1521.wav",
+   "lang": "uk",
+   "cer": 0.013157894736842105,
+   "wer": 0.08333333333333333,
+   "ref_chars": 76,
+   "hyp": "Супутнику у космосі отримує виклик і потім майже одразу відображає його назад."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/uk/fleurs_1534.wav",
+   "lang": "uk",
+   "cer": 0.025210084033613446,
+   "wer": 0.125,
+   "ref_chars": 119,
+   "hyp": "Через це, а також через відносне недоступність назву Тімбукту став використовувати як метафору екзотичних далеких країн."
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/ja/fleurs_1521.wav",
+   "lang": "ja",
+   "unsupported_language": "mynah-asr: pre-quantized checkpoint models_local/nemotron-3.5-asr-streaming-0.6b/model.int8.safetensors\nmynah-asr: language 'ja' is not supported\n",
+   "cer": null
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/ja/fleurs_1534.wav",
+   "lang": "ja",
+   "unsupported_language": "mynah-asr: pre-quantized checkpoint models_local/nemotron-3.5-asr-streaming-0.6b/model.int8.safetensors\nmynah-asr: language 'ja' is not supported\n",
+   "cer": null
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/en/fleurs_long.wav",
+   "lang": "en",
+   "cer": 0.061855670103092786,
+   "wer": 0.09278350515463918,
+   "ref_chars": 1164,
+   "hyp": "This new environment has different resources and different competitors, so the new population will need different features or adaptations to be a strong competitor than what they had needed before.  When the fighting ceased after the wounded were transported to the hospital, about forty of the other remaining inmates stayed in the yard and refused to return to their cells.  Please treat the site w"
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/long/en_long.wav",
+   "lang": "en",
+   "cer": 0.07991360691144708,
+   "wer": 0.1187800963081862,
+   "ref_chars": 3704,
+   "hyp": "The UN also hopes to finalize the fund to help countries affected by global warming to cope with the impacts.  This new environment has different resources and different competitors, so the new population will need different features or adaptations to be a strong competitor than what they had needed before Argentina is well known for having one of the best polo teens and players in the world when "
+  },
+  {
+   "clip": "/Users/gabrielemastrapasqua/source/personal/mynah-asr/samples/long/de_long.wav",
+   "lang": "de",
+   "cer": 0.034394904458598725,
+   "wer": 0.0881057268722467,
+   "ref_chars": 1570,
+   "hyp": "Die vereinten Nationen hoffen zudem, einen Fonds einrichten zu können, der den von der globalen Erwärmung betroffenen Ländern helfen soll mit den Auswirkungen fertig zu werden.  Dieses neue Umfeld hat andere Ressourcen und andere Konkurrenten, so dass die neue Bevölkerung andere Merkmale oder Anpassung benötigt, um einer starken Konkurrenz zu sein als das, was Sie vorher gebraucht hat.  C EP inner"
+  }
+ ]
+}

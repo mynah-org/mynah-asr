@@ -383,6 +383,34 @@ bench-stream-wave:
 bench-stream-soak:
 	@python3 tools/bench/stream_load.py --mode soak --streams $(STREAM_N) --duration $(STREAM_DURATION) --warmup 30 --window 60 --bank short,medium,long --seed 42 --port $(STREAM_PORT) --clips $(STREAM_CLIPS) --json soak-$(STREAM_N).json
 
+# The three tiers: three questions, three budgets, one command each. See the
+# header of tools/bench/tier.sh for why they exist and what each refuses.
+#   tier0 ~90 s   does this build serve correctly at all (run it after a change)
+#   tier1 ~8 min  where is the knee on THIS host (bisection, one warm server)
+#   tier2 ~30 min certify one point: two soaks that must agree, with references
+# PARAKEET_DIR gives tier 0 its light-model REST probe.
+TIER_C ?= 0
+tier0: mynah-asr mynah-asr-server
+	@sh tools/bench/tier.sh 0 -m $(MODEL_DIR) $(if $(wildcard $(PARAKEET110_DIR)),--parakeet $(PARAKEET110_DIR),)
+tier1: mynah-asr mynah-asr-server
+	@sh tools/bench/tier.sh 1 -m $(MODEL_DIR)
+tier2: mynah-asr mynah-asr-server
+	@if [ "$(TIER_C)" = "0" ]; then \
+	  echo "tier2 needs the concurrency tier1 screened: make tier2 TIER_C=32"; exit 2; fi
+	@sh tools/bench/tier.sh 2 -m $(MODEL_DIR) -C $(TIER_C)
+
+# The quality baseline a later run is compared against, and the regression gate.
+# QUALITY_BASELINE defaults to the file cer_offline writes for this model+quant.
+QUALITY_BASELINE ?= configs/quality/$(notdir $(MODEL_DIR))-$(QUANT)-offline.json
+QUANT ?= int8
+cer-baseline: mynah-asr
+	@mkdir -p configs/quality
+	@python3 tools/eval/cer_offline.py --model $(MODEL_DIR) --quant $(QUANT) \
+	  --manifest samples/manifest.json --json $(QUALITY_BASELINE)
+cer-check: mynah-asr
+	@python3 tools/eval/cer_offline.py --model $(MODEL_DIR) --quant $(QUANT) \
+	  --manifest samples/manifest.json --baseline $(QUALITY_BASELINE)
+
 # End-to-end server test (REST + concurrency + WebSocket)
 test-server: mynah-asr-server
 	@sh tests/test_server.sh $(MODEL_DIR); rc=$$?; \

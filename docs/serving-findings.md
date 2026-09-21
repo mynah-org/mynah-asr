@@ -1197,3 +1197,92 @@ version of the same one.
 
 **NOT AN ISA QUESTION.** No SVE, SVE2 or bf16 is involved. The largest single
 item in this serving path is work that does not need doing at all.
+
+## F28 — The projection is gone, and it was bigger than F27 measured: half its rows were never read
+
+**STATUS: the mechanism is proved; the capacity claim is NOT.** Everything below
+was measured on the development host (Darwin, Accelerate, unpinned) or is a
+property of the code. The only number that decides whether this was worth doing
+is the Axion ladder, and it has not been run. Do not quote a knee from this
+entry.
+
+**FACT — half of every rel-pos projection was dead.** In `stream_attention_core`
+the rel_shift reads `brow[base + j]` with `base = K-1-valid-t` and `j < K`.
+Since `K = valid + Q` by construction, `base = Q-1-t` and `t < Q`, so the rows
+that can ever be touched are `[0, K+Q-1)`. At the serving shape (K=74, Q=4) that
+is **77 of the 147 rows** that the projection and the `bd` GEMM both produced.
+F27 measured the projection at 48.6 % of the encoder step without knowing that
+47 % of what it measured was thrown away unread.
+
+**FACT — the projection is a property of the model, not of the pass.**
+`rk(K) = pe(K) @ relk_w^T` depends on neither the stream, the audio nor the
+contents of the cache, and `pe(K)[p]` depends only on `pos = K-1-p`. Therefore
+
+    rk(K)[p] == RK[p + (kmax - K)]      with   RK = pe(kmax) @ relk_w^T
+
+so one table per layer, built once at load, serves every K. S1-7 shared this
+quantity between the streams of one pass that happened to agree on K; the
+quantity was never per pass. ~14 MiB per model for Nemotron 0.6B, built before
+the server forks, so the workers share the pages rather than each holding one.
+
+**FACT — the position embedding goes with it.** `mynah_asr_pos_emb` builds
+`2K-1` rows of double `pow`/`sin`/`cos`, with the `pow` sitting in the inner
+loop although it depends only on the column. It ran on every step while a
+stream's left cache filled (~18 steps) and again after every
+`mynah_asr_enc_stream_reset`, which in the server is once per utterance. With
+the table there is nothing to feed it, so it is not built at all.
+
+**FACT — bit-exact, checked in two places rather than trusted.** The identity
+rests on the row independence of the DOT family (`x @ W^T`, one dot per output
+element over the whole of k), which is the same property S1-4 already rests on.
+At load the table compares a probe window against a direct projection byte for
+byte and refuses to install itself where that fails. In `tests/test_stream_batch`
+the table is built BETWEEN the two passes, so the float comparison is
+"batched, reading one table built once" against "single, projecting for itself
+every step":
+
+| arm | B=2 | B=4 | B=8 |
+|---|---|---|---|
+| int8, floats compared / differing | 74 240 / **0** | 133 120 / **0** | 266 240 / **0** |
+| f32, floats compared / differing | 74 240 / **0** | 133 120 / **0** | 266 240 / **0** |
+| K/V and conv caches differing | 0 of 6 | 0 of 12 | 0 of 24 |
+
+Transcripts IDENTICAL OK at B = 1,2,3,4,8 for both quants; per-stage oracle
+parity (features, subsampling, encoder) unchanged; zero allocations per chunk
+and per batched step unchanged. With `MYNAH_ASR_RELPOS_TABLE=0` the S1-7 path
+returns and is equally exact, so the A/B arm is real.
+
+**DEV SIGNAL ONLY (Darwin, Accelerate, unpinned, one process, noisy at small
+B).** `tests/test_stream_batch --steptime`, fitted over B >= 2:
+
+| arm | a (ms) | b (ms/stream) |
+|---|---|---|
+| table off | 15.57 | 18.52 |
+| table on | 11.79 | **14.06** |
+
+`b` is **1.32x smaller**. This is NOT the 1.94x that F27's component table
+predicted for the Axion, and the two hosts are not comparable: the Axion runs
+our own sgemm on Neoverse-V2 where the projection measured 48.6 % of the step,
+Darwin runs Accelerate where it was never measured. The honest reading is that
+the direction is confirmed and the magnitude is unknown until the box runs.
+
+**PREDICTION, recorded before the ladder, with its arithmetic.** The cadence
+budget per worker is `N_w * (a/B + b + finalize) <= P`, and at the F22 knee the
+3x8 server sat at `N_w = 12`, `a/B = 4.45`, `b = 19.00`, `finalize = 3.86`,
+summing to 27.31 ms against P = 320 ms. Substituting only `b`:
+
+| `b` becomes | per-stream cost | `N_w` | predicted C |
+|---|---|---|---|
+| 19.00 (today) | 27.31 | 11.7 | 36 (measured knee) |
+| 14.39 (the dev host's 1.32x) | 22.70 | 14.1 | **~42** |
+| 9.79 (F27's 1.94x) | 18.10 | 17.7 | **~53** |
+
+So the range to expect is C = 42..53 against a measured 36, and anything outside
+it means the law or the reasoning is wrong — which is itself the finding. **The
+success criterion is unchanged and is not any of the numbers above: the capacity
+curve has to move on the same ladder, same corpus, same seed, same affinity.**
+
+**Still standing after this.** The next items are not this one repeated: the
+elementwise stages that run on the scheduler thread while seven cores idle, the
+RNNT joint head, the ~300-400 pool barriers per step, and the K/V cache copy.
+See `.work/serving-audit-metrics-tests-hotpath.md`.

@@ -1,7 +1,12 @@
 # Serving audit: metrics, test tiers, quality gates, and the hot path
 
-Status: OPEN (written 2026-09-20 with the box off; everything below is read
-from code, scripts and the frozen ledger, nothing was measured)
+Status: IN PROGRESS. The audit was written 2026-09-20 with the box off, from
+code, scripts and the frozen ledger only. On 2026-09-21 four of its items
+landed on the development host with their gates green: S10-1 (the rel-pos
+table, `5fc9d36`), S10-2 (the joint head, `ebd91de`), Q-1 and T-1 and T-2
+(the harness, `a822d31` and after). The box has still measured nothing: the
+capacity claim is open and F28 says so. The runbook at the end of this note is
+what the box day runs.
 
 Task: S10-1 .. S10-9, Q-1 .. Q-4, T-1 .. T-3 (the board section "S10 — After
 the audit")
@@ -214,13 +219,101 @@ count) are all mechanical, bit-identical changes.
 
 ## Next action
 
-Before the box (Mac, every step with its bit-exactness gate): S10-1 (RK
-table, K+Q-1 rows), S10-2 (joint head on `qmat_mul_rows`, stacked across B),
-S10-3 (parallel_for over streams), Q-1 (one CER, one pct, `load_transcripts`
-keyed by `lang/file`), T-1 reporting-only additions, `make fetch-stress-bank`.
+**Done on the development host, 2026-09-21, each with its gate:**
 
-On the box, 90-minute budget: dispatch map, identity gates int8 and f32, the
-`objdump` check for `expf`, pool meter at C=32, then the same BEFORE ladder
-walked by bisection with validity-length rungs on the new binary, and only if
-the knee moved, one 600 s soak at the new C with `--transcripts`. Success is
-the curve moving (Phase 7 criterion), not any mechanism metric.
+- S10-1, the rel-pos table. 0 of 266,240 floats differ at B=8 in both quants,
+  with the table built between the two passes so the comparison is
+  table-against-per-step. Recorded as F28.
+- S10-2, the joint head on the weight-stationary path. Transcripts byte-identical
+  on five languages; the qmat counters account for the migration exactly
+  (`dot` -276, `dot_rows` +276 at B=8).
+- Q-1, one CER and one percentile. It exposed a real bug: the percentile rank
+  was computed as `(p/100)*n`, so the p99.9 of a thousand samples was silently
+  the maximum. Fixed and pinned.
+- T-1, the reporting the data already supported: p99/p99.9 (withheld below the
+  n that can name a rank under the maximum), audio per wall second,
+  end-of-utterance latency, per-stream fairness, longest inter-delta gap, WER.
+- T-2, the three tiers as one command each, with `knee.py` (bisection on a warm
+  server), `cer_offline.py` (baseline and margin) and `compare_runs.py` (which
+  refuses to compare runs that differ in an undeclared way).
+- The first quality baseline, `configs/quality/`: this pack at int8 scores
+  CER mean 0.045, weighted 0.060, worst clip pt/fleurs_1521 at 0.272. Before
+  today no committed number said what "still correct" means for this model.
+
+**Deliberately NOT done, and why.** S10-3 (the elementwise stages), S10-4 (the
+pool spin sweep) and S10-5 (the K/V cache) are the next largest items and all
+three are left alone until the box has measured the two changes already
+stacked. Landing a third would make the ladder unattributable, which is the
+guardrail this campaign has been run under from the start.
+
+**Next: the box.** See the runbook at the end of this note. The success
+criterion is unchanged and is not a mechanism metric: the capacity curve moves,
+or the change did not work.
+
+---
+
+## Box runbook, written 2026-09-21 before the box is opened
+
+Budget: 90 minutes. Everything below runs from a clean committed tree, in tmux,
+on the Axion. The order is fixed: nothing that costs time runs before the thing
+that could invalidate it.
+
+**Before anything (5 min) — does this build do what the Mac build did.**
+
+```
+git pull && make clean && make
+./mynah-asr-server --dispatch-map | tee dispatch.txt      # int8_rows must resolve
+./tests/test_stream_batch models/<pack>                    # EXACT OK / IDENTICAL OK
+MYNAH_ASR_RELPOS_TABLE=0 ./tests/test_stream_batch models/<pack>
+objdump -d ./mynah-asr-server | grep -c _ZGVnN4v_expf      # S10-7: 0 means scalar
+```
+
+The gate is the same one that ran on the dev host, so a difference here is the
+provider, not the change. The `objdump` line settles S10-7 in one command: it
+is the only open question in the audit that a Linux binary can answer for free.
+
+**The measurement that decides everything (25 min) — the same ladder, twice.**
+
+Same corpus, same seed, same affinity, same warm-up, same run length as the
+`a48d443` BEFORE ladder of F22. Run the AFTER arm first, then the BEFORE arm by
+setting `MYNAH_ASR_RELPOS_TABLE=0` on the same binary, so the two differ in one
+environment variable and nothing else — not a rebuild, not a checkout.
+
+Report, per rung, exactly the F22 columns: audio/wall, lag p50/p95, backlog,
+step, finalize, runnable idle, no-work, model, mean B, ready-to-model-start
+p50/p95/p99, verdict. The success criterion is F28's, and it is not a
+percentage: **C_safe and C_knee move, or the change did not work.** The
+predicted range is C = 42..53 against a measured 36. Outside it, the cadence law
+or the reasoning behind F28 is wrong, and that is the finding.
+
+`tools/bench/knee.py` can find the knee in about five probes on one warm server,
+but the BEFORE/AFTER comparison must be the SAME ladder F22 ran, rung for rung.
+Use the bisection for the exploring, the full ladder for the claim.
+
+**Only if the knee moved (35 min) — qualify the new point.**
+
+```
+make fetch-stress-bank                 # once; every soak before this scored nothing
+make cer-baseline MODEL_DIR=models/<pack>
+sh tools/bench/tier.sh 2 -m models/<pack> -C <the new knee>
+```
+
+Tier 2 runs two identical 600 s soaks with references and refuses to start on a
+dirty tree or without a manifest. Two runs, because the widest move between two
+identical runs IS the noise floor of this harness at that point, and no smaller
+difference may be called a result afterwards.
+
+**What NOT to do on this box day.**
+
+- Do not also land S10-3 (the elementwise stages), S10-4 (the pool spin sweep)
+  or S10-5 (the K/V cache) first. Two changes are already stacked, S10-1 and
+  S10-2; a third makes the ladder unattributable. The table has an A/B arm
+  (`MYNAH_ASR_RELPOS_TABLE`) precisely so that one of the two can be isolated.
+- Do not tune a threshold to make a rung pass.
+- Do not promote C from a wave. Only tier 2 promotes.
+- Do not read the Darwin 1.32x as a prediction for this host. It is a direction.
+
+**What the box owes back to the repo**, whatever the answer: the ladder table in
+`docs/serving-findings.md` as F29, the profile in `configs/perf/` updated with
+`measured_short_run_safe` and, only if tier 2 passed twice, `long_soak_qualified`.
+A negative result is written up in the same detail as a positive one.
