@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <sys/resource.h>   /* R-3E: page faults across the first model step */
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -482,6 +484,18 @@ static void sched_cancel(mynah_asr_slot *s, const char *code, const char *msg) {
  * had consumed by then. */
 static int g_trace_steps = -1;
 
+/* R-3E. The first model step of a fresh process measured 43.8, 49.4 and
+ * 1010.6 ms on three identical runs, so whatever costs the second is NOT a
+ * deterministic lazy initialisation. Minor and major faults across the step
+ * separate "first touch of the weights" from "something initialised lazily":
+ * a slow step that takes faults is paging, a slow step that takes none is not.
+ * Two getrusage calls per traced step, none at all when the trace is off. */
+static void sched_faults(long *minflt, long *majflt) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) { *minflt = ru.ru_minflt; *majflt = ru.ru_majflt; }
+    else { *minflt = -1; *majflt = -1; }
+}
+
 static int sched_trace_steps(void) {
     if (g_trace_steps < 0) {
         const char *e = getenv("MYNAH_ASR_TRACE_TTFP");
@@ -513,9 +527,9 @@ static void sched_emit_done(mynah_asr_slot *s) {
          * read here rather than stamped here: by `done` the first delta is
          * long gone. A zero means the stage never happened. */
         fprintf(stderr,
-                "[TTFP] slot=%d END open=%.6f first_audio=%.6f first_result=%.6f "
+                "[TTFP] pid=%d slot=%d END open=%.6f first_audio=%.6f first_result=%.6f "
                 "first_queued=%.6f first_send=%.6f steps=%d deltas=%d audio_s=%.4f\n",
-                s->id, s->t_open, s->t_first_audio, s->t_first_delta,
+                (int)getpid(), s->id, s->t_open, s->t_first_audio, s->t_first_delta,
                 s->t_first_queued, mynah_asr_stream_out_first_send(s->out),
                 s->steps, s->deltas, audio_s);
     }
@@ -675,25 +689,38 @@ static void sched_step_batch(int B) {
     }
     /* Before the call, so `emitted` below counts only this step's deltas. */
     const int trace_n = sched_trace_steps();
-    if (trace_n > 0)
-        for (int j = 0; j < B; j++) g.b_d0[j] = g.b_slot[j]->deltas;
+    long mn0 = 0, mj0 = 0;
+    int trace_now = 0;
+    if (trace_n > 0) {
+        for (int j = 0; j < B; j++) {
+            g.b_d0[j] = g.b_slot[j]->deltas;
+            if ((int)g.b_slot[j]->steps <= trace_n) trace_now = 1;
+        }
+        if (trace_now) sched_faults(&mn0, &mj0);
+    }
 
     const int rc = mynah_asr_stream_step_batch(g.b_stream, B, g.b_samples, g.b_n,
                                                sched_on_result, g.b_ud);
     const double t_end = mynah_asr_now();
     const unsigned long us = (unsigned long)((t_end - t0) * 1e6 + 0.5);
 
-    if (trace_n > 0) {
+    if (trace_now) {
+        long mn1 = 0, mj1 = 0;
+        sched_faults(&mn1, &mj1);
         for (int j = 0; j < B; j++) {
             mynah_asr_slot *s = g.b_slot[j];
             if ((int)s->steps > trace_n) continue;
+            /* pid, because under prefork the slot ids of different workers
+             * collide and a trace that cannot tell two workers apart cannot be
+             * paired with anything. */
             fprintf(stderr,
-                    "[TTFP] slot=%d step=%d B=%d consumed_s=%.4f arrival=%.6f "
-                    "ready=%.6f sel=%.6f mstart=%.6f mend=%.6f emitted=%d\n",
-                    s->id, (int)s->steps, B,
+                    "[TTFP] pid=%d slot=%d step=%d B=%d consumed_s=%.4f arrival=%.6f "
+                    "ready=%.6f sel=%.6f mstart=%.6f mend=%.6f emitted=%d "
+                    "minflt=%ld majflt=%ld\n",
+                    (int)getpid(), s->id, (int)s->steps, B,
                     s->stream ? mynah_asr_stream_audio_seconds(s->stream) : 0.0,
                     g.b_ctx[j].arrival, g.b_ready[j], g.b_sel[j], t0, t_end,
-                    s->deltas - g.b_d0[j]);
+                    s->deltas - g.b_d0[j], mn1 - mn0, mj1 - mj0);
         }
     }
 

@@ -37,31 +37,62 @@ for L in open(os.path.join(out, "server.log")).read().splitlines():
     (ends if " END " in L else steps).append(kv)
 
 runs = []
-for f in sorted(glob.glob(os.path.join(out, "samples_*.json"))):
-    u = json.load(open(f))["utterances"][0]
-    if u.get("error"):
-        print(f"  SKIP {os.path.basename(f)}: {u['error']}")
+for f in sorted(glob.glob(os.path.join(out, "*.json"))):
+    d = json.load(open(f))
+    if "utterances" not in d:
         continue
-    runs.append(u)
-# The server prints END in EXECUTION order, glob() returns files ALPHABETICALLY.
+    for u in d["utterances"]:
+        if u.get("error") or not u.get("lag_marks"):
+            continue
+        runs.append(u)
 runs.sort(key=lambda u: u["t_start"])
-if len(ends) != len(runs):
-    print(f"WARNING: {len(ends)} server END lines vs {len(runs)} client runs")
+
+# PAIRING. Ordering by time works only while one stream runs at a time; at any
+# real concurrency the END lines interleave. So each client utterance claims the
+# unclaimed END line that is CONSISTENT with it -- its first audio arrived after
+# that utterance's first write, its first send happened before that utterance saw
+# text -- and, among those, the closest. On loopback the true match is separated
+# from every impostor by whole milliseconds, and an utterance that finds no
+# consistent line is reported rather than silently paired.
+claimed, pairs, orphans = set(), [], []
+for u in runs:
+    cli = u["lag_marks"][0][0]
+    fw = cli - u["ttfp_ms"] / 1000.0
+    best, bestd = None, None
+    for i, e in enumerate(ends):
+        if i in claimed or e["first_result"] == 0.0:
+            continue
+        if not (fw <= e["first_audio"] and e["first_send"] <= cli):
+            continue
+        d = e["first_audio"] - fw
+        if bestd is None or d < bestd:
+            best, bestd = i, d
+    if best is None:
+        orphans.append(u)
+        continue
+    claimed.add(best)
+    pairs.append((u, ends[best]))
+if orphans:
+    print(f"WARNING: {len(orphans)} utterance(s) matched no server END line; excluded")
+if len(ends) - len(claimed):
+    print(f"NOTE: {len(ends) - len(claimed)} server END line(s) unclaimed "
+          f"(warm-up streams, or streams the client did not keep)")
 
 rows = []
-for u, e in zip(runs, ends):
+for u, e in pairs:
     cli = u["lag_marks"][0][0]
     first_write = cli - u["ttfp_ms"] / 1000.0
     # The slot id is reused between runs, so the window is what selects a run's
     # steps: only those the model started while THIS stream was open.
     mine = sorted([s for s in steps
-                   if s["slot"] == e["slot"]
+                   if s["slot"] == e["slot"] and s.get("pid", e.get("pid")) == e.get("pid")
                    and e["first_audio"] <= s["mstart"] <= e["first_result"] + 1e-9],
                   key=lambda s: s["mstart"])
     rows.append((u, e, cli, first_write, mine))
 
-print(f"R-2  C=1  {len(rows)} utterances, one stream at a time, development host")
-print("DIAGNOSTIC (macOS/Accelerate): the MECHANISM transfers, the milliseconds do not.\n")
+import platform as _pf
+print(f"TTFP waterfall: {len(rows)} utterance(s) paired, host {_pf.system()} {_pf.machine()}")
+print("A run on the development host is DIAGNOSTIC: the mechanism transfers, the ms do not.\n")
 
 print("PAIRING AND CLOCK CHECK -- every server mark must sit inside the client's window")
 ok_all = True
@@ -122,10 +153,12 @@ for u, e, cli, fw, mine in rows:
     print(f"\n  {'/'.join(u['clip'].split('/')[-2:])}  onset {u['onset_s']:.2f}s  "
           f"first non-blank after {u['first_delta_audio_s']:.3f}s of audio "
           f"({u['first_delta_audio_s'] - u['onset_s']:.3f}s of speech)")
-    print(f"    {'step':>4} {'consumed_s':>11} {'idle_before_ms':>15} {'step_ms':>8} {'emitted':>8}")
+    print(f"    {'step':>4} {'consumed_s':>11} {'idle_before_ms':>15} {'step_ms':>8} "
+          f"{'B':>3} {'emitted':>8} {'minflt':>8} {'majflt':>7}")
     prev = None
     for s in mine:
         idle = (s["mstart"] - prev) * 1000.0 if prev else (s["mstart"] - e["first_audio"]) * 1000.0
         print(f"    {int(s['step']):>4} {s['consumed_s']:>11.3f} {idle:>15.1f} "
-              f"{(s['mend'] - s['mstart']) * 1000:>8.1f} {int(s['emitted']):>8}")
+              f"{(s['mend'] - s['mstart']) * 1000:>8.1f} {int(s.get('B', 0)):>3} "
+              f"{int(s['emitted']):>8} {int(s.get('minflt', -1)):>8} {int(s.get('majflt', -1)):>7}")
         prev = s["mend"]
