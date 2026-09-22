@@ -322,8 +322,29 @@ history rather than unlocking anything.
 The extreme blank logits before the first word are an **encoder** phenomenon --
 high-norm output while the stream opens on silence with a cold cache -- made
 visible, not caused, by the suppressive SOS predictor output. They are a
-signature, not a cause. R-3's attribution stands: the wait is the model wanting
-acoustic evidence.
+signature, not a cause.
+
+**What R-8 does NOT establish.** An earlier draft of this note ended "R-3's
+attribution stands: the wait is the model wanting acoustic evidence." That is
+stronger than the evidence. R-8 falsifies four things -- a predictor-state
+emission lock, an int8 numerical artefact, forcing the predictor as a safe
+lever, and the predictor as the origin of the extreme logits -- and it locates
+the phenomenon UPSTREAM of the predictor. It says nothing about whether the
+remaining 0.50-0.97 s is irreducible. That latency could still be produced
+anywhere along
+
+    encoder context policy -> cache fill -> lookahead / chunking / subsampling
+    -> encoder representation -> RNNT decision
+
+and R-8 examined only the last arrow. The correct frozen statement is:
+
+> **R-8 rejects an initial predictor-state emission lock. It does not establish
+> that the remaining first-word latency is irreducible acoustic-evidence
+> latency. The remaining causal search moves upstream, to encoder context,
+> cadence and cache behaviour.**
+
+The finding that the phenomenon lives in the encoder on the first frames with a
+filling cache makes that upstream search MORE interesting, not less.
 
 The word-mark result is the one thing worth keeping open, and it is a
 TOKENIZER/predictor interaction, not a latency lever: the model appears to be

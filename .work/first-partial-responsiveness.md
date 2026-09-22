@@ -930,3 +930,90 @@ and left these three. It still blocks R-5.
 
 Separately and independently: cold start is fully attributed (F30) and its fix
 is mechanical. It does not belong to this note.
+
+---
+
+## Family B, premise check BEFORE any benchmark (2026-09-22, code + pack only)
+
+`tools/eval/preset_derive.py`, which reads the pack's `mynah.json` and follows
+the four functions that decide: `mynah_asr_enc_stream_need`,
+`mynah_asr_mel_stream_samples_until`, `mynah_asr_ss_stream_step` and the
+`cache_valid` update in `mynah_asr_enc_stream_step`.
+
+### FACT — the presets this checkpoint actually has
+
+`[56,3]`, `[56,0]`, `[56,6]`, `[56,13]`. **`[56,1]` and `[56,2]` are not
+declared.** The runtime would accept them — `right` is just a chunk length — but
+the checkpoint was not trained for them, so they are off-distribution in the
+same way the mid-stream transition of R-7 is. `[56,2]` is worse than that: its
+`q = 3` does not divide `left_ctx = 56`, which breaks the invariant
+`src/encoder.h` rests its UNMASKED attention on ("the left context in the cache,
+always divisible by r+1, is EXACTLY the allowed context"). Every preset the pack
+declares divides it. That is a reason from the code, not a preference.
+
+### FACT — the derivation
+
+| preset | q | 1st chunk | steady | cadence P | future ctx by chunk position | mean | cache fill |
+|---|---|---|---|---|---|---|---|
+| `[56,0]` | 1 | 1 mel, **16 ms** | 8 mel | **80 ms** | 0 | **0 ms** | 4480 ms |
+| `[56,3]` | 4 | 25 mel, **256 ms** | 32 mel | **320 ms** | 240/160/80/**0** | **120 ms** | 4480 ms |
+| `[56,6]` | 7 | 49 mel, 496 ms | 56 mel | 560 ms | 480/…/**0** | 240 ms | 4480 ms |
+| `[56,13]` | 14 | 105 mel, 1056 ms | 112 mel | 1120 ms | 1040/…/**0** | 520 ms | 4480 ms |
+
+### The claim that was wrong for two plans
+
+"`[56,3] -> [56,0]` removes 240 ms of right context" is **wrong by a factor of
+two**, and this is why `[56,0]` disappointed.
+
+`es->right` never reaches the attention (two readers in `src/encoder.c`: its
+assignment and `enc_stream_need`). The streaming attention is **unmasked** over
+`[valid cache + chunk]` — no `mask`, no `-INFINITY`, and the softmax runs over
+`j in [0, K)` with `K = valid + Q`. So a frame at position `t` in a chunk of `q`
+attends to the `q-1-t` frames **after it in the same chunk**. Future context is
+a property of POSITION, not of the preset:
+
+- at `[56,3]` the four frames of a chunk get **240 / 160 / 80 / 0 ms**;
+- **the last frame of every chunk has no lookahead at all, in every preset**;
+- the expectation over positions, which is what a first token landing anywhere
+  pays, is `(q-1)/2 x 80 ms` = **120 ms**, not 240.
+
+**Checked against the saved evidence.** First natural token, `[56,3]` against
+`[56,0]`, 21 clips: **median −0.100 s, mean −0.129 s**. The derivation says
+120 ms. It agrees, and 6 of 21 clips move by exactly zero while one (pt/1521)
+gets **0.80 s worse**. The whole remaining lookahead budget between the fastest
+and the default preset is about 120 ms — against a first-word wait of
+0.50–0.97 s. Family B's ceiling on this axis is small, and it was already
+bought once, for mean CER 0.0405 -> 0.0525.
+
+### FACT — the cold cache is preset-invariant
+
+`cache_valid += q`, saturating at `left_ctx = 56` encoder frames. Steps to fill
+is `ceil(56/q)` and each step is `q x 80 ms` of audio, so the fill takes
+**4480 ms of audio in every preset**. Every first token in this corpus lands at
+0.9–6.1 s, i.e. **every one of them is decided with a partially filled cache**,
+and no choice of preset changes that by a millisecond.
+
+That is the same window R-8 found the high-norm encoder output living in.
+
+### What this makes the sensible next experiments
+
+Not chosen yet — listed so the choice is made from the derivation rather than
+from the preset names. Ordered by cost.
+
+1. **Free, from traces already on disk: does first-token latency track chunk
+   position?** The model above predicts a frame at position 0 pays 240 ms and at
+   position `q-1` pays 0. The prediction is falsifiable against the 21 baseline
+   traces without running anything. If it does not hold, the derivation is wrong
+   and nothing below is worth doing.
+2. **The cold cache, which is the bigger number.** 4480 ms of preset-invariant
+   fill against a 120 ms lookahead budget. A diagnostic that primes the cache
+   before the clip — and is therefore NOT deployable as it stands — would say
+   how much of the first-word wait is cache fill rather than evidence. That is
+   the upstream question R-8 pointed at, and it is worth more than the preset.
+3. **The presets nobody has priced: `[56,6]` and `[56,13]`.** They go the other
+   way, costing +120 ms and +400 ms of mean lookahead to cut the step count by
+   1.75x and 3.5x, which moves `P` in the cadence law `T(B) = a + b·B <= ρ·P`
+   from 320 ms to 560 or 1120. For a server that is a capacity lever, and the
+   trade has never been measured. It needs a box; the two above do not.
+
+**No preset change is proposed here and no machine is needed for 1 or 2.**
