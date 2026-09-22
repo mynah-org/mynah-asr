@@ -214,6 +214,20 @@ REFJSON="$RUN/reference.json"
 if [ -n "$REF_IN" ]; then
     [ -f "$REF_IN" ] || die "--reference-file $REF_IN does not exist"
     cp "$REF_IN" "$REFJSON" || die "could not copy $REF_IN"
+    # A reused reference that does not cover this corpus does not fail: the
+    # clips it is missing are simply never compared. So coverage is checked
+    # here too, not only where the reference is generated.
+    python3 - "$REFJSON" $BANK <<'REFCOV' || die "the reused reference does not cover this corpus"
+import json, sys
+ref = json.load(open(sys.argv[1]))
+clips = sys.argv[2:]
+missing = [c for c in clips if c not in ref]
+if missing:
+    sys.exit(f"{len(missing)} clip(s) of this corpus have no reference: {missing[:3]}")
+extra = [c for c in ref if c not in clips]
+print(f"reference covers all {len(clips)} clips"
+      + (f", {len(extra)} unused entries" if extra else ""))
+REFCOV
     say "reference: reusing $REF_IN ($(python3 -c "import json;print(len(json.load(open('$REFJSON'))))") clips)"
 elif [ "$PHASE" = all ] || [ "$PHASE" = reference ]; then
     say "--- V2-6 reference: C=1, unloaded, $NCLIP clips, from the server"
