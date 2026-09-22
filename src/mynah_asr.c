@@ -890,6 +890,19 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
 
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s) { return s->lang; }
 
+/* The transcript the LIBRARY currently holds, as opposed to the concatenation of
+ * the deltas a client has received.
+ *
+ * The two are assumed equal and nothing checks it: stream_decode_emit publishes
+ * `text + chars_emitted`, a byte slice, so a detokenisation that ever rewrote a
+ * byte BEFORE that offset -- a subword merge, the trailing-space strip, the
+ * inline language tag being resolved late -- would leave the client holding text
+ * the model no longer agrees with, and no delta could take it back. This getter
+ * exists so the quality gate can compare the two instead of assuming. */
+const char *mynah_asr_stream_text(const mynah_asr_stream *s) {
+    return s->detok.buf ? s->detok.buf : "";
+}
+
 int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
     if (lang) {
         const int prompt = resolve_prompt(s->m, lang);

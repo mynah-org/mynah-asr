@@ -26,7 +26,10 @@ static void usage(void) {
     printf("             --timestamps prints one word per line: t0 t1 word\n");
     printf("             --decoder ctc uses the CTC head of hybrid models (tdt_ctc)\n");
     printf("  stream     -m <model_dir> [-i file.wav] [--chunk-ms N] [--lang auto] [--quant int8|int4] [--vad <dir>]\n");
+    printf("             [--lookahead N] [--deltas]\n");
     printf("             live streaming: -i a WAV, or raw s16le 16 kHz mono on stdin\n");
+    printf("             --deltas prints one JSON object per published delta (t0, t1, text)\n");
+    printf("             and a final one with the concatenation, for the quality gate\n");
     printf("  quantize   -m <model_dir> --quant int8|int4\n");
     printf("             writes the pre-quantized checkpoint (instant load)\n");
     printf("  bench      -m <model_dir> [-i file.wav] [--runs N] [--warmup W] [--quant int8] [--vad <dir>]\n");
@@ -182,11 +185,81 @@ static int cmd_transcribe(int argc, char **argv) {
  * only know speech ended min_silence_ms after it did. */
 static double g_fed_sec;
 
+/* --deltas: one JSON object per published delta, on stdout, instead of the
+ * concatenated text.
+ *
+ * WHY THE CLI AND NOT THE SERVER.  The quality of a first partial -- is the
+ * first lexical token right, did anything get published during the leading
+ * silence, does the client's concatenation still equal what the model thinks it
+ * said -- is a property of the decoder and the checkpoint, not of the serving
+ * path, which R-4 measured at ~0.1 ms end to end. Measuring it here keeps load,
+ * scheduling and the socket out of the answer, and a WAV fed faster than real
+ * time makes the run deterministic and cheap enough for a gate.
+ *
+ * THE AXIS IS AUDIO, NOT WALL.  t1 is the audio the stream had consumed when
+ * the delta was published, so the numbers do not move with the host (proven
+ * clip-for-clip between this Mac and the Axion, F30/E2). Wall-clock
+ * time-to-first-partial is a serving question and belongs to the server
+ * harness, which already measures it. */
+static int g_deltas_json;
+static char *g_full;                    /* everything published, concatenated */
+static size_t g_full_len, g_full_cap;
+static int g_delta_n;
+
+static void full_append(const char *t) {
+    const size_t n = strlen(t);
+    if (g_full_len + n + 1 > g_full_cap) {
+        size_t cap = g_full_cap ? g_full_cap : 256;
+        while (cap < g_full_len + n + 1) cap *= 2;
+        char *nb = realloc(g_full, cap);
+        if (!nb) return;
+        g_full = nb;
+        g_full_cap = cap;
+    }
+    memcpy(g_full + g_full_len, t, n + 1);
+    g_full_len += n;
+}
+
+/* Minimal JSON string escape: the transcripts are UTF-8, which passes through
+ * unchanged; only the structural characters and the controls need work. */
+static void json_puts(const char *t) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)t; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\n': fputs("\\n", stdout); break;
+        case '\r': fputs("\\r", stdout); break;
+        case '\t': fputs("\\t", stdout); break;
+        default:
+            if (*p < 0x20) printf("\\u%04x", *p);
+            else putchar(*p);
+        }
+    }
+    putchar('"');
+}
+
 static void print_partial(const mynah_asr_result *res, void *ud) {
     (void)ud;
     if (res->is_eou) {
-        fprintf(stderr, "\n[eou at %.2fs, reported after %.0f ms]\n",
-                res->t1, (g_fed_sec - res->t1) * 1000.0);
+        if (g_deltas_json) {
+            printf("{\"type\":\"eou\",\"t1\":%.4f,\"fed_s\":%.4f}\n", res->t1, g_fed_sec);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "\n[eou at %.2fs, reported after %.0f ms]\n",
+                    res->t1, (g_fed_sec - res->t1) * 1000.0);
+        }
+        return;
+    }
+    if (g_deltas_json) {
+        full_append(res->text);
+        printf("{\"type\":\"delta\",\"i\":%d,\"t0\":%.4f,\"t1\":%.4f,\"fed_s\":%.4f,\"lang\":",
+               g_delta_n++, res->t0, res->t1, g_fed_sec);
+        if (res->lang) json_puts(res->lang); else fputs("null", stdout);
+        fputs(",\"text\":", stdout);
+        json_puts(res->text);
+        fputs("}\n", stdout);
+        fflush(stdout);
         return;
     }
     fputs(res->text, stdout);
@@ -203,6 +276,7 @@ static int cmd_stream(int argc, char **argv) {
         else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) vad_dir = argv[++i];
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) wav = argv[++i];
         else if (strcmp(argv[i], "--chunk-ms") == 0 && i + 1 < argc) chunk_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--deltas") == 0) g_deltas_json = 1;
         else if (strcmp(argv[i], "--quant") == 0 && i + 1 < argc) {
             i++;
             quant = strcmp(argv[i], "int8") == 0 ? MYNAH_ASR_QUANT_INT8
@@ -259,7 +333,27 @@ static int cmd_stream(int argc, char **argv) {
     }
     }
     mynah_asr_stream_finish(s, print_partial, NULL);
-    printf("\n");
+    if (g_deltas_json) {
+        /* The last line carries the CONCATENATION a client would hold, not the
+         * library's own string: the delta gate slices `text` by byte offset, so
+         * if a later detokenisation ever changed a byte already published
+         * nothing outside would notice. Recording both makes that checkable. */
+        printf("{\"type\":\"final\",\"deltas\":%d,\"fed_s\":%.4f,\"lang\":",
+               g_delta_n, g_fed_sec);
+        if (mynah_asr_stream_lang(s)[0]) json_puts(mynah_asr_stream_lang(s));
+        else fputs("null", stdout);
+        fputs(",\"text\":", stdout);
+        json_puts(g_full ? g_full : "");
+        fputs(",\"lib_text\":", stdout);
+        json_puts(mynah_asr_stream_text(s));
+        fputs("}\n", stdout);
+        fflush(stdout);
+        free(g_full);
+        g_full = NULL;
+        g_full_len = g_full_cap = 0;
+    } else {
+        printf("\n");
+    }
     if (mynah_asr_stream_lang(s)[0]) fprintf(stderr, "[lang=%s]\n", mynah_asr_stream_lang(s));
 
     mynah_asr_stream_close(s);

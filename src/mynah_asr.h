@@ -239,6 +239,10 @@ int mynah_asr_stream_finish(mynah_asr_stream *s, mynah_asr_result_cb cb, void *u
 
 /* Language detected so far ("" when not emitted yet). */
 const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
+/* The transcript the library holds now; the deltas are byte slices of it, so a
+ * client's concatenation SHOULD equal this. Nothing enforces that: the quality
+ * gate compares them. Valid until the next feed. */
+const char *mynah_asr_stream_text(const mynah_asr_stream *s);
 
 /* A new utterance on the SAME stream object: every cache, the decoder state,
  * the VAD state and the emitted-text bookkeeping go back to what open() gave,
