@@ -12,8 +12,42 @@ Exit 1 when any of these holds:
   * an addendum under .work/ names a task id (`Task: P1.4`) that PLAN.md does not contain.
 A missing PLAN.md is not a failure (the plan is local and untracked): the check reports
 it and exits 0.  Nothing here reads the content of the plan beyond paths and task ids.
+
+WHAT "EXISTS" MEANS.  A path exists when GIT has it, not when the working tree does.
+The two differ precisely where it hurts: `tests/test_stream_batch` is a gitignored
+BUILT binary, present on the machine that wrote the plan line and absent from every
+fresh clone, so a filesystem check passed locally and failed in CI on the same commit
+(2026-09-19..2026-09-21, every `Build & Test` job).  A gate that is green only on the
+author's disk is worse than no gate: it authorises "PASS" in a commit message.
+`.work/evidence/` and `.work/private/` are untracked BY DESIGN (.work/README.md rule 7);
+they are exempt and counted, never silently skipped.  Without git (a tarball) the check
+degrades to the filesystem and says so.
 """
-import argparse, os, re, sys
+import argparse, os, re, subprocess, sys
+
+UNTRACKED_BY_DESIGN = (".work/evidence/", ".work/private/")
+
+
+def git_truth(root):
+    """The set of paths a fresh clone would have: tracked files + their directories.
+
+    Returns None when git cannot answer, so the caller can degrade loudly."""
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    files = {f for f in out.stdout.split("\0") if f}
+    if not files:
+        return None
+    known = set(files)
+    for f in files:
+        parts = f.split("/")
+        for i in range(1, len(parts)):
+            known.add("/".join(parts[:i]))
+    return known
 
 TASK_RE = re.compile(r"^\s*-\s*\[( |x|X|~|-)\]\s+(P\d+\.\d+[a-z]?|[A-Z]+\d*-\d+[a-z]?)\b")
 PATH_RE = re.compile(r"(?<![\w/.-])(\.work/[\w./-]+|(?:docs|tools|tests|scripts|server|src|cli)/[\w./-]+|[\w-]+\.md)(?![\w/-])")
@@ -30,8 +64,20 @@ def main():
         print(f"check_plan: {a.plan} absent (local, untracked) — nothing to check")
         return 0
 
+    known = git_truth(root)
+
+    def exists(p):
+        """True when a FRESH CLONE would have this path."""
+        p = p.rstrip("/")
+        if p.startswith(UNTRACKED_BY_DESIGN):
+            return None                       # exempt: counted, not judged
+        if known is None:
+            return os.path.exists(os.path.join(root, p))
+        return p in known
+
     lines = open(a.plan, encoding="utf-8").read().splitlines()
     failures, ids, task_ids = [], {}, set()
+    exempt = 0
     current = None          # (id, done)
     for n, line in enumerate(lines, 1):
         m = TASK_RE.match(line)
@@ -46,12 +92,16 @@ def main():
             current = None  # a heading or paragraph ends the task block
         for p in PATH_RE.findall(line):
             p = p.rstrip(".,;:)")
-            if p.endswith(".md") and "/" not in p and not os.path.exists(p):
+            here = exists(p)
+            if here is None:
+                exempt += 1
+                continue
+            if p.endswith(".md") and "/" not in p and not here:
                 # a bare *.md that is not a file here may be prose (e.g. "the runbook.md");
                 # only flag it when the line says detail:/doc:/see:
                 if not re.search(r"\b(detail|doc|see|evidence):", line):
                     continue
-            if not os.path.exists(os.path.join(root, p)):
+            if not here:
                 who = f" (task {current[0]}{', marked [x]' if current[1] else ''})" if current else ""
                 # The recurring version of this failure is a BUILT artefact:
                 # the board names tests/foo, which exists on the machine that
@@ -60,10 +110,13 @@ def main():
                 # next reader to rediscover it.
                 hint = ""
                 for ext in (".c", ".sh", ".py"):
-                    if os.path.exists(os.path.join(root, p + ext)):
-                        hint = (f" -- but {p}{ext} exists: the board names a built"
+                    if exists(p + ext):
+                        hint = (f" -- but {p}{ext} is tracked: the board names a built"
                                 " binary, which is not in a fresh clone; name the source")
                         break
+                if not hint and os.path.exists(os.path.join(root, p.rstrip("/"))):
+                    hint = (" -- present on this disk but not in git: either track it"
+                            " or stop the board depending on it")
                 failures.append(f"line {n}: missing path {p}{who}{hint}")
 
     # addenda that name a task the plan does not have
@@ -84,11 +137,16 @@ def main():
     n_tasks = len(task_ids)
     n_done = sum(1 for l in lines if TASK_RE.match(l) and TASK_RE.match(l).group(1).lower() == "x")
     if failures:
-        print(f"check_plan: FAIL ({len(failures)} problem(s), {n_tasks} tasks, {n_done} done)")
+        how = "filesystem (no git here)" if known is None else "git (what a fresh clone has)"
+        print(f"check_plan: FAIL ({len(failures)} problem(s), {n_tasks} tasks, "
+              f"{n_done} done; paths resolved against {how})")
         for f in failures:
             print("  " + f)
         return 1
-    print(f"check_plan: PASS ({n_tasks} tasks, {n_done} done, {len(lines)} lines, every referenced path exists)")
+    how = "filesystem (no git here: WEAKER than CI)" if known is None else "git"
+    extra = f", {exempt} exempt (untracked by design)" if exempt else ""
+    print(f"check_plan: PASS ({n_tasks} tasks, {n_done} done, {len(lines)} lines, "
+          f"every referenced path exists in {how}{extra})")
     return 0
 
 
