@@ -274,3 +274,33 @@ manifest to check them against. There is one now.
 | DECISION | quality is a guardrail, not the mission; Server V2 qualification is the mission |
 | EXPERIMENT | `.work/server-v2-qualification.md`: candidate frozen, twelve bounds registered before the first run |
 | NEXT | ladder C=8/16/24/32 on Axion, then two independent 1800 s soaks at C=16 |
+
+## Q2 complete — all six arms
+
+| arm | EN WER-ff | FR WER-ff | EN CER-ff | EN first word |
+|---|---|---|---|---|
+| streaming `[56,3]` INT8 | 0.0916 | 0.1033 | 0.0377 | 0.825 |
+| offline INT8 | 0.0884 | 0.1011 | 0.0364 | 0.825 |
+| **streaming `[56,3]` F32** | **0.0857** | **0.1020** | 0.0351 | 0.815 |
+| **offline F32** | **0.0857** | **0.1020** | 0.0351 | 0.815 |
+| streaming `[56,6]` INT8 | 0.0819 | 0.1000 | 0.0321 | 0.830 |
+| streaming `[56,13]` INT8 | **0.0799** | **0.0966** | 0.0324 | **0.855** |
+
+**In F32, streaming and offline are the same number to four decimals, in both
+languages.** The +0.0032 EN / +0.0022 FR that streaming costs at INT8 is
+therefore not a property of streaming semantics; it is an interaction with
+quantization. There is no streaming bug to find.
+
+**INT8 costs 0.59 WER points in English** (0.0916 against 0.0857) and 0.13 in
+French. Real, small, and the price of the memory bandwidth the serving numbers
+depend on.
+
+**Configuration is the largest lever in the matrix.** `[56,13]` is worth
+-1.17 points EN and -0.67 FR against `[56,3]`, and takes first-word correctness
+from 82.5 % to 85.5 % — but it costs cadence: the chunk period goes 320 ms to
+1120 ms. That is a product tradeoff between responsiveness and accuracy, and it
+belongs to whoever is choosing between them, not to an optimizer.
+
+So the decomposition asked for by Q2 is answered: **the checkpoint carries
+8-10 %, quantization 0.6, streaming semantics 0.0, and configuration is worth
+about 1.2 points if latency can pay for it.**
