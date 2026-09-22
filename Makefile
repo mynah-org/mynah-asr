@@ -544,6 +544,7 @@ check:
 	@out=$$(python3 tools/bench/streaming_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_partial_quality.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_verdict.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
+	@out=$$(sh tests/test_v2_promote.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@python3 tools/check_plan.py
 	@python3 tools/check_repo_integrity.py
 	@python3 tools/check_flag_registry.py
