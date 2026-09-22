@@ -180,6 +180,27 @@ waterfall reconciles.
 - [ ] L-2 Unstable-tail partials for Nemotron (a decoder change; protocol already has `final`)
 - [ ] L-3 CUDA v2b resident encoder (from the v1 TODO; GPU serving is out of v2 scope)
 
+### S12 — Qualify SERVER V2 as a product → [`.work/server-v2-qualification.md`](.work/server-v2-qualification.md)
+
+The question four days of engine work did not answer: **what concurrency can we
+promise continuously, without stalls, dropped established streams, corrupted
+output or unbounded latency?** `configs/perf/axion-c4a-highcpu32-nemotron-streaming.json`
+has said `status: screened` since 2026-09-20 and says why itself — the C=32
+600 s soak passed every serving gate, lost no stream, and did not qualify
+because transcripts were never checked. C=16 is the hard product minimum; on
+32 vCPU it is expected to qualify with margin, and that is the claim under test.
+
+- [x] S12-1 The candidate frozen and the twelve bounds registered BEFORE the first run: four are the profile's own gates quoted rather than re-derived, eight are new because the previous soak had no equivalent — per-window drift, monotonic trend, server-side stall from SIGUSR1 dumps, a client-observable max emission lag, byte-identical transcript parity under load, RSS growth, worker deaths. TTFP deliberately gets no bound → [`.work/server-v2-qualification.md`](.work/server-v2-qualification.md)
+- [x] S12-2 `tools/bench/v2_qualify.sh`: server and load generator pinned to disjoint slices with every worker mask PROVEN inside the server slice, a fresh fleet per rung and per soak, the unloaded C=1 reference captured from the SERVER, SIGUSR1 dumps and RSS/roster samples every 30 s, the corpus identified by hash. It refuses a dirty tree, an UNKNOWN dispatch row, an escaped mask, a reference with holes and a reused reference that does not cover the corpus
+- [x] S12-3 `tools/bench/v2_verdict.py` + `tests/test_v2_verdict.sh` (19 assertions): the verdict is a conclusion drawn from artefacts, a bound with no evidence is INCONCLUSIVE and never a pass, the worst WINDOW is checked beside the pooled percentile, and the lag bound is `(lookahead+1)x80` from the run's own manifest rather than the literal 320
+- [x] S12-4 `tools/bench/v2_promote.py` + `tests/test_v2_promote.sh` (10 assertions, 8 of them refusals): promotion requires two independent soaks, same concurrency, same bank, DIFFERENT seeds, each over ten minutes, every bound PASS — and the operating point carries the WORSE run in every column
+- [x] S12-5 Ladder C=8/16/24/32 on Axion, 90 s per rung, fresh fleet each: emission lag p95 **55/71/73/73 ms** against a 320 ms bound, backlog max 0.184 s against 0.640, **zero** stalls at every threshold over ~14,700 published deltas, and transcript parity PASS at every rung — 27 clips, identical across streams and to the unloaded reference
+- [ ] S12-6 Two independent 1800 s soaks at C=16, fresh fleet each, analysed in 60 s windows against all twelve bounds with the worst window reported
+- [ ] S12-7 The next operating point above C=16, qualified rather than observed, and the bottleneck that stops the one above it
+- [ ] S12-8 The 16-core deployment question: characterise whether C=16 is sustainable on a 16-core machine and report the measured safe point rather than the wanted one. A 12-cpu slice of this 32-core box is a PROXY, not a 16-core machine — it shares L3 and memory bandwidth with the generator — and must be labelled as one
+- [ ] S12-9 Promote `configs/perf/axion-c4a-highcpu32-nemotron-streaming.json` to `qualified` from the artefacts, with the previous soak pushed into history carrying the reason it was not promoted
+
+
 ## Durable contract (changes only when a decision changes)
 
 1. Config-driven: every model number comes from the converted pack's
