@@ -23,6 +23,8 @@
 #       [--phase freeze|reference|ladder|soak|all] [-o ~/asr-evidence/v2]
 #       [--ladder "8 16 24 32"] [--soak-c 16] [--soak-seconds 1800] [--soaks 2]
 #       [--reference-file <reference.json from an earlier run of this tool>]
+#       [--http-threads 32]   per worker; W x this is the fleet's CONNECTION
+#                             ceiling, NOT its compute width
 #       [--server-cpus 0-23] [--gen-cpus 24-31] [-W 3] [-T 8] [-C 96]
 #
 # It refuses rather than produce a number it cannot support: a dirty tree, a
@@ -31,7 +33,7 @@
 set -u
 
 MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
-W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3
+W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3; HTTP_T=32
 LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
 SERVER_CPUS="0-23"; GEN_CPUS="24-31"; REF_IN=""
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
         -W) W="$2"; shift 2 ;;
         -T) T="$2"; shift 2 ;;
         -C) CAP="$2"; shift 2 ;;
+        --http-threads) HTTP_T="$2"; shift 2 ;;
         -q) QUANT="$2"; shift 2 ;;
         --phase) PHASE="$2"; shift 2 ;;
         --ladder) LADDER="$2"; shift 2 ;;
@@ -107,8 +110,16 @@ say "            corpus $NCLIP clips < 20 s, bank-sha256 $BANK_SHA   evidence ->
 SRV=""
 start_fleet() {   # start_fleet <tag>
     tag="$1"
+    # --threads is the HTTP pool and a WebSocket stream holds one of its threads
+    # for its whole life (server/main.c: "one slot per HTTP thread"), so W x it
+    # is the fleet's CONNECTION ceiling. It is NOT the compute width: each
+    # worker's pool sizes itself from its affinity slice, which --prefork-threads
+    # sets. Passing --threads $T (copied from box_qualify.sh) gave 3x8 = 24
+    # connections and silently capped the C=24 and C=32 rungs of 2026-09-22 at
+    # 8 active slots per worker -- C=32 ran 24 streams and reported fewer
+    # utterances and LOWER throughput than C=24, which read as noise.
     taskset -c "$SERVER_CPUS" ./mynah-asr-server -m "$MODEL" --quant "$QUANT" -p "$PORT" \
-        --prefork "$W" --prefork-threads "$T" --threads "$T" --cap "$CAP" \
+        --prefork "$W" --prefork-threads "$T" --threads "$HTTP_T" --cap "$CAP" \
         --batch-window-ms 0 --metrics-port $(( PORT + 1000 )) \
         > "$RUN/server-$tag.log" 2>&1 &
     SRV=$!
@@ -149,7 +160,25 @@ for pid, mask in rows:
     seen |= m
 print(f"masks ok: {len(rows)} disjoint workers inside {slice_s}")
 PY
-    say "$tag: fleet up, $(wc -l < "$RUN/masks-$tag.txt" | tr -d ' ') workers pinned inside $SERVER_CPUS"
+    # Proven from the worker's own banner, not from the flag we passed.
+    RES_HTTP=$(sed -n 's/.*(\([0-9][0-9]*\) http threads.*/\1/p' "$RUN/server-$tag.log" | head -1)
+    RES_SLOTS=$(sed -n 's/.*http threads, \([0-9][0-9]*\) stream slots.*/\1/p' "$RUN/server-$tag.log" | head -1)
+    [ "${RES_HTTP:-0}" = "$HTTP_T" ] || { kill -TERM $SRV 2>/dev/null
+        die "$tag: asked for $HTTP_T http threads, the worker reports ${RES_HTTP:-none}"; }
+    [ "${RES_SLOTS:-0}" = "$CAP" ] || { kill -TERM $SRV 2>/dev/null
+        die "$tag: asked for $CAP stream slots, the worker reports ${RES_SLOTS:-none}"; }
+    say "$tag: fleet up, $(wc -l < "$RUN/masks-$tag.txt" | tr -d ' ') workers pinned inside $SERVER_CPUS, \
+$RES_HTTP http threads x $W = $(( RES_HTTP * W )) connections, $RES_SLOTS slots each"
+}
+
+# A concurrency above the fleet's connection ceiling does not measure capacity,
+# it measures the ceiling: the surplus clients sit waiting for an HTTP thread
+# while the run reports no error and no 503.
+check_ceiling() {   # check_ceiling <C>
+    lim=$(( HTTP_T * W ))
+    [ "$1" -le "$lim" ] || die "C=$1 exceeds this fleet's connection ceiling of $lim \
+($W workers x $HTTP_T http threads): the rung would measure the ceiling, not the machine. \
+Raise --http-threads."
 }
 stop_fleet() {
     [ -n "$SRV" ] || return 0
@@ -267,6 +296,7 @@ fi
 if [ "$PHASE" = all ] || [ "$PHASE" = ladder ]; then
     say "--- V2-3 ladder ($LADDER), ${LADDER_S}s per rung, fresh server per rung"
     for C in $LADDER; do
+        check_ceiling "$C"
         start_fleet "ladder-C$C"
         dumper_start "ladder-C$C"
         say "--- LADDER C=$C"
@@ -283,6 +313,7 @@ fi
 if [ "$PHASE" = all ] || [ "$PHASE" = soak ]; then
     n=1
     while [ "$n" -le "$SOAKS" ]; do
+        check_ceiling "$SOAK_C"
         say "--- V2-4 soak $n/$SOAKS: C=$SOAK_C for ${SOAK_S}s, fresh server"
         start_fleet "soak$n"
         dumper_start "soak$n"
@@ -300,7 +331,8 @@ fi
 cat > "$RUN/manifest.json" <<JSON
 { "utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "commit": "$REV", "dirty_files": $DIRTY,
   "binary_sha256": "$BIN_SHA", "model": "$MODEL", "quant": "$QUANT", "lookahead": $LOOKAHEAD,
-  "workers": $W, "threads_per_worker": $T, "cap": $CAP,
+  "workers": $W, "threads_per_worker": $T, "cap": $CAP, "http_threads_per_worker": $HTTP_T,
+  "connection_ceiling": $(( HTTP_T * W )),
   "server_cpus": "$SERVER_CPUS", "gen_cpus": "$GEN_CPUS",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA",
   "configuration": "shipped-default",

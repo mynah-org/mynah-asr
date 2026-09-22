@@ -64,6 +64,31 @@ def g(d, *path, default=None):
     return d if d is not None else default
 
 
+def slot_ceiling(dumps, run_manifest, streams):
+    """Was this run able to CONNECT the concurrency it claims to measure?
+
+    A WebSocket stream holds one HTTP thread for its whole life, so W x
+    --threads is the fleet's connection ceiling. Above it the surplus clients
+    wait for a thread and the run reports no error and no 503: on 2026-09-22 the
+    C=32 rung ran 24 streams, produced fewer utterances than C=24 and lower
+    throughput, and read as noise. A run that could not connect its own
+    concurrency does not measure the machine, so it is INVALID rather than
+    merely worse."""
+    lim = (run_manifest or {}).get("connection_ceiling")
+    peak = None
+    for seqs in dumps.values():
+        for rec in seqs.values():
+            if rec.get("active") is not None:
+                peak = rec["active"] if peak is None else max(peak, rec["active"])
+    if lim is None:
+        return None, peak
+    if streams is not None and streams > lim:
+        return (f"concurrency C={streams} is above this fleet's connection ceiling of "
+                f"{lim}: the surplus streams waited for an HTTP thread and the rung "
+                f"measured the ceiling, not the machine"), peak
+    return None, peak
+
+
 def parse_dumps(path):
     """Per worker, the ordered (seq, active, steps, model_busy_s) samples."""
     if not os.path.exists(path):
@@ -205,7 +230,7 @@ def window_check(d, limit):
     return (OK if not bad else BAD), msg, worst
 
 
-def verdict_for(path, dump_path, proc_path):
+def verdict_for(path, dump_path, proc_path, run_manifest=None):
     d = json.load(open(path))
     s = d["summary"]
     man = d.get("manifest") or {}
@@ -236,7 +261,8 @@ def verdict_for(path, dump_path, proc_path):
     trend = g(s, "drift", "emission_lag_ms", "trend_pct")
     row(7, "monotonic trend", NOEV if trend is None else (OK if trend <= TREND_MAX_PCT else BAD),
         "not computed" if trend is None else f"{trend:+.1f}% last third vs first third, bound +{TREND_MAX_PCT:.0f}%")
-    st, msg, viol = stall_check(parse_dumps(dump_path))
+    dumps = parse_dumps(dump_path)
+    st, msg, viol = stall_check(dumps)
     row(8, "server-side stall", st, msg + ("; " + "; ".join(viol[:3]) if viol else ""))
     lmax = g(m, "emission_lag_ms", "max")
     row(9, "client-observable stall", NOEV if lmax is None else (OK if lmax <= LAG_MAX_MS else BAD),
@@ -254,9 +280,11 @@ def verdict_for(path, dump_path, proc_path):
     row(11, "worker RSS growth", rss_state, rss_msg)
     row(12, "worker deaths", dead_state, dead_msg)
 
+    invalid, peak_slots = slot_ceiling(dumps, run_manifest, man.get("concurrency"))
     failed = [r for r in rows if r["state"] == BAD]
     missing = [r for r in rows if r["state"] == NOEV]
     return {
+        "invalid": invalid, "peak_active_slots": peak_slots,
         "file": os.path.basename(path),
         # These are stream_load's OWN manifest field names. An earlier draft read
         # "streams" and "duration", which exist nowhere: both came back None and
@@ -272,8 +300,9 @@ def verdict_for(path, dump_path, proc_path):
         "fairness": s.get("fairness"),
         "bank_sha256": bank_id(man),
         "rows": rows,
-        "verdict": "QUALIFIED" if not failed and not missing else
-                   ("NOT QUALIFIED" if failed else "INCONCLUSIVE (missing evidence)"),
+        "verdict": "INVALID" if invalid else
+                   ("QUALIFIED" if not failed and not missing else
+                    ("NOT QUALIFIED" if failed else "INCONCLUSIVE (missing evidence)")),
     }
 
 
@@ -285,10 +314,14 @@ def pick(run):
     rungs = []
     for path in sorted(glob.glob(os.path.join(run, "ladder-C*.json"))):
         tag = os.path.basename(path)[:-5]
+        mp = os.path.join(run, "manifest.json")
         v = verdict_for(path,
                         os.path.join(run, f"server-{tag}.log"),
-                        os.path.join(run, f"procsample-{tag}.txt"))
+                        os.path.join(run, f"procsample-{tag}.txt"),
+                        json.load(open(mp)) if os.path.exists(mp) else None)
         bad = [r for r in v["rows"] if r["bound"] in SCREEN_BOUNDS and r["state"] != OK]
+        if v.get("invalid"):
+            bad = [{"bound": 0, "name": "INVALID: " + v["invalid"]}] + bad
         rungs.append((v["streams"], not bad, v, bad))
     rungs.sort(key=lambda r: (r[0] is None, r[0]))
     for c, good, v, bad in rungs:
@@ -318,6 +351,8 @@ def main():
         print(c)
         return 0
     out = []
+    mpath = os.path.join(a.run, "manifest.json")
+    run_manifest = json.load(open(mpath)) if os.path.exists(mpath) else None
     for path in sorted(glob.glob(os.path.join(a.run, "soak*.json"))
                        + sorted(glob.glob(os.path.join(a.run, "ladder-C*.json")))):
         tag = os.path.basename(path)[:-5]
@@ -329,7 +364,7 @@ def main():
             proc = os.path.join(a.run, cand)
             if os.path.exists(proc):
                 break
-        out.append(verdict_for(path, dump, proc))
+        out.append(verdict_for(path, dump, proc, run_manifest))
     if not out:
         sys.exit(f"no soak*.json or ladder-C*.json in {a.run}")
     for v in out:
@@ -338,8 +373,12 @@ def main():
                 + (f", bank {v['bank_sha256']}" if v.get("bank_sha256") else ""))
         print("\n" + head)
         print("-" * len(head))
+        if v.get("invalid"):
+            print(f"  !!  INVALID RUN: {v['invalid']}")
         for r in v["rows"]:
             print(f"  {r['bound']:2d}  {r['name']:26s} {r['state']:11s} {r['detail']}")
+        if v.get("peak_active_slots") is not None:
+            print(f"      peak active slots on one worker: {v['peak_active_slots']}")
         st = v.get("stalls")
         if st:
             cols = "   ".join(f">{t:.0f}ms: {n}" for t, n in st["rows"])

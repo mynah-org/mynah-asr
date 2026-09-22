@@ -82,6 +82,27 @@ case "$(head_of healthy)" in
     *) bad "the header lost the run's identity: '$(head_of healthy)'" ;;
 esac
 
+# A run whose concurrency exceeds the fleet's connection ceiling measured the
+# ceiling, not the machine: on 2026-09-22 the C=32 rung ran 24 streams, produced
+# FEWER utterances than C=24 and lower throughput, and read as noise. It is
+# INVALID, not merely worse, so it can never come out QUALIFIED.
+mk ceiling "pass"
+python3 -c "
+import json,sys
+p=sys.argv[1]+'/manifest.json'
+json.dump({'connection_ceiling': 24}, open(p,'w'))" "$TMP/ceiling"
+[ "$(verdict ceiling)" = "QUALIFIED" ] \
+    && ok "C=16 inside a 24-connection ceiling stays qualified" \
+    || bad "a run inside the ceiling was called invalid: $(verdict ceiling)"
+mk ceiling2 "d['manifest']['concurrency'] = 32"
+python3 -c "
+import json,sys
+p=sys.argv[1]+'/manifest.json'
+json.dump({'connection_ceiling': 24}, open(p,'w'))" "$TMP/ceiling2"
+[ "$(verdict ceiling2)" = "INVALID" ] \
+    && ok "C=32 against a 24-connection fleet is INVALID, not merely worse" \
+    || bad "a rung that could not connect its own concurrency was scored: $(verdict ceiling2)"
+
 mk lost "d['summary']['counts']['errors'] = 3"
 [ "$(verdict lost)" = "NOT QUALIFIED" ] && ok "three lost streams disqualify" || bad "lost streams did not disqualify"
 
