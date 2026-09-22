@@ -128,3 +128,111 @@ The unloaded C=1 pass over the corpus produces the reference transcripts, from
 the **server**, not from the CLI — the question is whether the server's own
 scheduling changes its own output. Those clips are then replayed throughout the
 soak and compared byte for byte (bound 10).
+
+---
+
+# RESULT — 2026-09-22, GCP c4a-highcpu-32 (Axion Neoverse-V2)
+
+Commit `067e9f3`, clean HTTPS clone, `make clean && make -j32`, `make test` RC=0
+with `streaming parity: IDENTICAL OK`, dispatch 0 rows UNKNOWN
+(`neon-smmla` / `neon-sdot` / sgemm `own`), 3 workers x 8 threads pinned inside
+cpus 0-23 with every mask proven disjoint, generator alone on 24-31.
+
+## V2-4 — two independent 1800 s soaks at C=16: QUALIFIED
+
+| bound | soak 1 | soak 2 | limit |
+|---|---|---|---|
+| 1 established streams lost | **0** | **0** | 0 |
+| 2 emission lag p95 | **65 ms** | **66 ms** | 320 |
+| 3 finalization p95 | 99 ms | 98 ms | 500 |
+| 4 backlog max | 0.184 s | 0.184 s | 0.640 |
+| 5 503 refusals | 0 | 0 | counted apart |
+| 6 worst 60 s window | 71 ms (w13) | 71 ms (w13) | 320 |
+| 7 trend, last third vs first | **+1.9 %** | **-0.6 %** | +50 % |
+| 8 server-side stall | 0 of 177 intervals | 0 of 177 | 0 |
+| 9 max emission lag | 233 ms | 218 ms | 3000 |
+| 10 transcript parity | **PASS** | **PASS** | byte-identical |
+| 11 worker RSS growth | **1.007x** | 1.009x | 1.15x |
+| 12 worker deaths | 0 of 60 samples | 0 of 60 | 0 |
+
+7738 utterances, 56 488 audio-seconds — 15.7 hours of speech. **Zero stalls at
+every threshold over 125 948 published deltas**; the latest delta of the whole
+campaign arrived 233 ms behind its audio against a 320 ms cadence.
+`audio/wall` 15.63x and 15.61x: the fleet carried sixteen real-time streams.
+Fairness 1.23x and 1.27x worst-stream-over-median. TTFP p95 2426/2430 ms,
+REPORTED and ungated. Peak 6 active slots per worker against a ceiling of 32,
+so neither run was throttled by its own connection limit.
+
+The two runs used different seeds on fresh fleets and agree to 1 ms of p95.
+
+**This closes the hole that kept the profile at `screened` since 2026-09-20**:
+transcripts were checked, 27 clips, every one identical across streams and
+identical to the unloaded C=1 reference taken from the server itself.
+
+## V2-3 — ladder, 90 s per rung, fresh fleet each
+
+| C | emission lag p95 | finalization p95 | backlog max | max lag | stalls | parity | peak slots/worker |
+|---|---|---|---|---|---|---|---|
+| 8 | 55 ms | 87 ms | 0.104 s | 113 ms | 0 | PASS | 3 |
+| 16 | 71 ms | ~100 ms | 0.184 s | 165 ms | 0 | PASS | 6 |
+| 24 | 73 ms | 114 ms | 0.184 s | 202 ms | 0 | PASS | **8 (at the ceiling)** |
+| 32 | 73 ms | 119 ms | 0.184 s | 213 ms | 0 | PASS | **8 (INVALID)** |
+
+C=24 and C=32 are **not** capacity measurements. `--threads` is the HTTP pool and
+a WebSocket stream holds one of its threads for its whole life, so the fleet had
+3 x 8 = 24 connections while `--cap` advertised 96 slots. Both rungs pinned at 8
+active slots per worker; C=32 ran 24 streams, produced FEWER utterances than
+C=24 (253 against 270) and lower throughput (18.75 against 19.13 audio/wall),
+with no error and no 503 — a stream that never connects is neither. The upward
+ladder with the fix (`--http-threads 32`, ceiling 96) had started when the box
+became unreachable.
+
+## Why the box looks idle at C=16, with the arithmetic
+
+From the worker's own `/v1/health` during soak 1:
+
+    batched_steps_total 7670   ready_mean 1.031   step_wall_ms mean 15.85
+    by_b   B=1: 7479 steps 15.46 ms   B=2: 154 / 28.08   B=3: 26 / 40.25   B=4: 11 / 49.70
+    audio_seconds / steps = 2570 / 8246 = 0.3117 s  -> one step advances one 320 ms chunk
+
+One stream costs **15.85 ms of compute per 320 ms of audio = 4.95 % of a worker**.
+16 streams over 3 workers is 5.33 each, so **26.4 % duty** — which is what the
+SIGUSR1 dump reports (`model_duty` 0.277 at 240 s, 0.281 at 961 s, flat) and what
+`htop` shows. The fleet is not slow at C=16; C=16 asks it for a quarter of itself.
+A worker saturates near 320/15.85 ~ 20 streams.
+
+Two open items fell out of this and are NOT conclusions:
+
+* **97.5 % of steps run at batch 1** (`ready_mean` 1.03). With
+  `--batch-window-ms 0` a step fires the instant one stream is ready, so a ready
+  set never accumulates. The by-B table says batching pays: 15.46 ms/stream at
+  B=1 against 12.43 at B=4, **-20 %**. The profile records that a 40 ms window did
+  not move the ceiling, but that was measured before the F15 stall fix and on a
+  different corpus. Worth re-testing.
+* **`runnable_idle` 0.223, of which 99.9 % in `park`**, with `ready_sel`
+  0.1/20.0/50.0 ms. This is NOT yet called waste: this profile has already been
+  wrong about this exact figure once, by charging the finalization tail to it,
+  and the correction left only 1-3 % genuinely avoidable. It needs the same
+  recomputation from raw dumps first.
+
+The 50 % `no_work` is not a defect and is not recoverable: streams arrive in real
+time and the server cannot encode audio nobody has spoken yet.
+
+## Evidence
+
+`gabrielemastrapasqua@34.136.69.91:~/asr-evidence/v2/`
+`20260922T162708Z` (freeze, reference, first ladder) and
+`20260922T163950Z` (the two C=16 soaks, with `server-soak*.log`,
+`procsample-soak*.txt`, `masks-soak*.txt`, `onsets.json`, `bank.txt`).
+
+**NOT ARCHIVED.** The instance became unreachable — no ICMP, port 22 filtered —
+before the copy. The numbers above are the verdict tool's own output, recorded
+verbatim; the per-utterance JSON behind them is on that disk. If the instance
+was stopped the disk survives and the evidence is one `scp` away; if it was
+deleted the raw records are gone and only this table remains.
+
+**The profile therefore stays `screened`.** `tools/bench/v2_promote.py` derives a
+promotion from artefacts and refuses without them, and hand-writing the block it
+would have written is exactly what that tool exists to prevent. The measurement
+passed; the archive is what is missing, and it is one command once the box
+returns.
