@@ -160,8 +160,24 @@ happens to start with silence is a different recording, not a warmed-up engine.
 detected onset moves. First-word CORRECTNESS is a pure text comparison and is
 unaffected by this, which is why the rejection rests on it.
 
-**DECISION C-1.** Close the lead-in / cache-warmth branch. R-12 stays specified
-and unjustified. Nothing is prepended in production.
+**RESULT C-1b — the dose-response settles it. More lead-in is monotonically
+worse.**
+
+| | base | +2.0 s | +4.5 s (full cache) |
+|---|---|---|---|
+| EN WER format-free | 0.0916 | 0.0919 | **0.1106** |
+| EN first word CORRECT | 0.8250 | 0.7700 | **0.7136** |
+| FR WER format-free | 0.1033 | 0.1045 | 0.1080 |
+| FR first word CORRECT | 0.8600 | 0.8450 | 0.8450 |
+
+At the dose that fills the encoder cache completely, English first-word
+correctness falls **11 points**. A fully warm cache makes the first word worse,
+which is the exact opposite of the Phase B correlation's direction.
+
+**DECISION C-1.** Close the lead-in / cache-warmth branch. **R-12 is no longer
+merely unjustified: the evidence points against it.** Nothing is prepended in
+production, and cache priming does not get built. The correlation was a property
+of which recordings have clean lead-ins, not of the engine's state.
 
 **RESULT C-2 — FACT, and it changes every quality number so far.
 A quarter of the bank was being scored on a convention, not on recognition.**
