@@ -93,3 +93,47 @@ see a 2-point WER move, which is what makes Phase C's candidates judgeable.
    first-emission behaviour matters most, so the two problems overlap.
 
 **NEXT.** Phase B: does the R-13 high-norm regime predict any of these?
+
+---
+
+## PHASE B — does the R-13 high-norm regime matter?
+
+**EXPERIMENT B-1.** Per utterance on the 400-clip bank, the fraction of
+pre-crossing decisions with `|enc| > 10`, joined to the outcomes the frozen gate
+already scored. Split at each language's median.
+
+**RESULT B-1 — FACT, and it is the opposite of a pathology.**
+
+| outcome | EN low → high | FR low → high |
+|---|---|---|
+| WER (mean) | 0.1418 → **0.0943** | 0.1459 → **0.1173** |
+| CER (mean) | 0.0834 → 0.0556 | 0.0659 → 0.0643 |
+| first word CORRECT | 0.761 → **0.908** | 0.790 → **0.930** |
+| speech → first word | 1.259 → 1.119 s | 0.940 → 0.952 s |
+
+**High-norm utterances are BETTER, in both languages, on every outcome that
+matters.** Nothing is normalised, clamped or compensated for. R-13 stands as a
+fact about the representation and is closed as a defect.
+
+**RESULT B-2 — the high norm is a PROXY.** `hi_frac` tracks leading silence
+almost perfectly (mean onset: EN 0.059 s low against 0.525 s high; FR 0.275
+against 1.438). Splitting by **onset alone** reproduces most of the effect:
+
+| split by onset | EN short-lead → long-lead | FR short-lead → long-lead |
+|---|---|---|
+| first word CORRECT | 0.770 → **0.880** | 0.802 → **0.919** |
+| WER | 0.1410 → **0.1013** | 0.1472 → **0.1157** |
+
+Within the long-lead half `hi_frac` still separates (EN 0.843 → 0.967, n=70/30;
+FR 0.882 → 0.958, n=51/48), so it is not a pure proxy — but the dominant
+variable is how much audio the engine processed before speech began.
+
+**DECISION B.** Close the high-norm branch. Promote what it uncovered:
+**an utterance whose engine has been running before speech starts gets a better
+first word and a lower WER, by 11–12 points and 3–4 points respectively.**
+
+**Still a CORRELATION.** A recording with a clean lead-in may simply be a better
+recording. That is what Phase C's first candidate tests causally.
+
+**NEXT.** Phase C candidate 1: feed the encoder audio before the speech and see
+whether the effect survives, on the same bank, each language on its own.
