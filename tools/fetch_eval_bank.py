@@ -117,13 +117,20 @@ def main():
         tmp = CACHE / cfg
         extract(cfg, a.split, [r["source_file"] for r in recs], tmp)
         for r in recs:
-            dst = out / lang / f"fleurs_{r['fleurs_id']}.wav"
+            # NAME BY THE SOURCE FILE, not by fleurs_id. FLEURS records the same
+            # sentence from several speakers under one id -- 200 French records
+            # are only 100 distinct ids -- so naming by id silently overwrote
+            # half the bank and left a manifest with 400 rows pointing at 209
+            # files. Caught by comparing the two counts, which is why they are
+            # both printed below.
+            stem = r["source_file"].rsplit(".", 1)[0]
+            dst = out / lang / f"f{r['fleurs_id']}_{stem}.wav"
             if not dst.exists():
                 dur = to_wav(tmp / a.split / r["source_file"], dst)
             else:
                 with wave.open(str(dst)) as w:
                     dur = w.getnframes() / float(w.getframerate())
-            samples.append({"file": f"{lang}/fleurs_{r['fleurs_id']}.wav", "lang": lang,
+            samples.append({"file": f"{lang}/{dst.name}", "lang": lang,
                             "fleurs_id": r["fleurs_id"], "duration_sec": round(dur, 3),
                             "text": r["text"], "text_norm": r["text_norm"],
                             "gender": r["gender"], "split": a.split})
@@ -137,7 +144,12 @@ def main():
            "samples": samples}
     (out / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=1),
                                        encoding="utf-8")
-    print(f"wrote {out/'manifest.json'}: {len(samples)} utterances")
+    files = {s["file"] for s in samples}
+    if len(files) != len(samples):
+        raise SystemExit(f"BUG: {len(samples)} manifest rows over {len(files)} distinct "
+                         "files — the bank would score some audio against the wrong text")
+    print(f"wrote {out/'manifest.json'}: {len(samples)} utterances over "
+          f"{len(files)} distinct files")
     return 0
 
 
