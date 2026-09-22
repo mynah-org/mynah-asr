@@ -45,6 +45,12 @@ OK, BAD, NOEV = "PASS", "FAIL", "NO EVIDENCE"
 # the 3000 ms column is a registered bound (bound 9).
 STALL_MULTIPLES = (1.0, 2.0, 4.0)
 
+# A 90 s rung cannot evidence every bound: a trend needs more windows than it
+# has, and RSS over three samples is noise. So --pick judges a rung on the
+# bounds a SCREEN can actually carry, and says so. This selects a candidate to
+# soak; it promotes nothing. WAVE screens, SOAK promotes (ENGINEERING.md §8).
+SCREEN_BOUNDS = (1, 2, 3, 4, 6, 9, 10)
+
 
 def chunk_ms(lookahead):
     return (int(lookahead) + 1) * 80.0
@@ -271,11 +277,46 @@ def verdict_for(path, dump_path, proc_path):
     }
 
 
+def pick(run):
+    """The highest ladder rung that clears every bound a 90 s screen can carry.
+
+    Prints one line per rung and the choice, so an unattended chain leaves the
+    reason behind it rather than only the number."""
+    rungs = []
+    for path in sorted(glob.glob(os.path.join(run, "ladder-C*.json"))):
+        tag = os.path.basename(path)[:-5]
+        v = verdict_for(path,
+                        os.path.join(run, f"server-{tag}.log"),
+                        os.path.join(run, f"procsample-{tag}.txt"))
+        bad = [r for r in v["rows"] if r["bound"] in SCREEN_BOUNDS and r["state"] != OK]
+        rungs.append((v["streams"], not bad, v, bad))
+    rungs.sort(key=lambda r: (r[0] is None, r[0]))
+    for c, good, v, bad in rungs:
+        why = "" if good else "  <- " + "; ".join(f"{r['bound']} {r['name']}" for r in bad)
+        lag = g(v, "rows")
+        print(f"  C={c:<4} {'CLEARS' if good else 'FAILS '} the screen bounds{why}",
+              file=sys.stderr)
+    passing = [c for c, good, _, _ in rungs if good and c]
+    if not passing:
+        print("  no rung cleared the screen bounds", file=sys.stderr)
+        return None
+    return max(passing)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run", help="a v2_qualify run directory")
     ap.add_argument("--json", help="write the verdicts here")
+    ap.add_argument("--pick", action="store_true",
+                    help="print the highest ladder rung that clears the screen "
+                         "bounds, for an unattended chain to soak next")
     a = ap.parse_args()
+    if a.pick:
+        c = pick(a.run)
+        if c is None:
+            return 1
+        print(c)
+        return 0
     out = []
     for path in sorted(glob.glob(os.path.join(a.run, "soak*.json"))
                        + sorted(glob.glob(os.path.join(a.run, "ladder-C*.json")))):
@@ -322,8 +363,8 @@ def main():
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1)
         print(f"\nwrote {a.json}")
-    sys.exit(0 if all(v["verdict"] == "QUALIFIED" for v in out) else 1)
+    return 0 if all(v["verdict"] == "QUALIFIED" for v in out) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
