@@ -215,3 +215,62 @@ deletion -- so digit utterances are still harder, just not three times harder.
 **NEXT.** Q2, the ceiling matrix: the same 400 utterances through int8 and f32,
 streaming and offline, and the other declared presets, to find out whether 9-10 %
 belongs to the checkpoint or to us.
+
+---
+
+## Q2, the ceiling matrix — the two arms that decided it
+
+The matrix was asked one question: **is 9-10 % coming from the checkpoint,
+quantization, streaming semantics, our implementation, or configuration?** Two
+of the six arms answer it, and they finished first.
+
+| | EN | FR |
+|---|---|---|
+| WER format-free, streaming `[56,3]` INT8 | 0.0916 | 0.1033 |
+| WER format-free, offline INT8 | 0.0884 | 0.1011 |
+| **streaming cost** | **+0.0032** | **+0.0022** |
+| CER format-free delta | +0.0013 | +0.0009 |
+| S/D/I streaming | 388/63/105 | 478/56/137 |
+| S/D/I offline | 378/62/103 | 485/49/130 |
+
+Per-utterance classification over the same 200 clips per language:
+
+| | EN | FR |
+|---|---|---|
+| both correct | 25.0 % | 17.0 % |
+| **both wrong in the identical way** | **45.0 %** | **45.5 %** |
+| both wrong, differently | 25.5 % | 33.0 % |
+| offline correct / streaming wrong | 4.0 % | 2.0 % |
+| streaming correct / offline wrong | 0.5 % | 2.5 % |
+
+**RESULT.** Streaming costs three tenths of a WER point. Nearly half the corpus
+produces the *same error on both paths*, which is what an error inherited from
+the checkpoint looks like and is not what a serving defect looks like. The
+asymmetric cells are small and nearly balanced in French.
+
+**DECISION.** There is no catastrophic engine/quantization/streaming quality gap
+hiding inside 12-13 %. That was the one thing this matrix could have found that
+would have outranked everything else, and it is not there. So the quality lane
+closes as a research topic and WER/CER revert to what they should have been all
+along: **regression gates on the engine**. The remaining arms (f32 streaming and
+offline, lookahead 6 and 13) keep running and will say whether INT8 costs
+recognition, but they cannot change this conclusion and nothing waits on them.
+
+## PRIORITY CORRECTION — the mission is SERVER V2
+
+Four days of engine investigation, a real scheduler freeze found and fixed, a
+scoring convention corrected, curves up to C=64 — and still no answer to the
+only question a deployment asks: *what concurrency can I promise continuously?*
+
+`configs/perf/axion-c4a-highcpu32-nemotron-streaming.json` has said
+`status: screened` and `long_soak_qualified: null` since 2026-09-20, and it says
+why itself: the C=32 600 s soak passed every serving gate, lost no stream, and
+did not qualify because **transcripts were never checked** -- there was no
+manifest to check them against. There is one now.
+
+| | |
+|---|---|
+| FACT | streaming costs +0.003 WER against offline; 45 % of errors are identical on both paths |
+| DECISION | quality is a guardrail, not the mission; Server V2 qualification is the mission |
+| EXPERIMENT | `.work/server-v2-qualification.md`: candidate frozen, twelve bounds registered before the first run |
+| NEXT | ladder C=8/16/24/32 on Axion, then two independent 1800 s soaks at C=16 |
