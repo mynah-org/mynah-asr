@@ -569,6 +569,11 @@ static int run_layers(const mynah_asr_encoder *enc, float *x, int T, const float
 }
 
 /* -------------------------------------------------- prompt + projector */
+/* R-13: the streaming step installs this while probing, so encoder_post can be
+ * split into its prompt MLP and its encoder projector without the probe leaking
+ * into the offline path or into any build that is not tracing. */
+static void (*g_post_probe)(const float *, int, int, const char *);
+
 size_t mynah_asr_encoder_post_scratch_floats(const mynah_asr_encoder *enc, int T) {
     if (!enc->encproj_w || !enc->prompt_l1_w) return 0;
     return (size_t)T * (size_t)(enc->d_model + enc->num_prompts)     /* cat   */
@@ -625,6 +630,8 @@ void mynah_asr_encoder_post_scratch(const mynah_asr_encoder *enc, const float *x
     for (int t = 0; t < T; t++)
         for (int i = 0; i < d; i++) fused[(size_t)t * (size_t)d + (size_t)i] += enc->prompt_l2_b[i];
 
+    if (g_post_probe) g_post_probe(mid, T, di, "prompt_mid");
+    if (g_post_probe) g_post_probe(fused, T, d, "prompt_fused");
     matmul_wt(fused, enc->encproj_w, out, T, enc->d_out, d);
     for (int t = 0; t < T; t++)
         for (int i = 0; i < enc->d_out; i++) out[(size_t)t * (size_t)enc->d_out + (size_t)i] += enc->encproj_b[i];
@@ -1046,14 +1053,84 @@ static void stream_conv_module(mynah_asr_enc_stream *es, const mynah_asr_enc_lay
     mynah_asr_qmat_mul(&L->pw2_w, es->sc_t, out, Q);
 }
 
+/* ------------------------------------------------------------- R-13 probe
+ * WHERE do chunk positions 0/1/2 diverge from position 3?
+ *
+ * R-11 measured, on 478 pre-crossing decisions, that the high-norm encoder
+ * regime is strongly POSITION-dependent: |enc| above 10 on 60 / 52 / 66 % of
+ * decisions at positions 0, 1 and 2 against 22 % at position 3 -- and 0 % at
+ * every position once the first token has been emitted. Position 3 is the frame
+ * whose receptive field ends exactly at the chunk boundary and which carries no
+ * future context.
+ *
+ * This prints a per-position norm at the coarse boundaries first: the mel slice
+ * a frame comes from, the subsampling output, and each layer's output. The point
+ * is to LOCALISE the earliest boundary at which the positions part company, not
+ * to explain it and not to instrument the whole network. If they already differ
+ * at the mel or subsampling boundary the answer is chunk assembly and no
+ * attention probe is needed.
+ *
+ * Both an absolute norm and an RMS per dimension are printed, so a difference in
+ * how many values are summed cannot masquerade as activation amplification.
+ *
+ * Diagnostic, default OFF, bounded to the first MYNAH_ASR_TRACE_ENC steps. */
+static int enc_probe_steps(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_TRACE_ENC");
+        v = (e == NULL || *e == '\0' || *e == '0') ? 0 : atoi(e);
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+static const mynah_asr_enc_stream *g_probe_es;
+static void enc_probe(const mynah_asr_enc_stream *es, const char *point, int li,
+                      const float *v, int Q, int d) {
+    for (int t = 0; t < Q; t++) {
+        const float *row = v + (size_t)t * (size_t)d;
+        double n = 0.0;
+        for (int i = 0; i < d; i++) n += (double)row[i] * row[i];
+        fprintf(stderr, "[ENC] frame=%ld t=%d valid=%d point=%-10s li=%2d "
+                        "norm=%.4f rms=%.6f\n",
+                es->t_abs + t, t, es->cache_valid, point, li,
+                sqrt(n), sqrt(n / (double)d));
+    }
+}
+
+static void post_probe_cb(const float *v, int T, int dim, const char *what) {
+    if (g_probe_es) enc_probe(g_probe_es, what, -1, v, T, dim);
+}
+
 int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_mel,
                           int n_mels, int prompt_id, int is_last, float *out) {
     const mynah_asr_encoder *enc = es->enc;
     const int d = enc->d_model;
 
     float *x = es->sx;
+    const int probe = enc_probe_steps() > 0 && es->t_abs < (long)enc_probe_steps();
+    if (probe && n_mel > 0) {
+        /* the mel the chunk was assembled from, sliced the way subsampling will
+         * consume it: sub_factor frames per encoder frame. A difference HERE is
+         * the input, not the network. */
+        const int sub = enc->ss.sub_factor;
+        for (int t = 0; t * sub < n_mel; t++) {
+            const int rows = (t + 1) * sub <= n_mel ? sub : n_mel - t * sub;
+            double n = 0.0;
+            for (int r = 0; r < rows; r++)
+                for (int i = 0; i < n_mels; i++) {
+                    const float z = mel[(size_t)(t * sub + r) * (size_t)n_mels + i];
+                    n += (double)z * z;
+                }
+            fprintf(stderr, "[ENC] frame=%ld t=%d valid=%d point=%-10s li=%2d "
+                            "norm=%.4f rms=%.6f\n",
+                    es->t_abs + t, t, es->cache_valid, "mel", -1,
+                    sqrt(n), sqrt(n / (double)(rows * n_mels)));
+        }
+    }
     const int Q = mynah_asr_ss_stream_step(&enc->ss, &es->ss, mel, n_mel, n_mels, is_last, x);
     if (Q <= 0) return -1;
+    if (probe) enc_probe(es, "subsample", -1, x, Q, d);
 
     const size_t nd = (size_t)Q * (size_t)d;
     float *tmp = es->stmp, *tmp2 = es->stmp2, *xn = es->sxn, *kn = es->skn;
@@ -1103,11 +1180,21 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         for (size_t i = 0; i < nd; i++) x[i] += 0.5f * tmp[i];
         layer_norm_f(x, L->ln_out_w, L->ln_out_b, xn, Q, d);
         memcpy(x, xn, nd * sizeof(float));
+        if (probe) enc_probe(es, "layer_out", li, x, Q, d);
     }
 
+    if (probe) enc_probe(es, "pre_post", -1, x, Q, d);
     es->cache_valid = (es->cache_valid + Q < es->left) ? es->cache_valid + Q : es->left;
 
+    if (probe) { g_probe_es = es; g_post_probe = post_probe_cb; }
     mynah_asr_encoder_post_scratch(enc, x, Q, prompt_id, out, es->spost);
+    g_post_probe = NULL;
+    /* AFTER the prompt one-hot + projector: this is what the joint actually
+     * reads, and it is a different width from everything above. R-11's |enc|
+     * was measured here, so the probe has to end here too or the two cannot be
+     * compared. */
+    if (probe) enc_probe(es, "post_proj", -1, out, Q, enc->d_out);
+    es->t_abs += Q;
     return Q;
 }
 

@@ -108,6 +108,10 @@ typedef struct {
     float *conv_cache;          /* [n_layers, conv_k-1, d_model] */
     int left, right, q;         /* q = right+1 encoder frames per chunk */
     int cache_valid;            /* valid frames in the K/V cache (0..left) */
+    long t_abs;                 /* absolute encoder frames produced so far: the
+                                   R-13 probe needs a frame index, and deriving
+                                   one outside from cache_valid stops working
+                                   the moment the cache saturates */
     /* hot-path scratch, ONE malloc at init (zero mallocs per chunk):
      * pointers carved out of scr. Sized for Qmax = q+2, Kmax = left+Qmax. */
     float *scr;

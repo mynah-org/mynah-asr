@@ -181,6 +181,16 @@ static const mynah_asr_flag g_flags[] = {
      " no decision",
      NULL, NULL},
 
+    {"MYNAH_ASR_TRACE_ENC", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "src/encoder.c: N = how many encoder frames to probe from the start of a stream. For each of them"
+     " print an absolute norm AND an RMS per dimension at the mel slice it came from, at the subsampling"
+     " output, at every layer output and at the encoder output. R-13: R-11 measured that the high-norm"
+     " regime before the first token is POSITION-dependent inside a chunk (60/52/66 % against 22 % at the"
+     " last position), and this localises the earliest boundary at which the positions part company."
+     " Two norms because a difference in how many values are summed must not masquerade as activation"
+     " amplification. Diagnostic only, one stream at a time",
+     NULL, NULL},
+
     {"MYNAH_ASR_TRACE_PRED", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
      "src/decoder.c: after every pred_step(), print the norms of the predictor's h and c and"
      " of its output g, plus a checksum of g. R-8 needs it to say what the SOS state IS:"

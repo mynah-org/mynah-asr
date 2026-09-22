@@ -1137,3 +1137,86 @@ boundary and which has no future context at all. Whether that is the
 explanation, a coincidence of the subsampling geometry, or an artefact of how
 the chunk is assembled is unknown, and it is answerable from the encoder rather
 than from the serving path.
+
+---
+
+## R-13 RESULT — where the positions part company (2026-09-22, development host)
+
+`MYNAH_ASR_TRACE_ENC=N` probes the first N encoder frames of a stream at the
+mel slice a frame came from, the subsampling output, every layer output, the
+input of `encoder_post`, the two boundaries inside it, and its output. Both an
+absolute norm and an RMS per dimension, so a difference in how many values are
+summed cannot masquerade as activation amplification. Default OFF, and the
+transcript is byte-identical with the probe on (checked, md5).
+
+Six clips, **EN, FR**, IT and DE. The first chunk is excluded throughout: it is
+fed 25 mel frames rather than 32 and carries the init pad, so its last position
+sees one mel row instead of eight — a fact about chunk assembly, not about the
+network, and visible only in the absolute norm (183.8 against ~520) while the
+RMS is the same 16.2 at every position.
+
+### The localisation
+
+Median RMS per dimension, steady-state chunks, ratio of position 0 to position 3:
+
+| boundary | t=0 | t=1 | t=2 | t=3 | t0/t3 |
+|---|---|---|---|---|---|
+| **PRE-crossing** | | | | | |
+| mel | 15.04 | 14.84 | 14.83 | 15.07 | **1.00** |
+| subsampling | 71.82 | 74.11 | 77.71 | 73.35 | **0.98** |
+| layer 0 … layer 11 | — | — | — | — | **1.00** |
+| layer 17 | 8.49 | 8.76 | 9.02 | 9.43 | 0.90 |
+| layer 21 | 4.95 | 5.08 | 5.34 | 5.86 | 0.84 |
+| layer 23 (= input of `encoder_post`) | 0.0497 | 0.0493 | 0.0470 | 0.0439 | 1.13 |
+| **`prompt_mid` (after the ReLU)** | **0.1612** | **0.1550** | **0.0454** | **0.0224** | **7.21** |
+| `prompt_fused` | 0.5848 | 0.5634 | 0.1455 | 0.0675 | 8.66 |
+| `post_proj` (what the joint reads) | 0.8133 | 0.7854 | 0.2147 | 0.1327 | **6.13** |
+| **POST-crossing** | | | | | |
+| layer 23 | 0.0436 | 0.0435 | 0.0437 | 0.0436 | 1.00 |
+| `prompt_mid` | 0.0277 | 0.0256 | 0.0266 | 0.0249 | 1.11 |
+| `post_proj` | 0.1448 | 0.1404 | 0.1406 | 0.1365 | 1.06 |
+
+### FACT — the earliest responsible boundary
+
+**The positions are identical through the whole conformer stack and diverge for
+the first time at the ReLU in the first layer of the prompt projector**
+(`mid = ReLU([x, one-hot(prompt)] @ prompt_l1_w^T + b)`, `src/encoder.c`).
+Its input differs by 1.13x; its output by 7.21x.
+
+Not chunk assembly, not subsampling, not attention, not the convolution, not the
+residual stream. Everything R-11 saw at `|enc| ~ 20` is produced after the last
+layer norm.
+
+Two separate things happen there, and pre/post-crossing separates them:
+
+- **a magnitude change**: `prompt_mid` RMS is 0.161 at t=0 pre-crossing against
+  0.028 post-crossing, about 6x, at every position;
+- **a positional spread**: 7.21x pre-crossing against 1.11x post-crossing.
+
+### The mechanism the code makes readable — HYPOTHESIS, not measured
+
+`cat` is `[x, one-hot(prompt_id)]`. `x` arrives from the final layer norm with an
+RMS around 0.044–0.05; the one-hot entry is **1.0**, roughly twenty times any
+single component of `x`. The ReLU's pre-activation is therefore dominated by the
+prompt column, and `x` acts as a small perturbation that decides **which units
+survive the gate**. A 13 % difference in `x` flipping gates into a 7x difference
+in what survives is consistent with that picture.
+
+**This is a reading of the code, not a measurement.** Nothing here shows which
+units gate, or that the gating is what produces the spread. It is written down
+so the next step can test it rather than inherit it.
+
+### What is NOT established, and what must not be done next
+
+- **That a high norm is bad.** Nothing here shows that reducing it would improve
+  TTFP or quality. R-11 measured that high `|enc|` co-occurs with a large blank
+  margin; it did not show that it *causes* a later or worse first token.
+- **No normalisation, clamp, scaling or decoder compensation** may be tried
+  until high norm is shown to predict a delayed first correct lexical token, a
+  wrong first token, or CER/WER — per language, EN and FR independently.
+- If this is simply the representation the checkpoint produces while its prompt
+  pathway dominates a small encoder output, the right action is to leave it
+  alone and spend the effort elsewhere.
+
+R-13 stops here: the boundary is localised with a reproducible contrast across
+four languages, and the instrumentation is not expanded further.
