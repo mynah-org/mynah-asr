@@ -151,7 +151,19 @@ stop_fleet() {
 }
 # SIGUSR1 every DUMP_EVERY seconds for as long as the fleet lives.  The parent
 # forwards it to every worker (server/obs.c), so one signal dumps the fleet.
-dumper_start() { ( while kill -0 $SRV 2>/dev/null; do sleep "$DUMP_EVERY"; kill -USR1 $SRV 2>/dev/null; done ) & DUMPER=$!; }
+#
+# The dump carries no RSS and no roster, so bounds 11 (memory growth) and 12
+# (worker deaths) would have had no evidence at all. They are sampled from the
+# OS on the same tick, which also dates every sample against the dump beside it.
+dumper_start() {   # dumper_start <tag>
+    ( while kill -0 $SRV 2>/dev/null; do
+          sleep "$DUMP_EVERY"
+          kill -USR1 $SRV 2>/dev/null
+          printf 't=%s pids=%s\n' "$(date -u +%H:%M:%S)" "$(pgrep -P $SRV 2>/dev/null | tr '\n' ',')" \
+              >> "$RUN/procsample-$1.txt"
+          ps -o pid=,rss=,stat=,etimes= -p "$(pgrep -P $SRV 2>/dev/null | tr '\n' ',' | sed 's/,$//')" \
+              2>/dev/null >> "$RUN/procsample-$1.txt"
+      done ) & DUMPER=$!; }
 dumper_stop()  { kill $DUMPER 2>/dev/null; DUMPER=""; }
 trap 'dumper_stop; [ -n "$SRV" ] && kill -TERM $SRV 2>/dev/null; exit 130' INT TERM
 
@@ -220,7 +232,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = ladder ]; then
     say "--- V2-3 ladder ($LADDER), ${LADDER_S}s per rung, fresh server per rung"
     for C in $LADDER; do
         start_fleet "ladder-C$C"
-        dumper_start
+        dumper_start "ladder-C$C"
         say "--- LADDER C=$C"
         load --mode soak --streams "$C" --duration "$LADDER_S" --warmup 10 --window 30 --seed 42 \
              --clips $BANK ${REFJSON:+--reference "$REFJSON"} \
@@ -237,7 +249,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = soak ]; then
     while [ "$n" -le "$SOAKS" ]; do
         say "--- V2-4 soak $n/$SOAKS: C=$SOAK_C for ${SOAK_S}s, fresh server"
         start_fleet "soak$n"
-        dumper_start
+        dumper_start "soak$n"
         load --mode soak --streams "$SOAK_C" --duration "$SOAK_S" --warmup "$WARMUP" \
              --window "$WINDOW" --seed $(( 42 + n )) --clips $BANK \
              ${REFJSON:+--reference "$REFJSON"} \
