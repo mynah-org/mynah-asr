@@ -1099,5 +1099,41 @@ the remaining 0.6 s.** What can be said:
 post-crossing — but it is **not the explanation for the large residual
 latency**, and the ceiling the derivation puts on it (120 ms against a
 0.50–0.97 s wait) was already the argument. The structure that keeps appearing
-in the pre-crossing window is the encoder's own output, positional and
-cache-dependent. That is where the next question is, and R-11 stops here.
+in the pre-crossing window is the encoder's own output, which **occurs during
+partial-cache operation and is strongly position-dependent**.
+
+The wording matters. *Position-dependent* is measured: 60 / 52 / 66 % against
+22 % across the four chunk positions, on 478 decisions. *Cache-dependent* is
+**not** established — the regime is observed WHILE the cache is partial, and
+that is a co-occurrence, not a demonstrated cause. Writing "cache-dependent"
+would let tomorrow start from a causal claim nobody has earned.
+
+That is where the next question is, and R-11 stops here.
+
+## Status, frozen 2026-09-22
+
+| claim | verdict |
+|---|---|
+| initial predictor-state emission lock (R-8) | **rejected** |
+| int8 numerical artefact behind the extreme logits | **rejected** — f32 reproduces it frame for frame |
+| forcing a first token as a fix | **rejected** — delays, degrades, and disrupts equally after the first token |
+| within-chunk lookahead as a real mechanism | **confirmed** — monotone 2.26 → 6.11 on 3101 balanced post-crossing decisions |
+| lookahead as the explanation of the ~0.7 s | **no** — the derived and measured lever is 100–120 ms |
+| high-norm encoder regime before the first token | **FACT** |
+| that regime being position-dependent inside the chunk | **FACT**, new 2026-09-22 |
+| cache fill as the CAUSE of the residual latency | **HYPOTHESIS**, not established |
+| cache priming | specified, not justified to run |
+
+## The next question, sharpened
+
+Not "how do I lower TTFP?" but:
+
+> **Why do chunk positions 0, 1 and 2 during early, partial-cache operation so
+> often produce an encoder output norm around 20, while position 3 does so much
+> less often?**
+
+Position 3 is the frame whose receptive field ends exactly at the chunk
+boundary and which has no future context at all. Whether that is the
+explanation, a coincidence of the subsampling geometry, or an artefact of how
+the chunk is assembled is unknown, and it is answerable from the encoder rather
+than from the serving path.
