@@ -27,6 +27,8 @@
 #include "../src/backend.h"
 #include "../src/threads.h"
 
+#define AFFINITY_CHILD "--affinity-child"
+
 static int failures;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { printf("threads FAIL: %s\n", msg); failures = 1; } \
@@ -84,7 +86,13 @@ static int pool_child(const char *spin_us, const char *threads, int after_fork) 
     return 1;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* The re-exec'd half of the affinity gate at the bottom of this file: a
+     * process that has done NOTHING else, under a mask its parent narrowed.
+     * It must come before anything that could call num_threads(). */
+    if (argc > 1 && strcmp(argv[1], AFFINITY_CHILD) == 0)
+        return mynah_asr_num_threads() == 1 ? 0 : 1;
+
     /* FIRST, before this process has a pool or a cached thread count: the
      * children below must be pristine for their environment to mean anything. */
     {
@@ -170,34 +178,45 @@ int main(void) {
      * the whole box oversubscribes its own slice, and since a parallel region
      * ends at its slowest worker the extra threads buy a straggler, not
      * throughput. Measured on a 32-cpu Neoverse-V2 pinned to 24: a 32-thread
-     * pool. The check runs in a CHILD because num_threads caches on first call
-     * and this process has already called it. */
+     * pool.
+     *
+     * IT MUST BE A RE-EXEC, NOT A fork().  num_threads() caches in a
+     * function-local static on first call and this process has already called
+     * it, so a forked child COPIES the answer: it reports the parent's 8 under
+     * a one-cpu mask and the gate fails for a reason that has nothing to do
+     * with affinity.  That is what turned every Linux CI job red on 2026-09-20
+     * while macOS -- where this whole block is compiled out -- stayed green.
+     * Proven on the dev host with the real src/threads.c: parent 3, fork'd
+     * child with the env unset 3 (inherited), exec'd child with the env unset 8
+     * (re-derived).  The mask survives execve, the static does not, so the
+     * child is the fresh process whose behaviour is actually the contract. */
 #if defined(__linux__)
     {
-        const pid_t pid = fork();
-        if (pid == 0) {
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            CPU_SET(0, &set);
-            if (sched_getaffinity(0, sizeof(set), &set) != 0)
-                _exit(77);                       /* cannot ask: skip, do not fail */
-            const int have = CPU_COUNT(&set);
-            if (have < 2) _exit(77);             /* nothing to narrow */
-            cpu_set_t one;
-            CPU_ZERO(&one);
-            for (int c = 0, put = 0; c < CPU_SETSIZE && put < 1; c++)
-                if (CPU_ISSET(c, &set)) { CPU_SET(c, &one); put++; }
-            if (sched_setaffinity(0, sizeof(one), &one) != 0) _exit(77);
-            unsetenv("MYNAH_ASR_THREADS");       /* the env wins by design */
-            _exit(mynah_asr_num_threads() == 1 ? 0 : 1);
-        }
-        int st = 0;
-        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
-            if (WEXITSTATUS(st) == 77)
-                printf("threads SKIP: affinity cannot be narrowed here\n");
-            else
-                CHECK(WEXITSTATUS(st) == 0,
-                      "a process pinned to one cpu builds a pool of one thread");
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof(set), &set) != 0 || CPU_COUNT(&set) < 2) {
+            printf("threads SKIP: affinity cannot be narrowed here\n");
+        } else {
+            const pid_t pid = fork();
+            if (pid == 0) {
+                cpu_set_t one;
+                CPU_ZERO(&one);
+                for (int c = 0, put = 0; c < CPU_SETSIZE && put < 1; c++)
+                    if (CPU_ISSET(c, &set)) { CPU_SET(c, &one); put++; }
+                if (sched_setaffinity(0, sizeof(one), &one) != 0) _exit(77);
+                unsetenv("MYNAH_ASR_THREADS");   /* the env wins by design */
+                fflush(NULL);
+                execl("/proc/self/exe", argv[0], AFFINITY_CHILD, (char *)NULL);
+                _exit(77);                       /* cannot re-exec: skip, do not fail */
+            }
+            int st = 0;
+            if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
+                if (WEXITSTATUS(st) == 77)
+                    printf("threads SKIP: affinity cannot be narrowed here\n");
+                else
+                    CHECK(WEXITSTATUS(st) == 0,
+                          "a process pinned to one cpu builds a pool of one thread");
+            }
         }
     }
 #endif
