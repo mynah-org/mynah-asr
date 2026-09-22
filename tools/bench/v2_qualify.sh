@@ -167,8 +167,18 @@ dumper_start() {   # dumper_start <tag>
 dumper_stop()  { kill $DUMPER 2>/dev/null; DUMPER=""; }
 trap 'dumper_stop; [ -n "$SRV" ] && kill -TERM $SRV 2>/dev/null; exit 130' INT TERM
 
+# Where the speech in each clip actually starts. Without it TTFP charges the
+# server for whatever room tone the clip leads with: the unloaded C=1 pass over
+# this corpus reads p50 1516 ms and p95 4418 ms, and the gap is the bank, not
+# the fleet. TTFP has no registered bound either way, but a number that is
+# reported has to be a number that means something.
+ONSETS="$RUN/onsets.json"
+python3 tools/bench/clip_onset.py $BANK --json "$ONSETS" > "$RUN/onsets.txt" 2>&1 \
+    || { say "WARNING onset detection failed; TTFP will be reported from stream open only"; ONSETS=""; }
+
 load() { taskset -c "$GEN_CPUS" python3 tools/bench/stream_load.py --port "$PORT" \
-             --lookahead "$LOOKAHEAD" --bank short,medium --class-bounds 8,20 "$@"; }
+             --lookahead "$LOOKAHEAD" --bank short,medium --class-bounds 8,20 \
+             ${ONSETS:+--onsets "$ONSETS"} "$@"; }
 
 # ------------------------------------------------------------------ 1. freeze
 if [ "$PHASE" = all ] || [ "$PHASE" = freeze ]; then
