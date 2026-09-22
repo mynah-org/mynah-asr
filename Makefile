@@ -534,6 +534,8 @@ leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align tests/test
 # no tracked script depending on an untracked file
 check:
 	@sh tests/test_check_plan.sh
+	@out=$$(python3 tools/bench/streaming_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
+	@out=$$(sh tests/test_partial_quality.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@python3 tools/check_plan.py
 	@python3 tools/check_repo_integrity.py
 	@python3 tools/check_flag_registry.py

@@ -303,6 +303,165 @@ def cer(hyp, ref):
     return edit_distance(h, r) / len(r)
 
 
+# ------------------------------------------------------------------- partial quality
+# WHAT THE FIRST PARTIAL IS WORTH, not only when it arrives.
+#
+# R-4 closed the serving half: publication costs ~0.1 ms at every concurrency, so
+# anything that moves the first word moves the DECODER, and a decoder change can
+# buy earliness by being wrong. Q-2 already showed one stable runner-up in four is
+# wrong, which is why "first nonblank moved earlier" is not a result on its own.
+#
+# The axis here is AUDIO CONSUMED, not wall clock: the same clip gave the same
+# speech-at-first-nonblank on this Mac and on the Axion, clip for clip (F30/E2),
+# so these numbers compare two decoder configurations without renting a machine.
+# Wall-clock TTFP stays with the server harness, where load belongs.
+#
+# REVISION IS IMPOSSIBLE HERE, AND THAT IS THE POINT. stream_decode_emit
+# publishes `text + chars_emitted`, a byte slice of the running transcript, so a
+# client's view only ever grows: there is no retraction to count. The risk is the
+# other one -- a wrong prefix that is published and never corrected -- so it is
+# measured directly (`first_word_correct`) instead of being hidden behind a
+# revision rate that is zero by construction. `published_prefix_divergence` keeps
+# the assumption itself honest: if detokenisation ever rewrites a byte the client
+# already holds, the concatenation and the library's own string stop matching.
+
+
+def first_word_of(text):
+    """The first normalised word of `text`, or None when there is none yet."""
+    w = normalise(text).split()
+    return w[0] if w else None
+
+
+def word_settled(raw):
+    """Is the first word of this partial COMPLETE, or still a growing subword?
+
+    It is complete once a boundary has been published after it: either a second
+    word has started, or the raw text ends in something `normalise` turns into a
+    space (whitespace or punctuation). Until then "I" may yet become "Il", and
+    scoring it against the reference would score the tokenizer's chunking."""
+    if not raw:
+        return False
+    if len(normalise(raw).split()) >= 2:
+        return True
+    last = raw[-1]
+    return last.isspace() or last in PUNCT or unicodedata.category(last).startswith("P")
+
+
+def token_compatible(a, b):
+    """Could these be the same word, one of them possibly truncated?
+
+    Prefix-compatible in either direction, on normalised text. A partial that has
+    published "sat" against a reference "satellite" is evidence that the right
+    word is being produced; it is not yet proof, which is why earliness computed
+    this way is reported separately from the settled first word."""
+    a, b = normalise(a or ""), normalise(b or "")
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
+def partial_quality(deltas, ref, lib_text=None, onset_s=None, offline=None):
+    """Six quantities about ONE streamed utterance, none of them merged.
+
+    `deltas` is the published sequence, in order, each {"t1": audio consumed at
+    publication, "text": the delta}. `ref` is the human reference -- the corpus,
+    never the model's own offline output, which is reported beside it precisely
+    because the two disagree on some clips. `lib_text` is what the library held
+    at the end, when the caller can supply it. `onset_s` is speech onset.
+
+    Every "speech_*" is audio minus onset and is None without an onset: an
+    utterance with no onset has no speech axis, which is a fact, while silently
+    using the audio axis instead would put two different measurements in one
+    column."""
+    out = {
+        "n_deltas": len(deltas),
+        "audio_at_first_partial": None, "speech_at_first_partial": None,
+        "first_word": None, "audio_at_first_word": None, "speech_at_first_word": None,
+        "first_word_correct": None,
+        "audio_at_first_evidence": None, "speech_at_first_evidence": None,
+        "leading_silence_deltas": 0,
+        "published_prefix_divergence": None,
+        "text": "", "cer": None, "wer": None,
+        "offline_cer": None, "streaming_vs_offline_cer": None,
+    }
+    if not deltas:
+        return out
+
+    def speech(a):
+        return None if (a is None or onset_s is None) else a - onset_s
+
+    out["audio_at_first_partial"] = deltas[0].get("t1")
+    out["speech_at_first_partial"] = speech(out["audio_at_first_partial"])
+
+    ref_first = first_word_of(ref) if ref else None
+    concat = ""
+    for d in deltas:
+        t1 = d.get("t1")
+        if onset_s is not None and t1 is not None and t1 <= onset_s:
+            # published having consumed only audio from BEFORE speech began
+            out["leading_silence_deltas"] += 1
+        concat += d.get("text") or ""
+        if out["audio_at_first_evidence"] is None and ref_first:
+            fw = first_word_of(concat)
+            if fw and token_compatible(fw, ref_first):
+                out["audio_at_first_evidence"] = t1
+                out["speech_at_first_evidence"] = speech(t1)
+        if out["audio_at_first_word"] is None and word_settled(concat):
+            out["first_word"] = first_word_of(concat)
+            out["audio_at_first_word"] = t1
+            out["speech_at_first_word"] = speech(t1)
+            if ref_first:
+                out["first_word_correct"] = out["first_word"] == ref_first
+
+    out["text"] = concat
+    if lib_text is not None:
+        out["published_prefix_divergence"] = normalise(concat) != normalise(lib_text)
+    if ref:
+        out["cer"], out["wer"] = cer(concat, ref), wer(concat, ref)
+        if offline is not None:
+            out["offline_cer"] = cer(offline, ref)
+            out["streaming_vs_offline_cer"] = cer(concat, offline)
+    return out
+
+
+def _rate(rows, pred, guard=None):
+    """(rate, numerator, denominator) over the rows where the question applies."""
+    elig = [r for r in rows if guard is None or guard(r)]
+    if not elig:
+        return None, 0, 0
+    n = sum(1 for r in elig if pred(r))
+    return n / len(elig), n, len(elig)
+
+
+def partial_quality_summary(rows):
+    """Aggregate per-utterance partial_quality() dicts. Rates carry their
+    denominator: "1 of 4" and "25 of 100" are not the same evidence."""
+    def col(k):
+        return [r[k] for r in rows if r.get(k) is not None]
+
+    s = {"n": len(rows)}
+    for k in ("speech_at_first_partial", "speech_at_first_word",
+              "speech_at_first_evidence", "cer", "wer",
+              "streaming_vs_offline_cer", "offline_cer"):
+        v = col(k)
+        s[k] = {"n": len(v), "median": pct(v, 50), "p95": pct(v, 95),
+                "mean": (sum(v) / len(v)) if v else None} if v else None
+    for name, pred, guard in (
+        ("wrong_first_word", lambda r: r.get("first_word_correct") is False,
+         lambda r: r.get("first_word_correct") is not None),
+        ("no_first_word", lambda r: r.get("audio_at_first_word") is None, None),
+        ("leading_silence", lambda r: (r.get("leading_silence_deltas") or 0) > 0,
+         lambda r: r.get("leading_silence_deltas") is not None),
+        ("prefix_divergence", lambda r: r.get("published_prefix_divergence") is True,
+         lambda r: r.get("published_prefix_divergence") is not None),
+        ("disagrees_with_offline", lambda r: (r.get("streaming_vs_offline_cer") or 0) > 0,
+         lambda r: r.get("streaming_vs_offline_cer") is not None),
+    ):
+        rate, num, den = _rate(rows, pred, guard)
+        s[name] = {"rate": rate, "n": num, "of": den}
+    return s
+
+
 def analyze_utterance(rec, frame_ms=100.0, pace=1.0, onsets=None):
     """Every per-utterance metric.  Marks are [t, value] so they can be windowed later."""
     sends = [list(s) for s in rec.get("sends") or []]
@@ -1149,6 +1308,90 @@ def self_test():
 
     print("report formatting does not raise")
     print(format_summary(agg, envelope_verdict(agg, thr), indent="    "))
+
+    # ------------------------------------------------------- partial quality
+    # Fixed synthetic transcripts, chosen so each assertion can only pass for
+    # one reason. A pairing, percentile or oracle bug in this file has already
+    # changed a conclusion once (the E3 publication delay came out NEGATIVE from
+    # one mispaired row); these are the known answers that stop the next one.
+    print("partial quality: first word, earliness, and what the gate refuses to guess")
+    REF = "Il satellite nello spazio riceve il segnale."
+
+    def d(t1, text):
+        return {"t1": t1, "text": text}
+
+    # the first word arrives as two subwords: settled only when a boundary follows
+    q = partial_quality([d(0.80, "I"), d(1.10, "l"), d(1.40, " satellite")],
+                        REF, onset_s=0.30)
+    bad += not _eq(q["audio_at_first_partial"], 0.80, "audio at the first partial")
+    bad += not _eq(q["speech_at_first_partial"], 0.50, "speech at the first partial")
+    bad += not _eq(q["audio_at_first_evidence"], 0.80, "compatible evidence exists at the first subword")
+    bad += not _eq(q["audio_at_first_word"], 1.40, "but the first word is not settled until a boundary follows")
+    bad += not _eq(q["first_word"], "il", "and it is the whole word, not the subword")
+    bad += not _eq(q["first_word_correct"], True, "first word correct")
+    bad += not _eq(q["leading_silence_deltas"], 0, "nothing published before onset")
+
+    # a wrong first word is published and, being a byte slice, never taken back
+    q = partial_quality([d(0.80, "La "), d(1.40, "satellite")], REF, onset_s=0.30)
+    bad += not _eq(q["first_word"], "la", "a wrong first word is reported as what it is")
+    bad += not _eq(q["first_word_correct"], False, "and marked wrong")
+    bad += not _eq(q["audio_at_first_evidence"], None, "with no compatible evidence at any point")
+
+    # earliness alone must not read as a win: earlier AND wrong is the Q-2 case
+    early = partial_quality([d(0.50, "La "), d(1.0, "satellite")], REF, onset_s=0.30)
+    late = partial_quality([d(0.90, "Il "), d(1.4, "satellite")], REF, onset_s=0.30)
+    bad += not _eq(early["speech_at_first_word"] < late["speech_at_first_word"], True,
+               "the wrong arm IS earlier -- the summary must separate the two axes")
+    summ = partial_quality_summary([early, late])
+    bad += not _eq(summ["wrong_first_word"]["rate"], 0.5, "and the wrong-first-word rate says so")
+    bad += not _eq(summ["wrong_first_word"]["of"], 2, "over the utterances where the question applies")
+
+    # text on pre-onset audio only: a hallucination in the leading silence
+    q = partial_quality([d(0.20, "Ehm "), d(1.40, "il satellite")], REF, onset_s=0.30)
+    bad += not _eq(q["leading_silence_deltas"], 1, "a delta published before onset is counted")
+
+    # the client's concatenation vs what the library holds
+    q = partial_quality([d(0.8, "Il "), d(1.4, "satellite")], REF, lib_text="Il satellite")
+    bad += not _eq(q["published_prefix_divergence"], False, "concatenation matches the library")
+    q = partial_quality([d(0.8, "Il "), d(1.4, "satellite")], REF, lib_text="Lo satellite")
+    bad += not _eq(q["published_prefix_divergence"], True, "and a rewritten byte is detected")
+
+    # no onset: the speech axis must be absent, not silently the audio axis
+    q = partial_quality([d(0.80, "Il "), d(1.4, "satellite")], REF)
+    bad += not _eq(q["speech_at_first_partial"], None, "no onset -> no speech axis")
+    bad += not _eq(q["audio_at_first_partial"], 0.80, "the audio axis still exists")
+
+    # no reference: correctness is unknown, which is not the same as wrong
+    q = partial_quality([d(0.80, "Il "), d(1.4, "satellite")], None, onset_s=0.3)
+    bad += not _eq(q["first_word_correct"], None, "no reference -> correctness unknown, not False")
+    bad += not _eq(partial_quality_summary([q])["wrong_first_word"]["of"], 0,
+               "and it is excluded from the denominator")
+
+    # an utterance that published nothing
+    q = partial_quality([], REF, onset_s=0.3)
+    bad += not _eq(q["n_deltas"], 0, "an utterance with no delta reports none")
+    bad += not _eq(q["audio_at_first_partial"], None, "and no first-partial time")
+    bad += not _eq(partial_quality_summary([q])["no_first_word"]["rate"], 1.0,
+               "and counts as having produced no first word")
+
+    # streaming vs offline vs reference stay three separate numbers
+    q = partial_quality([d(0.8, "Il satellite nello spazio riceve il segnale.")],
+                        REF, offline="Il satellite nello spazio riceve il segnale")
+    bad += not _eq(q["cer"], 0.0, "streaming against the corpus")
+    bad += not _eq(q["offline_cer"], 0.0, "offline against the corpus")
+    bad += not _eq(q["streaming_vs_offline_cer"], 0.0, "and the two against each other")
+    q = partial_quality([d(0.8, "Il satellite nello spasio")], REF,
+                        offline="Il satellite nello spazio")
+    bad += not _eq(q["streaming_vs_offline_cer"] > 0, True,
+               "a streaming/offline disagreement is not folded into the corpus CER")
+    bad += not _eq(q["offline_cer"] < q["cer"], True,
+               "and the offline arm keeps its own, better, number")
+
+    # the normaliser is shared: punctuation and case cannot decide a first word
+    bad += not _eq(token_compatible("Il,", "il"), True, "token compatibility uses the one normaliser")
+    bad += not _eq(word_settled("Il"), False, "a bare token is not settled")
+    bad += not _eq(word_settled("Il "), True, "a trailing space settles it")
+    bad += not _eq(word_settled("Il,"), True, "so does punctuation")
 
     print(f"\nstreaming_metrics self-test: {'FAIL' if bad else 'PASS'} ({int(bad)} failures)")
     return 1 if bad else 0
