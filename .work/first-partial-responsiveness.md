@@ -720,6 +720,74 @@ the question is separable and worth separating, because the steady-state
 numbers moved by nearly a factor of two while the first-word wait did not move
 at all.
 
+## R-7 state audit (2026-09-22, source inspection only, no code changed)
+
+Asked of the code before touching it: which state depends on `right_ctx`, what
+would survive a mid-stream change of it, and what would not.
+
+**FACT — `right` is not a mask here, it is a chunk length.** In `src/encoder.c`
+`es->right` is read in exactly two places: its assignment in
+`mynah_asr_enc_stream_init` (line 646) and `mynah_asr_enc_stream_need`
+(lines 731-732). It never reaches the step, the attention, the convolution or
+any cache. `q = right + 1` is how many encoder frames a chunk yields, and the
+streaming attention is full over `[valid cache + chunk]` with no mask at all
+(the contract at the top of `src/encoder.h`). The right context is realised by
+putting future frames INSIDE the chunk, not by widening a window.
+
+**FACT — the state that carries no memory of `right`:**
+
+| state | how it is sized or derived | depends on `right` |
+|---|---|---|
+| `k_cache`, `v_cache` | `[n_layers, left, d_model]` | no |
+| `conv_cache` | `[n_layers, conv_k-1, d_model]` | no |
+| `cache_valid` | `min(cache_valid + Q, left)` | no |
+| `ss.cache[s]` | `[C_in, F]`, the stage's last input frame | no |
+| `ss.first` | the one-off init pad | no |
+| `sa_pe_K` | recomputed whenever `pe_K = cache_valid + Q` moves (encoder.c:1065) | no — a varying Q is ALREADY handled |
+| rel-pos table | `kmax = left + max_q + 2`, `max_q` over EVERY declared preset (mynah_asr.c:378) | no — already sized for the largest q |
+
+**FACT — the state that is sized at open, and would overflow if `right` GREW
+mid-stream:** `es->scr` (`Qm = q+2`, `Km = left+Qm`, `Pm = 2Km-1`), the `ss`
+scratch (`max_n_mel = sub*(right+1)+1`), `s->mel_buf` (same bound) and
+`s->enc_buf` (`q * d_out`).
+
+**CONSEQUENCE — last night's note had the dangerous direction backwards.** It
+said "a switch UP (q=1 -> q=4) is the dangerous direction and must be covered".
+It is dangerous only for a stream OPENED at q=1, which is not the design. A
+stream opened at `[56,3]` has every buffer sized for q=4; running its first
+chunks with `es->right = 0` feeds SMALLER chunks and produces a SMALLER Q, which
+fits everywhere, and restoring `es->right = 3` returns to the size the buffers
+were made for. **In the direction actually wanted, no reallocation is needed and
+no bound is crossed.** The scheduler groups streams by `es->right`
+(mynah_asr.c:1230), so such a stream would move between batch groups at the
+switch — a grouping change, not a correctness one.
+
+**UNPROVEN, and it is now the whole question.** None of the above says the MODEL
+accepts it. What changes across the switch is the chunk grid: frames cached
+while q=1 were produced on a one-frame grid, and the frames that follow sit on a
+four-frame grid whose boundary need not align with `cache_valid`. Cache-aware
+training samples an attention context per UTTERANCE, so a grid that changes
+inside one utterance is off-distribution. That is a hypothesis about the
+checkpoint, not a fact about this code, and no amount of source reading settles
+it. `sched_ensure_stream()` reopening the stream is not evidence either way: it
+says the implementation does not do this today, nothing more.
+
+**What the gate must show, and it exists now.**
+`tools/eval/partial_quality.py` compares two configurations on the corpus and
+reports final CER/WER, speech consumed before the first settled word and before
+the first compatible evidence, wrong-first-token rate, leading-silence emission,
+published-byte rewriting and the streaming/offline/corpus three-way, each on its
+own line. The transition arm has to be run through it against BOTH fixed-preset
+references on the same audio. If the transcript is not defensible at the library
+level there is no serving change to design and R-7 closes there — and it closes
+on quality, not on latency, because `[56,0]` already showed that removing
+context buys about 100 ms of speech and costs mean CER 0.0405 -> 0.0525.
+
+**Blocked here today:** the converted packs live on an external volume that is
+not mounted (`models/*` are symlinks into `/Volumes/shared`), so nothing
+model-dependent can be measured on this machine right now. The audit above is
+source-only and complete; the A/B is not started.
+
 ## Next action
 
 Two, in this order, both on the development host and neither started.
@@ -741,9 +809,12 @@ The gate comes first, and it is not a latency measurement:
   a gate, not an argument;
 - the scratch and the rel-pos table must be proved large enough for both
   regimes from the sizes in `mynah_asr_enc_stream_init`, not from inspection of
-  one run;
-- a switch UP (q=1 -> q=4) is the dangerous direction and must be covered even
-  if only the DOWN direction is wanted.
+  one run — DONE by the state audit above: the rel-pos table is already built
+  for the largest declared preset, and a stream opened at `[56,3]` never grows
+  past its own buffers;
+- a switch UP is dangerous only for a stream OPENED at the small q. The audit
+  corrects this: open at `[56,3]`, run the opening chunks at `right = 0`, then
+  restore. Nothing is reallocated.
 
 If the transcript is not defensible at the library level, there is no serving
 change to design and R-7 closes there.
