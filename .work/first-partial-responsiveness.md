@@ -801,6 +801,97 @@ not mounted (`models/*` are symlinks into `/Volumes/shared`), so nothing
 model-dependent can be measured on this machine right now. The audit above is
 source-only and complete; the A/B is not started.
 
+## R-3F, first third: does it talk into the silence? (2026-09-22, saved traces)
+
+`tools/eval/rnnt_silence.py`, run on the two arms already on disk
+(`.work/evidence/q2-earliness-2026-09-21` and `q2-lookahead0-2026-09-21`).
+**No model and no box were needed**: the RNNT traces, the transcripts and the
+committed WAVs are all that this reads. 21 clips, 3579 decisions per arm.
+
+### FACT — it does not
+
+| | `[56,3]` | `[56,0]` |
+|---|---|---|
+| clips that DECODED a token on pre-onset audio only | **0 / 21** | **0 / 21** |
+| clips that PUBLISHED text on pre-onset audio only | **0 / 21** | **0 / 21** |
+| pre-onset steps in the corpus (the denominator) | 58 | 269 |
+| empty transcripts | 0 / 21 | 0 / 21 |
+
+The denominator matters: two clips lead with 3.45 s and 4.69 s of room tone, so
+this is not a corpus without silence to hallucinate into. Decoded and published
+are counted separately because R-3B showed they differ — the language tag is
+lifted out of the text and `total > chars_emitted` gates the delta.
+
+**This closes one of the three things R-3F still owed.** Partial revisions and
+first-correct-lexical-token latency remain; `tools/eval/partial_quality.py`
+measures both but has not been run on a real pack yet.
+
+### FACT — but the blank logit before the first word is in another regime
+
+Asked because a trace line looked wrong, not because anything predicted it.
+Three things are unusual at the start of an utterance and crediting the wrong
+one is easy, so the classification is a 2x2x2: audio (per-frame RMS against the
+clip's own floor, `clip_onset`'s +12 dB rule) x predictor (`SOS` or `moved`) x
+encoder cache (`filling` or `FULL` at `cache_valid = left_ctx`).
+
+`[56,3]`, 3579 decisions, ordered by size:
+
+| audio | pred | cache | frames | \|blank\| median | p90 | >100 |
+|---|---|---|---|---|---|---|
+| SPEECH | moved | FULL | 1796 | 32.8 | 60.8 | 0.1 % |
+| SPEECH | moved | filling | 673 | 37.3 | 59.9 | **0.0 %** |
+| silence | moved | FULL | 591 | 27.5 | 45.3 | **0.0 %** |
+| silence | SOS | filling | 288 | **914.5** | 1005.5 | **62.8 %** |
+| SPEECH | SOS | filling | 168 | 28.4 | **996.5** | **36.3 %** |
+| silence | moved | filling | 47 | 32.0 | 65.7 | **0.0 %** |
+| SPEECH | SOS | FULL | 11 | 28.3 | 682.6 | 18.2 % |
+| silence | SOS | FULL | 5 | 26.2 | 990.1 | 40.0 % |
+
+**Every cell where the predictor has moved is 0.0-0.1 %, whatever the audio and
+whatever the cache. Every cell at SOS is 18-63 %.** Silence is controlled for
+(638 frames of silence with a moved predictor, zero extremes) and cache fill is
+controlled for (720 frames of a filling cache with a moved predictor, zero
+extremes). The `[56,0]` arm reproduces the table cell for cell.
+
+The code says why the window exists at all: **`pred_step()` runs only on an
+emitted token** (src/decoder.c:326, "state advances only on emit") and once at
+SOS with blank. So `s->g`, which is added to every encoder frame before the
+joint, is **frozen for the entire pre-first-token window**.
+
+### What this is NOT
+
+- **Observational, not causal.** SOS coincides with "early in the utterance".
+  The only cells that decouple the predictor state from position — SOS with a
+  full cache — hold **16 frames across two clips**, far too few to read either
+  way, and they are the one place the effect weakens. That is the honest limit
+  of this design, and it is exactly why R-8 exists: an injection moves the
+  predictor while holding the audio and the cache fixed.
+- **Not explained.** A blank logit near -900 with a margin near +97 is
+  numerically odd for this joint. Whether that is a real property of the
+  distribution at SOS or an int8 artifact of the head early in the stream is not
+  established here. It is what the decision was actually made on either way.
+- **Not a threshold result.** `>100` is arbitrary; the medians (914 against 27)
+  need no threshold.
+
+### One thing it does settle about our own frozen table
+
+Q-2D's margin trajectory pooled these frames. Checked: among the decisions 3, 2
+and 1 before the crossing, the extreme ones are 2/21, 1/21 and 0/21, and Q-2D
+reported **medians** (5.98 / 4.47 / 2.85 recomputed here). Means would have been
+badly polluted — 15.75 against a median of 5.98 three decisions out. **The
+pre-registered choice of median is what kept that table honest**, by luck as
+much as design.
+
+### What it does to R-8
+
+It sharpens the arms rather than pre-empting them. The barrier, if it is one, is
+not a metaphor: the predictor output is literally constant until something is
+emitted, and the blank logit in that window is in a regime it never returns to.
+Arm **G** (inject `dec->blank`) becomes the sharpest test, because SOS already
+IS blank: injecting it again moves `h`/`c` while changing nothing about the
+content, which is the cleanest possible separation of "a state transition" from
+"linguistic information".
+
 ## Next action
 
 Two, in this order, both on the development host and neither started.
