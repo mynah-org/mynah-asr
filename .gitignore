@@ -35,6 +35,9 @@ tools/.venv/
 # the streaming stress bank (~640 MB, regenerable with `make fetch-stress-bank`):
 # its manifest.json and README.md are tracked, its audio never is
 samples/stress-en/**/*.wav
+# the EN/FR quality bank (FLEURS test split, fetched by tools/fetch_eval_bank.py):
+# audio and its manifest are evidence, not repository content (rule 6)
+samples/eval-bank/
 
 # long bench fixtures (10 MB, LibriSpeech): regenerable with
 # scripts/make_long_fixtures.sh — do not commit

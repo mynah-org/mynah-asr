@@ -293,6 +293,46 @@ def wer(hyp, ref):
     return edit_distance(h, r) / len(r)
 
 
+def align_counts(hyp, ref):
+    """Substitutions, deletions and insertions over the normalised WORD sequence.
+
+    A WER is one number and three different failures produce it. A model that
+    drops the end of every utterance and one that hallucinates a clause both
+    score 0.30, and only the split says which. Deletions are what an ASR under
+    pressure does; insertions are what a hallucinating decoder does; they are not
+    the same defect and must not be averaged.
+
+    Backtracking Levenshtein over words: O(len(h) x len(r)) cells, which is fine
+    for utterances and is never run per frame."""
+    r = normalise(ref).split()
+    h = normalise(hyp).split()
+    if not r:
+        return None
+    n, m = len(h), len(r)
+    d = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        d[i][0] = i
+    for j in range(m + 1):
+        d[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                          d[i - 1][j - 1] + (h[i - 1] != r[j - 1]))
+    sub = dele = ins = 0
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and d[i][j] == d[i - 1][j - 1] + (h[i - 1] != r[j - 1]):
+            sub += h[i - 1] != r[j - 1]
+            i, j = i - 1, j - 1
+        elif i > 0 and d[i][j] == d[i - 1][j] + 1:
+            ins += 1                       # a word in the hypothesis with no reference
+            i -= 1
+        else:
+            dele += 1                      # a reference word the hypothesis never said
+            j -= 1
+    return {"sub": sub, "del": dele, "ins": ins, "ref_words": m, "hyp_words": n}
+
+
 def cer(hyp, ref):
     """Character error rate over normalised text. None when the reference is empty:
     a rate with an empty denominator is not a large error, it is no measurement."""
@@ -456,6 +496,10 @@ def partial_quality_summary(rows):
          lambda r: r.get("published_prefix_divergence") is not None),
         ("disagrees_with_offline", lambda r: (r.get("streaming_vs_offline_cer") or 0) > 0,
          lambda r: r.get("streaming_vs_offline_cer") is not None),
+        # Q-5: today this reads 0 on every corpus we have, and that zero is the
+        # point. A fine-tune that starts producing empties would otherwise show
+        # up only as a WER that drifted.
+        ("empty_transcript", lambda r: not normalise(r.get("text") or ""), None),
     ):
         rate, num, den = _rate(rows, pred, guard)
         s[name] = {"rate": rate, "n": num, "of": den}
@@ -1386,6 +1430,33 @@ def self_test():
                "a streaming/offline disagreement is not folded into the corpus CER")
     bad += not _eq(q["offline_cer"] < q["cer"], True,
                "and the offline arm keeps its own, better, number")
+
+    print("word-level alignment: one WER, three different failures")
+    a = align_counts("il satellite nello spazio", "il satellite nello spazio")
+    bad += not _eq(a["sub"] + a["del"] + a["ins"], 0, "an exact transcript has no errors")
+    a = align_counts("il satellite", "il satellite nello spazio")
+    bad += not _eq(a["del"], 2, "a truncated transcript is 2 DELETIONS")
+    bad += not _eq(a["ins"], 0, "and no insertions")
+    a = align_counts("il satellite nello spazio ieri sera", "il satellite nello spazio")
+    bad += not _eq(a["ins"], 2, "a hallucinated tail is 2 INSERTIONS")
+    bad += not _eq(a["del"], 0, "and no deletions")
+    a = align_counts("il satellite nella spazio", "il satellite nello spazio")
+    bad += not _eq(a["sub"], 1, "one wrong word is 1 SUBSTITUTION")
+    a1 = align_counts("il satellite", "il satellite nello spazio")
+    a2 = align_counts("il satellite nello spazio ieri sera", "il satellite nello spazio")
+    bad += not _eq(wer("il satellite", "il satellite nello spazio"),
+                   wer("il satellite nello spazio ieri sera", "il satellite nello spazio"),
+                   "deletion and insertion give the SAME wer -- which is why the split exists")
+    bad += not _eq(a1["del"] != a2["del"], True, "and the split tells them apart")
+    bad += not _eq(align_counts("anything", ""), None, "no reference -> no alignment, not zero errors")
+    bad += not _eq(align_counts("", "il satellite")["del"], 2, "an EMPTY transcript is all deletions")
+
+    print("empty-transcript rate is counted, not inferred from a large CER")
+    e = partial_quality_summary([partial_quality([], "il satellite"),
+                                 partial_quality([{"t1": 1.0, "text": "il satellite"}],
+                                                 "il satellite")])
+    bad += not _eq(e["empty_transcript"]["rate"], 0.5, "one of two utterances is empty")
+    bad += not _eq(e["empty_transcript"]["of"], 2, "over both")
 
     # the normaliser is shared: punctuation and case cannot decide a first word
     bad += not _eq(token_compatible("Il,", "il"), True, "token compatibility uses the one normaliser")
