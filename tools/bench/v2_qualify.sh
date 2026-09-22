@@ -22,6 +22,7 @@
 #   tools/bench/v2_qualify.sh -m models/nemotron-3.5-asr-streaming-0.6b \
 #       [--phase freeze|reference|ladder|soak|all] [-o ~/asr-evidence/v2]
 #       [--ladder "8 16 24 32"] [--soak-c 16] [--soak-seconds 1800] [--soaks 2]
+#       [--reference-file <reference.json from an earlier run of this tool>]
 #       [--server-cpus 0-23] [--gen-cpus 24-31] [-W 3] [-T 8] [-C 96]
 #
 # It refuses rather than produce a number it cannot support: a dirty tree, a
@@ -33,7 +34,7 @@ MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
 W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3
 LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
-SERVER_CPUS="0-23"; GEN_CPUS="24-31"
+SERVER_CPUS="0-23"; GEN_CPUS="24-31"; REF_IN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MODEL="$2"; shift 2 ;;
@@ -51,6 +52,7 @@ while [ $# -gt 0 ]; do
         --soaks) SOAKS="$2"; shift 2 ;;
         --server-cpus) SERVER_CPUS="$2"; shift 2 ;;
         --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
+        --reference-file) REF_IN="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "v2_qualify: unknown option: $1" >&2; exit 2 ;;
     esac
@@ -171,8 +173,15 @@ if [ "$PHASE" = all ] || [ "$PHASE" = freeze ]; then
 fi
 
 # --------------------------------------------------- 2. the unloaded reference
+# Phases can run in separate invocations, and a soak-only run must NOT quietly
+# lose the parity check because the reference lived in another run directory.
+# --reference-file carries it forward explicitly; nothing is inferred.
 REFJSON="$RUN/reference.json"
-if [ "$PHASE" = all ] || [ "$PHASE" = reference ]; then
+if [ -n "$REF_IN" ]; then
+    [ -f "$REF_IN" ] || die "--reference-file $REF_IN does not exist"
+    cp "$REF_IN" "$REFJSON" || die "could not copy $REF_IN"
+    say "reference: reusing $REF_IN ($(python3 -c "import json;print(len(json.load(open('$REFJSON'))))") clips)"
+elif [ "$PHASE" = all ] || [ "$PHASE" = reference ]; then
     say "--- V2-6 reference: C=1, unloaded, $NCLIP clips, from the server"
     start_fleet ref
     load --mode wave --streams 1 --repeat "$NCLIP" --clips $BANK \
