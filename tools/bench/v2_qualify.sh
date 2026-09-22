@@ -189,7 +189,11 @@ load() { taskset -c "$GEN_CPUS" python3 tools/bench/stream_load.py --port "$PORT
              ${ONSETS:+--onsets "$ONSETS"} "$@"; }
 
 # ------------------------------------------------------------------ 1. freeze
-if [ "$PHASE" = all ] || [ "$PHASE" = freeze ]; then
+# UNCONDITIONAL. A run that measures without recording what it measured is the
+# failure mode this campaign exists to end, and --phase soak used to skip this
+# block entirely: the soak that promotes a profile would have carried no
+# dispatch map, no topology plan and no host record of its own.
+if true; then
     say "--- V2-1 freeze"
     (uname -a; echo; lscpu 2>/dev/null; echo; nproc; echo; free -g; cat /proc/loadavg) > "$RUN/host.txt" 2>&1
     ./mynah-asr --dispatch-map > "$RUN/dispatch.txt" 2>&1
