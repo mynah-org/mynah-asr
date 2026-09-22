@@ -293,6 +293,151 @@ def wer(hyp, ref):
     return edit_distance(h, r) / len(r)
 
 
+# ------------------------------------------------------------------ number format
+# A QUARTER OF THE FLEURS BANK IS SCORED ON A CONVENTION, NOT ON RECOGNITION.
+#
+# FLEURS references keep digits: "Since 1966 ... 400 Royal Bengal tigers".
+# This checkpoint verbalises: "since nineteen sixty-six ... four hundred royal
+# bengal tigers". Measured on the frozen baseline, the utterances whose
+# reference contains a digit are 23 % of the bank and carry WER 0.246 (EN) and
+# 0.253 (FR) against 0.083 and 0.097 for the rest -- and they account for 76 of
+# 105 English insertions and 100 of 137 French ones, because one reference token
+# "2007" becomes three hypothesis tokens.
+#
+# THIS IS NOT LOOSENING THE SCORER. The words must still be right: only the
+# written form of a number is forgiven, and only among forms that are legitimate
+# spoken renderings of THAT number. "2007" may be read as "two thousand seven"
+# or "twenty oh seven"; it may not become "two thousand eight". A strict score
+# is reported beside it, always, and neither replaces the other.
+#
+# Standard library only, like the rest of this file: no num2words on a bare box.
+
+_EN_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+            "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_EN_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+            "eighty", "ninety")
+_FR_ONES = ("zéro un deux trois quatre cinq six sept huit neuf dix onze douze treize "
+            "quatorze quinze seize dix-sept dix-huit dix-neuf").split()
+_FR_TENS = {20: "vingt", 30: "trente", 40: "quarante", 50: "cinquante", 60: "soixante"}
+
+
+def _en_below_1000(n):
+    if n < 20:
+        return _EN_ONES[n]
+    if n < 100:
+        t, r = divmod(n, 10)
+        return _EN_TENS[t] + (f" {_EN_ONES[r]}" if r else "")
+    h, r = divmod(n, 100)
+    return _EN_ONES[h] + " hundred" + (f" {_en_below_1000(r)}" if r else "")
+
+
+def _fr_below_100(n):
+    if n < 20:
+        return _FR_ONES[n]
+    if n < 70:
+        t, r = divmod(n, 10)
+        base = _FR_TENS[t * 10]
+        if r == 1:
+            return base + " et un"
+        return base + (f" {_FR_ONES[r]}" if r else "")
+    if n < 80:                                   # soixante-dix .. soixante-dix-neuf
+        r = n - 60
+        return "soixante" + (" et onze" if r == 11 else f" {_FR_ONES[r]}")
+    r = n - 80
+    if r == 0:
+        return "quatre vingts"
+    return "quatre vingt " + _FR_ONES[r]
+
+
+def _fr_below_1000(n):
+    if n < 100:
+        return _fr_below_100(n)
+    h, r = divmod(n, 100)
+    head = "cent" if h == 1 else f"{_FR_ONES[h]} cent" + ("s" if r == 0 else "")
+    return head + (f" {_fr_below_100(r)}" if r else "")
+
+
+def _cardinal(n, lang):
+    """0..999,999. Beyond that the reference is not a number a speaker reads out."""
+    if n >= 1000000:
+        return None
+    th, r = divmod(n, 1000)
+    if lang == "fr":
+        if not th:
+            return _fr_below_1000(r)
+        head = "mille" if th == 1 else f"{_fr_below_1000(th)} mille"
+        return head + (f" {_fr_below_1000(r)}" if r else "")
+    if not th:
+        return _en_below_1000(r)
+    head = f"{_en_below_1000(th)} thousand"
+    return head + (f" {_en_below_1000(r)}" if r else "")
+
+
+def _year_forms(n, lang):
+    """A four-digit number a speaker may read in pairs: 1966 -> nineteen sixty-six."""
+    if not (1100 <= n <= 2099):
+        return []
+    hi, lo = divmod(n, 100)
+    if lang == "fr":
+        return []                                # French reads years as cardinals
+    if lo == 0:
+        return [f"{_en_below_1000(hi)} hundred"]
+    if lo < 10:
+        # "twenty oh seven", never "twenty seven": that is a different number.
+        return [f"{_en_below_1000(hi)} oh {_EN_ONES[lo]}"]
+    return [f"{_en_below_1000(hi)} {_en_below_1000(lo)}"]
+
+
+_NUM_RE = re.compile(r"\d[\d  \u00a0\u202f.,]*\d|\d")
+
+
+def number_variants(text, lang):
+    """Every legitimate spoken rendering of `text`, digits expanded. The written
+    form is kept as one of them, so a model that emits digits is not punished
+    either. Returns a list, always non-empty, capped so a sentence full of
+    numbers cannot explode."""
+    spans = list(_NUM_RE.finditer(text))
+    if not spans:
+        return [text]
+    outs = [text]
+    for _ in range(1):                          # one pass: all numbers together
+        for pick_year in (False, True):
+            buf, last = [], 0
+            for m in spans:
+                raw = m.group(0)
+                digits = re.sub(r"[^\d]", "", raw)
+                if not digits or len(digits) > 6:
+                    continue
+                n = int(digits)
+                forms = (_year_forms(n, lang) if pick_year else []) or [_cardinal(n, lang)]
+                if not forms or forms[0] is None:
+                    continue
+                buf.append(text[last:m.start()])
+                buf.append(forms[0])
+                last = m.end()
+            if buf:
+                buf.append(text[last:])
+                cand = "".join(buf)
+                if cand not in outs:
+                    outs.append(cand)
+    return outs
+
+
+def wer_format_free(hyp, ref, lang):
+    """The best WER over the legitimate spoken renderings of the reference's
+    numbers. Charitable about FORM, never about content: every word still has to
+    be the right word. Report it beside the strict WER, never instead of it."""
+    vals = [wer(hyp, v) for v in number_variants(ref, lang)]
+    vals = [v for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
+def cer_format_free(hyp, ref, lang):
+    vals = [cer(hyp, v) for v in number_variants(ref, lang)]
+    vals = [v for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
 def align_counts(hyp, ref):
     """Substitutions, deletions and insertions over the normalised WORD sequence.
 
@@ -1053,6 +1198,10 @@ def _ev(t, audio_s, text, lag_ms=None, kind="delta"):
     return {"t": t, "type": kind, "audio_s": audio_s, "lag_ms": lag_ms, "text": text}
 
 
+def M_zero(v):
+    return v is not None and abs(v) < 1e-9
+
+
 def _eq(got, want, what, tol=1e-6):
     """Numbers compare within `tol`; anything else compares exactly. The normaliser and
     the text fields are strings, and a tolerance on a string is meaningless."""
@@ -1430,6 +1579,28 @@ def self_test():
                "a streaming/offline disagreement is not folded into the corpus CER")
     bad += not _eq(q["offline_cer"] < q["cer"], True,
                "and the offline arm keeps its own, better, number")
+
+    print("number format is forgiven; the words are not")
+    bad += not _eq(_cardinal(1966, "en"), "one thousand nine hundred sixty six", "EN cardinal")
+    bad += not _eq(_cardinal(1966, "fr"), "mille neuf cent soixante six", "FR cardinal")
+    bad += not _eq(_cardinal(80, "fr"), "quatre vingts", "FR 80 takes the s")
+    bad += not _eq(_cardinal(81, "fr"), "quatre vingt un", "FR 81 does not")
+    bad += not _eq(_cardinal(71, "fr"), "soixante et onze", "FR 71 is soixante et onze")
+    bad += not _eq(_cardinal(400, "fr"), "quatre cents", "FR round hundreds take the s")
+    bad += not _eq(_year_forms(1966, "en")[0], "nineteen sixty six", "EN reads a year in pairs")
+    bad += not _eq(len(_year_forms(1966, "fr")), 0, "French reads years as cardinals")
+    REFN = "Since 1966 there were 400 tigers"
+    bad += not _eq(wer("since nineteen sixty six there were four hundred tigers", REFN),
+                   5.0 / 6.0, "strict WER charges 5 errors on 6 reference words for "
+                   "two correctly recognised numbers")
+    bad += not _eq(M_zero(wer_format_free("since nineteen sixty six there were four hundred tigers",
+                                          REFN, "en")), True,
+                   "format-free WER scores it correct")
+    bad += not _eq(wer_format_free("since nineteen sixty seven there were four hundred tigers",
+                                   REFN, "en") > 0, True,
+                   "but a WRONG number is still an error -- only the form is forgiven")
+    bad += not _eq(wer_format_free("since 1966 there were 400 tigers", REFN, "en"), 0.0,
+                   "a model that emits digits is not punished either")
 
     print("word-level alignment: one WER, three different failures")
     a = align_counts("il satellite nello spazio", "il satellite nello spazio")

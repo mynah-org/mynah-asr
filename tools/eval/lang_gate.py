@@ -43,6 +43,7 @@ import argparse
 import json
 import os
 import random
+import re
 import statistics as st
 import subprocess
 import sys
@@ -64,6 +65,18 @@ def boot_ci(vals, n=2000, seed=20260922, lo=2.5, hi=97.5):
         means.append(sum(vals[r.randrange(k)] for _ in range(k)) / k)
     means.sort()
     return means[int(lo / 100 * n)], means[min(int(hi / 100 * n), n - 1)]
+
+
+def run_offline(binary, model, quant, clip, lang, extra):
+    """The offline path on the same audio. No partials exist here, so every
+    first-word quantity is absent rather than zero: an offline run has no first
+    published word, and inventing one from the final text would compare two
+    different things."""
+    p = subprocess.run([binary, "transcribe", "-m", model, "-i", clip, "--quant", quant,
+                        "--lang", lang] + extra, capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    return [{"t1": None, "text": p.stdout.strip()}], None
 
 
 def run_clip(binary, model, quant, clip, lang, extra):
@@ -91,6 +104,8 @@ def summarise(rows):
     """Everything about one language. `rows` are per-utterance dicts."""
     wer = [r["wer"] for r in rows if r["wer"] is not None]
     cer = [r["cer"] for r in rows if r["cer"] is not None]
+    werf = [r["wer_ff"] for r in rows if r.get("wer_ff") is not None]
+    cerf = [r["cer_ff"] for r in rows if r.get("cer_ff") is not None]
     al = [r["align"] for r in rows if r["align"]]
     s = {
         "n": len(rows),
@@ -101,6 +116,16 @@ def summarise(rows):
         "cer": {"mean": st.mean(cer) if cer else None,
                 "median": st.median(cer) if cer else None,
                 "ci95": boot_ci(cer), "n": len(cer)},
+        # FORMAT-FREE, reported BESIDE the strict score and never instead of it:
+        # the reference's digits expanded into every legitimate spoken form of
+        # the same number. The words still have to be right (streaming_metrics).
+        "wer_ff": {"mean": st.mean(werf) if werf else None,
+                   "median": st.median(werf) if werf else None,
+                   "ci95": boot_ci(werf), "n": len(werf)},
+        "cer_ff": {"mean": st.mean(cerf) if cerf else None,
+                   "median": st.median(cerf) if cerf else None,
+                   "ci95": boot_ci(cerf), "n": len(cerf)},
+        "n_with_digits": sum(1 for r in rows if r.get("has_digit")),
         "sub": sum(a["sub"] for a in al), "del": sum(a["del"] for a in al),
         "ins": sum(a["ins"] for a in al), "ref_words": sum(a["ref_words"] for a in al),
     }
@@ -137,13 +162,19 @@ def fmt(v, nd=4):
 
 def report(lang, s):
     print(f"\n=== {lang.upper()}   {s['n']} utterances, {s['audio_s']:.0f} s of audio")
-    for k in ("wer", "cer"):
-        d = s[k]
+    for k in ("wer", "wer_ff", "cer", "cer_ff"):
+        d = s.get(k)
+        if not d:
+            continue
         ci = d["ci95"]
         band = f"[{ci[0]:.4f}, {ci[1]:.4f}]" if ci[0] is not None else "—"
         width = (ci[1] - ci[0]) if ci[0] is not None else None
-        print(f"  {k.upper():4} mean {fmt(d['mean'])}  median {fmt(d['median'])}  "
+        label = {"wer": "WER", "cer": "CER",
+                 "wer_ff": "WER*", "cer_ff": "CER*"}[k]
+        print(f"  {label:5} mean {fmt(d['mean'])}  median {fmt(d['median'])}  "
               f"95% CI {band}" + (f"  (width {width:.4f})" if width is not None else ""))
+    print(f"  * = format-free: the reference's digits read aloud, every legitimate form; "
+          f"{s.get('n_with_digits', 0)}/{s['n']} references contain a digit")
     print(f"  WER pooled over words: {s['wer_pooled']:.4f}   "
           f"S {s['sub']}  D {s['del']}  I {s['ins']}  over {s['ref_words']} reference words")
     for k, label in (("empty", "empty transcripts"),
@@ -179,6 +210,8 @@ def main():
     ap.add_argument("--margin", type=float, default=0.01,
                     help="WER a language may lose against the baseline before this exits 1")
     ap.add_argument("--label", default="")
+    ap.add_argument("--mode", choices=("stream", "offline"), default="stream",
+                    help="offline runs `transcribe`: same audio, same references, no partials")
     a = ap.parse_args()
 
     for p, what in ((a.binary, "binary"), (a.manifest, "manifest")):
@@ -200,7 +233,8 @@ def main():
         clip = os.path.join(a.root, s["file"])
         if not os.path.exists(clip):
             continue
-        got = run_clip(a.binary, a.model, a.quant, clip, s["lang"], extra)
+        runner = run_offline if a.mode == "offline" else run_clip
+        got = runner(a.binary, a.model, a.quant, clip, s["lang"], extra)
         if got is None:
             failed += 1
             continue
@@ -212,6 +246,9 @@ def main():
         q = M.partial_quality(deltas, s["text"], lib_text=lib, onset_s=onset)
         row = {"file": s["file"], "duration_sec": s["duration_sec"], "text": q["text"],
                "wer": q["wer"], "cer": q["cer"],
+               "wer_ff": M.wer_format_free(q["text"], s["text"], s["lang"]),
+               "cer_ff": M.cer_format_free(q["text"], s["text"], s["lang"]),
+               "has_digit": bool(re.search(r"\d", s["text"])),
                "align": M.align_counts(q["text"], s["text"]),
                "first_word": q["first_word"],
                "first_word_correct": q["first_word_correct"],
@@ -223,7 +260,7 @@ def main():
     if failed:
         print(f"lang_gate: {failed} clip(s) the CLI refused", file=sys.stderr)
 
-    out = {"model": a.model, "quant": a.quant, "manifest": a.manifest,
+    out = {"model": a.model, "quant": a.quant, "manifest": a.manifest, "mode": a.mode,
            "extra": extra, "label": a.label, "langs": {}}
     for lang in sorted(by_lang):
         s = summarise(by_lang[lang])
@@ -242,8 +279,8 @@ def main():
             n = out["langs"][lang]["summary"]
             for k in ("wer", "cer"):
                 d = n[k]["mean"] - b[k]["mean"]
-                bad = k == "wer" and d > a.margin
-                print(f"  {lang.upper()} {k.upper()} {b[k]['mean']:.4f} -> {n[k]['mean']:.4f} "
+                bad = k in ("wer", "wer_ff") and d > a.margin
+                print(f"  {lang.upper()} {k.upper():6} {b[k]['mean']:.4f} -> {n[k]['mean']:.4f} "
                       f"({d:+.4f}){'   REGRESSION' if bad else ''}")
                 if bad:
                     rc = 1

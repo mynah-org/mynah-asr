@@ -137,3 +137,65 @@ recording. That is what Phase C's first candidate tests causally.
 
 **NEXT.** Phase C candidate 1: feed the encoder audio before the speech and see
 whether the effect survives, on the same bank, each language on its own.
+
+---
+
+## PHASE C — responsiveness and quality candidates
+
+**RESULT C-1 — REJECTED. The lead-in effect is not causal.**
+Give all 400 utterances +2.0 s of leading silence, paired per utterance:
+
+| | WER strict | WER format-free | first word CORRECT | insertions/utt |
+|---|---|---|---|---|
+| EN | 0.1211 → 0.1214 | 0.0916 → 0.0919 | **0.825 → 0.770** | 0.525 → 0.490 |
+| FR | 0.1316 → 0.1332 | 0.1033 → 0.1045 | **0.860 → 0.845** | 0.685 → 0.665 |
+
+WER does not move, and first-word correctness gets **worse** — 5.5 points in
+English. Phase B's +11-point correlation was confounded: a recording that
+happens to start with silence is a different recording, not a warmed-up engine.
+
+*Not interpretable from this arm:* speech-to-first-word appears to rise by
+0.36 s (EN) and 0.72 s (FR), but `clip_onset` estimates its noise floor from the
+10th-percentile frame energy and digital silence drives that to zero, so the
+detected onset moves. First-word CORRECTNESS is a pure text comparison and is
+unaffected by this, which is why the rejection rests on it.
+
+**DECISION C-1.** Close the lead-in / cache-warmth branch. R-12 stays specified
+and unjustified. Nothing is prepended in production.
+
+**RESULT C-2 — FACT, and it changes every quality number so far.
+A quarter of the bank was being scored on a convention, not on recognition.**
+
+FLEURS references keep digits (`Since 1966 ... 400 Royal Bengal tigers`); this
+checkpoint verbalises (`since nineteen sixty six ... four hundred royal bengal
+tigers`). Both FLEURS columns keep digits -- `text_norm` only lowercases -- so
+this is not a wrong-column mistake, it is a genuine convention mismatch.
+
+| | n | WER strict | **WER format-free** | CER strict | **CER format-free** |
+|---|---|---|---|---|---|
+| EN, reference has a digit | 47 | 0.2461 | **0.1204** | 0.1933 | 0.0502 |
+| EN, no digit | 153 | 0.0827 | 0.0827 | 0.0338 | 0.0338 |
+| **EN all** | 200 | 0.1211 | **0.0916** | 0.0713 | **0.0377** |
+| FR, reference has a digit | 44 | 0.2529 | **0.1241** | 0.1872 | 0.0542 |
+| FR, no digit | 156 | 0.0974 | 0.0974 | 0.0306 | 0.0306 |
+| **FR all** | 200 | 0.1316 | **0.1033** | 0.0651 | **0.0358** |
+
+It also explains the insertion excess flagged in A-3: 76 of 105 English
+insertions and 100 of 137 French ones are on digit utterances, because one
+reference token `2007` becomes three hypothesis tokens.
+
+**THIS IS NOT LOOSENING THE SCORER.** The words must still be right. The
+reference's digits are expanded into every legitimate spoken rendering of *that*
+number and the best is taken: `2007` may be "two thousand seven" or "twenty oh
+seven", never "two thousand eight". A model that emits digits is not punished
+either. Self-tested, including that a WRONG number is still an error. Both
+scores are reported side by side, always; neither replaces the other.
+
+**Recognition WER is therefore EN 9.2 % and FR 10.3 %**, not 12.1 and 13.2. The
+remaining digit-utterance error (0.12 in both languages against 0.08/0.10
+elsewhere) is real -- e.g. `Le 15 août` transcribed as `Le août`, a genuine
+deletion -- so digit utterances are still harder, just not three times harder.
+
+**NEXT.** Q2, the ceiling matrix: the same 400 utterances through int8 and f32,
+streaming and offline, and the other declared presets, to find out whether 9-10 %
+belongs to the checkpoint or to us.
