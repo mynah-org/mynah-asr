@@ -595,6 +595,19 @@ bare SentencePiece word mark `▁`, which is not a lexical token at all. A rule
 that refused degenerate tokens would have excluded two of the three. With n=3
 that is a hypothesis for a larger corpus, not a design.
 
+**2026-09-22 — a second, independent observation now points at the same token.**
+A report on the same model family, from a different corpus and a different
+fine-tune, describes the token involved near the first emission as usually "not
+even a word, the marker that just means a word starts here", and reports that
+forcing one token into the decoder turned 178 of 179 EMPTY outputs into non-empty
+ones. That is an intervention, not a correlation, and it raises the priority of
+looking — it does not make our n=3 any larger, and their regime is not ours: we
+have no empty transcripts at all. Recorded, with what it does and does not
+establish and the experiment that would decide it, in
+[`.work/rnnt-first-emission.md`](.work/rnnt-first-emission.md) (R-8, R-9, Q-5).
+The trace cannot answer it today: `best_excluding` returns the best NON-BLANK,
+which may itself be `▁`.
+
 ### Q-2A — the oracle, and a crack in it
 
 CER against the reference is recorded per clip for streaming and offline
