@@ -1017,3 +1017,87 @@ from the preset names. Ordered by cost.
    trade has never been measured. It needs a box; the two above do not.
 
 **No preset change is proposed here and no machine is needed for 1 or 2.**
+
+---
+
+## R-11 RESULT — the within-chunk phase test (2026-09-22, saved traces only)
+
+`tools/eval/chunk_phase.py` on `.work/evidence/r8-A-2026-09-22/`, the frozen
+`[56,3]` baseline, 21 clips, 3579 decisions. Predictions and the confound were
+written first, in [`.work/chunk-phase-prereg.md`](.work/chunk-phase-prereg.md).
+No model change, no machine, no cache priming.
+
+### P1 is NOT falsified — it is untestable on this data
+
+| t | future | n | median speech@frame | mean | min | max |
+|---|---|---|---|---|---|---|
+| 0 | 240 ms | **17** | 0.770 | 0.915 | 0.400 | 2.640 |
+| 1 | 160 ms | **2** | 0.640 | — | 0.630 | 0.650 |
+| 2 | 80 ms | **2** | 0.620 | — | 0.480 | 0.760 |
+| 3 | 0 ms | **0** | — | — | — | — |
+
+**17 of 21 crossings land at position 0, and none at position 3.** That is
+exactly the confound registered in advance: `greedy_decode_scratch` scans the
+chunk in order and breaks at the first non-blank, so the lowest position wins
+whenever more than one would fire. The treatment has almost no variance, so the
+observed spread (−0.150 s against a predicted +0.160 s, non-monotone) rests on
+groups of **2 and 2**. It is not evidence for or against the lookahead, and
+quoting it as a refutation would be as wrong as quoting it as a confirmation.
+
+### P2 pre-crossing — the positional structure is the ENCODER, not the lookahead
+
+All 478 pre-crossing decisions, by position:
+
+| t | future | n | \|enc\| median | \|enc\| > 10 | margin median | margin, \|enc\| ≤ 10 only | n |
+|---|---|---|---|---|---|---|---|
+| 0 | 240 ms | 122 | 19.89 | **59.8 %** | 95.27 | 11.30 | 49 |
+| 1 | 160 ms | 120 | 16.31 | **51.7 %** | 89.23 | 11.54 | 58 |
+| 2 | 80 ms | 118 | 19.80 | **66.1 %** | 96.81 | 10.03 | 40 |
+| 3 | 0 ms | 118 | **3.29** | **22.0 %** | 14.41 | 13.31 | 92 |
+
+**New observation: the high-norm encoder regime is positional, and it spares the
+LAST frame of each chunk.** 52–66 % of decisions at positions 0–2 are in it
+against 22 % at position 3 — the frame whose receptive field ends exactly at the
+chunk boundary and which has no future context at all.
+
+Once `|enc|` is controlled, margins are **flat** across positions
+(11.30 / 11.54 / 10.03 / 13.31) and fall monotonically in only 9 of 61 paired
+chunks. So the "each frame dominated by its own past" picture is not supported;
+what dominates the pre-crossing window is the encoder regime, not the phase.
+
+### The lookahead IS visible — after the first token, where it cannot help
+
+The same split on the 3101 post-crossing decisions, balanced across positions:
+
+| t | future | n | \|enc\| median | \|enc\| > 10 | margin median |
+|---|---|---|---|---|---|
+| 0 | 240 ms | 780 | 3.82 | 0.0 % | **2.26** |
+| 1 | 160 ms | 779 | 3.82 | 0.0 % | 4.58 |
+| 2 | 80 ms | 775 | 3.63 | 0.0 % | 4.88 |
+| 3 | 0 ms | 767 | 3.54 | 0.0 % | **6.11** |
+
+**Monotone, well powered, and in the direction the code predicts**: more future
+context, lower blank margin, closer to emitting. This is the clearest evidence
+so far that the within-chunk lookahead does real work — and it is measured in
+the regime that does not set first-word latency.
+
+### How much of the ~0.7 s can the lookahead explain?
+
+**This test does not license a number, and 120 ms must not be extrapolated into
+the remaining 0.6 s.** What can be said:
+
+- the derivation caps the mean lookahead tax at **120 ms** (R-10), and the
+  `[56,3]` vs `[56,0]` measurement agreed (median −0.100 s, mean −0.129 s);
+- R-11 neither confirms nor refutes that cap **for the first token**, because
+  the crossing position has no variance to test with;
+- the positional effect it does establish is a **margin** difference of about
+  3.9 units in the steady state, and nothing here calibrates margin into time;
+- in the window that actually sets first-word latency, the positional signal is
+  swamped by the encoder regime.
+
+**Conclusion.** Lookahead is not dead as a mechanism — it demonstrably works
+post-crossing — but it is **not the explanation for the large residual
+latency**, and the ceiling the derivation puts on it (120 ms against a
+0.50–0.97 s wait) was already the argument. The structure that keeps appearing
+in the pre-crossing window is the encoder's own output, positional and
+cache-dependent. That is where the next question is, and R-11 stops here.
