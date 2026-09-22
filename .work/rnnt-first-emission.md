@@ -198,3 +198,156 @@ Production decoding unchanged. No forced token ever reaches a client. This is a
 causal diagnostic; it does not become a serving feature without its own gate,
 and Q-2 already showed that publishing early on persistence alone is a defect,
 not a trade.
+
+
+---
+
+# R-8 RESULT (2026-09-22, development host, 21 clips, int8 unless stated)
+
+Model `models_local/nemotron-3.5-asr-streaming-0.6b`, preset `[56,3]`, corpus
+`samples/manifest.json` as the only oracle. Evidence:
+`.work/evidence/r8-A-2026-09-22/`. No cloud machine was used.
+
+**Baseline frozen and verified first.** All 21 clips reproduce the 2026-09-21
+first-natural-token FRAME exactly. (A first comparison said every clip differed;
+that was a parser fault of mine on the OLD trace format, whose `emit` line comes
+AFTER the frames of its own step, so the audio it reported was one step early.
+The frame index is unambiguous and matches 21/21.)
+
+## FACT — the extreme blank regime is not int8, and not the predictor
+
+R-9 now records, per decision: absolute frame, audio consumed, `|enc|`,
+`|joint|`, predictor SOS/MOVED, post-intervention flag, and blank / word-mark /
+best-lexical / best-non-blank each with id, logit and 1-based rank. The word
+mark is resolved through `mynah_asr_tok_find` from the pack's own `tokens.json`
+(id 2 here) and is never hard-coded.
+
+**Not a quantisation artefact.** f32 produces the extreme values on the same
+frames as int8: -969 / -972 / -947 against -946 / -959 / -946 on frames 2, 4, 5
+of the same clip. That branch is closed.
+
+**It is born in the encoder.** `|enc|` is ~2.7 on ordinary frames and ~21 on the
+extreme ones, and `|joint|` follows (0.89 -> 17.2). Over six clips:
+
+| audio | pred | cache | frames | \|enc\| median | >10 |
+|---|---|---|---|---|---|
+| silence | SOS | filling | 120 | **19.74** | 68.3 % |
+| SPEECH | SOS | filling | 71 | 4.23 | 32.4 % |
+| SPEECH | MOVED | FULL | 464 | 3.68 | **0.0 %** |
+
+The encoder cannot see the predictor -- they are separate networks -- so the
+"extreme ⟺ SOS" association reported from the saved traces was MEDIATED, not
+direct. **The earlier note over-attributed it to the predictor; this corrects
+it.**
+
+## CAUSAL RESULT — holding the encoder fixed, the predictor does not explain it
+
+The observational 2x2x2 could never fill the cell where the predictor has moved
+and the encoder is still in its high-norm regime. The injection fills it:
+inject at frame 4, inside the leading silence, and look only at frames with
+`|enc| > 10`.
+
+| arm | window | frames | \|enc\| med | \|joint\| med | \|blank\| med | >100 |
+|---|---|---|---|---|---|---|
+| A | pre | 115 | 20.70 | 17.00 | 953.5 | 100 % |
+| G@4 | **post** | 109 | 20.65 | 19.48 | **1295.0** | **100 %** |
+
+**Moving the predictor state does not remove the extreme regime. It slightly
+amplifies it** -- consistent with `|g|` falling from 15.46 to 2.28, so the ReLU
+suppresses less and the joint grows. An earlier reading of mine ("0 % extreme
+after the injection") was the `|enc|` drop confound: injecting near the crossing
+puts the post window past the leading silence. Held fixed, the effect vanishes.
+
+## CAUSAL RESULT — the injection does not unlock emission
+
+Every arm injected at the frozen point k=2 decisions before the baseline
+crossing, mapped to an absolute encoder frame. The injected token is never
+published and never counted as a natural emission.
+
+| arm | injected | n | Δ blanks med | range | audio earlier/same/later | CER A | CER arm | text = A | first word correct |
+|---|---|---|---|---|---|---|---|---|---|
+| G | `blank` | 21 | **+4.0** | -2..+14 | 1 / 8 / 12 | 0.0286 | 0.0662 | 0/21 | — |
+| B | best non-blank | 21 | +0.0 | -2..+5 | 7 / 11 / 3 | 0.0286 | 0.0370 | 3/21 | — |
+| E | bare `▁` | 21 | **-2.0** | -2..+0 | **14 / 7 / 0** | 0.0286 | **0.0214** | 6/21 | **10/21** |
+| F' | best lexical | 21 | +1.0 | -2..+5 | 5 / 12 / 4 | 0.0286 | 0.0545 | 0/21 | — |
+| A | (baseline) | 21 | — | — | — | 0.0286 | — | — | **16/21** |
+
+**G delays.** Median +4 blank decisions, and it changes the transcript in 21 of
+21 while roughly doubling median CER.
+
+**The post-first-token control says it is not special.** The same hidden
+`pred_step(blank)` after the first natural token delays too: +2.0 at frame+4
+(7 of 7 later) and +4.0 at frame+8 (11 of 11 later). An arbitrary predictor
+perturbation disrupts decoding wherever it is applied. *Limit of the seam:* the
+control was served on only 7 and 11 of 21 clips, because after the first token
+the requested frame often falls inside a block that emits earlier and the loop
+never reaches it. That is a limitation, not a result.
+
+**Token identity matters, and orders the arms**: G +4, F' +1, B 0, E -2. One
+`pred_step` is not equivalent to another.
+
+## The one arm that advances emission fails the axis Q-2 said to watch
+
+Arm E -- injecting the bare word mark -- is the only arm that never delays
+(0 of 21 later) and the only one whose median CER improves. Δ blanks -2 means
+the natural token arrives **at the injection frame itself**: give the model the
+word-start marker and the word piece follows immediately.
+
+**But the first published word is right in 10 of 21, against 16 of 21 in the
+baseline.** Per clip: `les` -> `l`, `il` -> `i`, `w` -> `v`, `o` -> `lično`,
+`в` -> `า`. The injected `▁` is suppressed from the output by design, so the
+word boundary it represents never reaches the client and the first piece arrives
+without it. The median CER improvement is partly the normaliser collapsing
+whitespace; the first-token axis, which Q-2 established as the one that matters
+for a transcript that revises nothing, moves the wrong way.
+
+**And at a DEPLOYABLE point it collapses.** E at the fixed frame 4 -- no
+baseline knowledge, identical definition on every clip -- gives Δ blanks -14
+and 21 of 21 earlier, at median CER **0.0575**, double the baseline's 0.0286.
+Forcing a word start before the evidence exists makes the model speak early and
+wrong, which is the Q-2 finding again in a new costume.
+
+**Oracle-relative and deployable are not the same experiment.** k=2 uses the
+baseline crossing, i.e. future knowledge. Nothing in the k-relative rows may be
+read as a proposed algorithm.
+
+## INTERPRETATION
+
+The first-emission-lock hypothesis, as it applies to THIS checkpoint and THIS
+configuration, is **rejected**. Moving the predictor state does not release a
+barrier: it delays emission, it degrades the transcript, and it does the same
+thing after the first token, which is the signature of corrupting predictor
+history rather than unlocking anything.
+
+The extreme blank logits before the first word are an **encoder** phenomenon --
+high-norm output while the stream opens on silence with a cold cache -- made
+visible, not caused, by the suppressive SOS predictor output. They are a
+signature, not a cause. R-3's attribution stands: the wait is the model wanting
+acoustic evidence.
+
+The word-mark result is the one thing worth keeping open, and it is a
+TOKENIZER/predictor interaction, not a latency lever: the model appears to be
+waiting to emit the word-start marker, and supplying it pulls the word piece
+forward. That is interesting about the checkpoint. It is not a serving change:
+the two ways of using it both fail, one on first-word correctness and one on CER.
+
+## STILL UNKNOWN
+
+- Why the encoder's output norm is ~7x larger on early silent frames with a cold
+  cache. Not investigated; it may be benign (an unnormalised region of the
+  representation) or it may be worth a look on its own.
+- Whether arms C and D (oracle-correct and deliberately-wrong lexical tokens)
+  separate further. They were not run: G, B, E and F' already answer "does
+  identity matter" (yes) and "does any transition unlock" (no), and C/D need
+  frozen selection rules written before results.
+- Whether the post-first-token control holds on the 10-14 clips where the seam
+  could not serve it.
+- Whether a checkpoint trained with FastEmit behaves differently here. Q-5's
+  metric set exists for exactly that comparison and has not been used.
+
+## Not done, deliberately
+
+No forced first token in serving, no blank bias, no `▁` publication rule, no
+predictor priming, no dynamic lookahead. R-8 was a mechanism experiment and it
+returned a negative result on its main hypothesis; the engineering choice is the
+user's to make from this evidence.

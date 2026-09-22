@@ -65,6 +65,11 @@ void mynah_asr_dec_state_reset(const mynah_asr_decoder *dec, mynah_asr_dec_state
 
 static inline float sigmoid_f(float x) { return mynah_asr_sigmoid(x); }
 
+/* R-8's predictor probe, defined below beside the rest of the experiment. */
+static int pred_trace(void);
+static void pred_dump(const mynah_asr_decoder *dec, const mynah_asr_dec_state *s,
+                      const char *what, int token);
+
 /* One stacked-LSTM step + projector: input = embedding[token]. Updates h/c and s->g. */
 static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int token) {
     const int H = dec->hidden;
@@ -90,6 +95,7 @@ static void pred_step(const mynah_asr_decoder *dec, mynah_asr_dec_state *s, int 
     mynah_asr_gemv_f32(0, H, H, 1.0f, dec->proj_w, H, s->h[dec->n_layers - 1],
                        1.0f, s->g);
     s->last_token = token;
+    if (pred_trace()) pred_dump(dec, s, "after pred_step", token);
 }
 
 /* BLOCKED greedy: g changes only on a non-blank emission, so the frames of a
@@ -136,6 +142,204 @@ static int best_excluding(const float *lg, const float *bias, int V, int skip,
     }
     *score = bv;
     return best;
+}
+
+/* Same, excluding two ids: blank and the word mark, so "best LEXICAL" means a
+ * piece that is neither. -1 when the vocabulary is only those two. */
+static int best_excluding2(const float *lg, const float *bias, int V, int s1, int s2,
+                           float *score) {
+    int best = -1;
+    float bv = 0.0f;
+    for (int k = 0; k < V; k++) {
+        if (k == s1 || k == s2) continue;
+        const float v = lg[k] + bias[k];
+        if (best < 0 || v > bv) { bv = v; best = k; }
+    }
+    *score = bv;
+    return best;
+}
+
+/* 1-based rank of `id` by score: how many tokens beat it, plus one. O(V) and
+ * only ever called from the trace. */
+static int rank_of(const float *lg, const float *bias, int V, int id) {
+    if (id < 0 || id >= V) return -1;
+    const float mine = lg[id] + bias[id];
+    int above = 0;
+    for (int k = 0; k < V; k++)
+        if (k != id && lg[k] + bias[k] > mine) above++;
+    return above + 1;
+}
+
+/* The audio a streaming caller had consumed when it handed us this block.
+ * Diagnostic only: the decoder has no notion of samples, and reconstructing
+ * this from the frame index outside would re-derive a number the stream layer
+ * already knows exactly. Set to a negative value when nobody said. */
+static double g_trace_audio_s = -1.0;
+
+void mynah_asr_dec_trace_audio(double audio_s) { g_trace_audio_s = audio_s; }
+
+/* ------------------------------------------------------- R-8: predictor probe
+ *
+ * WHY THIS EXISTS AT ALL. It is tempting to describe arm G -- feeding blank
+ * through pred_step() once more -- as "the same content, only the state moves".
+ * The implementation does not warrant that phrasing without a check, so here is
+ * the check. mynah_asr_dec_state_reset() zeroes h, c and g; the greedy loop then
+ * calls pred_step(blank) once, so the SOS representation IS pred_step(blank)
+ * APPLIED TO A ZERO STATE. A second pred_step(blank) feeds the SAME embedding
+ * through the SAME weights but from a DIFFERENT recurrent state, and an LSTM is
+ * not idempotent. G therefore holds the token identity fixed and moves the
+ * state; it does not "return to SOS" and it is not a no-op. This prints the
+ * numbers that say so. */
+static void pred_dump(const mynah_asr_decoder *dec, const mynah_asr_dec_state *s,
+                      const char *what, int token) {
+    double hn = 0.0, cn = 0.0, gn = 0.0;
+    unsigned long hs = 1469598103934665603UL;
+    for (int l = 0; l < dec->n_layers; l++)
+        for (int i = 0; i < dec->hidden; i++) {
+            hn += (double)s->h[l][i] * s->h[l][i];
+            cn += (double)s->c[l][i] * s->c[l][i];
+        }
+    for (int i = 0; i < dec->hidden; i++) {
+        gn += (double)s->g[i] * s->g[i];
+        unsigned char b[4];
+        memcpy(b, &s->g[i], 4);
+        for (int k = 0; k < 4; k++) { hs ^= b[k]; hs *= 1099511628211UL; }
+    }
+    fprintf(stderr, "[PRED] %-22s token=%d |h|=%.6f |c|=%.6f |g|=%.6f g_fnv=%016lx\n",
+            what, token, sqrt(hn), sqrt(cn), sqrt(gn), hs);
+}
+
+static int pred_trace(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_TRACE_PRED");
+        v = (e != NULL && *e != '\0' && *e != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+/* --------------------------------------------------------- R-8: the injection
+ *
+ * MYNAH_ASR_RNNT_INJECT="frame=<n>,mode=<blank|wmark|best|lex|id>[,id=<n>]"
+ *
+ * At the named ABSOLUTE encoder frame, feed one token through pred_step() and
+ * do not publish it. The frame comes from OUTSIDE, computed by the harness from
+ * the frozen baseline trace, because the decoder has no idea where a baseline
+ * crossing was and choosing the point in here would be choosing it per run.
+ *
+ * What it must not do, and what keeps it honest:
+ *   - the token is never written into `tokens[]`, so no client and no scorer
+ *     ever sees it (it is not passed to the emit path at all);
+ *   - `n_emitted` is not touched, so the trace's SOS/MOVED label keeps meaning
+ *     "a NATURAL token was emitted", not "something happened";
+ *   - the encoder, its caches and the audio position are not reachable from
+ *     here, so they cannot move;
+ *   - the frames of the current block BEFORE the injection point are decided
+ *     first, normally, and only then is the state perturbed and the block
+ *     recomputed from that frame -- the block's logits were computed with the
+ *     old g and must not be reused across the perturbation;
+ *   - if a natural token is emitted before the injection frame is reached, the
+ *     injection is abandoned and says so: the point was mis-specified for that
+ *     utterance, which is a fact about the run and not something to paper over.
+ *
+ * Default OFF. Diagnostic. This is a mechanism experiment, not a fast path. */
+typedef struct {
+    int armed, done, mode, id, noted;
+    long frame, at;
+} inject_cfg;
+enum { INJ_BLANK = 0, INJ_WMARK, INJ_BEST, INJ_LEX, INJ_ID };
+
+static inject_cfg *inject_conf(void) {
+    static inject_cfg c;
+    static int parsed = 0;
+    if (parsed) return &c;
+    parsed = 1;
+    c.frame = -1;
+    c.id = -1;
+    const char *e = getenv("MYNAH_ASR_RNNT_INJECT");
+    if (!e || !*e) return &c;
+    const char *p = strstr(e, "frame=");
+    if (p) c.frame = atol(p + 6);
+    p = strstr(e, "id=");
+    if (p) c.id = atoi(p + 3);
+    if (strstr(e, "mode=wmark")) c.mode = INJ_WMARK;
+    else if (strstr(e, "mode=best")) c.mode = INJ_BEST;
+    else if (strstr(e, "mode=lex")) c.mode = INJ_LEX;
+    else if (strstr(e, "mode=id")) c.mode = INJ_ID;
+    else c.mode = INJ_BLANK;
+    c.armed = c.frame >= 0;
+    return &c;
+}
+
+/* The token this arm injects at this frame. -1 when the arm cannot be served
+ * (no word mark in the vocabulary, no id given), which aborts the injection
+ * rather than silently substituting another arm. */
+static int inject_token(const mynah_asr_decoder *dec, const inject_cfg *c,
+                        const float *lb) {
+    float sc = 0.0f;
+    switch (c->mode) {
+    case INJ_WMARK: return dec->word_mark;
+    case INJ_BEST:  return best_excluding(lb, dec->head_b, dec->vocab, dec->blank, &sc);
+    case INJ_LEX:   return best_excluding2(lb, dec->head_b, dec->vocab,
+                                           dec->blank, dec->word_mark, &sc);
+    case INJ_ID:    return (c->id >= 0 && c->id < dec->vocab) ? c->id : -1;
+    default:        return dec->blank;
+    }
+}
+
+/* One decision, fully described (R-9).
+ *
+ * WHAT THIS HAS TO SEPARATE. Before the first emitted token the blank logit
+ * sits in a regime it never returns to (median |blank| 914 against 27 after;
+ * .work/first-partial-responsiveness.md). Three explanations were still open
+ * from saved traces: the audio is silent, the encoder cache is filling, or the
+ * predictor has not moved. The trace cannot decide that on its own -- R-8's
+ * intervention can -- but it CAN stop conflating the things it prints:
+ *
+ *   blank   the score the decision is actually made against
+ *   wmark   the bare SentencePiece word mark: not a lexical token at all, and
+ *           2 of Q-2's 3 stably-wrong runner-ups were exactly this
+ *   lex     the best piece that is neither blank nor the word mark
+ *   nb      the best non-blank, which MAY BE the word mark -- this is what the
+ *           old trace called best_nonblank, and why it could not answer the
+ *           question it was being asked
+ *
+ * Ranks are 1-based over the whole vocabulary, so "blank rank 1, lex rank 3"
+ * reads without knowing the scores. `pred` is SOS while no natural token has
+ * been emitted. */
+static void dec_trace_line(const mynah_asr_decoder *dec, const mynah_asr_dec_state *s,
+                           const float *lb, long frame, int chosen, int post,
+                           const float *enc_frame) {
+    const int V = dec->vocab;
+    const float *bias = dec->head_b;
+    const int wm = dec->word_mark;
+    float nb_sc = 0.0f, lex_sc = 0.0f, wm_sc = 0.0f;
+    const int nb = best_excluding(lb, bias, V, dec->blank, &nb_sc);
+    const int lex = best_excluding2(lb, bias, V, dec->blank, wm, &lex_sc);
+    if (wm >= 0 && wm < V) wm_sc = lb[wm] + bias[wm];
+    const float blank_sc = lb[dec->blank] + bias[dec->blank];
+    /* |enc| and |joint| decide whether an out-of-scale logit was born in the
+     * encoder or in the joint. They are not decoration: the pre-first-token
+     * blank logits reach -900 in f32 as well as int8, so the question "which
+     * stage produced that magnitude" is the whole question. */
+    double en = 0.0, jn = 0.0;
+    for (int i = 0; i < dec->hidden; i++) {
+        const float e = enc_frame ? enc_frame[i] : 0.0f;
+        const float j = e + s->g[i];
+        en += (double)e * e;
+        if (j > 0.0f) jn += (double)j * j;
+    }
+    fprintf(stderr,
+            "[RNNT] frame=%ld audio_s=%.4f enc=%.2f joint=%.2f pred=%s post=%d"
+            " blank=%d:%.4f:r%d wmark=%d:%.4f:r%d lex=%d:%.4f:r%d nb=%d:%.4f:r%d"
+            " chose=%d margin_lex=%.4f margin_nb=%.4f\n",
+            frame, g_trace_audio_s, sqrt(en), sqrt(jn),
+            s->n_emitted ? "MOVED" : "SOS", post,
+            dec->blank, blank_sc, rank_of(lb, bias, V, dec->blank),
+            wm, wm_sc, rank_of(lb, bias, V, wm),
+            lex, lex_sc, rank_of(lb, bias, V, lex),
+            nb, nb_sc, rank_of(lb, bias, V, nb),
+            chosen, blank_sc - lex_sc, blank_sc - nb_sc);
 }
 
 static int argmax_bias(const float *lg, const float *bias, int V) {
@@ -280,21 +484,52 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
              * for the block. */
             mynah_asr_qmat_mul_rows(&dec->head, jin, logits, Bc, hqx, hsx);
 
-        int first = -1, best = -1;
+        inject_cfg *inj = inject_conf();
+        int first = -1, best = -1, hit = -1;
+        if (inj->armed && !inj->done)
+            for (int b = 0; b < Bc; b++)
+                if ((long)(s->t_abs + t + b) == inj->frame) { hit = b; break; }
+
         for (int b = 0; b < Bc; b++) {
             const float *lb = logits + (size_t)b * (size_t)V;
             const int am = argmax_bias(lb, dec->head_b, V);
-            if (dec_trace()) {
-                float nb_score = 0.0f;
-                const int nb = best_excluding(lb, dec->head_b, V, dec->blank, &nb_score);
-                const float blank_score = lb[dec->blank] + dec->head_b[dec->blank];
-                fprintf(stderr,
-                        "[RNNT] frame=%ld blank=%.4f best_nonblank=%d:%.4f "
-                        "margin=%.4f chose=%s\n",
-                        (long)(s->t_abs + t + b), blank_score, nb, nb_score,
-                        blank_score - nb_score, am == dec->blank ? "blank" : "TOKEN");
-            }
+            if (dec_trace())
+                dec_trace_line(dec, s, lb, (long)(s->t_abs + t + b), am,
+                               (inj->armed && inj->done) ? 1 : 0,
+                               enc + (size_t)(t + b) * (size_t)H);
             if (am != dec->blank) { first = b; best = am; break; }
+            /* The injection frame, reached with every earlier frame in this
+             * block decided normally: perturb, then recompute FROM HERE. The
+             * logits already in `logits` were produced with the old g. */
+            if (b == hit) {
+                const int tok = inject_token(dec, inj, lb);
+                if (tok < 0) {
+                    fprintf(stderr, "[INJECT] ABORTED frame=%ld: this arm has no token\n",
+                            inj->frame);
+                    inj->armed = 0;
+                } else {
+                    if (pred_trace()) pred_dump(dec, s, "before injection", s->last_token);
+                    pred_step(dec, s, tok);
+                    inj->done = 1;
+                    inj->at = s->t_abs + t + b;
+                    fprintf(stderr, "[INJECT] frame=%ld token=%d (not published, "
+                                    "n_emitted still %d)\n", inj->at, tok, s->n_emitted);
+                }
+                first = -2;                       /* redo this frame with the new g */
+                break;
+            }
+        }
+        if (first == -2) { t += hit; B = 4; continue; }
+        /* A natural token before the requested frame is NOT a reason to give up:
+         * the post-first-token perturbation is a deliberate control (does an
+         * arbitrary pred_step always disrupt decoding, or is the pre-first-token
+         * window special?). Say it happened and keep the injection armed. */
+        if (inj->armed && !inj->done && first >= 0 && !inj->noted &&
+            (long)(s->t_abs + t + first) < inj->frame) {
+            fprintf(stderr, "[INJECT] note: a natural token was emitted at frame %ld, "
+                            "before the requested frame %ld -- this is the post-token control\n",
+                    (long)(s->t_abs + t + first), inj->frame);
+            inj->noted = 1;
         }
         if (first < 0) {                                   /* all-blank run */
             t += Bc;
@@ -323,6 +558,7 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
                 if (frames) frames[n_out] = (int)(s->t_abs + t);
                 tokens[n_out++] = best;
             }
+            s->n_emitted++;                                /* NATURAL emissions only */
             pred_step(dec, s, best);                       /* state advances only on emit */
         }
         t++;

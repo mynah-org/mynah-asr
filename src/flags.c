@@ -181,6 +181,27 @@ static const mynah_asr_flag g_flags[] = {
      " no decision",
      NULL, NULL},
 
+    {"MYNAH_ASR_TRACE_PRED", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "src/decoder.c: after every pred_step(), print the norms of the predictor's h and c and"
+     " of its output g, plus a checksum of g. R-8 needs it to say what the SOS state IS:"
+     " dec_state_reset zeroes h/c and the greedy loop then calls pred_step(blank), so SOS is"
+     " pred_step(blank) applied to a ZERO state, and a second pred_step(blank) is a different"
+     " thing -- measured here as |g| 15.46 -> 2.28. Without this the claim that an injection"
+     " moves 'only the state, not the content' would be an assumption",
+     NULL, NULL},
+
+    {"MYNAH_ASR_RNNT_INJECT", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "src/decoder.c: \"frame=<n>,mode=<blank|wmark|best|lex|id>[,id=<n>]\" -- at that ABSOLUTE"
+     " encoder frame, feed one token through pred_step() and DO NOT publish it. R-8's causal"
+     " probe: it perturbs predictor state while the audio, the encoder and its caches stay"
+     " where they were. The frame comes from outside because the decoder does not know where a"
+     " baseline crossing was and choosing it in here would mean choosing it per run. The token"
+     " is never written into the output, n_emitted is not touched (so the trace keeps saying"
+     " SOS), decisions after it are marked post=1, and an arm with no token ABORTS instead of"
+     " falling back to another arm. Diagnostic, default OFF, never a serving path:"
+     " tests/test_rnnt_inject.sh asserts each of those",
+     NULL, NULL},
+
     {"MYNAH_ASR_TRACE_TTFP", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
      "server/sched.c: trace the first N steps of every stream on stderr -- consumed audio,"
      " arrival, ready, selected, model start and end, and whether that step emitted anything --"

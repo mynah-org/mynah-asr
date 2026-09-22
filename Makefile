@@ -260,6 +260,13 @@ test-stream-batch-allocs: tests/test_stream_batch $(MALLOC_COUNT_LIB)
 	fi; \
 	if [ $$rc -eq 77 ]; then echo "SKIP stream-batch-allocs: model missing or interposition unavailable"; \
 	elif [ $$rc -ne 0 ]; then exit $$rc; fi
+# R-8: the diagnostic injection must not leak into anything a user can see
+# (model-gated; 77 without a converted streaming pack).
+test-rnnt-inject: mynah-asr
+	@MODEL_DIR=$(MODEL_DIR) sh tests/test_rnnt_inject.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP rnnt-inject: no converted streaming pack"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 # S1-3: zero allocations per streaming chunk after warm-up (model-gated).
 test-stream-allocs: mynah-asr $(MALLOC_COUNT_LIB)
 	@sh tests/test_stream_allocs.sh $(MODEL_DIR) tests/audio/test_it.wav; rc=$$?; \

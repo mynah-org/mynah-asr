@@ -377,6 +377,12 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
             if (m->lookaheads[i] + 1 > max_q) max_q = m->lookaheads[i] + 1;
         mynah_asr_enc_relpos_table_init(&m->enc, m->left_ctx + max_q + 2);
     }
+    /* R-9: the bare SentencePiece word mark, resolved from THIS pack's
+     * tokens.json. The trace needs it to separate "the best non-blank" from
+     * "the best lexical token", which the old trace could not do. -1 when the
+     * vocabulary has no such piece, and the trace then prints -1 rather than
+     * guessing an id. */
+    m->dec.word_mark = mynah_asr_tok_find(&m->tok, "\u2581");
     return m;
 
 fail:
@@ -963,6 +969,7 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
         if (!nb) return -1;
         s->tokens = nb;
     }
+    mynah_asr_dec_trace_audio((double)s->samples_fed / (double)m->feat.sample_rate);
     const int added = mynah_asr_greedy_decode_scratch(&m->dec, &s->dec, s->enc_buf, q,
                                                  s->tokens + s->n_tokens, NULL,
                                                  s->cap_tokens - s->n_tokens, s->dec_scr);
