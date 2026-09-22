@@ -21,7 +21,15 @@ dir, mutate = sys.argv[1], sys.argv[2]
 win = [{"window": i, "t0_s": i*60.0, "t1_s": (i+1)*60.0, "n": 1800,
         "p50": 40.0, "p95": 90.0} for i in range(6)]
 d = {
- "manifest": {"lookahead": 3, "streams": 16, "duration": 1800.0},
+ # stream_load's REAL manifest field names. The first draft of this test
+ # invented "streams" and "duration"; v2_verdict read those same invented names
+ # and the test passed while both were None against a live run.
+ "manifest": {"lookahead": 3, "concurrency": 16, "duration_s": 1800.0, "seed": 43,
+              "chunk_period_ms": 320.0,
+              "bank": {"short": [{"clip": "samples/en/a.wav", "audio_s": 7.4,
+                                  "sha256": "aa"}],
+                       "medium": [{"clip": "samples/fr/b.wav", "audio_s": 10.4,
+                                   "sha256": "bb"}]}},
  "summary": {
    "counts": {"utterances": 600, "ok": 600, "errors": 0, "rejected": 0,
               "warmup_excluded": 20, "deltas": 9000, "eous": 600,
@@ -64,6 +72,15 @@ verdict() { python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/$1" 2>/dev/null | se
 mk healthy "pass"
 [ "$(verdict healthy)" = "QUALIFIED" ] || bad "a healthy run should qualify (got '$(verdict healthy)')"
 [ "$(verdict healthy)" = "QUALIFIED" ] && ok "a healthy synthetic run qualifies on all twelve bounds"
+
+# A verdict that cannot say WHICH run it judged is not evidence. This caught a
+# real defect: the tool read manifest fields named "streams" and "duration",
+# which stream_load never writes, so every header printed C=None.
+head_of() { python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/$1" 2>/dev/null | sed -n '2p'; }
+case "$(head_of healthy)" in
+    *"C=16"*"bank "*) ok "the verdict names the concurrency and the bank it judged" ;;
+    *) bad "the header lost the run's identity: '$(head_of healthy)'" ;;
+esac
 
 mk lost "d['summary']['counts']['errors'] = 3"
 [ "$(verdict lost)" = "NOT QUALIFIED" ] && ok "three lost streams disqualify" || bad "lost streams did not disqualify"

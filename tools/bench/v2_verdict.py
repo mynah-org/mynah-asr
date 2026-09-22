@@ -37,6 +37,14 @@ TREND_MAX_PCT = 50.0         # bound 7: last third vs first third
 RSS_GROWTH_MAX = 1.15        # bound 11
 OK, BAD, NOEV = "PASS", "FAIL", "NO EVIDENCE"
 
+# The qualified PocketTTS profile does not report a worst gap, it reports how
+# MANY gaps crossed 250 ms and how many crossed 500 ms, because "max 700 ms"
+# and "700 ms once in 64205 requests" are different products. The ASR analogue
+# is the emission lag of every published delta, counted at the cadence the
+# model sets and at multiples of it. Counts are reported for every run; only
+# the 3000 ms column is a registered bound (bound 9).
+STALL_MULTIPLES = (1.0, 2.0, 4.0)
+
 
 def chunk_ms(lookahead):
     return (int(lookahead) + 1) * 80.0
@@ -137,6 +145,39 @@ def proc_check(path):
             deaths)
 
 
+def bank_id(man):
+    """A stable id for the audio a run actually played.
+
+    The manifest already carries a sha256 per clip, so the bank identifies
+    itself from inside the run record rather than from a sibling file that
+    could belong to a different run."""
+    bank = man.get("bank") or {}
+    rows = sorted((e.get("clip", ""), e.get("sha256", ""))
+                  for v in bank.values() for e in v)
+    if not rows:
+        return None
+    import hashlib
+    h = hashlib.sha256()
+    for clip, sha in rows:
+        h.update(f"{clip} {sha}\n".encode())
+    return f"{h.hexdigest()[:16]} / {len(rows)} clips"
+
+
+def stall_counts(d, cm):
+    """How many published deltas crossed each threshold, and over how many."""
+    utts = d.get("utterances") or []
+    lags = [v for u in utts for _, v in (u.get("lag_marks") or [])]
+    if not lags:
+        return None
+    rows = []
+    for mult in STALL_MULTIPLES:
+        thr = cm * mult
+        rows.append((thr, sum(1 for v in lags if v > thr)))
+    rows.append((LAG_MAX_MS, sum(1 for v in lags if v > LAG_MAX_MS)))
+    return {"deltas": len(lags), "rows": rows,
+            "worst_ms": max(lags), "over_1s": sum(1 for v in lags if v > 1000.0)}
+
+
 def window_check(d, limit):
     """Bound 6: EVERY steady window, not the pooled percentile."""
     dr = g(d, "summary", "drift", "emission_lag_ms", default={})
@@ -211,11 +252,19 @@ def verdict_for(path, dump_path, proc_path):
     missing = [r for r in rows if r["state"] == NOEV]
     return {
         "file": os.path.basename(path),
-        "streams": man.get("streams"), "duration_s": man.get("duration"),
+        # These are stream_load's OWN manifest field names. An earlier draft read
+        # "streams" and "duration", which exist nowhere: both came back None and
+        # the header printed C=None while every bound still read PASS.
+        "streams": man.get("concurrency"), "duration_s": man.get("duration_s"),
+        "seed": man.get("seed"), "chunk_period_ms": man.get("chunk_period_ms"),
         "utterances": c["ok"], "audio_s": round(c.get("audio_s", 0.0), 1),
         "audio_per_wall": g(m, "audio_per_wall", "max"),
         "ttfp_p95_ms": g(m, "ttfp_ms", "p95"),
         "pacing": g(s, "pacing", "verdict"),
+        "stalls": stall_counts(d, cm),
+        "max_delta_gap_p95_ms": g(m, "max_delta_gap_ms", "p95"),
+        "fairness": s.get("fairness"),
+        "bank_sha256": bank_id(man),
         "rows": rows,
         "verdict": "QUALIFIED" if not failed and not missing else
                    ("NOT QUALIFIED" if failed else "INCONCLUSIVE (missing evidence)"),
@@ -244,12 +293,25 @@ def main():
         sys.exit(f"no soak*.json or ladder-C*.json in {a.run}")
     for v in out:
         head = (f"{v['file']}  C={v['streams']}  {v['utterances']} utterances, "
-                f"{v['audio_s']:.0f} audio-s, {v['pacing']}")
+                f"{v['audio_s']:.0f} audio-s, {v['pacing']}"
+                + (f", bank {v['bank_sha256']}" if v.get("bank_sha256") else ""))
         print("\n" + head)
         print("-" * len(head))
         for r in v["rows"]:
             print(f"  {r['bound']:2d}  {r['name']:26s} {r['state']:11s} {r['detail']}")
+        st = v.get("stalls")
+        if st:
+            cols = "   ".join(f">{t:.0f}ms: {n}" for t, n in st["rows"])
+            print(f"      stalls over {st['deltas']} published deltas   {cols}"
+                  f"   worst {st['worst_ms']:.0f} ms")
+        fa = v.get("fairness")
+        if fa and fa.get("worst_over_median"):
+            print(f"      fairness  worst stream p95 {fa['worst_p95_ms']:.0f} ms vs median "
+                  f"{fa['median_p95_ms']:.0f} ms ({fa['worst_over_median']:.2f}x over "
+                  f"{fa['streams']} streams)")
         extra = []
+        if v["max_delta_gap_p95_ms"]:
+            extra.append(f"max gap between deltas p95 {v['max_delta_gap_p95_ms']:.0f} ms")
         if v["audio_per_wall"]:
             extra.append(f"audio/wall {v['audio_per_wall']:.2f}x")
         if v["ttfp_p95_ms"]:

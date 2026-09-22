@@ -85,15 +85,23 @@ PY
 )
 [ -n "$BANK" ] || die "no clip under 20 s found under samples/ or tests/audio/"
 NCLIP=$(echo "$BANK" | wc -w | tr -d ' ')
+# The corpus is part of the claim, so it is identified the way the qualified
+# PocketTTS profile identifies its text bank: by a hash over the clips
+# themselves, not by a count. A bank that changed under a promoted profile must
+# be visible as a different bank.
+BANK_SHA=$(for c in $BANK; do printf '%s %s\n' "$c" \
+    "$( (sha256sum "$c" 2>/dev/null || shasum -a 256 "$c") | cut -d' ' -f1)"; done \
+    | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-16)
 
 REV=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 BIN_SHA=$( (sha256sum ./mynah-asr-server 2>/dev/null || shasum -a 256 ./mynah-asr-server) | cut -d' ' -f1)
 [ "$DIRTY" = "0" ] || die "dirty tree ($DIRTY files): a qualification measures a commit, not a desk (ENGINEERING.md §13)"
 
+for c in $BANK; do printf '%s %s\n' "$( (sha256sum "$c" 2>/dev/null || shasum -a 256 "$c") | cut -d' ' -f1)" "$c"; done > "$RUN/bank.txt"
 say "v2_qualify  commit=$REV binary=$BIN_SHA model=$MODEL quant=$QUANT"
 say "            topology ${W}x${T} cap=$CAP  server_cpus=$SERVER_CPUS  gen_cpus=$GEN_CPUS"
-say "            corpus $NCLIP clips < 20 s   evidence -> $RUN"
+say "            corpus $NCLIP clips < 20 s, bank-sha256 $BANK_SHA   evidence -> $RUN"
 
 # ---------------------------------------------------------------- start a fleet
 SRV=""
@@ -276,7 +284,9 @@ cat > "$RUN/manifest.json" <<JSON
   "binary_sha256": "$BIN_SHA", "model": "$MODEL", "quant": "$QUANT", "lookahead": $LOOKAHEAD,
   "workers": $W, "threads_per_worker": $T, "cap": $CAP,
   "server_cpus": "$SERVER_CPUS", "gen_cpus": "$GEN_CPUS",
-  "corpus_clips": $NCLIP, "ladder": "$LADDER", "ladder_seconds": $LADDER_S,
+  "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA",
+  "configuration": "shipped-default",
+  "ladder": "$LADDER", "ladder_seconds": $LADDER_S,
   "soak_concurrency": $SOAK_C, "soak_seconds": $SOAK_S, "soaks": $SOAKS,
   "warmup_s": $WARMUP, "window_s": $WINDOW, "dump_every_s": $DUMP_EVERY,
   "registered_bounds": ".work/server-v2-qualification.md V2-2" }
