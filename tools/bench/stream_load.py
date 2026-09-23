@@ -396,6 +396,10 @@ def build_args():
     ap.add_argument("--done-timeout", type=float, default=60.0)
     ap.add_argument("--json", help="write the manifest, the summary and every utterance here")
     ap.add_argument("--reference", help="JSON {clip: expected_text}; mismatches invalidate the run")
+    ap.add_argument("--keep-events", type=int, default=0, metavar="N",
+                    help="keep the published partials (type/t/text/audio_s/lag_ms) for "
+                         "1 utterance in N, chosen by clip hash so the slice is the same "
+                         "across runs, plus EVERY errored or rejected utterance. 0 = off")
     ap.add_argument("--onsets", help="JSON {clip: speech_onset_seconds} from "
                                      "tools/bench/clip_onset.py: makes TTFP measurable "
                                      "from the moment speech begins, not from the moment "
@@ -511,6 +515,24 @@ def main() -> int:
                       if isinstance(v, (int, float))}
     utts = [M.analyze_utterance(r, frame_ms=a.frame_ms, pace=a.pace, onsets=onsets)
             for r in records]
+    # The published partials, kept for a DETERMINISTIC slice of the run and for
+    # every utterance that went wrong. analyze_utterance folds the events into a
+    # concatenated text and drops the sequence, which is exactly what a person
+    # auditing a PASS later needs to see: what the server said, when, and how it
+    # changed. Keeping them for everything would multiply a 15 MB soak record by
+    # an order of magnitude, so the slice is by clip hash -- stable across runs,
+    # so the same clips are auditable in the loaded run and in the reference.
+    if a.keep_events:
+        for u, r in zip(utts, records):
+            clip = r.get("clip") or ""
+            keep = bool(r.get("error") or r.get("rejected"))
+            if not keep and a.keep_events > 0:
+                h = int(hashlib.sha1(clip.encode()).hexdigest()[:8], 16)
+                keep = (h % a.keep_events) == 0
+            if keep:
+                u["events"] = [{k: e.get(k) for k in ("type", "t", "text", "audio_s", "lag_ms")}
+                               for e in (r.get("events") or [])]
+                u["t_start_abs"] = r.get("t_start")
     warmup = a.warmup if a.mode == "soak" else 0.0
     window = a.window if a.mode == "soak" else None
     reference = json.load(open(a.reference)) if a.reference else None

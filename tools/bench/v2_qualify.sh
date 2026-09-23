@@ -495,8 +495,12 @@ if [ "$PHASE" = all ] || [ "$PHASE" = soak ]; then
         say "--- V2-4 soak $n/$SOAKS: C=$SOAK_C for ${SOAK_S}s, fresh server"
         start_fleet "soak$n"
         dumper_start "soak$n"
+        # Qualification keeps the published partials for a deterministic slice,
+        # so the PASS can be audited later without re-running the server. The
+        # discovery ladder does not: it certifies nothing and the records would
+        # be an order of magnitude larger for no reader.
         load --mode soak --streams "$SOAK_C" --duration "$SOAK_S" --warmup "$WARMUP" \
-             --window "$WINDOW" --seed $(( 42 + n )) --clips $BANK \
+             --window "$WINDOW" --seed $(( 42 + n )) --clips $BANK --keep-events 25 \
              ${REFJSON:+--reference "$REFJSON"} \
              --json "$RUN/soak$n-C$SOAK_C.json" 2>&1 | tee -a "$RUN/run.log" \
              | grep -E "TTFP|emission lag|finaliz|backlog|drift|verdict|utterances|pacing|REFERENCE|identity|window" || true
