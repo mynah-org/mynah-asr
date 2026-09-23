@@ -690,3 +690,92 @@ possibly a lightweight English lane. It is not a replacement.**
 activations and recomputes Q/K/V over the history every step; mynah already
 caches projected K/V. Moving toward the reference here would be strictly more
 work for identical numbers.
+
+---
+
+# S13-5 / Q2 — RESULT: the control emits earlier, and the gain splits in two
+
+**EXPERIMENT.** Both models, **the same 120 clips** (40 per length class from the
+qualification's own bank), the same onsets, the same committed tool
+(`tools/eval/first_emission.py`), the same box, the same session, both int8,
+each at its own pack-default preset. Measured in AUDIO time, so faster-than-real-time
+CLI execution cannot contaminate it. Commit `b1f74db`, clean tree.
+
+| | Nemotron 3.5 0.6B `[56,3]` | Parakeet Realtime EOU 120M `[70,1]` |
+|---|---|---|
+| speech → first non-blank, p50 | 860 ms | **570 ms** |
+| p95 | 1990 ms | **1590 ms** |
+| p99 | 2960 ms | **2460 ms** |
+| blank decisions before the first | 17 | 16 |
+| publication gate | 0 ms | **0 ms** |
+| errors | 0 | 0 |
+
+**Paired per clip**, which is what decides it:
+
+- **The 120M is earlier on 112 of 120 clips, later on 1, tied on 7.**
+  Sign test **z = +10.44**.
+- Median **−300 ms**, mean −326 ms, p05 −700 ms, p95 +0 — it is essentially
+  never materially later.
+
+**FACT — R-15 reproduces on a second, independent checkpoint.** The 120M's
+`publication_gate_ms` is **0.0 at every percentile** too. Two different models,
+two different vocabularies, two different cadences, same answer: the
+append-only contract withholds nothing. That closes component C harder than one
+model could.
+
+## Where the 300 ms comes from — both halves measured
+
+**FACT — the model commits after fewer decisions.** Paired, the 120M needs
+**2.2 fewer decoder decisions** on average before its first non-blank. At
+80 ms per encoder frame in both models that is **≈ −176 ms**.
+
+**FACT — and it publishes on a grid twice as fine.** `[70,1]` gives a 2-frame
+chunk (160 ms); `[56,3]` gives 4 frames (320 ms). Over the 120 clips the first
+non-blank lands on **9 distinct audio values for Nemotron and 17 for the 120M**,
+with minima of **0.900 s and 0.600 s**. The average rounding-up cost of a
+320 ms grid over a 160 ms one is 80 ms, and the residual of the paired mean
+(−326 + 176 = **−150 ms**) is consistent with that plus interaction.
+
+**OBSERVATION — so it is roughly half model and half cadence**, and neither half
+was assumed: the decision count is a measured paired count, and the grid is a
+measured set of distinct values.
+
+## DECISION
+
+The user's pre-registered fork — *"if Realtime EOU emits substantially earlier
+on the same clips, architecture / training / decoder / context become the
+primary suspects"* — **is taken, on the earlier branch.** A shared frontend or
+runtime assumption is ruled out as the dominant cause, because the same
+frontend and the same runtime produced both numbers.
+
+The candidate causes are now specific and two of them are documented rather
+than speculative:
+1. **Training.** NeMo's shipped FastEmit lambda is `5e-3` for cache-aware
+   streaming and `3e-2` for the EOU model's config — **6x** — and FastEmit is
+   training-time only, which is exactly a "commit earlier" regulariser.
+2. **Cadence.** `[70,1]` against `[56,3]`, measured above as ~150 ms of it.
+3. Depth and width (17 x 512 against 24 x 1024) and the absence of the prompt
+   projector remain untested as causes.
+
+**NOT established.** Which of those produces the −176 ms decision-count half.
+FastEmit is a documented, quantified candidate; it is not yet a measured cause,
+and the honest next step is a Nemotron preset sweep (`[56,0]` is already known
+to buy ~100 ms at a CER cost) rather than a claim.
+
+## And the cost side, which must not be forgotten
+
+The 120M's documented Open-ASR WER is **9.30 at 160 ms** against Nemotron
+English's **7.67 at 160 ms**, it is **English-only**, and it emits **no
+punctuation or capitalisation**. Our own corpus scoring would hide that last
+one, because `normalise()` strips both. **This is a control and possibly a
+lightweight English lane. It is not a replacement for a multilingual model.**
+
+## Oracle parity (Q1), partial
+
+`oracle == offline == streaming`, byte-identical, on 3 of the 3 short committed
+English clips completed so far. **OBSERVATION and limitation:** the oracle reads
+the SAME converted pack, so this validates the C implementation against the
+reference math — it does not independently validate the conversion against
+NeMo. The strong evidence that the conversion is right is different and
+circumstantial: the transcripts are correct English matching the audio, and a
+mis-assigned tensor does not produce that.
