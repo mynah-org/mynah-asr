@@ -251,6 +251,10 @@ Raise --http-threads."
 }
 stop_fleet() {
     [ -n "$SRV" ] || return 0
+    # The router's /metrics carries no scheduler counter -- it says so itself.
+    # A worker's /v1/health does: batched_steps_total, ready_mean and the
+    # per-B step table, which is the only honest source for the batch.
+    curl -s -m 5 "http://localhost:$PORT/v1/health" > "$RUN/health-$1.json" 2>&1
     curl -s -m 5 "http://localhost:$(( PORT + 1000 ))/metrics" > "$RUN/metrics-$1.txt" 2>&1
     kill -TERM $SRV 2>/dev/null; wait $SRV 2>/dev/null; SRV=""
     sleep 1

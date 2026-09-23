@@ -16,12 +16,20 @@ not the model and the next question is which lock, thread or queue it is.
     tools/bench/v2_saturation.py <run_dir> [<run_dir> ...]
 
 Everything comes from artefacts the campaign already writes: the run JSON for
-throughput and tails, the fleet's SIGUSR1 dumps for duty. The mean batch is
-DERIVED, not reported: a worker's audio_s divided by its steps is the audio one
-step carried, and dividing that by the chunk period gives the streams it
-carried. Checked against a live /v1/health during the C=16 soak it read 0.974
-where the server said ready_mean 1.031, so it is good to a few percent and is
-labelled as derived rather than quoted as the server's own number.
+throughput and tails, the fleet's SIGUSR1 dumps for duty.
+
+There is NO batch column, and the reason is worth keeping. A first version
+derived one as audio_s / steps / chunk_period and it agreed with a live
+/v1/health at C=16 -- 0.974 against ready_mean 1.031 -- so it looked sound. Run
+across the real ladder it printed 0.98 at every rung from C=32 to C=80, over a
+2.1x range of throughput and a fleet going from 56% to 99.6% model duty. A
+quantity that constant across that range is not measuring the batch: `steps` in
+the dump counts per SLOT, not per batched step, so audio_s/steps is the chunk
+period by construction and the division gives 1 whatever the batch does. The
+real numbers live in a worker's /v1/health (batched_steps_total, ready_mean,
+by_b), which stop_fleet now captures. A column that agrees with the truth at the
+one point you checked it, and is constant by construction everywhere else, is
+worse than no column.
 """
 from __future__ import annotations
 
@@ -82,10 +90,6 @@ def rung(path, log):
     def avg(k):
         v = [r[k] for r in per.values() if k in r]
         return sum(v) / len(v) if v else None
-    steps = sum(r.get("steps", 0) for r in per.values())
-    audio = sum(r.get("audio_s", 0.0) for r in per.values())
-    # audio one step carried, in chunks: the streams it stacked.
-    cps = (audio / steps) / (cm / 1000.0) if steps else None
     g = lambda k, q="p95": (m.get(k) or {}).get(q)
     return {
         "C": man.get("concurrency"), "utt": cnt["ok"], "lost": cnt["errors"],
@@ -93,7 +97,6 @@ def rung(path, log):
         "audio_per_wall": g("audio_per_wall", "max"),
         "model_duty": avg("model_duty"), "busy": avg("busy_frac"),
         "runnable_idle": avg("idle_frac"), "no_work": avg("nowork_frac"),
-        "chunks_per_step": cps,
         "lag95": g("emission_lag_ms"), "lag99": g("emission_lag_ms", "p99"),
         "lagmax": g("emission_lag_ms", "max"),
         "backlog": g("backlog_max_s", "max"), "fin95": g("finalization_lag_ms"),
@@ -122,13 +125,13 @@ def main(dirs):
     rows.sort(key=lambda r: (r["C"] is None, r["C"]))
     f = lambda v, n=2: "  -  " if v is None else f"{v:.{n}f}"
     print(f"{'C':>4} {'utt':>6} {'lost':>5} {'a/wall':>7} {'duty':>6} {'idle':>6} "
-          f"{'nowork':>7} {'chk/step':>9} {'lag95':>6} {'lag99':>6} {'lagmax':>7} "
+          f"{'nowork':>7} {'lag95':>6} {'lag99':>6} {'lagmax':>7} "
           f"{'backlog':>8} {'fin95':>6} {'held':>6} {'paced':>6}")
     for r in rows:
         print(f"{r['C'] if r['C'] is not None else '?':>4} {r['utt']:>6} {r['lost']:>5} "
               f"{f(r['audio_per_wall']):>7} {f(r['model_duty'], 3):>6} "
               f"{f(r['runnable_idle'], 3):>6} {f(r['no_work'], 3):>7} "
-              f"{f(r['chunks_per_step']):>9} {f(r['lag95'], 0):>6} {f(r['lag99'], 0):>6} "
+              f"{f(r['lag95'], 0):>6} {f(r['lag99'], 0):>6} "
               f"{f(r['lagmax'], 0):>7} {f(r['backlog'], 3):>8} {f(r['fin95'], 0):>6} "
               f"{(str(r['held']) + ('*' if r['held'] and r['C'] and r['held'] < r['C'] else '')) if r['held'] else '-':>6} "
               f"{'yes' if r['paced'] else 'NO':>6}")
