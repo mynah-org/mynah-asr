@@ -250,6 +250,11 @@ FLEURS original (349) vs synthetic concatenations (149), WER mean: 0.0907 /
 the comparison. Caveats this table does not isolate: Parakeet 110m is
 English-only against Nemotron's 40 locales, and the quantisation schemes differ.
 
+Paired per clip rather than compared as means: Parakeet is better on **167**
+clips, worse on **86**, tied on **245** (sign test z = +5.09; format-free
+166/88/244, CER 176/105/217). Nemotron's largest single win is the retake clip
+`long_0021_f708.wav`, which it wins by transcribing less of the repeated audio.
+
 ### Parakeet offline capacity, REST (`rest_load.py`) — SCREEN, promotes nothing
 
 Fresh 6 x 5 fleet per rung on cpus 0-29, generator on 30-31, affinity proven per
@@ -268,6 +273,13 @@ median latency grows 4.1x. **0 errors and 0 refusals at every rung**, so this
 ladder located a knee, not a limit. Cores plateau at 18.7-19.8 of the 30 pinned
 from C=8 upward — the same shape as S12-7c on Nemotron, on a different model
 and a different code path.
+
+At C=64 the fleet is at capacity: 426/512 served, and the remaining 86 split
+between clean 503 refusals and client-side broken pipes. Tripling the
+generator's cpus (at the server's expense) moved that split from 34/52 to 51/30
+while served requests barely changed, so the fleet refuses correctly and a
+starved generator was breaking the connection before receiving its own 503.
+C=64 and C=128 stay INVALID rungs: this screen located a knee, not a limit.
 
 ## First-word latency decomposition, Nemotron `[56,3]` — Axion — 2026-09-23
 

@@ -83,6 +83,23 @@ of this bank's long class for every model. It cancels in the comparison, since
 both models see the same clips, and it is the reason the corpus-weighted WER
 (0.131 / 0.144) sits well above the per-clip median (0.056 / 0.071).
 
+### The comparison is paired, not a difference of means
+
+Means over 498 clips can be moved by a handful of outliers, so the ordering was
+re-read per clip. Parakeet is better on **167** clips, worse on **86** and tied
+on **245** (strict WER; format-free 166/88/244, CER 176/105/217). A sign test on
+the non-tied pairs gives **z = +5.09** for WER, +4.89 format-free, +4.24 CER, so
+the advantage is systematic and not carried by a few clips. The per-clip median
+difference is exactly 0.0000 -- on most clips the two models produce the same
+WER -- and the mean difference is -0.0128 in Parakeet's favour.
+
+Recorded against our own conclusion: **Nemotron's single largest win is
+`long_0021_f708.wav`, the retake clip**, by +0.300 WER. It wins there because it
+transcribed *less* of the repeated audio, which happens to match a reference
+that covers the sentence once. That is the reference artefact paying out, not
+recognition quality, and it is the clearest illustration of why the artefact was
+recorded rather than filtered away.
+
 ## Evidence — offline capacity (A3)
 
 Fresh six-worker fleet per rung, 5 threads each, cpus 0-29, generator pinned to
@@ -114,6 +131,42 @@ Nemotron** (23.1 of 30 at saturation, falling under overload) on a different
 model, a different decoder family and a different code path — offline
 weight-stationary rather than cache-aware streaming. That makes a
 Nemotron-specific explanation less likely; it does not identify the cause.
+
+### C=64 and beyond: what the errors were, and what they were not
+
+`rest_load.py` invalidates a rung with any non-503 error, and C=64 produced 56
+of them (`Broken pipe` from the client's own `urlopen`) beside 29 clean 503
+refusals. Reproduced on a second fleet: 52 errors, 34 refusals. **The server's
+own shutdown accounting contradicts a server fault**: `assigned == completed`
+and `still-in-flight=0` on all six workers, `over-service-cap=0`. It finished
+everything it accepted.
+
+The discriminating arm changed exactly one thing -- the generator's cpu slice,
+2 cpus (30-31) to 6 (26-31) -- and did so *at the server's expense*, since
+26-29 belong to the server's own slice. Its throughput numbers are therefore
+uninterpretable by construction and are not read; only the outcome counts are.
+
+| arm | generator cpus | ok | refused (503) | errors | ok+refused+errors |
+|---|---|---|---|---|---|
+| a | 2 | 426 | 34 | 52 | 512 |
+| b | 6 | 431 | 51 | 30 | 512 |
+
+**RESULT.** Served requests barely move (426 -> 431) while the failure budget
+migrates from broken pipes to clean refusals (52/34 -> 30/51), with the total
+of the two almost constant (86 -> 81). Giving the generator three times the
+cpus did not make the fleet serve more; it made the overload get *reported*
+properly. The mechanism this supports is that the fleet is genuinely at
+capacity at C=64 -- roughly 16 % of requests cannot be served -- the admission
+ladder is refusing them correctly, and a cpu-starved generator was breaking the
+connection before it could receive its own 503.
+
+**What is NOT established.** That the generator explains all of it: 30 errors
+survive at 6 cpus. And the per-rung generator cpu measurement failed (the
+sampler took its last reading after the process had exited and reported 0.00
+cores), so the attribution above rests on the outcome counts, not on a direct
+measurement of generator saturation. C=64 and C=128 remain **INVALID rungs**;
+this screen located a knee between C=4 and C=8 and a capacity edge near C=64,
+and it does not certify either.
 
 ## Conclusion
 
