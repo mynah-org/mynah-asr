@@ -24,7 +24,12 @@
 #       [--ladder "8 16 24 32"] [--soak-c 16] [--soak-seconds 1800] [--soaks 2]
 #       [--reference-file <reference.json from an earlier run of this tool>]
 #       [--corpus samples/stress-en/manifest.json] [--min-peak-dbfs -30]
-#                             a bank manifest instead of the committed clips
+#       [--corpus-sample 500] [--corpus-seed 42]
+#                             a bank manifest instead of the committed clips.
+#                             --corpus-sample takes a deterministic, class-
+#                             balanced subset: the unloaded reference pass runs
+#                             at real time, so it costs exactly the corpus's own
+#                             duration, and 1316 clips is 5.8 hours of it
 #       [--http-threads 32]   per worker; W x this is the fleet's CONNECTION
 #                             ceiling, NOT its compute width
 #       --phase genscale [--gen-arms "24-31 24-27 24-25"] [--genscale-c 32]
@@ -43,7 +48,7 @@ MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
 W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3; HTTP_T=32
 LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
 GEN_ARMS="24-31 24-27 24-25"; GENSCALE_C=32; GENSCALE_S=180
-CORPUS=""; MIN_PEAK_DBFS=-30; CLASSES=""
+CORPUS=""; MIN_PEAK_DBFS=-30; CLASSES=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; REF_C=1
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
 SERVER_CPUS="0-23"; GEN_CPUS="24-31"; REF_IN=""
 while [ $# -gt 0 ]; do
@@ -69,6 +74,9 @@ while [ $# -gt 0 ]; do
         --genscale-seconds) GENSCALE_S="$2"; shift 2 ;;
         --corpus) CORPUS="$2"; shift 2 ;;
         --min-peak-dbfs) MIN_PEAK_DBFS="$2"; shift 2 ;;
+        --corpus-sample) CORPUS_SAMPLE="$2"; shift 2 ;;
+        --corpus-seed) CORPUS_SEED="$2"; shift 2 ;;
+        --ref-c) REF_C="$2"; shift 2 ;;
         --reference-file) REF_IN="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "v2_qualify: unknown option: $1" >&2; exit 2 ;;
@@ -97,9 +105,11 @@ die() { say "REFUSED: $*"; exit 3; }
 # 35 dB and nothing normalises them: a clip nobody can hear still costs a full
 # step, so it is fine as LOAD and useless for the transcript parity gate, which
 # needs the unloaded pass to produce something to compare.
-BANK=$(CORPUS="$CORPUS" MIN_PEAK="$MIN_PEAK_DBFS" python3 - <<'BANKPY'
-import glob, json, os, wave
+BANK=$(CORPUS="$CORPUS" MIN_PEAK="$MIN_PEAK_DBFS" SAMPLE="$CORPUS_SAMPLE" \
+       SEED="$CORPUS_SEED" python3 - <<'BANKPY'
+import glob, json, os, random, wave
 man, minpeak = os.environ.get("CORPUS", ""), float(os.environ.get("MIN_PEAK", "-30"))
+sample, seed = int(os.environ.get("SAMPLE", "0")), int(os.environ.get("SEED", "42"))
 out = []
 if man:
     d = json.load(open(man))
@@ -119,8 +129,21 @@ if man:
         if pk is not None and pk < minpeak:
             quiet += 1
             continue
-        out.append(p)
-    print(" ".join(sorted(out)))
+        out.append((c.get("class") or "?", p))
+    if sample and sample < len(out):
+        # Class-balanced and seeded, so the same --corpus-sample/--corpus-seed
+        # always selects the same clips and the bank hash identifies WHICH.
+        byc = {}
+        for k, f in out:
+            byc.setdefault(k, []).append(f)
+        picked = []
+        per = max(1, sample // max(1, len(byc)))
+        for k in sorted(byc):
+            pool = sorted(byc[k])
+            random.Random(f"{seed}:{k}").shuffle(pool)
+            picked += pool[:per]
+        out = [("", f) for f in picked]
+    print(" ".join(sorted(f for _, f in out)))
 else:
     for c in sorted(glob.glob("samples/*/*.wav") + glob.glob("tests/audio/*.wav")):
         try:
@@ -331,9 +354,15 @@ print(f"reference covers all {len(clips)} clips"
 REFCOV
     say "reference: reusing $REF_IN ($(python3 -c "import json;print(len(json.load(open('$REFJSON'))))") clips)"
 elif [ "$PHASE" = all ] || [ "$PHASE" = reference ]; then
-    say "--- V2-6 reference: C=1, unloaded, $NCLIP clips, from the server"
+    # The pass runs at REAL TIME, so it costs exactly the corpus's own duration
+    # divided by --ref-c. C=1 is the cleanest baseline and 498 clips of it is
+    # 110 minutes; C=4 on a 24-core fleet is about 7% duty, which is unloaded by
+    # any measure this campaign uses, and costs 27. Whatever queueing C=4 does
+    # add inflates the BASELINE, which makes bound 13 more lenient, never
+    # stricter -- so it cannot manufacture a pass that idle would have failed.
+    say "--- V2-6 reference: C=$REF_C, $NCLIP clips, from the server"
     start_fleet ref
-    load --mode wave --streams 1 --repeat "$NCLIP" --clips $BANK \
+    load --mode wave --streams "$REF_C" --repeat $(( (NCLIP + REF_C - 1) / REF_C )) --clips $BANK \
          --json "$RUN/ref-raw.json" 2>&1 | tee -a "$RUN/run.log" | grep -E "verdict|utterance|pacing" || true
     stop_fleet ref
     python3 - "$RUN/ref-raw.json" "$REFJSON" "$NCLIP" <<'PY' || die "the reference pass did not cover the corpus"
@@ -484,6 +513,8 @@ cat > "$RUN/manifest.json" <<JSON
   "connection_ceiling": $(( HTTP_T * W )),
   "server_cpus": "$SERVER_CPUS", "gen_cpus": "$GEN_CPUS",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA",
+  "corpus": "${CORPUS:-committed samples under 20 s}", "corpus_sample": $CORPUS_SAMPLE,
+  "corpus_seed": $CORPUS_SEED, "min_peak_dbfs": $MIN_PEAK_DBFS, "reference_concurrency": $REF_C,
   "configuration": "shipped-default",
   "ladder": "$LADDER", "ladder_seconds": $LADDER_S,
   "soak_concurrency": $SOAK_C, "soak_seconds": $SOAK_S, "soaks": $SOAKS,
