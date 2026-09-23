@@ -772,8 +772,8 @@ lightweight English lane. It is not a replacement for a multilingual model.**
 
 ## Oracle parity (Q1), partial
 
-`oracle == offline == streaming`, byte-identical, on 3 of the 3 short committed
-English clips completed so far. **OBSERVATION and limitation:** the oracle reads
+`oracle == offline == streaming`, byte-identical, on **4 of 4** committed
+English clips including the long one. **OBSERVATION and limitation:** the oracle reads
 the SAME converted pack, so this validates the C implementation against the
 reference math — it does not independently validate the conversion against
 NeMo. The strong evidence that the conversion is right is different and
