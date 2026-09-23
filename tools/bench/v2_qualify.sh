@@ -173,7 +173,7 @@ BIN_SHA=$( (sha256sum ./mynah-asr-server 2>/dev/null || shasum -a 256 ./mynah-as
 for c in $BANK; do printf '%s %s\n' "$( (sha256sum "$c" 2>/dev/null || shasum -a 256 "$c") | cut -d' ' -f1)" "$c"; done > "$RUN/bank.txt"
 say "v2_qualify  commit=$REV binary=$BIN_SHA model=$MODEL quant=$QUANT"
 say "            topology ${W}x${T} cap=$CAP  server_cpus=$SERVER_CPUS  gen_cpus=$GEN_CPUS"
-say "            corpus $NCLIP clips < 20 s, bank-sha256 $BANK_SHA   evidence -> $RUN"
+say "            corpus $NCLIP clips${CORPUS:+ from $CORPUS}, bank-sha256 $BANK_SHA   evidence -> $RUN"
 
 # ---------------------------------------------------------------- start a fleet
 SRV=""
