@@ -75,6 +75,11 @@ def main():
     ap.add_argument("a"); ap.add_argument("b")
     ap.add_argument("--label-a", default=None); ap.add_argument("--label-b", default=None)
     ap.add_argument("--json")
+    ap.add_argument("--drop-composed", action="store_true",
+                    help="keep only original single-utterance recordings. A bank that "
+                         "concatenates two turns into one file is structurally unfair to "
+                         "a model trained to END an utterance, and mixing the two "
+                         "measures the corpus rather than the model")
     o = ap.parse_args()
 
     da, A = load(o.a); db, B = load(o.b)
@@ -84,6 +89,10 @@ def main():
               if A[c].get("wer") is not None and B[c].get("wer") is not None
               and A[c].get("speech_to_first_nonblank_ms") is not None
               and B[c].get("speech_to_first_nonblank_ms") is not None]
+    if o.drop_composed:
+        n0 = len(scored)
+        scored = [c for c in scored if not A[c].get("composed")]
+        print(f"  --drop-composed: {n0 - len(scored)} synthetic concatenation(s) removed")
 
     print(f"{la}  vs  {lb}")
     print(f"  {len(common)} clip(s) in both runs, {len(scored)} with both a timing and a score\n")
