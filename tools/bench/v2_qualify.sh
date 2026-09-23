@@ -23,6 +23,8 @@
 #       [--phase freeze|reference|ladder|soak|all] [-o ~/asr-evidence/v2]
 #       [--ladder "8 16 24 32"] [--soak-c 16] [--soak-seconds 1800] [--soaks 2]
 #       [--reference-file <reference.json from an earlier run of this tool>]
+#       [--corpus samples/stress-en/manifest.json] [--min-peak-dbfs -30]
+#                             a bank manifest instead of the committed clips
 #       [--http-threads 32]   per worker; W x this is the fleet's CONNECTION
 #                             ceiling, NOT its compute width
 #       --phase genscale [--gen-arms "24-31 24-27 24-25"] [--genscale-c 32]
@@ -41,6 +43,7 @@ MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
 W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3; HTTP_T=32
 LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
 GEN_ARMS="24-31 24-27 24-25"; GENSCALE_C=32; GENSCALE_S=180
+CORPUS=""; MIN_PEAK_DBFS=-30; CLASSES=""
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
 SERVER_CPUS="0-23"; GEN_CPUS="24-31"; REF_IN=""
 while [ $# -gt 0 ]; do
@@ -64,6 +67,8 @@ while [ $# -gt 0 ]; do
         --gen-arms) GEN_ARMS="$2"; shift 2 ;;
         --genscale-c) GENSCALE_C="$2"; shift 2 ;;
         --genscale-seconds) GENSCALE_S="$2"; shift 2 ;;
+        --corpus) CORPUS="$2"; shift 2 ;;
+        --min-peak-dbfs) MIN_PEAK_DBFS="$2"; shift 2 ;;
         --reference-file) REF_IN="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "v2_qualify: unknown option: $1" >&2; exit 2 ;;
@@ -82,20 +87,52 @@ die() { say "REFUSED: $*"; exit 3; }
 # languages, so the fleet is never fed a synchronized equal-length herd.  The
 # three clips over 90 s are excluded ON PURPOSE: one 305 s stream in a 1800 s
 # soak is a different experiment, not a longer one.
-BANK=$(python3 - <<'PY'
-import glob, wave
+# The corpus. Without --corpus: every committed clip under 20 s -- what a bare
+# clone has, enough to run, and far too small to load-test with. 27 clips over a
+# 1800 s soak at C=16 is each clip played about 145 times, which measures a warm
+# page cache as much as a fleet.
+#
+# With --corpus <manifest.json>: a bank manifest (samples/stress-en). Clips whose
+# peak is below --min-peak-dbfs are dropped, because FLEURS levels vary by about
+# 35 dB and nothing normalises them: a clip nobody can hear still costs a full
+# step, so it is fine as LOAD and useless for the transcript parity gate, which
+# needs the unloaded pass to produce something to compare.
+BANK=$(CORPUS="$CORPUS" MIN_PEAK="$MIN_PEAK_DBFS" python3 - <<'BANKPY'
+import glob, json, os, wave
+man, minpeak = os.environ.get("CORPUS", ""), float(os.environ.get("MIN_PEAK", "-30"))
 out = []
-for c in sorted(glob.glob("samples/*/*.wav") + glob.glob("tests/audio/*.wav")):
-    try:
-        w = wave.open(c); d = w.getnframes() / w.getframerate(); w.close()
-    except Exception:
-        continue
-    if d < 20.0:
-        out.append(c)
-print(" ".join(out))
-PY
+if man:
+    d = json.load(open(man))
+    root = os.path.dirname(man)
+    clips = d["clips"] if isinstance(d, dict) and "clips" in d else d
+    if isinstance(clips, dict):
+        clips = [v for v in clips.values()]
+    quiet = 0
+    for c in clips:
+        f = c.get("file") or c.get("clip")
+        if not f:
+            continue
+        p = f if os.path.exists(f) else os.path.join(root, f)
+        if not os.path.exists(p):
+            continue
+        pk = c.get("peak_dbfs")
+        if pk is not None and pk < minpeak:
+            quiet += 1
+            continue
+        out.append(p)
+    print(" ".join(sorted(out)))
+else:
+    for c in sorted(glob.glob("samples/*/*.wav") + glob.glob("tests/audio/*.wav")):
+        try:
+            w = wave.open(c); dur = w.getnframes() / w.getframerate(); w.close()
+        except Exception:
+            continue
+        if dur < 20.0:
+            out.append(c)
+    print(" ".join(out))
+BANKPY
 )
-[ -n "$BANK" ] || die "no clip under 20 s found under samples/ or tests/audio/"
+[ -n "$BANK" ] || die "the corpus is empty (--corpus '$CORPUS', --min-peak-dbfs $MIN_PEAK_DBFS)"
 NCLIP=$(echo "$BANK" | wc -w | tr -d ' ')
 # The corpus is part of the claim, so it is identified the way the qualified
 # PocketTTS profile identifies its text bank: by a hash over the clips
@@ -222,8 +259,25 @@ ONSETS="$RUN/onsets.json"
 python3 tools/bench/clip_onset.py $BANK --json "$ONSETS" > "$RUN/onsets.txt" 2>&1 \
     || { say "WARNING onset detection failed; TTFP will be reported from stream open only"; ONSETS=""; }
 
+# Which duration classes this corpus actually populates. build_bank() exits if a
+# named class has no clip, so naming them by hand ties the tool to one bank.
+CLASSES=$(python3 - $BANK <<'CLSPY'
+import sys, wave
+have = set()
+for c in sys.argv[1:]:
+    try:
+        w = wave.open(c); d = w.getnframes() / w.getframerate(); w.close()
+    except Exception:
+        continue
+    have.add("short" if d < 8 else "medium" if d < 20 else "long")
+print(",".join(k for k in ("short", "medium", "long") if k in have))
+CLSPY
+)
+[ -n "$CLASSES" ] || die "no clip fell into a duration class"
+say "            classes present: $CLASSES"
+
 load() { taskset -c "$GEN_CPUS" python3 tools/bench/stream_load.py --port "$PORT" \
-             --lookahead "$LOOKAHEAD" --bank short,medium --class-bounds 8,20 \
+             --lookahead "$LOOKAHEAD" --bank "$CLASSES" --class-bounds 8,20 \
              ${ONSETS:+--onsets "$ONSETS"} "$@"; }
 
 # ------------------------------------------------------------------ 1. freeze
