@@ -49,6 +49,9 @@ for s in soaks:
     n = s["n"]
     json.dump(s["d"], open(f"{dir}/soak{n}-C16.json", "w"))
     with open(f"{dir}/server-soak{n}.log", "w") as f:
+        for w in range(3):
+            f.write(f"mynah-asr-server 0.9.1: prefork worker {w} ready, group 'g' "
+                    f"(32 http threads, 96 stream slots, batch 8, streaming yes)\n")
         for seq in range(1, 7):
             for w in range(3):
                 f.write(f"[DUMP] worker={w} seq={seq} slots active=6 cap=96 sessions=10 "

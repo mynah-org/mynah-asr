@@ -51,6 +51,9 @@ exec(mutate)
 json.dump(d, open(dir + "/soak1-C16.json", "w"))
 # three workers, steps always advancing, slots always busy
 with open(dir + "/server-soak1.log", "w") as f:
+    for w in range(3):
+        f.write(f"mynah-asr-server 0.9.1: prefork worker {w} ready, group 'g' "
+                f"(32 http threads, 96 stream slots, batch 8, streaming yes)\n")
     for seq in range(1, 7):
         for w in range(3):
             f.write(f"[DUMP] worker={w} seq={seq} slots active=6 cap=96 sessions=10 "
@@ -96,9 +99,10 @@ json.dump({'connection_ceiling': 24}, open(p,'w'))" "$TMP/ceiling"
     || bad "a run inside the ceiling was called invalid: $(verdict ceiling)"
 mk ceiling2 "d['manifest']['concurrency'] = 32"
 python3 -c "
-import json,sys
-p=sys.argv[1]+'/manifest.json'
-json.dump({'connection_ceiling': 24}, open(p,'w'))" "$TMP/ceiling2"
+import sys
+p=sys.argv[1]+'/server-soak1.log'
+s=open(p).read().replace('32 http threads','8 http threads')
+open(p,'w').write(s)" "$TMP/ceiling2"
 [ "$(verdict ceiling2)" = "INVALID" ] \
     && ok "C=32 against a 24-connection fleet is INVALID, not merely worse" \
     || bad "a rung that could not connect its own concurrency was scored: $(verdict ceiling2)"

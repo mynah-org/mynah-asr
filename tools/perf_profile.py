@@ -70,9 +70,18 @@ def validate_one(pid):
     # A claim needs evidence: `qualified` without a soak is the exact thing the
     # status ladder exists to prevent.
     m = d.get("measured") or {}
-    if st == "qualified" and not m.get("soak"):
-        bad.append("status is `qualified` but `measured.soak` is empty: a WAVE may "
+    if st == "qualified" and not (m.get("soak") or m.get("long_soak_qualified")):
+        bad.append("status is `qualified` but neither `measured.soak` nor "
+                   "`measured.long_soak_qualified` is present: a WAVE may "
                    "disqualify a rung, it never promotes one")
+    lsq = m.get("long_soak_qualified") or {}
+    if lsq and lsq.get("runs", 0) < 2:
+        bad.append(f"`measured.long_soak_qualified` records {lsq.get('runs')} run(s): "
+                   "one long run is a run, not a qualification")
+    if lsq and not lsq.get("connection_ceiling"):
+        bad.append("`measured.long_soak_qualified` does not state the fleet's connection "
+                   "ceiling: on 2026-09-22 a rung silently measured that ceiling instead "
+                   "of the machine, so a capacity claim has to name it")
     if st in ("screened", "qualified") and not m.get("date"):
         bad.append(f"status is `{st}` but `measured.date` is missing")
     for var, spec in (d.get("runtime", {}).get("environment") or {}).items():

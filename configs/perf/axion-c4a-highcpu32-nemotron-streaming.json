@@ -2,8 +2,8 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-c4a-highcpu32-nemotron-streaming",
-    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, Nemotron 3.5 streaming 0.6B, int8, cache-aware streaming over WebSocket. Three workers of 8 threads over a 24-cpu slice, the remaining 8 cpus reserved for whatever generates the load. A 12-rung capacity ladder (C = 8..64) found C_safe = 32 with zero lost streams; no long soak has held it yet, so the status is screened, not qualified.",
-    "status": "screened",
+    "description": "GCP c4a-highcpu-32 / Axion Neoverse-V2, Nemotron 3.5 streaming 0.6B, int8, cache-aware streaming over WebSocket. Three workers of 8 threads over a 24-cpu slice, the remaining 8 cpus reserved for whatever generates the load. C=16 is QUALIFIED as of 2026-09-22: two independent 1800 s soaks on fresh fleets with different seeds, 7738 utterances and 56488 audio-seconds, zero established streams lost, zero stalls over 125948 published deltas, and every transcript byte-identical to the unloaded reference. It is a floor, not a ceiling: one stream costs 15.85 ms of compute per 320 ms of audio, so C=16 asks this fleet for about a quarter of itself. The knee above it is not yet measured -- the 2026-09-22 C=24 and C=32 rungs were invalid, having been run against a fleet that could only connect 24 streams.",
+    "status": "qualified",
     "objective": {
       "primary": "concurrent_realtime_streams",
       "secondary": "emission_lag_p95",
@@ -102,7 +102,7 @@
     "notes": "320 ms is not a taste: it is (lookahead + 1) x 80 ms, the cadence the model itself sets, so a stream whose emission lag exceeds it is falling behind the audio. ttfp_p95_ms is null because this repo cannot yet defend a number for it, NOT because TTFP does not matter. It has a load-independent floor of about 1545 ms on this build and corpus -- 1544 at C=8, 1545 at C=16, 1646 at C=32 -- plus a queueing term that appears only past the knee (1925 at C=40, 2827 at C=64). The earlier note here claimed the floor was leading silence; that holds for samples/en/fleurs_long.wav, which is silent until 23.2 s, and NOT for the three clips actually used, whose onsets are 0.02, 0.18 and 0.64 s. Roughly one second is unaccounted for. A TTFP gate needs that second explained and a corpus trimmed to speech onset, in that order."
   },
   "measured": {
-    "date": "2026-09-20",
+    "date": "2026-09-23",
     "measured_short_run_safe": {
       "concurrency": 32,
       "run_length_s": 90,
@@ -113,7 +113,82 @@
       "rejected": 0,
       "what_this_licenses": "Comparisons against other 90 s runs on this box. Nothing else. It is the point the ladder selected for qualification, not a supported capacity."
     },
-    "long_soak_qualified": null,
+    "long_soak_qualified": {
+      "date": "2026-09-23",
+      "commit": "504236d",
+      "configuration": "shipped-default",
+      "concurrency": 16,
+      "verdict": "QUALIFIED",
+      "runs": 2,
+      "soak_seconds_each": 1800.0,
+      "seeds": [
+        43,
+        44
+      ],
+      "bank": "b6898f8cc4efa84f / 27 clips",
+      "connection_ceiling": 24,
+      "peak_active_slots_per_worker": 6,
+      "utterances_total": 7738,
+      "audio_s_total": 56487.7,
+      "established_streams_lost": 0,
+      "admission_refusals_503": 0,
+      "emission_lag_p50_ms": 16.849273999469006,
+      "emission_lag_p95_ms": 65.94019100066362,
+      "emission_lag_p99_ms": 89.27150599993183,
+      "emission_lag_max_ms": 233.24946100001398,
+      "finalization_p95_ms": 99.35985799984337,
+      "finalization_p99_ms": 134.7053380000034,
+      "backlog_max_s": 0.18400000000000105,
+      "ttfp_p95_ms": 2430.272543999763,
+      "ttfp_from_onset_p95_ms": 1250.9525479999866,
+      "max_delta_gap_p95_ms": 1455.7586230002926,
+      "audio_s_per_wall_s": 15.6069928118264,
+      "published_deltas_total": 125948,
+      "stalls_over_1_chunk": 0,
+      "stalls_over_1s": 0,
+      "stalls_over_3s": 0,
+      "worst_delta_lag_ms": 233.24946100001398,
+      "fairness_worst_over_median": 1.2711433569801538,
+      "transcript_parity": "27 clip(s), every transcript identical across streams and to the unloaded reference",
+      "per_run": [
+        {
+          "tag": "soak1-C16",
+          "seed": 43,
+          "utterances": 3915,
+          "lost": 0,
+          "rejected": 0,
+          "emission_lag_p95_ms": 64.63709699983156,
+          "emission_lag_max_ms": 233.24946100001398,
+          "finalization_p95_ms": 99.35985799984337,
+          "backlog_max_s": 0.18400000000000105,
+          "stalls_over_1_chunk": 0,
+          "stalls_over_3s": 0,
+          "worst_window": "29 steady window(s), worst p95 71 ms in window 13 [780-840s] vs bound 320 ms; 2 ramp/drain window(s) excluded: [0, 30]",
+          "trend": "+1.9% last third vs first third, bound +50%",
+          "rss": "worst 1.007x over the run, bound 1.15x; pid 8814 826 -> 832 MiB (1.007x); pid 8815 811 -> 816 MiB (1.007x); pid 8816 810 -> 816 MiB (1.007x)",
+          "evidence": "20260922T163950Z/soak1-C16.json"
+        },
+        {
+          "tag": "soak2-C16",
+          "seed": 44,
+          "utterances": 3823,
+          "lost": 0,
+          "rejected": 0,
+          "emission_lag_p95_ms": 65.94019100066362,
+          "emission_lag_max_ms": 217.5687069993728,
+          "finalization_p95_ms": 98.22353799972916,
+          "backlog_max_s": 0.18400000000000016,
+          "stalls_over_1_chunk": 0,
+          "stalls_over_3s": 0,
+          "worst_window": "29 steady window(s), worst p95 71 ms in window 13 [780-840s] vs bound 320 ms; 2 ramp/drain window(s) excluded: [0, 30]",
+          "trend": "-0.6% last third vs first third, bound +50%",
+          "rss": "worst 1.009x over the run, bound 1.15x; pid 18499 830 -> 838 MiB (1.009x); pid 18500 812 -> 819 MiB (1.009x); pid 18501 813 -> 820 MiB (1.008x)",
+          "evidence": "20260922T163950Z/soak2-C16.json"
+        }
+      ],
+      "evidence_dir": "20260922T163950Z",
+      "what_this_licenses": "A promise of this concurrency on this box shape, this model, this quant and this topology, for streams of this corpus's shape. It licenses nothing about a machine of a different size: the per-stream cost is a function of how many cores walk the weights."
+    },
     "knee_concurrency": 36,
     "overload_concurrency": 48,
     "throughput_ceiling_audio_s_per_wall_s": 40,
@@ -338,32 +413,7 @@
       "b_ms_per_stream_at_c24": 10.13,
       "note": "Fitted from mynah_asr_step_b_wall_ms_sum / mynah_asr_step_b_count on the 1x24 topology, i.e. the step AS THE SCHEDULER CALLS IT. The bench in isolation says b = 4.58. These constants have NOT been refitted for 3x8 and must not be applied to it: b is a function of how many cores walk the weights, and 8 threads per worker is a different function from 24."
     },
-    "soak": {
-      "date": "2026-09-20",
-      "commit": "d0c36f4",
-      "concurrency": 32,
-      "duration_s": 600,
-      "utterances": "2362/2362 ok",
-      "lost": 0,
-      "rejected": 0,
-      "audio_s_per_wall_s": 30.71,
-      "emission_lag_p95_ms": 229,
-      "finalization_p95_ms": 390,
-      "backlog_max_s": 0.444,
-      "ttfp_p95_ms": 1657,
-      "drift_pct": 10,
-      "trend_pct": 7,
-      "model_execution": 0.965,
-      "runnable_idle": 0.015,
-      "mean_batch": 2.25,
-      "ready_to_model_start_ms": [
-        37,
-        104,
-        147
-      ],
-      "harness_verdict": "MARGINAL",
-      "why_not_qualifying": "Every serving gate passes and no stream was lost in ten minutes. It does not qualify for two reasons. Transcripts were not checked -- 0 utterances scored against a reference, because no manifest exists in this repo and make fetch-stress-bank has never been run -- and the profile's own condition is zero losses AND transcripts checked. And TTFP p95 is 1657 ms against a 1160 ms limit; that is load-independent (1544 ms at C=8) so it is not a capacity signal, but the explanation this file used to give for it -- leading silence -- is wrong for this corpus, whose clips start speaking at 0.02, 0.18 and 0.64 s. About a second of pipeline latency is unexplained. The limit is not being moved."
-    },
+    "soak": null,
     "solo_group_ab": {
       "date": "2026-09-20",
       "on": {
@@ -392,7 +442,35 @@
       },
       "note": "The third OFF rung is the pre-F15 stall, not a property of the arm. It landing in the CONTROL arm is what rules the change out as its cause -- a ladder run just before this A/B had shown the failure twice with the change ON, which on its own would have been read as a regression."
     },
-    "ladder_note": "finalize_share is null on nine rungs ON PURPOSE. The campaign harness printed that column against a denominator about 3x too small, and the raw per-worker dumps that would correct it were overwritten by a later run on every rung but C = 32/36/40. A wrong number removed beats a wrong number kept; see docs/serving-findings.md F21. Every other column recomputes from the raw dumps to within 0.003."
+    "ladder_note": "finalize_share is null on nine rungs ON PURPOSE. The campaign harness printed that column against a denominator about 3x too small, and the raw per-worker dumps that would correct it were overwritten by a later run on every rung but C = 32/36/40. A wrong number removed beats a wrong number kept; see docs/serving-findings.md F21. Every other column recomputes from the raw dumps to within 0.003.",
+    "history": [
+      {
+        "date": "2026-09-20",
+        "commit": "d0c36f4",
+        "concurrency": 32,
+        "duration_s": 600,
+        "utterances": "2362/2362 ok",
+        "lost": 0,
+        "rejected": 0,
+        "audio_s_per_wall_s": 30.71,
+        "emission_lag_p95_ms": 229,
+        "finalization_p95_ms": 390,
+        "backlog_max_s": 0.444,
+        "ttfp_p95_ms": 1657,
+        "drift_pct": 10,
+        "trend_pct": 7,
+        "model_execution": 0.965,
+        "runnable_idle": 0.015,
+        "mean_batch": 2.25,
+        "ready_to_model_start_ms": [
+          37,
+          104,
+          147
+        ],
+        "harness_verdict": "MARGINAL",
+        "why_not_promoted": "Every serving gate passes and no stream was lost in ten minutes. It does not qualify for two reasons. Transcripts were not checked -- 0 utterances scored against a reference, because no manifest exists in this repo and make fetch-stress-bank has never been run -- and the profile's own condition is zero losses AND transcripts checked. And TTFP p95 is 1657 ms against a 1160 ms limit; that is load-independent (1544 ms at C=8) so it is not a capacity signal, but the explanation this file used to give for it -- leading silence -- is wrong for this corpus, whose clips start speaking at 0.02, 0.18 and 0.64 s. About a second of pipeline latency is unexplained. The limit is not being moved."
+      }
+    ]
   },
   "provenance": {
     "measured_on": "gabrielemastrapasqua@c4a-highcpu-32, Linux 7.0.0-1011-gcp, loadavg < 0.5 at start, one fresh server per rung",

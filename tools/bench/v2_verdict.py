@@ -64,7 +64,20 @@ def g(d, *path, default=None):
     return d if d is not None else default
 
 
-def slot_ceiling(dumps, run_manifest, streams):
+def banner_connections(log_path):
+    """W x http threads, read from the fleet's own start-up banners."""
+    if not os.path.exists(log_path):
+        return None
+    n, per = 0, None
+    for line in open(log_path, errors="replace"):
+        m = re.search(r"\((\d+) http threads, (\d+) stream slots", line)
+        if m:
+            n += 1
+            per = int(m.group(1))
+    return n * per if n and per else None
+
+
+def slot_ceiling(dumps, run_manifest, streams, banner_ceiling=None, have_log=True):
     """Was this run able to CONNECT the concurrency it claims to measure?
 
     A WebSocket stream holds one HTTP thread for its whole life, so W x
@@ -74,14 +87,21 @@ def slot_ceiling(dumps, run_manifest, streams):
     throughput, and read as noise. A run that could not connect its own
     concurrency does not measure the machine, so it is INVALID rather than
     merely worse."""
-    lim = (run_manifest or {}).get("connection_ceiling")
+    # The worker's own banner is the authority and it is present in every run,
+    # including ones taken before the manifest carried this field -- where the
+    # check would otherwise have been silently skipped.
+    lim = banner_ceiling if banner_ceiling else (run_manifest or {}).get("connection_ceiling")
     peak = None
     for seqs in dumps.values():
         for rec in seqs.values():
             if rec.get("active") is not None:
                 peak = rec["active"] if peak is None else max(peak, rec["active"])
     if lim is None:
-        return None, peak
+        if not have_log:
+            return None, peak       # bound 8 already reports the missing evidence
+        return ("the fleet's connection ceiling is unknown: neither the worker banners "
+                "nor the manifest state it, so whether this run could connect its own "
+                "concurrency was never checked"), peak
     if streams is not None and streams > lim:
         return (f"concurrency C={streams} is above this fleet's connection ceiling of "
                 f"{lim}: the surplus streams waited for an HTTP thread and the rung "
@@ -280,11 +300,14 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None):
     row(11, "worker RSS growth", rss_state, rss_msg)
     row(12, "worker deaths", dead_state, dead_msg)
 
-    invalid, peak_slots = slot_ceiling(dumps, run_manifest, man.get("concurrency"))
+    invalid, peak_slots = slot_ceiling(dumps, run_manifest, man.get("concurrency"),
+                                       banner_connections(dump_path),
+                                       os.path.exists(dump_path))
     failed = [r for r in rows if r["state"] == BAD]
     missing = [r for r in rows if r["state"] == NOEV]
     return {
         "invalid": invalid, "peak_active_slots": peak_slots,
+        "connection_ceiling": banner_connections(dump_path),
         "file": os.path.basename(path),
         # These are stream_load's OWN manifest field names. An earlier draft read
         # "streams" and "duration", which exist nowhere: both came back None and
@@ -378,7 +401,9 @@ def main():
         for r in v["rows"]:
             print(f"  {r['bound']:2d}  {r['name']:26s} {r['state']:11s} {r['detail']}")
         if v.get("peak_active_slots") is not None:
-            print(f"      peak active slots on one worker: {v['peak_active_slots']}")
+            print(f"      peak active slots on one worker: {v['peak_active_slots']}"
+                  + (f", fleet connection ceiling {v['connection_ceiling']}"
+                     if v.get("connection_ceiling") else ""))
         st = v.get("stalls")
         if st:
             cols = "   ".join(f">{t:.0f}ms: {n}" for t, n in st["rows"])

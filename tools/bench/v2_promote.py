@@ -57,6 +57,8 @@ def collect(run):
         st = v.get("stalls") or {}
         out.append({
             "tag": tag, "verdict": v["verdict"], "rows": v["rows"],
+            "connection_ceiling": v.get("connection_ceiling"),
+            "peak_active_slots": v.get("peak_active_slots"),
             "concurrency": v["streams"], "soak_seconds": v["duration_s"],
             "seed": v.get("seed"), "bank": v.get("bank_sha256"),
             "utterances": s["counts"]["ok"],
@@ -137,6 +139,10 @@ def operating_point(soaks, commit, run):
         "soak_seconds_each": soaks[0]["soak_seconds"],
         "seeds": [s["seed"] for s in soaks],
         "bank": soaks[0]["bank"],
+        # Named because a run that cannot connect its own concurrency measures the
+        # ceiling and not the machine, with no error and no 503 to show for it.
+        "connection_ceiling": soaks[0]["connection_ceiling"],
+        "peak_active_slots_per_worker": worst("peak_active_slots"),
         "utterances_total": sum(s["utterances"] for s in soaks),
         "audio_s_total": round(sum(s["audio_s"] for s in soaks), 1),
         "established_streams_lost": worst("lost"),
