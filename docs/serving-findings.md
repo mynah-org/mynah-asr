@@ -1585,3 +1585,118 @@ different owners:
 
 **The serving path owns a tenth of a millisecond of the first word at every
 concurrency measured.** Further optimisation of the output path cannot pay.
+
+---
+
+## F31 — Topology, not core count, sets this fleet's capacity
+
+**STATUS: discovery. Certifies nothing.** 180 s per rung, fresh fleet each, no
+reference pass. A screen may disqualify a rung; it never promotes one.
+
+**Provenance.** GCP c4a-highcpu-32, Neoverse-V2, aarch64, `blas=own`,
+`simd=neon+dotprod+i8mm`, `kernel.int8_rows -> neon-smmla`, 0 UNKNOWN dispatch
+rows. Commits `601c074`..`a969877`. Model `nemotron-3.5-asr-streaming-0.6b`,
+int8, preset `[56, 3]`. Corpus `samples/stress-en`, 498 clips sampled
+class-balanced from 1316 (seed 42), 3.2 s to 42.4 s, bank `04a7753aa1e80f9a`.
+Load generator pinned to 2 cpus and PACED at every rung reported here.
+Evidence under `.work/evidence/serving-v2/`.
+
+### The generator never needed eight cores
+
+Server frozen at 3x8 on cpus 0-23 in all three arms; the cpus the generator gave
+up were left EMPTY, so nothing could be attributed to two simultaneous changes.
+
+| generator cpus | cores it used | worst send lateness | offered audio/wall | server lag p95 |
+|---|---|---|---|---|
+| 8 | 0.10 | 1.9 ms | 26.90 | 88 ms |
+| 4 | 0.09 | 0.5 ms | 26.76 | 85 ms |
+| **2** | **0.09** | 1.1 ms | 26.87 | 88 ms |
+
+Offered load within 0.5 %, zero errors, transcript parity intact, and the
+8-core arm had the WORST lateness of the three. Six cores recovered.
+
+### The curves
+
+3x8 on 24 cpus, and 6x5 on 30:
+
+| C | 3x8 audio/wall | 3x8 duty | 3x8 lag p95 | 6x5 audio/wall | 6x5 duty | 6x5 lag p95 |
+|---|---|---|---|---|---|---|
+| 56 | 45.69 | 0.915 | 131 | — | — | — |
+| 64 | 53.61 | 0.979 | 207 | 54.44 | 0.702 | 80 |
+| 72 | 55.01 | 0.930 | **546** | — | — | — |
+| 80 | 56.86 | 0.996 | **2064** | 64.26 | 0.859 | 108 |
+| 88 | — | — | — | 72.07 | 0.921 | 133 |
+| 96 | — | — | — | 78.65 | 0.973 | 182 |
+| 104 | — | — | — | 82.51 | 0.991 | **305** |
+| 112 | — | — | — | 87.65 | 0.996 | **556** |
+| 120 | — | — | — | 90.07 | 0.996 | **1328** |
+
+3x8: last clean rung **56**, marginal **64** (backlog 0.644 against a 0.640
+bound), first clearly bad **72**.
+6x5: last clean rung **96**, first bad **104**.
+
+### Topology at the transition and one rung below it
+
+Compared at C=64 and C=56, same corpus, build, generator isolation and duration,
+topology the only difference:
+
+| topology | cpus | C=56 duty / lag p95 / backlog | C=64 duty / lag p95 / backlog | C=64 verdict |
+|---|---|---|---|---|
+| 3x8 | 24 | 0.901 / 124 / 0.384 | 0.975 / 190 / 0.704 | fails backlog |
+| 3x10 | 30 | 0.870 / 115 / 0.424 | 0.958 / 183 / 0.684 | fails backlog |
+| 2x15 | 30 | 0.993 / 424 / 0.724 | 0.996 / 2007 / 3.684 | fails everything |
+| 5x6 | 30 | 0.677 / 78 / 0.184 | 0.761 / 87 / 0.284 | clean |
+| **6x5** | **30** | — | **0.702 / 80 / 0.264** | **clean** |
+
+### What is established
+
+**FACT.** 3x10 does not raise throughput over 3x8 at either measured point:
+45.69 against 45.72 audio/wall at C=56, 53.72 against 53.70 at C=64.
+
+**FACT.** 2x15 degrades severely -- lag p95 2007 ms at C=64 where 3x8 reads 190.
+
+**FACT.** Narrow-and-many raises both latency headroom and the observed
+throughput ceiling. 3x8 flattens at 55-57 audio/wall; 6x5 reaches 90.07 at
+C=120 and still cleared every bound at C=96.
+
+**FACT.** Under overload this fleet loses nothing and says the same thing. Zero
+established streams lost at every rung of every topology, up to C=120 with lag
+at 1.3 s and backlog at 2.2 s, and transcript parity PASSED at every rung: the
+same clip played by different streams produced the same text, identical to the
+unloaded reference. It degrades by getting slow.
+
+**OBSERVATION.** 6x5 beat 5x6 at every point tried (C=64 duty 0.702 against
+0.761; C=80 0.859 against 0.917) and moved the knee: 5x6 failed four bounds at
+C=96, 6x5 cleared it.
+
+**OBSERVATION.** Measured cpu-seconds per worker say the fleet uses about 23
+of its 30 cpus at C=88-96, and FEWER as it is overloaded -- 23.5 at C=96, 22.9
+at 104, 21.5 at 112, 20.8 at 120.
+
+**HYPOTHESIS.** More, narrower workers suit this workload and this machine.
+
+**NOT ESTABLISHED.** Why ~7 core-equivalents go unused at saturation, and why
+that number falls under overload. Parallel efficiency inside the step,
+synchronisation, memory bandwidth, GEMM shape and serial sections are all
+candidates and none is measured. Also NOT established: any general threshold on
+threads per worker. These data show 15 is bad and 10 buys nothing over 8. They
+do not locate a limit near 12, which an older note asserted from another series.
+
+### Two readings of my own that the curves falsified
+
+A mean batch derived as `audio_s / steps / chunk_period` agreed with a live
+`/v1/health` at C=16 -- 0.974 against `ready_mean` 1.031 -- and then printed
+0.98 at every rung from C=32 to C=80 while throughput moved 2.1x. `steps` counts
+per SLOT, so the quantity is the chunk period by construction. Removed; the real
+figures come from `/v1/health`, which `stop_fleet` now captures.
+
+"The throughput ceiling is set by total compute, not topology", taken from 3x8
+and 6x5 both reading ~54 audio/wall at C=64. The full curves show 3x8 flattens
+near 56 and 6x5 reaches 90.
+
+And `workers x model_duty x threads` -- 23.4 for 3x8, 22.8 for 6x5 -- was quoted
+as if it measured cpu work. `model_duty` is the scheduler thread's own fraction
+of wall and says nothing about the pool's occupancy during it. Measured
+cpu-seconds later put 6x5 at 23.1 cores where that arithmetic said 27.6.
+
+**Every one of the three came from comparing at a single point.**
