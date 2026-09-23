@@ -889,7 +889,7 @@ direct integration."*
 
 ## FACT — they independently made our central architectural call
 
-`src/asr/encoder/fastconformer.h:114-121`, verbatim:
+their `fastconformer.h` lines 114-121, verbatim:
 
 > *"Follows NeMo's per-layer cur/next cache convention … **except we cache
 > projected K/V rather than the pre-projection layer input.**"*
@@ -904,7 +904,7 @@ them from `mudler/parakeet.cpp`, which caches the pre-projection input.
 
 **The one cheap idea, and it is genuinely cheap.** They advance a `ring_head_`
 modulo `cache_left_ctx` and read the arena at that offset
-(`cache_aware_encoder.cpp:487-491`). We do a `memmove` instead — verified in
+(their `cache_aware_encoder.cpp:487-491`). We do a `memmove` instead — verified in
 `src/encoder.c`, `update_kv_cache()`: once the cache saturates, every chunk
 memmoves `from_old` rows per layer, for K and for V.
 
@@ -931,7 +931,7 @@ construction — same values, different addresses.
 frontend, encoder, **predictor**, **joint**, fused TDT, VAD and PnC, with a
 work-conserving scheduler and an **ingress cohort coordinator** that releases a
 batch as soon as the declared wave has arrived instead of paying a timer
-(`batching.h:141-210`). We stack only the encoder.
+(their `batching.h:141-210`). We stack only the encoder.
 
 **OBSERVATION, against our own measurement.** `server/prefork.h` already records
 cross-worker batching as built, measured and REJECTED: requests that could batch
@@ -946,14 +946,14 @@ cohort target — not wholesale cross-worker batching.
 
 No thread pool of their own (`ggml_backend_set_n_threads` only); **one
 `std::mutex` serializing every ggml graph**, which their own doc states
-(`runtime.h:196-198`, `asr-batching.md:131-134`); HTTP worker pool default **4**;
+(their `runtime.h:196-198` and `asr-batching.md:131-134`); HTTP worker pool default **4**;
 **no admission control** beyond `throw std::runtime_error("state arena is full")`;
 **zero hand-written CPU SIMD** — 19 of 21 ggml patches are CUDA, one Metal, and
 their AVX2-host issue #23 is an open **SIGILL** on the published v0.1.0 tarball,
 which is exactly the failure our `src/dispatch.h` guard converts into exit 78.
 
 **And the gates differ in kind, not degree.** Their batching parity is a
-tolerance — `edit_limit = max(2, 5% of tokens)` (`test_transducer_offline.cpp:175-177`)
+tolerance — `edit_limit = max(2, 5% of tokens)` (their `test_transducer_offline.cpp:175-177`)
 — and their own fast GEMM header says *"results are not bit-identical to mmq"*.
 Ours is identity: `==`/memcmp on every chunk of every stream plus the final K/V
 and conv caches. They have a Python-oracle parity suite **only for the
