@@ -121,6 +121,24 @@ def refuse(soaks):
     return bad
 
 
+def topology_of(run):
+    """The configuration these soaks actually ran, from the run's own manifest.
+
+    A profile describes ONE configuration. An operating point that does not name
+    its own topology lets a qualified C be read against whatever the profile's
+    server block happens to say, which after a topology change is a different
+    machine wearing the same number."""
+    p = os.path.join(run, "manifest.json")
+    if not os.path.exists(p):
+        return None
+    m = json.load(open(p))
+    return {k: m.get(k) for k in
+            ("workers", "threads_per_worker", "http_threads_per_worker", "cap",
+             "connection_ceiling", "server_cpus", "gen_cpus", "quant", "lookahead",
+             "binary_sha256", "corpus", "corpus_sample", "corpus_seed",
+             "min_peak_dbfs", "reference_concurrency")}
+
+
 def operating_point(soaks, commit, run):
     """The block a profile carries, with the WORST of the runs in every column.
 
@@ -139,6 +157,7 @@ def operating_point(soaks, commit, run):
         "soak_seconds_each": soaks[0]["soak_seconds"],
         "seeds": [s["seed"] for s in soaks],
         "bank": soaks[0]["bank"],
+        "topology": topology_of(run),
         # Named because a run that cannot connect its own concurrency measures the
         # ceiling and not the machine, with no error and no 503 to show for it.
         "connection_ceiling": soaks[0]["connection_ceiling"],
@@ -230,7 +249,39 @@ def main():
         prev.setdefault("why_not_promoted", prev.pop("why_not_qualifying", None))
         hist.append(prev)
         d["measured"]["soak"] = None
+    # A previously QUALIFIED point is evidence, not scratch space. Overwriting it
+    # would erase the record that C=16 on 3x8 was proved, which is exactly what
+    # measured.history exists to keep.
+    old_q = d["measured"].get("long_soak_qualified")
+    if old_q:
+        old_q = dict(old_q)
+        old_q.setdefault("superseded_by",
+                         f"C={op['concurrency']} on "
+                         f"{(op.get('topology') or {}).get('workers')}x"
+                         f"{(op.get('topology') or {}).get('threads_per_worker')} "
+                         f"({op['date']})")
+        hist.append(old_q)
     d["measured"]["long_soak_qualified"] = op
+    # The profile describes ONE configuration: the qualified one.
+    topo = op.get("topology") or {}
+    srv = d.setdefault("server", {})
+    for key, val in (("prefork_workers", topo.get("workers")),
+                     ("threads_per_worker", topo.get("threads_per_worker")),
+                     ("cap", topo.get("cap")),
+                     ("quant", topo.get("quant")),
+                     ("lookahead", topo.get("lookahead")),
+                     ("server_cpus", topo.get("server_cpus")),
+                     ("reserved_cpus", topo.get("gen_cpus"))):
+        if val is not None:
+            srv[key] = val
+    if topo.get("http_threads_per_worker") and topo.get("workers"):
+        srv["http_threads"] = topo["http_threads_per_worker"] * topo["workers"]
+        srv["http_threads_per_worker"] = topo["http_threads_per_worker"]
+    # dispatch_required.threads.pool is the per-worker pool width and the
+    # preflight refuses on a mismatch, so a topology change has to move it or
+    # every future check fails against the profile it just qualified.
+    if topo.get("threads_per_worker") and "threads.pool" in (d.get("dispatch_required") or {}):
+        d["dispatch_required"]["threads.pool"] = topo["threads_per_worker"]
     d["measured"]["date"] = op["date"]
     d["profile"]["status"] = "qualified"
     json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)

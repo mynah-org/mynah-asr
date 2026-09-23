@@ -171,7 +171,11 @@ def main(dirs):
               "and duty belong to the number it held, not to C.")
     # The reading the table exists to make, stated rather than left to the eye.
     have = [r for r in rows if r["audio_per_wall"] and r["model_duty"]]
-    if len(have) >= 2:
+    # Only when the rows span more than one concurrency. Two soaks at the same C
+    # are a repeat, and comparing one with the other printed "neither throughput
+    # nor duty moved: the bottleneck is upstream of the step" about a pair of
+    # runs that agreed to 1%, which is what a repeat is supposed to do.
+    if len(have) >= 2 and len({r["C"] for r in have}) >= 2:
         lo, hi = have[0], have[-1]
         dw = hi["audio_per_wall"] / lo["audio_per_wall"]
         dd = hi["model_duty"] / lo["model_duty"] if lo["model_duty"] else None

@@ -152,4 +152,45 @@ assert len(h) == 1 and h[0]["concurrency"] == 32, h
 assert "transcripts were never checked" in h[0]["why_not_promoted"], h[0]
 PY
 
+# Promoting a NEW point must not erase the one already proved. C=16 on 3x8 was
+# qualified before C=80 on 6x5 existed, and measured.history is where that
+# record lives -- overwriting it would delete evidence, which is the one thing
+# this tool must never do.
+mkprofile
+python3 - "$TMP/perf/testbox.json" <<'PY2'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+# A DIFFERENT concurrency from the fixture's soaks, so "the new point replaced
+# the old" cannot pass by the two coinciding.
+d["measured"]["long_soak_qualified"] = {"concurrency": 99, "runs": 2,
+                                        "verdict": "QUALIFIED", "date": "2026-09-22"}
+d["dispatch_required"] = {"threads.pool": 8}
+d["server"] = {"prefork_workers": 3, "threads_per_worker": 8}
+json.dump(d, open(p, "w"), indent=1)
+PY2
+mkrun supersede "pass"
+python3 -c "
+import json,sys
+p=sys.argv[1]+'/manifest.json'
+json.dump({'commit':'abc1234','workers':6,'threads_per_worker':5,'cap':96,
+           'http_threads_per_worker':32,'connection_ceiling':192,
+           'server_cpus':'0-29','gen_cpus':'30-31','quant':'int8','lookahead':3},
+          open(p,'w'))" "$TMP/supersede"
+run supersede --apply > /dev/null 2>&1
+python3 - "$TMP/perf/testbox.json" <<'PY3' && ok "a new qualified point pushes the old one into history and moves the configuration with it"     || bad "promoting a new point erased the previous qualified record or left a stale topology"
+import json, sys
+d = json.load(open(sys.argv[1]))
+m = d["measured"]
+assert m["long_soak_qualified"]["concurrency"] == 16, m["long_soak_qualified"]["concurrency"]
+old = [h for h in m["history"] if h.get("concurrency") == 99 and h.get("verdict") == "QUALIFIED"]
+assert old, "the previously qualified point is not in history"
+assert "superseded_by" in old[0], old[0]
+# and the profile now describes what was qualified, not what it used to be
+assert d["server"]["prefork_workers"] == 6, d["server"]
+assert d["server"]["threads_per_worker"] == 5, d["server"]
+assert d["server"]["http_threads"] == 192, d["server"]
+assert d["dispatch_required"]["threads.pool"] == 5, d["dispatch_required"]
+PY3
+
 if [ "$fails" = 0 ]; then echo "test_v2_promote: OK"; else echo "test_v2_promote: $fails FAILED"; exit 1; fi

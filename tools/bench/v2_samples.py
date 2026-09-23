@@ -235,6 +235,15 @@ gates were computed from.
 
 The complete per-utterance record stays in the run's own soak*.json beside this
 folder; this is the readable slice, not a replacement for it.
+
+wer_vs_human and cer_vs_human are empty on utterances the run excluded from its
+warm-up: those are played but not scored, which is what excluding them means.
+Their serving fields -- timings, partials, and the comparison against the
+unloaded transcript -- are all present.
+
+serving_regression is the question the SERVER is judged on: did the loaded
+transcript differ from this clip's own unloaded one. wer_vs_human and
+cer_vs_human describe the CHECKPOINT and no amount of serving work changes them.
 """)
     print(f"{len(rows)} row(s) ({len(anomalies)} notable -- a selection, not a verdict), "
           f"{copied} wav copied -> {out}")
