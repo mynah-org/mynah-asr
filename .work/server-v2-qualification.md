@@ -280,3 +280,137 @@ promotion from artefacts and refuses without them, and hand-writing the block it
 would have written is exactly what that tool exists to prevent. The measurement
 passed; the archive is what is missing, and it is one command once the box
 returns.
+
+---
+
+# DISCOVERY — 2026-09-23, what this Axion actually carries
+
+Cheap runs: 180 s per rung, fresh fleet each, no reference pass. Discovery finds
+the knee; it certifies nothing. Corpus `samples/stress-en`, 498 clips sampled
+class-balanced from 1316 (seed 42), 3.2 s to 42.4 s. Generator on cpus 30-31.
+
+## G1 — the load generator needed two cores, not eight
+
+Server frozen at 3x8 on 0-23 in all three arms, the cpus the generator gave up
+left EMPTY, so nothing could be attributed to two changes at once.
+
+| generator cpus | cores it used | worst send lateness | utterances | offered audio/wall | server lag p95 |
+|---|---|---|---|---|---|
+| 24-31 (8) | 0.10 | 1.9 ms | 702 | 26.90 | 88 ms |
+| 24-27 (4) | 0.09 | 0.5 ms | 699 | 26.76 | 85 ms |
+| **24-25 (2)** | **0.09** | 1.1 ms | 701 | 26.87 | 88 ms |
+
+Offered load within 0.5 %, PACED everywhere, zero errors, transcript parity
+intact, and the 8-core arm had the WORST lateness of the three. That is noise,
+not signal. Six cores recovered; they stayed unused until a topology experiment
+said what they were worth.
+
+## G3 — the frozen 3x8 baseline, C = 32..80
+
+| C | audio/wall | model duty | runnable idle | no work | lag p95 | lag p99 | backlog | final p95 | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 32 | 26.85 | 0.560 | 0.133 | 0.306 | 59 | 105 | 0.184 | 127 | GOOD |
+| 40 | 33.70 | 0.693 | 0.096 | 0.211 | 78 | 128 | 0.284 | 161 | GOOD |
+| 48 | 41.01 | 0.819 | 0.058 | 0.124 | 106 | 165 | 0.284 | 228 | GOOD |
+| **56** | 45.69 | 0.915 | 0.033 | 0.052 | 131 | 194 | 0.444 | 258 | **GOOD, last clean** |
+| 64 | 53.61 | 0.979 | 0.007 | 0.013 | 207 | 303 | **0.644** | 427 | marginal: backlog over by 4 ms |
+| 72 | 55.01 | 0.930 | 0.020 | 0.050 | **546** | 813 | 0.804 | **1068** | BAD |
+| 80 | 56.86 | 0.996 | 0.001 | 0.003 | 2064 | 2454 | 3.964 | 3066 | overloaded |
+
+**Two questions this closed.**
+
+The machine was never idle for a bad reason. Model duty runs 0.560 at C=32 to
+0.979 at C=64: the 26 % `htop` showed at C=16 was a low rung, not a stalled
+fleet. And `runnable_idle`, which was 0.219 at C=16 and looked like a scheduler
+parking on work it could do, collapses to **0.007** at C=64. It was slack. The
+hypothesis is withdrawn, by measurement rather than by argument.
+
+**Zero established streams lost at every rung including C=80**, and transcript
+parity PASSED at every rung including C=80: 498 clips, identical across streams
+and identical to the unloaded reference, while lag sat at two seconds and
+backlog at four. Under overload this fleet gets slow. It does not change what it
+says, and it does not drop work it accepted.
+
+## G4/G4b — topology, compared AT the transition and one rung below
+
+Same corpus, same build, same generator isolation, 180 s, fresh fleet, topology
+the only difference.
+
+| topology | cpus | C=56 duty / lag p95 / backlog | C=64 duty / lag p95 / backlog | C=64 verdict |
+|---|---|---|---|---|
+| 3x8 | 24 | 0.901 / 124 / 0.384 | 0.975 / 190 / 0.704 | NOT QUALIFIED (backlog) |
+| 3x10 | 30 | 0.870 / 115 / 0.424 | 0.958 / 183 / 0.684 | NOT QUALIFIED (backlog) |
+| 2x15 | 30 | 0.993 / 424 / 0.724 | 0.996 / 2007 / 3.684 | NOT QUALIFIED (everything) |
+| **5x6** | **30** | **0.677 / 78 / 0.184** | **0.761 / 87 / 0.284** | **QUALIFIED** |
+
+## G5 — where 5x6 actually breaks
+
+| C | audio/wall | duty | lag p95 | lag p99 | lag max | backlog | final p95 | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 56 | 45.79 | 0.677 | 78 | 128 | 229 | 0.184 | 152 | GOOD |
+| 64 | 54.43 | 0.761 | 87 | 135 | 346 | 0.284 | 184 | GOOD |
+| 72 | 59.48 | 0.852 | 114 | 166 | 517 | 0.504 | 239 | GOOD |
+| 80 | 64.05 | 0.917 | 126 | 186 | 443 | 0.384 | 258 | GOOD |
+| 88 | 71.63 | 0.967 | 174 | 249 | 559 | 0.484 | 345 | GOOD, at the knee |
+| 96 | 77.36 | 0.993 | **337** | 475 | 1101 | **0.664** | **689** | BAD |
+
+C=96 fails four bounds together -- emission lag, finalization, backlog and
+per-window drift -- rather than one threshold by a margin. That is a capacity
+limit, not a noisy gate.
+
+---
+
+## What is established, and what is not
+
+**FACT.** 3x10 does not raise throughput over 3x8 at either measured point:
+45.69 against 45.72 audio/wall at C=56, 53.72 against 53.70 at C=64. Two
+independent points, same corpus and build.
+
+**FACT.** 2x15 degrades severely: lag p95 2007 ms and finalization 2992 ms at
+C=64, where 3x8 reads 190 and 377.
+
+**FACT.** 5x6 raises latency headroom AND the observed throughput ceiling. The
+3x8 curve flattens at 55-57 audio/wall; 5x6 reaches 71.63 at C=88 and 77.36 at
+C=96. About +36 % of observed ceiling for +25 % of cores.
+
+**OBSERVATION.** 6x5 is better than 5x6 at both points tried so far: duty 0.702
+against 0.761 at C=64, and 0.859 against 0.917 with lag p95 108 against 126 at
+C=80. Consistent, and much smaller than the 3x8 -> 5x6 step.
+
+**HYPOTHESIS.** More, narrower workers suit this workload and this machine
+better than fewer wide ones.
+
+**NOT ESTABLISHED.** The microarchitectural mechanism. And specifically NOT a
+threshold: these data show 15 threads per worker is bad and 10 buys nothing over
+8. They do not locate a general limit near 12, which an older note asserted from
+a different series and which nothing here reproduces.
+
+**RETRACTED.** Two readings of my own, both from comparing at a single point.
+First, a mean batch derived as `audio_s / steps / chunk_period`, which agreed
+with a live `/v1/health` at C=16 and then printed 0.98 at every rung from C=32
+to C=80 -- `steps` counts per slot, so the quantity is the chunk period by
+construction. Second, "the throughput ceiling is set by total compute, not by
+topology", taken from 3x8 and 5x6 both reading ~54 audio/wall at C=64; the full
+curves show 5x6's ceiling is about 36 % higher.
+
+**A SANITY CHECK, NOT A MEASUREMENT.** `workers x model_duty x threads` reads
+23.4 for 3x8 and 22.8 for 5x6 at C=64. `model_duty` is the scheduler thread's
+fraction of wall in model execution and says nothing about how busy the pool was
+during it. The procsample now records cumulative cpu-seconds per worker so the
+qualification can measure cores used instead of inferring them.
+
+## Choosing the point to qualify
+
+Three numbers, kept apart on purpose:
+
+* `first_failed_concurrency` -- where bounds break. **96** for 5x6.
+* `short_run_last_good_concurrency` -- the highest 180 s rung that cleared every
+  bound. **88** for 5x6, at 0.967 model duty.
+* `qualified_safe_concurrency` -- what survives two independent 1800 s soaks.
+  Not yet measured, and it will not be 88: a point that passes at 96.7 % duty
+  has no room for a bad day, and this profile is meant to be boring.
+
+The candidates are C=72 (duty 0.852) and C=80 (duty 0.917). C=80's short-run
+tails are in places BETTER than C=72's -- backlog 0.384 against 0.504 -- which
+over 180 s is variance rather than structure, and is exactly what a 1800 s soak
+is for.
