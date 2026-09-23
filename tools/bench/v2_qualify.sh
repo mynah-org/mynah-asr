@@ -306,6 +306,15 @@ REFJSON="$RUN/reference.json"
 if [ -n "$REF_IN" ]; then
     [ -f "$REF_IN" ] || die "--reference-file $REF_IN does not exist"
     cp "$REF_IN" "$REFJSON" || die "could not copy $REF_IN"
+    # The TTFP baseline travels with the text reference or the paired gate has
+    # nothing to pair against, and would quietly not be applied at all.
+    REF_TTFP_IN=$(echo "$REF_IN" | sed 's/\.json$/-ttfp.json/')
+    if [ -f "$REF_TTFP_IN" ]; then
+        cp "$REF_TTFP_IN" "$RUN/reference-ttfp.json"
+        say "reference: TTFP baseline carried ($(python3 -c "import json;print(len(json.load(open('$RUN/reference-ttfp.json'))))") clips)"
+    else
+        say "WARNING no TTFP baseline beside $REF_IN: the paired TTFP gate cannot be applied"
+    fi
     # A reused reference that does not cover this corpus does not fail: the
     # clips it is missing are simply never compared. So coverage is checked
     # here too, not only where the reference is generated.
@@ -349,7 +358,22 @@ empty = [c for c, t in ref.items() if not t.strip()]
 if empty:
     sys.exit(f"{len(empty)} clip(s) transcribed to nothing unloaded: {empty[:3]}")
 json.dump(ref, open(out, "w"), indent=1, ensure_ascii=False)
-print(f"reference: {len(ref)} clips, all non-empty")
+
+# The unloaded TTFP of each clip, kept so a loaded run can be compared with it
+# PAIRED. Subtracting two p95s conflates the corpus with the fleet: a clip that
+# leads with 700 ms of silence carries those 700 ms loaded and unloaded alike,
+# and in a paired difference it vanishes. Raw open->first-partial stays reported
+# because it is what a listener waits, but it cannot be the server's gate.
+base = {}
+for u in d["utterances"]:
+    if u.get("error") or u.get("rejected") or u.get("ttfp_ms") is None:
+        continue
+    base[u["clip"]] = {"ttfp_ms": u["ttfp_ms"],
+                       "ttfp_from_onset_ms": u.get("ttfp_from_onset_ms"),
+                       "first_delta_lag_ms": u.get("first_delta_lag_ms"),
+                       "first_delta_audio_s": u.get("first_delta_audio_s")}
+json.dump(base, open(out.replace(".json", "-ttfp.json"), "w"), indent=1)
+print(f"reference: {len(ref)} clips, all non-empty; {len(base)} with an unloaded TTFP")
 PY
     say "reference: $(python3 -c "import json;print(len(json.load(open('$REFJSON'))))") clips -> $REFJSON"
 fi

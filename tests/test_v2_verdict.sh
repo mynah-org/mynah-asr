@@ -18,6 +18,7 @@ mk() {  # mk <dir> <python mutation of the dict `d`>
     python3 - "$dir" "$2" <<'PY'
 import json, sys
 dir, mutate = sys.argv[1], sys.argv[2]
+PEN = 0.0; RPEN = 0.0; WITH_BASELINE = False
 win = [{"window": i, "t0_s": i*60.0, "t1_s": (i+1)*60.0, "n": 1800,
         "p50": 40.0, "p95": 90.0} for i in range(6)]
 d = {
@@ -46,9 +47,17 @@ d = {
    "text_groups": {"samples/en/a.wav": ["hello"], "samples/fr/b.wav": ["bonjour"]},
    "identity_fail": {}, "reference_fail": {},
    "quality": {"with_reference": 0, "without_reference": 600, "worst": None}},
- "utterances": []}
+ "utterances": [{"clip": "a.wav", "ttfp_ms": 1000.0 + PEN,
+                 "first_delta_lag_ms": 40.0 + RPEN,
+                 "lag_marks": [[0.0, 40.0], [1.0, 60.0]]} for _ in range(120)]}
 exec(mutate)
+d["utterances"] = [{"clip": "a.wav", "ttfp_ms": 1000.0 + PEN,
+                    "first_delta_lag_ms": 40.0 + RPEN,
+                    "lag_marks": [[0.0, 40.0], [1.0, 60.0]]} for _ in range(120)]
 json.dump(d, open(dir + "/soak1-C16.json", "w"))
+if WITH_BASELINE:
+    json.dump({"a.wav": {"ttfp_ms": 1000.0, "first_delta_lag_ms": 40.0}},
+              open(dir + "/reference-ttfp.json", "w"))
 # three workers, steps always advancing, slots always busy
 with open(dir + "/server-soak1.log", "w") as f:
     for w in range(3):
@@ -106,6 +115,51 @@ open(p,'w').write(s)" "$TMP/ceiling2"
 [ "$(verdict ceiling2)" = "INVALID" ] \
     && ok "C=32 against a 24-connection fleet is INVALID, not merely worse" \
     || bad "a rung that could not connect its own concurrency was scored: $(verdict ceiling2)"
+
+# TTFP, registered 2026-09-23 for capacity rungs. A run that carries no unloaded
+# baseline must SAY so and still be judged on the twelve bounds it registered --
+# adding a thirteenth after the fact is what the frozen-qualification rule bans.
+[ "$(verdict healthy)" = "QUALIFIED" ] \
+    && ok "a run with no TTFP baseline keeps its verdict on the twelve registered bounds" \
+    || bad "the new bound was applied retroactively"
+python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/healthy" 2>/dev/null | grep -q "NOT REGISTERED" \
+    && ok "and says NOT REGISTERED instead of passing quietly" || bad "the missing bound was silent"
+
+mk ttfp_ok "WITH_BASELINE = True; PEN = 200.0"
+[ "$(verdict ttfp_ok)" = "QUALIFIED" ] && ok "a paired TTFP penalty of 200 ms passes" \
+    || bad "200 ms of paired TTFP penalty failed a 250 ms gate"
+mk ttfp_degr "WITH_BASELINE = True; PEN = 300.0"
+[ "$(verdict ttfp_degr)" = "NOT QUALIFIED" ] && ok "300 ms is DEGRADED and does not qualify" \
+    || bad "a degraded TTFP penalty was qualified"
+python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/ttfp_degr" 2>/dev/null | grep -q "DEGRADED" \
+    && ok "and is named DEGRADED, not lumped in with a hard failure" || bad "DEGRADED was not reported"
+mk ttfp_bad "WITH_BASELINE = True; PEN = 600.0"
+[ "$(verdict ttfp_bad)" = "NOT QUALIFIED" ] && ok "600 ms of paired TTFP penalty fails" \
+    || bad "600 ms of paired penalty passed"
+
+# The paired construction is the point: a clip that leads with silence carries it
+# on both sides, so a huge ABSOLUTE ttfp with a zero penalty must still pass.
+mk ttfp_silence "WITH_BASELINE = True; PEN = 0.0
+d2 = json.load(open(dir + '/soak1-C16.json')) if False else None"
+python3 -c "
+import json,sys
+p=sys.argv[1]+'/reference-ttfp.json'
+json.dump({'a.wav': {'ttfp_ms': 4400.0, 'first_delta_lag_ms': 40.0}}, open(p,'w'))
+q=sys.argv[1]+'/soak1-C16.json'
+d=json.load(open(q))
+for u in d['utterances']: u['ttfp_ms']=4400.0
+json.dump(d,open(q,'w'))" "$TMP/ttfp_silence"
+[ "$(verdict ttfp_silence)" = "QUALIFIED" ] \
+    && ok "4.4 s of leading silence cancels in the pairing and does not fail the server" \
+    || bad "the paired gate charged the server for the corpus's silence"
+
+mk ready_bad "WITH_BASELINE = True; RPEN = 400.0"
+[ "$(verdict ready_bad)" = "NOT QUALIFIED" ] \
+    && ok "losing more than one cadence before the first partial fails" \
+    || bad "400 ms of extra first-frame lateness passed a 320 ms cadence bound"
+mk ready_ok "WITH_BASELINE = True; RPEN = 300.0"
+[ "$(verdict ready_ok)" = "QUALIFIED" ] && ok "and 300 ms, inside the cadence, does not" \
+    || bad "300 ms failed a 320 ms bound"
 
 mk lost "d['summary']['counts']['errors'] = 3"
 [ "$(verdict lost)" = "NOT QUALIFIED" ] && ok "three lost streams disqualify" || bad "lost streams did not disqualify"

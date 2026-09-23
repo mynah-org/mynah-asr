@@ -88,6 +88,50 @@ could not have caught what it was asked to catch.
 | 11 | worker RSS | end ≤ **1.15 ×** post-warm-up | a leak over 30 minutes is a leak |
 | 12 | worker deaths / restarts | **0** | a fleet that silently replaces a worker has not held the load |
 
+## V2-2b — REGISTERED 2026-09-23: TTFP, for CAPACITY rungs only
+
+Registered **after** the C=16 qualification ran and deliberately **not applied to
+it**: that run was registered against twelve bounds before it started, and
+adding a thirteenth once the results are known is the thing the frozen-line rule
+exists to forbid. `v2_verdict` prints bounds 13 and 14 as NOT REGISTERED on a
+run that carries no unloaded baseline, which is a statement, not a silent pass.
+
+Raw `open -> first partial` is not the server's gate. It sums three unrelated
+things: the silence a clip leads with, the speech this checkpoint wants before
+it will commit to a word, and the delay the fleet adds. On this corpus the first
+two dominate — the C=16 soaks read 2430 ms of raw TTFP and **816 ms median /
+1251 ms p95 measured from speech onset**. Gating on the raw figure would fail a
+healthy server for the corpus's room tone.
+
+So the server is gated on the **paired** penalty, per clip:
+
+    penalty_i(C) = ttfp_i(loaded) - ttfp_i(unloaded, same clip, same build)
+
+A clip that leads with 700 ms of silence carries those 700 ms on both sides and
+vanishes from the difference. Subtracting two p95s would not do this: it would
+compare a loaded corpus with an unloaded one and call the gap the server.
+
+| # | bound | GOOD | DEGRADED | BAD |
+|---|---|---|---|---|
+| 13 | paired TTFP load penalty, p95 | **<= 250 ms** | 250-500 ms | > 500 ms |
+| 14 | paired `ready -> first partial` penalty, p95 | **<= one cadence** | — | > `(lookahead+1)x80` ms |
+
+Bound 14 uses `first_delta_lag_ms`: the server's own lateness on the frame whose
+audio the model actually consumed for its first partial. It excludes leading
+silence and excludes the speech the model wanted, because it is measured against
+the audio the server *had*. Losing a whole model cadence there, before a single
+word is published, is a concrete queueing signal — and the cadence is the same
+`(lookahead+1) x 80 ms` the emission-lag bound already uses, not a new taste.
+
+**Reported, never the server's gate:** `speech -> first partial`, p50/p95, with
+GOOD <= 1500 ms, WARN <= 1800, BAD above. These are reasonable for THIS
+checkpoint and THIS preset given its observed floor, and they are not claimed as
+universal ASR thresholds. This line belongs to the product and the checkpoint;
+bounds 13 and 14 belong to the fleet.
+
+A capacity rung is SERVER GOOD only when the twelve original bounds pass **and**
+13 and 14 pass.
+
 **TTFP has no gate**, and that is deliberate. The profile refuses to defend a
 number for it: there is a load-independent floor near 1545 ms on this build and
 roughly a second of it is unexplained. It is reported as a secondary

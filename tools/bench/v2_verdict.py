@@ -28,6 +28,12 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The percentile comes from the metrics module, never from a second definition
+# here: two harnesses with two definitions of p95 produce two numbers that
+# cannot be compared (ENGINEERING.md §8).
+from streaming_metrics import pct                       # noqa: E402
+
 # Registered in .work/server-v2-qualification.md V2-2. Bounds 2 and 4 are
 # expressed in chunk periods, as the profile expresses them, so they move with
 # the preset instead of being three digits someone typed.
@@ -36,6 +42,25 @@ LAG_MAX_MS = 3000.0          # bound 9: the max, not a percentile
 TREND_MAX_PCT = 50.0         # bound 7: last third vs first third
 RSS_GROWTH_MAX = 1.15        # bound 11
 OK, BAD, NOEV = "PASS", "FAIL", "NO EVIDENCE"
+DEGR = "DEGRADED"        # measurably worse, not yet out of envelope
+NA = "NOT REGISTERED"    # the run predates the bound; stated, never silently passed
+
+# TTFP, registered 2026-09-23 for CAPACITY rungs, not applied retroactively to
+# the C=16 qualification, which was registered against twelve bounds before it
+# ran. Raw open->first-partial mixes leading silence, the speech the model wants
+# before it commits, and serving delay; on this corpus the first two dominate.
+# So the SERVER gate is the PAIRED penalty: the same clip's loaded TTFP minus its
+# own unloaded TTFP, which cancels whatever silence that clip carries.
+TTFP_PENALTY_GOOD_MS = 250.0
+TTFP_PENALTY_BAD_MS = 500.0
+# ready->first-partial, paired: one model cadence of extra delay before the
+# first partial is a concrete queueing signal, and the cadence is the same
+# (lookahead+1)x80 the emission-lag bound already uses.
+READY_PENALTY_BAD_MULT = 1.0
+# The UX guardrail. Reported with a verdict, never the principal server gate:
+# it belongs to the checkpoint and the configuration as much as to the fleet.
+SPEECH_TTFP_GOOD_MS = 1500.0
+SPEECH_TTFP_WARN_MS = 1800.0
 
 # The qualified PocketTTS profile does not report a worst gap, it reports how
 # MANY gaps crossed 250 ms and how many crossed 500 ms, because "max 700 ms"
@@ -214,6 +239,29 @@ def bank_id(man):
     return f"{h.hexdigest()[:16]} / {len(rows)} clips"
 
 
+def paired_ttfp(d, baseline, field):
+    """loaded minus that SAME clip's unloaded value, per utterance.
+
+    Subtracting two p95s would compare a loaded corpus against an unloaded one
+    and call the difference the server. A clip that leads with 700 ms of silence
+    carries those 700 ms on both sides, so in a paired difference it vanishes."""
+    if not baseline:
+        return None
+    vals = []
+    for u in d.get("utterances") or []:
+        if u.get("error") or u.get("rejected"):
+            continue
+        b = baseline.get(u.get("clip") or "")
+        if not b or b.get(field) is None or u.get(field) is None:
+            continue
+        vals.append(u[field] - b[field])
+    if not vals:
+        return None
+    return {"n": len(vals), "p50": pct(vals, 50), "p95": pct(vals, 95),
+            "p99": pct(vals, 99) if len(vals) >= 100 else None, "max": max(vals),
+            "min": min(vals)}
+
+
 def stall_counts(d, cm):
     """How many published deltas crossed each threshold, and over how many."""
     utts = d.get("utterances") or []
@@ -250,7 +298,7 @@ def window_check(d, limit):
     return (OK if not bad else BAD), msg, worst
 
 
-def verdict_for(path, dump_path, proc_path, run_manifest=None):
+def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=None):
     d = json.load(open(path))
     s = d["summary"]
     man = d.get("manifest") or {}
@@ -300,13 +348,43 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None):
     row(11, "worker RSS growth", rss_state, rss_msg)
     row(12, "worker deaths", dead_state, dead_msg)
 
+    # --- TTFP, three separate questions (bounds 13 and 14, plus a UX line)
+    ttfp_pen = paired_ttfp(d, ttfp_baseline, "ttfp_ms")
+    if ttfp_pen is None:
+        row(13, "TTFP load penalty", NA,
+            "no unloaded TTFP baseline in this run: registered 2026-09-23 for capacity "
+            "rungs, and this run predates it or did not carry one")
+    else:
+        st = (OK if ttfp_pen["p95"] <= TTFP_PENALTY_GOOD_MS else
+              DEGR if ttfp_pen["p95"] <= TTFP_PENALTY_BAD_MS else BAD)
+        row(13, "TTFP load penalty", st,
+            f"paired, n={ttfp_pen['n']}: p50 {ttfp_pen['p50']:+.0f} p95 {ttfp_pen['p95']:+.0f} "
+            + (f"p99 {ttfp_pen['p99']:+.0f} " if ttfp_pen['p99'] is not None else "")
+            + f"max {ttfp_pen['max']:+.0f} ms vs GOOD <= {TTFP_PENALTY_GOOD_MS:.0f}, "
+              f"BAD > {TTFP_PENALTY_BAD_MS:.0f}")
+    ready_pen = paired_ttfp(d, ttfp_baseline, "first_delta_lag_ms")
+    if ready_pen is None:
+        row(14, "ready->first partial", NA, "no unloaded baseline for the first frame's lag")
+    else:
+        lim = READY_PENALTY_BAD_MULT * cm
+        row(14, "ready->first partial", OK if ready_pen["p95"] <= lim else BAD,
+            f"paired, n={ready_pen['n']}: p95 {ready_pen['p95']:+.0f} ms of extra server "
+            f"lateness on the first frame, vs one cadence ({lim:.0f} ms)")
+
     invalid, peak_slots = slot_ceiling(dumps, run_manifest, man.get("concurrency"),
                                        banner_connections(dump_path),
                                        os.path.exists(dump_path))
-    failed = [r for r in rows if r["state"] == BAD]
+    failed = [r for r in rows if r["state"] in (BAD, DEGR)]
     missing = [r for r in rows if r["state"] == NOEV]
+    ux = g(m, "ttfp_from_onset_ms", "p95")
     return {
         "invalid": invalid, "peak_active_slots": peak_slots,
+        "ttfp_penalty": ttfp_pen, "ready_penalty": ready_pen,
+        "speech_ttfp_p50_ms": g(m, "ttfp_from_onset_ms", "p50"),
+        "speech_ttfp_p95_ms": ux,
+        "speech_ttfp_verdict": (None if ux is None else
+                                "GOOD" if ux <= SPEECH_TTFP_GOOD_MS else
+                                "WARN" if ux <= SPEECH_TTFP_WARN_MS else "BAD"),
         "connection_ceiling": banner_connections(dump_path),
         "file": os.path.basename(path),
         # These are stream_load's OWN manifest field names. An earlier draft read
@@ -338,10 +416,12 @@ def pick(run):
     for path in sorted(glob.glob(os.path.join(run, "ladder-C*.json"))):
         tag = os.path.basename(path)[:-5]
         mp = os.path.join(run, "manifest.json")
+        bp = os.path.join(run, "reference-ttfp.json")
         v = verdict_for(path,
                         os.path.join(run, f"server-{tag}.log"),
                         os.path.join(run, f"procsample-{tag}.txt"),
-                        json.load(open(mp)) if os.path.exists(mp) else None)
+                        json.load(open(mp)) if os.path.exists(mp) else None,
+                        json.load(open(bp)) if os.path.exists(bp) else None)
         bad = [r for r in v["rows"] if r["bound"] in SCREEN_BOUNDS and r["state"] != OK]
         if v.get("invalid"):
             bad = [{"bound": 0, "name": "INVALID: " + v["invalid"]}] + bad
@@ -376,6 +456,8 @@ def main():
     out = []
     mpath = os.path.join(a.run, "manifest.json")
     run_manifest = json.load(open(mpath)) if os.path.exists(mpath) else None
+    bpath = os.path.join(a.run, "reference-ttfp.json")
+    ttfp_baseline = json.load(open(bpath)) if os.path.exists(bpath) else None
     for path in sorted(glob.glob(os.path.join(a.run, "soak*.json"))
                        + sorted(glob.glob(os.path.join(a.run, "ladder-C*.json")))):
         tag = os.path.basename(path)[:-5]
@@ -387,7 +469,7 @@ def main():
             proc = os.path.join(a.run, cand)
             if os.path.exists(proc):
                 break
-        out.append(verdict_for(path, dump, proc, run_manifest))
+        out.append(verdict_for(path, dump, proc, run_manifest, ttfp_baseline))
     if not out:
         sys.exit(f"no soak*.json or ladder-C*.json in {a.run}")
     for v in out:
@@ -400,6 +482,10 @@ def main():
             print(f"  !!  INVALID RUN: {v['invalid']}")
         for r in v["rows"]:
             print(f"  {r['bound']:2d}  {r['name']:26s} {r['state']:11s} {r['detail']}")
+        if v.get("speech_ttfp_verdict"):
+            print(f"      speech -> first partial (UX guardrail, not the server gate): "
+                  f"p50 {v['speech_ttfp_p50_ms']:.0f} p95 {v['speech_ttfp_p95_ms']:.0f} ms"
+                  f"  -> {v['speech_ttfp_verdict']}")
         if v.get("peak_active_slots") is not None:
             print(f"      peak active slots on one worker: {v['peak_active_slots']}"
                   + (f", fleet connection ceiling {v['connection_ceiling']}"
