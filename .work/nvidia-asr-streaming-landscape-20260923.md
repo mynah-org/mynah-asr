@@ -871,3 +871,114 @@ nothing promoted.
 ends the utterance at a turn boundary, correctly, 53 times out of 149
 opportunities. That is the capability S13-7 was going to have to demonstrate
 some other way.
+
+---
+
+# S13-1c — NVIDIA/NeMo-Speech.cpp, audited against this engine
+
+**FACT.** The repository is real and first-party: `github.com/NVIDIA/NeMo-Speech.cpp`,
+Apache-2.0, created 2026-07-15, **last push 2026-09-23** (today), 120 stars,
+23 open issues. ~55k lines of C++17 on **ggml + llama.cpp submodules** (not
+standalone). One release, `v0.1.0`, 2026-08-19; 15 commits on `main`.
+
+**FACT.** Its scope is far broader than ours — ASR (the same four q8_0
+checkpoints), plus Sortformer diarization, NMT, TTS and a full-duplex
+speech-to-speech pipeline. `docs/server.md` states: *"NVIDIA NIM is the
+supported production deployment path; this server is intended for local use and
+direct integration."*
+
+## FACT — they independently made our central architectural call
+
+`src/asr/encoder/fastconformer.h:114-121`, verbatim:
+
+> *"Follows NeMo's per-layer cur/next cache convention … **except we cache
+> projected K/V rather than the pre-projection layer input.**"*
+
+**OBSERVATION.** Two independent C/C++ ports of the same model family both
+departed from the Python reference in the same place and for the same reason.
+That retires N3 from the backlog with more confidence than our own reasoning
+gave it, and it is worth recording in `docs/prior-art.md`: it also distinguishes
+them from `mudler/parakeet.cpp`, which caches the pre-projection input.
+
+## Where they are ahead, and what is worth taking
+
+**The one cheap idea, and it is genuinely cheap.** They advance a `ring_head_`
+modulo `cache_left_ctx` and read the arena at that offset
+(`cache_aware_encoder.cpp:487-491`). We do a `memmove` instead — verified in
+`src/encoder.c`, `update_kv_cache()`: once the cache saturates, every chunk
+memmoves `from_old` rows per layer, for K and for V.
+
+Arithmetic for Nemotron at `[56,3]`: 56 rows x 1024 f32 = 229 KB per layer per
+tensor, x 24 layers x 2 tensors = **~11 MB moved per chunk per stream**. At a
+320 ms cadence and the qualified C=80 that is **~2.75 GB/s of memory traffic
+that computes nothing.**
+
+**HYPOTHESIS, and it connects to an open item.** S12-7c records that measured
+CPU occupancy plateaus at 21.6-23.5 cores of 30 at saturation and *falls* under
+overload, mechanism UNKNOWN — and M-6 found the same shape on a different model
+and a different code path. Cache-shift bandwidth is a candidate that fits both:
+it scales with streams, not with cores, and a bandwidth-bound step leaves cores
+stalled rather than busy. **NOT established** — it is arithmetic plus a shape
+match, and the rejection condition is explicit: if a ring head removes the
+memmove and neither the core plateau nor the throughput ceiling moves, the
+hypothesis is dead and is recorded as such.
+
+Our `left % (r+1) == 0` invariant makes the ring *cleaner* than theirs: the wrap
+always lands on a chunk boundary. And the bit-exactness gates are unchanged by
+construction — same values, different addresses.
+
+**Ahead on batching breadth, and the reason matters.** They micro-batch the
+frontend, encoder, **predictor**, **joint**, fused TDT, VAD and PnC, with a
+work-conserving scheduler and an **ingress cohort coordinator** that releases a
+batch as soon as the declared wave has arrived instead of paying a timer
+(`batching.h:141-210`). We stack only the encoder.
+
+**OBSERVATION, against our own measurement.** `server/prefork.h` already records
+cross-worker batching as built, measured and REJECTED: requests that could batch
+at B>=3 coincided **1.6 % of the time** within +/-0.25 ms against a 25 % bar.
+Their design manufactures that coincidence with the cohort coordinator, on a GPU
+where one wide graph is the whole point. So the part of their design that
+survives our measurement is the **early release** idea — our scheduler already
+knows how many slots are ACTIVE and due this period, and that number *is* the
+cohort target — not wholesale cross-worker batching.
+
+## Where this engine is ahead, factually
+
+No thread pool of their own (`ggml_backend_set_n_threads` only); **one
+`std::mutex` serializing every ggml graph**, which their own doc states
+(`runtime.h:196-198`, `asr-batching.md:131-134`); HTTP worker pool default **4**;
+**no admission control** beyond `throw std::runtime_error("state arena is full")`;
+**zero hand-written CPU SIMD** — 19 of 21 ggml patches are CUDA, one Metal, and
+their AVX2-host issue #23 is an open **SIGILL** on the published v0.1.0 tarball,
+which is exactly the failure our `src/dispatch.h` guard converts into exit 78.
+
+**And the gates differ in kind, not degree.** Their batching parity is a
+tolerance — `edit_limit = max(2, 5% of tokens)` (`test_transducer_offline.cpp:175-177`)
+— and their own fast GEMM header says *"results are not bit-identical to mmq"*.
+Ours is identity: `==`/memcmp on every chunk of every stream plus the final K/V
+and conv caches. They have a Python-oracle parity suite **only for the
+diarizer**; there is no per-stage ASR oracle. There is **no statement anywhere**
+that a transcript is invariant to thread count or ISA.
+
+**FACT — they publish no performance numbers at all.** Not one RTF, latency,
+memory or concurrency figure in the README, the 28 docs files or the release
+notes. They ship the harness (`nemo-speech bench asr --concurrency 1,8,16,32`)
+and no measured output.
+
+**UNKNOWN.** Their actual CPU RTF, latency, memory and concurrency ceiling;
+whether their cross-stream batching pays on CPU at all (the ring-cache fast path
+is gated `use_gpu`); their WER on any corpus. Nothing was built or run.
+
+## Backlog additions
+
+**S1b (QUICK-ish, LOW cost) — ring-buffer the K/V cache.** Removes ~11 MB of
+memmove per chunk per stream at the qualified operating point. Tests unchanged.
+Rejection condition stated above. **This is now the top mechanical item.**
+
+**S1c (LOW-MEDIUM) — release a batch when the due-slot count is reached**,
+instead of always waiting `--batch-window-ms`. One function, and the A/B harness
+exists.
+
+**Q3 is answered**; what remains is a `docs/prior-art.md` entry, because a
+first-party runtime in the same niche that independently reached the same cache
+decision belongs in the prior-art record and not only in a research ledger.
