@@ -166,3 +166,60 @@ ample headroom at every latency preset (0/1/3/6/13 lookahead chunks).
   files: RTF up to 15× worse. Benchmark ONLY with models on local disk.
 - NEVER ±INFINITY in code with `-ffast-math` (cost 6.5× in RTF — see
   architecture-notes §6).
+
+## Streaming concurrency — GCP c4a-highcpu-32 (Axion Neoverse-V2) — 2026-09-23
+
+Nemotron 3.5 streaming 0.6B, int8, preset `[56, 3]`, `mynah-asr-server`, one
+fresh fleet per rung, 180 s each. Corpus `samples/stress-en`, 498 clips sampled
+class-balanced from 1316 (seed 42), 3.2 s to 42.4 s, bank `04a7753aa1e80f9a`.
+Load generator on 2 cpus, PACED at every rung listed. `audio/wall` is audio
+seconds carried per wall second; `duty` is the worker's model-execution fraction
+from its own SIGUSR1 dump. Bounds: emission lag p95 <= 320 ms
+(`(lookahead+1)x80`), finalization p95 <= 500 ms, backlog max <= 0.640 s.
+
+**These are 180 s SCREENS. They disqualify; they do not promote.** The only
+promoted number is in `configs/perf/`.
+
+### 3 workers x 8 threads, cpus 0-23
+
+| C | audio/wall | duty | lag p95 | lag p99 | backlog | final p95 | verdict |
+|---|---|---|---|---|---|---|---|
+| 32 | 26.85 | 0.560 | 59 | 105 | 0.184 | 127 | clean |
+| 40 | 33.70 | 0.693 | 78 | 128 | 0.284 | 161 | clean |
+| 48 | 41.01 | 0.819 | 106 | 165 | 0.284 | 228 | clean |
+| 56 | 45.69 | 0.915 | 131 | 194 | 0.444 | 258 | clean, last |
+| 64 | 53.61 | 0.979 | 207 | 303 | 0.644 | 427 | marginal, backlog by 4 ms |
+| 72 | 55.01 | 0.930 | 546 | 813 | 0.804 | 1068 | bad |
+| 80 | 56.86 | 0.996 | 2064 | 2454 | 3.964 | 3066 | overloaded |
+
+### 6 workers x 5 threads, cpus 0-29
+
+| C | audio/wall | duty | lag p95 | lag p99 | backlog | final p95 | cores used | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 54.44 | 0.702 | 80 | 128 | 0.264 | 160 | — | clean |
+| 80 | 64.26 | 0.859 | 108 | 161 | 0.284 | 221 | — | clean |
+| 88 | 72.07 | 0.921 | 133 | 196 | 0.384 | 271 | 23.1 | clean |
+| 96 | 78.65 | 0.973 | 182 | 268 | 0.484 | 379 | 23.5 | clean, last |
+| 104 | 82.51 | 0.991 | 305 | 425 | 0.744 | 619 | 22.9 | bad |
+| 112 | 87.65 | 0.996 | 556 | 763 | 0.944 | 1081 | 21.5 | bad |
+| 120 | 90.07 | 0.996 | 1328 | 1593 | 2.224 | 2058 | 20.8 | bad |
+
+### Topology at C=64, same corpus, build and generator isolation
+
+| topology | cpus | audio/wall | duty | lag p95 | backlog | final p95 |
+|---|---|---|---|---|---|---|
+| 3x8 | 24 | 53.70 | 0.975 | 190 | 0.704 | 377 |
+| 3x10 | 30 | 53.72 | 0.958 | 183 | 0.684 | 381 |
+| 2x15 | 30 | 46.25 | 0.996 | 2007 | 3.684 | 2992 |
+| 5x6 | 30 | 54.43 | 0.761 | 87 | 0.284 | 184 |
+| 6x5 | 30 | 54.44 | 0.702 | 80 | 0.264 | 160 |
+
+`cores used` is measured, from cumulative cpu-seconds per worker differenced
+over the run. It is NOT `workers x duty x threads`, which overstates it by about
+20 % because `model_duty` is the scheduler thread's fraction and says nothing
+about the pool's occupancy during it.
+
+**Zero established streams lost at every rung of every topology above**,
+including C=120 at 1.3 s of lag, and transcript parity passed at every one: the
+same clip played by different streams produced the same text, identical to the
+unloaded reference. This fleet degrades by getting slow.
