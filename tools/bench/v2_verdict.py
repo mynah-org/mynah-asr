@@ -344,6 +344,23 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=Non
     else:
         st, msg = BAD, f"{len(idf)} clip(s) differ across streams, {len(rff)} differ from the reference"
     row(10, "quality parity", st, msg)
+    # SERVING correctness is bound 10: does load change what the server says.
+    # MODEL correctness is WER/CER against the human reference, and it is NOT a
+    # serving gate -- a word this checkpoint gets wrong unloaded is not a defect
+    # of the fleet. Reported so a qualification states the quality it actually
+    # observed, never so it can fail a server for the model's errors.
+    qw, qc = m.get("wer") or {}, m.get("cer") or {}
+    if qw.get("p50") is not None or qc.get("p50") is not None:
+        bits = []
+        if qw.get("p50") is not None:
+            bits.append(f"WER p50 {qw['p50']:.4f} p95 {qw['p95']:.4f}")
+        if qc.get("p50") is not None:
+            bits.append(f"CER p50 {qc['p50']:.4f} p95 {qc['p95']:.4f}")
+        rows.append({"bound": "-", "name": "model quality (REPORTED)", "state": "n/a",
+                     "detail": f"vs the human reference over "
+                               f"{qw.get('n') or qc.get('n')} utterance(s): "
+                               + ", ".join(bits)
+                               + " -- NOT a serving gate"})
     (rss_state, rss_msg), (dead_state, dead_msg) = proc_check(proc_path)
     row(11, "worker RSS growth", rss_state, rss_msg)
     row(12, "worker deaths", dead_state, dead_msg)
@@ -481,7 +498,9 @@ def main():
         if v.get("invalid"):
             print(f"  !!  INVALID RUN: {v['invalid']}")
         for r in v["rows"]:
-            print(f"  {r['bound']:2d}  {r['name']:26s} {r['state']:11s} {r['detail']}")
+            b = r["bound"]
+            tag = b if isinstance(b, str) else f"{b:2d}"
+            print(f"  {tag:>2}  {r['name']:26s} {r['state']:11s} {r['detail']}")
         if v.get("speech_ttfp_verdict"):
             print(f"      speech -> first partial (UX guardrail, not the server gate): "
                   f"p50 {v['speech_ttfp_p50_ms']:.0f} p95 {v['speech_ttfp_p95_ms']:.0f} ms"

@@ -159,6 +159,13 @@ def _row(u, tag, clip, ref, ttfp_base, onsets, why):
         "emission_lag_max_ms": max((m for _, m in (u.get("lag_marks") or [])), default=None),
         "backlog_max_s": u.get("backlog_max_s"),
         "deltas": u.get("deltas"),
+        # Two different questions, kept apart. serving_regression compares the
+        # loaded transcript with this clip's own UNLOADED one and is what the
+        # server is judged on; wer/cer compare it with the human reference and
+        # describe the checkpoint, which load did not cause and cannot fix.
+        "serving_regression": (None if ref.get(clip) is None else
+                               normalise(u.get("text") or "") != normalise(ref[clip])),
+        "wer_vs_human": u.get("wer"), "cer_vs_human": u.get("cer"),
         "error": u.get("error"), "rejected": u.get("rejected"),
     }
 

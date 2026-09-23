@@ -168,6 +168,11 @@ def load_transcripts(path):
     out, by_base = {}, {}
     if isinstance(doc, dict) and isinstance(doc.get("samples"), list):
         pairs = [(e.get("file"), e.get("text")) for e in doc["samples"]]
+    elif isinstance(doc, dict) and isinstance(doc.get("clips"), list):
+        # samples/stress-en/manifest.json. Without this it fell to the generic
+        # dict branch below and registered "source", "url" and "licence" as clip
+        # names with their values as reference text.
+        pairs = [(e.get("file"), e.get("text")) for e in doc["clips"]]
     elif isinstance(doc, dict):
         pairs = [(k, v) for k, v in doc.items() if isinstance(v, str)]
     else:

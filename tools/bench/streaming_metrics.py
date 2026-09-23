@@ -893,20 +893,29 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
     # Quality, as opposed to speed. CER is per UTTERANCE against the bank's human
     # reference; it is NOT gated by pacing, because whether the transcript is right does
     # not depend on whether the client held its schedule -- only the cadence numbers do.
-    cers, cer_worst = [], None
+    cers, wers, cer_worst = [], [], None
     if transcripts:
         for u in ok:
             clip = u.get("clip") or ""
             ref = reference_for(transcripts, clip)
             if ref is None:
                 continue
+            w = wer(u["text"], ref)
+            if w is not None:
+                wers.append(w)
+                u["wer"] = w
             v = cer(u["text"], ref)
             if v is None:
                 continue
+            u["cer"] = v
             cers.append(v)
             if cer_worst is None or v > cer_worst[0]:
                 cer_worst = (v, clip, u["text"], ref)
     m["cer"] = stat(cers, "per utterance", "", True, "MEASURED")
+    # Beside CER because they fail differently: a dropped word is one deletion
+    # in WER and a dozen characters in CER, and a serving campaign wants to see
+    # both rather than argue about which one is the metric.
+    m["wer"] = stat(wers, "per utterance", "", True, "MEASURED")
     quality = {
         "with_reference": len(cers),
         "without_reference": len(ok) - len(cers),

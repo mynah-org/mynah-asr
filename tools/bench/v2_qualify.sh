@@ -513,6 +513,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = soak ]; then
         load --mode soak --streams "$SOAK_C" --duration "$SOAK_S" --warmup "$WARMUP" \
              --window "$WINDOW" --seed $(( 42 + n )) --clips $BANK --keep-events 25 \
              ${REFJSON:+--reference "$REFJSON"} \
+             ${CORPUS:+--transcripts "$CORPUS"} \
              --json "$RUN/soak$n-C$SOAK_C.json" 2>&1 | tee -a "$RUN/run.log" \
              | grep -E "TTFP|emission lag|finaliz|backlog|drift|verdict|utterances|pacing|REFERENCE|identity|window" || true
         dumper_stop
