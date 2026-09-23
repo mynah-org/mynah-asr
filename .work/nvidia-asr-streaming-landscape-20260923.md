@@ -237,3 +237,236 @@ the runtime refuses, or a `mynah_asr_stream_unsupported()` refusal at load —
 each of which converts the hypothesis into a named piece of work rather than a
 vague one. **Producing a pack is not producing a correct transcript**: numeric
 parity against the Python oracle is a separate gate and rule 3 still applies.
+
+---
+
+# S13-1 — Ecosystem audit, September 2026
+
+Sources fetched 2026-09-23 from `huggingface.co` model cards, their `config.json`
+and `processor_config.json`, and the HF API. Where a card and a config disagree
+that is recorded as a discrepancy, not resolved by preference.
+
+## The findings that change what we do
+
+**FACT — NVIDIA ships GGUF and its own C++ runtime.** `nemotron-3.5-asr-streaming-0.6b`,
+`nemotron-speech-streaming-en-0.6b`, `parakeet-tdt-0.6b-v3` and `parakeet-ctc-1.1b`
+each publish a `*.q8_0.gguf`, and those cards open their usage section with
+"Run locally with NeMo-Speech.cpp" (`github.com/NVIDIA/NeMo-Speech.cpp`),
+invoked as `nemo-speech transcribe audio.wav --model models/….q8_0.gguf`.
+**OBSERVATION.** That is a first-party runtime in this repo's exact niche,
+documented on the very model card mynah targets. It is not a reason to stop; it
+is a reason to know what it does and does not do, and it belongs in the backlog
+as an intelligence item before it is treated as either threat or irrelevance.
+
+**FACT — the two Nemotron streaming checkpoints do NOT share a left context.**
+The multilingual 3.5 declares `sliding_window=57` / `att_context_size=[56,R]`;
+the English `nemotron-speech-streaming-en-0.6b` declares `sliding_window=71` /
+`[70,R]`. Our own config forensics independently read `[[56,3],[56,0],[56,6],[56,13]]`
+for 3.5. **Anything that hard-codes 70 as "the Nemotron left context" is wrong
+for the multilingual checkpoint, and anything that hard-codes 56 is wrong for
+the English one.** The EOU 120M's `[70,1]` shares its left context with the
+English Nemotron, not with the multilingual one we serve.
+
+**FACT — NVIDIA publishes its own evidence that a TDT Parakeet collapses under
+chunked streaming.** From the `parakeet-unified-en-0.6b` card, `parakeet-tdt-0.6b-v2`
+under chunking: **1.12 s → WER 22.83, 0.56 s → 69.55, 0.40 s → 95.12.**
+**DECISION for S13-4a.** The prefix ladder is still worth running on v3 in EN and
+FR, but it is now an experiment to locate *where* usable output ends, with a
+strong prior that short prefixes are unusable. It is not a search for a hidden
+streaming mode. This also retires any hope of cheaply pseudo-streaming v3 at low
+latency.
+
+**FACT — a model we had not listed exists and is directly relevant:
+`parakeet-unified-en-0.6b`** (created 2026-04-07). "Unified-FastConformer-RNNT",
+24 layers, 600M, English, PnC, ONE checkpoint for offline and streaming with
+latency selectable 2080 → 160 ms in 80 ms steps. Its card states plainly: "The
+current inference pipeline supports only **buffered streaming** (left context is
+recomputed for each chunk)." Open ASR avg WER: offline 5.91, 1.12 s 6.29,
+0.56 s 6.52, 0.32 s 6.92, 0.16 s 8.44, 0.08 s **15.63** — and NVIDIA itself
+recommends switching to the cache-aware streaming model at 80 ms.
+**OBSERVATION.** This is NVIDIA's own answer to "can one checkpoint do both",
+and the answer is yes above ~240 ms and no below it. `.nemo` only; no
+safetensors, no GGUF.
+
+**FACT — NVIDIA's description of the language prompt matches our code.** The 3.5
+card: "Language Encoding expands a 128-dim one-hot language vector across the
+time axis → (K=128, T)… Concatenation along the feature axis → fused tensor
+(D + K, T). Projection layer maps the fused features to the RNNT decoder." That
+is exactly `mid = ReLU([x, one-hot(prompt)] @ W^T + b)` as read in R-13, and
+`num_prompts: 128` as read from the config. The `<xx-XX>` tokens in the
+tokenizer are OUTPUT tags emitted in `target_lang=auto` mode, not inputs.
+
+**FACT — the EOU 120M is a research drop, not a product.** 621 downloads against
+817k for Nemotron 3.5 and 568k for TDT v3; `.nemo` only, no HF-transformers
+path, card unchanged since 2025-12-03. Its documented numbers: Open ASR average
+WER **9.30** measured at 160 ms streaming, EOU detection latency p50 **160 ms**,
+p90 280 ms, p95 320 ms, and it outputs **no punctuation and no capitalisation**.
+**OBSERVATION.** WER 9.30 at 160 ms against Nemotron English 7.67 at 160 ms is a
+real quality gap, and the missing PnC is a product-visible difference our corpus
+scoring would hide, because `normalise()` strips both.
+
+**FACT — multitalker costs one full model instance per speaker** ("the number of
+model instances matches the number of speakers") and requires an external
+streaming Sortformer diarizer (`nvidia/diar_streaming_sortformer_4spk-v2.1`),
+with no enrollment audio and no speaker embeddings. Reported cpWER with that
+diarizer: AMI-IHM 21.26, AMI-SDM 37.44, CH109 15.81, Mixer6 23.81.
+**OBSERVATION.** For a serving fleet that is N x the compute per session rather
+than a batched head — a capacity question before it is an architecture question.
+
+**FACT — licences differ across one family.** Nemotron 3.5 is **OpenMDW-1.1**,
+`nemotron-speech-streaming-en` and the EOU 120M are NVIDIA Open Model License,
+Parakeet TDT v3 is **CC-BY-4.0**.
+
+## Discrepancies recorded rather than resolved
+
+- **FACT.** The 3.5 card advertises right contexts {0,1,3,6,13} while its own
+  `processor_config.json` declares `supported_num_lookahead_tokens: [3,0,6,13]`
+  — **no 1**. Our config read `[[56,3],[56,0],[56,6],[56,13]]`, which agrees with
+  the processor and not with the prose. So the advertised 160 ms point has no
+  declared preset in the checkpoint we serve.
+- **FACT.** `processor_config.prompt_dictionary` carries 121 keys → 84 distinct
+  prompt ids out of `num_prompts: 128`, including languages the card never
+  claims. `auto` is id 101 and `default_prompt_id: 101`, while the card's
+  pipeline note says the default is "index 0, en-US".
+- **FACT.** `mt-MT` has a tier and a prompt id but **no `<mt-MT>` output tag**
+  among the 39 locale tokens, so `auto` mode cannot emit a Maltese tag.
+
+## What the cards do NOT say, and our forensics does
+
+The EOU 120M repo publishes **no `config.json`**, so the card leaves hidden
+size, vocabulary, subsampling and predictor depth UNKNOWN. S13-2's range-fetch
+of the `.nemo`'s own `model_config.yaml` supplies exactly those: 17 x 512,
+128 mels with `normalize: NA`, `subsampling_factor: 8`, `num_classes: 1026`,
+`pred_rnn_layers: 1`, `use_bias: false`, `causal_downsampling: true`,
+`conv_norm_type: layer_norm`. The two sources are complementary and agree
+wherever they overlap (17 layers, `[70,1]`, RNNT, English, 120M).
+
+---
+
+# S13-1b — NeMo implementation intelligence
+
+Read from the NeMo source (3.1.0 local checkout, fidelity-checked against
+`NVIDIA-NeMo/NeMo@main`: 13 differing lines in `conformer_encoder.py`, **none**
+touching `cache`, `att_context` or `streaming`) plus the NeMo user guide.
+
+## The finding that closes a Track-B question
+
+**FACT — FastEmit is TRAINING-time only. There is no inference-time emission
+knob anywhere in NeMo.** It lives in the transducer loss gradient
+(`nemo/collections/asr/losses/rnnt.py`, `fastemit_lambda` → `RNNTLossNumba`,
+`grads[:, u, l] = (1 + fastemit_lambda) * grads[:, u, l]`). Shipped values:
+offline `0.0`, **cache-aware streaming `5e-3`**, and the **EOU model's xlarge
+config `3e-2`**. No decoding config carries an emission threshold, a delay
+penalty or a FastEmit setting.
+
+**DECISION.** This retires a whole family of ideas for our ~860 ms median: the
+first-word latency of a transducer is **baked into the weights**, and a runtime
+cannot trade latency for accuracy at decode time the way NVIDIA trades it at
+training time. It also explains R-8 in hindsight — every intervention there
+perturbed decoder state at inference, which is precisely the lever that does not
+exist.
+
+**OBSERVATION, and it sharpens the control.** The EOU 120M is trained with a
+FastEmit lambda **6x larger** than the streaming default. If it emits earlier on
+our clips, "trained to emit earlier" is a documented, quantified candidate cause
+rather than a vague architectural one. If it does NOT emit earlier despite that,
+the finding moves upstream of training to the frontend and the runtime, which is
+exactly the fork S13-5 was set up to take.
+
+## Corroborations of our own results, from NVIDIA's code
+
+- **FACT.** NeMo **enforces** `att_context_size[0] % (att_context_size[1]+1) == 0`
+  for `chunked_limited` and raises if violated. That is R-10's invariant,
+  arrived at independently from our own encoder, confirmed in the reference
+  implementation. It also confirms why `[56,2]` cannot exist for Nemotron.
+- **FACT.** In `chunked_limited` the right context does **not** compound across
+  layers (every frame in a chunk sees the whole chunk), so `cache_drop_size = 0`
+  and nothing is recomputed. In `regular` style it **does** compound —
+  effective look-ahead `= R x n_layers`. **OBSERVATION.** This is the precise
+  mechanism behind R-10's finding that `[56,3] -> [56,0]` is worth ~120 ms and
+  not 240: within a chunk the last frame has no look-ahead in any preset.
+- **FACT.** `chunk_size = att_context_size[1] + 1` frames and
+  `left_chunks_num = att_context_size[0] // chunk_size` — the same arithmetic
+  mynah derives, from the same quantities.
+
+## Where mynah is already ahead of the reference implementation
+
+**FACT (NeMo).** `cache_last_channel` does **not** hold K/V. It holds the
+post-`norm_self_att` layer input `x`, and `update_cache` concatenates it before
+the projections, so **NeMo recomputes the Q/K/V linear projections over the
+whole cached history on every step** (`multi_head_attention.py:207`,
+`conformer_modules.py:197`).
+
+**FACT (mynah).** `src/encoder.h:107` declares `float *k_cache, *v_cache;
+/* [n_layers, left, d_model] */` — mynah caches the **projected** K and V.
+
+**OBSERVATION.** Since the projections are linear and their inputs are frozen
+once cached, the two are numerically equivalent and mynah's is strictly less
+work per step. This is recorded not as a boast but because it removes a
+candidate explanation: whatever costs us at saturation, it is **not** this
+redundancy, and a future "optimise the cache like NeMo" suggestion should be
+rejected on sight.
+
+## Mechanisms worth taking, with their cost
+
+- **A bit-exactness oracle for the cache, free.** NeMo ships
+  `streaming.use_cache: false`: keep `left_context_size` frames of audio,
+  re-encode them every chunk, then drop the first `left_context` output frames.
+  It needs no retrain and no new model. **OBSERVATION.** That is exactly the
+  kind of gate rule 4 asks for, for the one piece of streaming state mynah has
+  no independent check on.
+- **The endpointer NVIDIA actually ships is not the EOU token.** There are TWO
+  EOU mechanisms and the production pipeline uses the second:
+  `GreedyEndpointing` walks backwards over decoded token ids counting silent
+  tokens, fires when `n_silent_tokens > stop_history_eou` and snaps to a word
+  boundary. Shipped config: `stop_history_eou: 800` (ms), `residue_tokens_at_end: 2`,
+  `word_boundary_tolerance: 4`. **It is model-agnostic integer bookkeeping over
+  token ids — roughly fifty lines of C — and it would work on Nemotron today,
+  with no new checkpoint.**
+- **NVIDIA's own streaming latency metric is defined per EOU segment.** LAAL
+  ("how far behind the audio the transcription is committed") is **skipped
+  entirely when endpointing is disabled**. OBSERVATION: that is a more honest
+  framing than a bare TTFP and is worth adopting alongside ours.
+- **The slot allocator is the same design as our fleet.**
+  `CacheAwareContextManager` with `num_slots` (default 256) >= `batch_size`, a
+  free-list queue, stream->slot maps, one big cache tensor indexed by slot, and
+  `index_fill_(0.0)` on release. Nothing to copy; it is corroboration that the
+  serving shape mynah qualified at C=80 is the shape NVIDIA also arrived at.
+
+## Multitalker, priced
+
+**FACT.** Speaker conditioning is injected by `register_forward_pre_hook` on
+`encoder.layers[0]` — **after subsampling, before Conformer layer 0** — as
+`x = x + kernel(x * spk_mask)`, where the kernel is
+`Linear(d->d_model) -> ReLU -> Dropout -> Linear(d_model->d)`. The encoder class
+is never modified. The alternative (`masked_asr`) masks the mel or the
+subsampled embedding instead.
+
+**FACT.** The ASR takes **`(B,T)` per speaker**, not `(B,T,N)`: a target-speaker
+mask plus the OR of all other speakers. The `(B,T,N) -> (B,T)` slice happens
+outside the model. Masks are built at 100 fps from RTTM and averaged over 8 mel
+frames to the 12.5 fps encoder rate. Values are **per-speaker independent
+sigmoids, not a softmax over speakers**.
+
+**FACT.** *"If there are at most N speakers and the batch size is B, then the
+real batch size for inference is at most B * N"* — the entire cache-aware
+encoder state and forward pass are replicated **per active speaker per
+session**. `num_spks: 4` is a fixed architectural maximum in the diarizer's
+output head; more speakers needs retraining. A **serial** single-cache path also
+exists (`perform_serial_streaming_stt_spk`), which is the shape a CPU runtime
+would take.
+
+**OBSERVATION.** For our fleet this prices multitalker before any design work:
+it is an N-fold capacity question first and an architecture question second. At
+the qualified C=80, four speakers would mean C=20 sessions at the same compute.
+
+## GPU-specific, and therefore not ours to copy
+
+`use_triton` fused subsampling (upstream only, GPU-only, PyTorch fallback for
+CPU/export) and `use_cuda_graph_decoder` (NVRTC + CUDA-graph conditional nodes)
+— **which NVIDIA itself ships disabled** in the cache-aware config, commented
+"Disabled due to issues with decoding". `loop_labels=True` is GPU-shaped
+throughput scheduling and is documented as result-equivalent to the scalar
+reference, so a C port is bit-compatible with the batched path by construction.
+Everything else in the streaming, decoding, EOU and multitalker paths is plain
+tensor and integer work that transfers to CPU.
