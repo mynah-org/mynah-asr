@@ -779,3 +779,95 @@ reference math — it does not independently validate the conversion against
 NeMo. The strong evidence that the conversion is right is different and
 circumstantial: the transcripts are correct English matching the audio, and a
 mis-assigned tensor does not produce that.
+
+---
+
+# S13-3c — Quality on the 498-clip bank, and whether the head start was paid for
+
+**Validity check first.** The Nemotron arm of this run reads WER mean
+**0.10634** and corpus **0.14618** on the 498 clips. Scoring the FROZEN C=80
+reference transcripts gave 0.1063 and 0.1462. An independent streaming pass
+reproduces the frozen evidence to four decimals, so the harness is sound before
+any comparison is read out of it.
+
+## FACT — the corpus-wide number is an artefact of the corpus
+
+| subset | n | Nemotron WER mean / p50 | EOU 120M WER mean / p50 |
+|---|---|---|---|
+| all | 498 | 0.1063 / 0.0714 | 0.2290 / 0.1500 |
+| **synthetic concatenations** | 149 | 0.1119 / 0.0789 | **0.4928 / 0.5106** |
+| **original FLEURS** | **349** | **0.1040 / 0.0667** | **0.1164 / 0.0769** |
+
+53 transcripts came back severely short (under half the reference's words).
+**All 53 are `cat2` composed clips. Zero are original recordings.** Truncation
+rate: composed **35.6 %**, original **0.0 %**. Duration is not the cause — the
+truncated clips run 16.9-21.2 s while intact long clips run to 42.4 s.
+
+## FACT — the truncation is EOU working, measured rather than assumed
+
+On those 53 clips, the 120M's transcript scores **WER 0.6314** against the full
+two-utterance reference and **0.1516 mean / 0.0769 p50** against the reference
+PREFIX of the same length. Worked example, `long_0070_cat2.wav`,
+`fleurs_ids [675, 1009]`: the hypothesis is the **first utterance, complete and
+correct**, ending exactly where the second begins.
+
+**DECISION.** The stress bank concatenates two turns into one file, and a model
+trained to detect end-of-utterance correctly stops at the seam. **This bank is
+structurally unfair to an EOU model**, and every quality comparison with it must
+drop the composed clips or it measures the corpus. `earliness_cost.py` grew a
+`--drop-composed` flag whose help text says why, so it cannot later be mistaken
+for dropping inconvenient clips.
+
+## RESULT — the paired question, on the 349 original recordings
+
+| paired, 120M minus Nemotron | p50 | mean | better / worse / tied | z |
+|---|---|---|---|---|
+| **first non-blank, ms** | **−300** | −301 | **311 / 4 / 34** | **+17.30** |
+| WER | +0.0000 | +0.0124 | 62 / 104 / 183 | −3.26 |
+| CER | +0.0000 | +0.0079 | 68 / 117 / 164 | −3.60 |
+| WER format-free | +0.0000 | +0.0148 | 57 / 110 / 182 | −4.10 |
+
+So there **is** a quality cost and it is statistically real — about **1.2 WER
+points on the mean** — but the **median delta is exactly zero**: on 183 of 349
+clips the two models score identically.
+
+## RESULT — and the head start is NOT what pays for it
+
+Spearman **rho(Δ first non-blank, Δ WER) = +0.1198, z = +2.24**. Positive means
+the clips where the 120M saves the most time are the clips where its WER delta
+is LOWEST. The quartile table makes it concrete:
+
+| bucket | n | Δt p50 | **Δ WER mean** |
+|---|---|---|---|
+| Q1, earliest | 97 | −500 ms | **−0.0001** |
+| Q2 | 79 | −300 ms | +0.0131 |
+| Q3 | 91 | −200 ms | +0.0110 |
+| Q4, least early | 82 | −100 ms | **+0.0283** |
+
+**On the quarter of clips where it gains half a second, it costs nothing at
+all. On the quarter where it gains least, it is at its worst.** The relationship
+runs opposite to a latency-for-accuracy trade.
+
+**OBSERVATION, not a mechanism.** The reading consistent with this is that a
+clip which is hard for a 120M model is hard in both ways at once — it commits
+late *and* it is wrong — rather than earliness causing error. Two checkpoints
+differ in depth, width, data, objective, cadence and vocabulary simultaneously,
+so this is a property of the pair. It says the trade is worth investigating on
+ONE model; it does not establish a cause.
+
+By length class on the original subset: short 0.0757 → 0.0873, medium
+0.1111 → 0.1240, long (17 clips) 0.3105 → 0.3263. Both models score badly on the
+long originals, which is the FLEURS retake artefact recorded in M-6.
+
+## Where this leaves the 120M
+
+**A defensible lightweight English lane, and a better control than expected.**
+It emits 300 ms earlier on 311 of 349 clips and costs ~1.2 WER points, with no
+truncation on genuine single-utterance audio. It remains English-only, without
+punctuation or capitalisation, and unqualified — no concurrency, no soak,
+nothing promoted.
+
+**And its EOU behaviour is now demonstrated on our own corpus**, by accident: it
+ends the utterance at a turn boundary, correctly, 53 times out of 149
+opportunities. That is the capability S13-7 was going to have to demonstrate
+some other way.
