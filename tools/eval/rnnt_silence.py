@@ -56,8 +56,43 @@ import wave
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bench"))
 import clip_onset  # noqa: E402
 
-FRAME = re.compile(r"\[RNNT\] frame=(\d+) blank=([-\d.]+) best_nonblank=(\d+):([-\d.]+) "
-                   r"margin=([-\d.]+) chose=(\w+)")
+# The emitter is src/decoder.c dec_trace_line(). R-9 extended that line with the
+# word mark, the best LEXICAL token, per-token ranks and |enc|/|joint|, and the
+# parsers here were left reading the pre-R-9 shape
+# `blank=<score> best_nonblank=<id>:<score> margin=<m> chose=TOKEN`.
+# They therefore matched nothing and reported an empty result as a finding.
+# Mapping from the old fields to the current ones, kept explicit so the next
+# format change is a one-line edit rather than an archaeology exercise:
+#   old blank          -> the SCORE inside `blank=<id>:<score>:r<rank>`
+#   old best_nonblank  -> `nb=<id>:<score>:r<rank>`
+#   old margin         -> `margin_nb` (blank minus best non-blank)
+#   old chose=TOKEN    -> `chose=<id>` with <id> != the blank id on that line
+FRAME_RE_SRC = (r"\[RNNT\] frame=(-?\d+) audio_s=(\S+) enc=(\S+) joint=(\S+) "
+                r"pred=(\S+) post=(\d+) blank=(\d+):(\S+):r(\d+) "
+                r"wmark=(-?\d+):(\S+):r(-?\d+) lex=(-?\d+):(\S+):r(-?\d+) "
+                r"nb=(-?\d+):(\S+):r(-?\d+) chose=(-?\d+) "
+                r"margin_lex=(\S+) margin_nb=(\S+)")
+
+
+def parse_frame(line):
+    """One decoder decision, in the fields the analyses here were written against.
+
+    Returns None when the line is not a frame line. `chose` is normalised back
+    to the strings "TOKEN"/"BLANK" the callers compare against."""
+    m = re.search(FRAME_RE_SRC, line)
+    if not m:
+        return None
+    g = m.groups()
+    blank_id, chose_id = int(g[6]), int(g[18])
+    return {"frame": int(g[0]), "audio_s": float(g[1]),
+            "enc": float(g[2]), "joint": float(g[3]),
+            "pred": g[4], "blank": float(g[7]), "blank_rank": int(g[8]),
+            "lex_id": int(g[12]), "lex": float(g[13]), "lex_rank": int(g[14]),
+            "nb_id": int(g[15]), "nb": float(g[16]), "nb_rank": int(g[17]),
+            "margin": float(g[20]), "margin_lex": float(g[19]),
+            "chose_id": chose_id,
+            "chose": "TOKEN" if chose_id != blank_id else "BLANK"}
+
 EMIT = re.compile(r"\[RNNT\] emit q=(\d+) audio_s=([\d.]+) tokens_added=(\d+) "
                   r"chars=(\d+) chars_emitted=(\d+)")
 CLIP = re.compile(r"\[stream: (\S+) in")
@@ -71,10 +106,10 @@ def parse(path):
         if m:
             clip = m.group(1)
             continue
-        m = FRAME.search(line)
-        if m:
-            pend.append({"frame": int(m.group(1)), "blank": float(m.group(2)),
-                         "margin": float(m.group(5)), "tok": m.group(6) == "TOKEN"})
+        f = parse_frame(line)
+        if f:
+            f["tok"] = f["chose"] == "TOKEN"
+            pend.append(f)
             continue
         m = EMIT.search(line)
         if m:
