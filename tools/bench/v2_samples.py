@@ -11,9 +11,14 @@ way there with their timestamps, and the timings the gates were computed from.
 
 What it collects:
 
-  * every ANOMALOUS utterance -- errored, rejected, transcript diverging from
-    the unloaded reference, or an outlier in TTFP or emission lag. These are
-    the ones a reader will want and the ones a summary hides.
+  * every NOTABLE utterance -- errored, rejected, transcript diverging from the
+    unloaded reference, empty, or in the top 1% of this run's own TTFP or
+    emission lag. These are what a reader wants and what a summary hides.
+
+    The percentile is a SELECTION rule, not a verdict. Every run has a tail, so
+    about 1% of a perfect run sits above its own p99; being kept here means
+    "worth looking at", never "out of envelope". PASS/FAIL belongs to the
+    registered gates in v2_verdict.py and nowhere else.
   * a deterministic representative sample of healthy ones, class-balanced.
 
 It does NOT copy thousands of WAVs: one copy per distinct clip, referenced by
@@ -35,7 +40,15 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from streaming_metrics import normalise, pct                  # noqa: E402
 
-OUTLIER_P = 99          # an utterance past this percentile of the run is kept
+# SELECTION, NOT JUDGEMENT. This percentile decides which utterances are worth
+# putting in front of a reader. It is NOT a health criterion and must never
+# become one: a perfect run has a tail by definition, so ~1% of any run sits
+# above its own p99 and being there means "interesting", never "wrong".
+#
+# What decides PASS/FAIL is the registered absolute and paired gates in
+# .work/server-v2-qualification.md, checked by v2_verdict.py. A row in this
+# index marked ANOMALY may belong to a run that passed every one of them.
+OUTLIER_P = 99
 
 
 def load_side(run, name):
@@ -85,15 +98,15 @@ def collect(run, per_class):
                     normalise(u.get("text") or "") != normalise(unloaded):
                 why.append("transcript diverges from the unloaded reference")
             if ttfp_hi is not None and (u.get("ttfp_ms") or 0) > ttfp_hi:
-                why.append(f"ttfp above the run's p{OUTLIER_P}")
+                why.append(f"top 1% of this run's ttfp (selection, not a gate)")
             umax = max((m for _, m in (u.get("lag_marks") or [])), default=None)
             if lag_hi is not None and umax is not None and umax > lag_hi:
-                why.append(f"emission lag above the run's p{OUTLIER_P}")
+                why.append("top 1% of this run's emission lag (selection, not a gate)")
             if not (u.get("text") or "").strip() and not u.get("rejected"):
                 why.append("empty transcript")
 
             if why:
-                rows.append(_row(u, tag, clip, ref, ttfp_base, onsets, "ANOMALY: " + "; ".join(why)))
+                rows.append(_row(u, tag, clip, ref, ttfp_base, onsets, "NOTABLE: " + "; ".join(why)))
                 clips_needed.add(clip)
                 continue
             # Representative healthy ones: deterministic, class-balanced, and
@@ -192,12 +205,19 @@ def main():
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    anomalies = [r for r in rows if r["why_kept"].startswith("ANOMALY")]
+    anomalies = [r for r in rows if r["why_kept"].startswith("NOTABLE")]
     with open(os.path.join(out, "README.txt"), "w") as f:
         f.write(f"""Qualification samples for {os.path.basename(a.run.rstrip('/'))}
 
 {len(rows)} rows in index.jsonl over {len(sources)} run file(s): {', '.join(sources)}
-{len(anomalies)} anomalous, {len(rows) - len(anomalies)} representative.
+{len(anomalies)} notable, {len(rows) - len(anomalies)} representative.
+
+NOTABLE is a SELECTION rule, not a verdict. Errors, rejections, transcript
+divergence and empty output are genuine faults; "top 1% of this run's ttfp or
+emission lag" is not -- every run has a tail, and about 1% of a perfect one
+sits above its own p99. Whether the run PASSED is decided by the registered
+gates in .work/server-v2-qualification.md and reported by v2_verdict.py, never
+by the presence of rows here.
 {copied} wav file(s) under wav/ ({len(clips)} distinct clips, {missing} not found on this host).
 
 One row per utterance INSTANCE; one wav per distinct clip, so a clip played
@@ -209,7 +229,8 @@ gates were computed from.
 The complete per-utterance record stays in the run's own soak*.json beside this
 folder; this is the readable slice, not a replacement for it.
 """)
-    print(f"{len(rows)} row(s) ({len(anomalies)} anomalous), {copied} wav copied -> {out}")
+    print(f"{len(rows)} row(s) ({len(anomalies)} notable -- a selection, not a verdict), "
+          f"{copied} wav copied -> {out}")
     if missing:
         print(f"  {missing} clip(s) were not on this host and were not copied")
     if a.zip:

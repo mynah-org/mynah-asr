@@ -89,7 +89,8 @@
       },
       "MYNAH_ASR_STACK_SOLO": {
         "value": "1",
-        "why": "default, stated here because it is load-bearing: a ready set of one goes through the stacked encoder path. Measured on this box, one binary, flag as the only difference, arms alternated, c=8 on a fresh server each time -- ON 105/104/103 ms emission lag p95, OFF 175/175 ms. The step itself goes 86.7 -> 16.8 ms for a lone stream. It matters most at low concurrency, which on a 3x8 fleet is every worker's common case."
+        "why": "the binary's DEFAULT, so it must NOT be exported -- it is recorded here because it is load-bearing, not because a deployment should set it. A ready set of one goes through the stacked encoder path. Measured on this box, one binary, flag as the only difference, arms alternated, c=8 on a fresh server each time -- ON 105/104/103 ms emission lag p95, OFF 175/175 ms. The step itself goes 86.7 -> 16.8 ms for a lone stream. It matters most at low concurrency, which on a 3x8 fleet is every worker's common case.",
+        "default": true
       }
     }
   },

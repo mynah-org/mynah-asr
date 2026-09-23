@@ -28,7 +28,7 @@ this shell. It exits non-zero on any mismatch, because a benchmark is invalid
 until dispatch is proven (ENGINEERING.md §5) and a profile that is "mostly"
 honoured is a profile nobody can reason about.
 """
-import argparse, glob, json, os, subprocess, sys
+import argparse, glob, json, os, platform, subprocess, sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERF = os.path.join(HERE, "configs", "perf")
@@ -150,6 +150,92 @@ def parse_dispatch(text):
             out[f[0]] = f[4]
     return out
 
+def read_host():
+    """What this machine actually is, from the kernel rather than from a note."""
+    h = {"architecture": platform.machine(), "kernel": platform.release(),
+         "os": platform.system()}
+    try:
+        h["logical_cpus"] = os.cpu_count()
+    except Exception:
+        pass
+    try:
+        txt = open("/proc/cpuinfo").read()
+        for line in txt.splitlines():
+            if line.lower().startswith(("model name", "cpu model")):
+                h["cpu_model"] = line.split(":", 1)[1].strip(); break
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=20).stdout
+        for line in out.splitlines():
+            k, _, v = line.partition(":")
+            k, v = k.strip().lower(), v.strip()
+            if k == "model name":
+                h.setdefault("cpu_model", v)
+            elif k == "thread(s) per core":
+                h["threads_per_core"] = int(v)
+            elif k == "core(s) per socket":
+                h["cores_per_socket"] = int(v)
+            elif k == "socket(s)":
+                h["sockets"] = int(v)
+            elif k == "numa node(s)":
+                h["numa_nodes"] = int(v)
+            elif k == "flags":
+                h["flags"] = set(v.split())
+    except Exception:
+        pass
+    if "cores_per_socket" in h and "sockets" in h:
+        h["physical_cores"] = h["cores_per_socket"] * h["sockets"]
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                h["ram_gib"] = round(int(line.split()[1]) / 1048576)
+                break
+    except Exception:
+        pass
+    return h
+
+
+def check_host(d, h):
+    """Every way this machine differs from the one the profile was proved on."""
+    want, bad = d.get("hardware") or {}, []
+    def cmp(key, label, hard=True):
+        w, g = want.get(key), h.get(key)
+        if w is None or g is None:
+            return
+        if str(w) != str(g):
+            bad.append(f"{label}: profile {w}, this host {g}"
+                       + ("" if hard else " (advisory)"))
+    cmp("architecture", "architecture")
+    cmp("logical_cpus", "logical cpus")
+    cmp("physical_cores", "physical cores")
+    cmp("numa_nodes", "numa nodes")
+    cmp("threads_per_core", "threads per core (SMT)")
+    # SMT is stated as prose in the existing profiles, so read it either way.
+    smt = (want.get("smt_policy") or "")
+    if h.get("threads_per_core") is not None and smt:
+        off = smt.strip().upper().startswith("OFF")
+        if off and h["threads_per_core"] != 1:
+            bad.append(f"SMT: profile says {smt.split(';')[0]}, this host reports "
+                       f"{h['threads_per_core']} threads per core")
+    if want.get("ram_gib") and h.get("ram_gib"):
+        if abs(int(want["ram_gib"]) - int(h["ram_gib"])) > max(2, int(want["ram_gib"]) * 0.1):
+            bad.append(f"ram: profile {want['ram_gib']} GiB, this host {h['ram_gib']} GiB")
+    for feat in (want.get("isa_features_used") or []):
+        if h.get("flags") and feat not in h["flags"]:
+            bad.append(f"ISA: the profile's numbers were taken with {feat} and this cpu "
+                       f"does not report it")
+    # A cpuset the machine cannot honour is a silently different topology.
+    srv = (d.get("server") or {}).get("server_cpus")
+    if srv and h.get("logical_cpus"):
+        hi = max(int(x) for part in str(srv).split(",")
+                 for x in part.split("-") if x.strip().isdigit())
+        if hi >= h["logical_cpus"]:
+            bad.append(f"server_cpus {srv} names cpu {hi} and this host has "
+                       f"{h['logical_cpus']} ({0}-{h['logical_cpus'] - 1})")
+    return bad
+
+
 def cmd_check(a):
     d = load(a.profile)
     if a.dispatch_map:
@@ -173,8 +259,24 @@ def cmd_check(a):
             bad.append(f"{var} is set to {live!r} and the profile says it must be ABSENT "
                        f"({spec['why']})")
         elif spec.get("value") is not None and live != str(spec["value"]):
-            bad.append(f"{var} is {live!r}, the profile requires {spec['value']!r}")
+            # `default: true` means the binary already uses this value when the
+            # variable is unset, so ABSENT is correct and exporting it changes
+            # nothing. Without this the preflight refused a correctly configured
+            # host for not setting a variable the profile itself calls a default
+            # -- and the qualified runs did not set it either.
+            if spec.get("default") and live is None:
+                continue
+            bad.append(f"{var} is {live!r}, the profile requires {spec['value']!r}"
+                       + ("" if not spec.get("default") else " (or absent, which is its default)"))
+    host = read_host()
+    hostbad = check_host(d, host)
+    bad += hostbad
     print(f"profile {d['profile']['id']}  status={d['profile']['status']}")
+    print(f"  host       {host.get('cpu_model', '?')}, {host.get('logical_cpus', '?')} cpus, "
+          f"{host.get('threads_per_core', '?')} thread(s)/core, "
+          f"{host.get('numa_nodes', '?')} numa node(s), {host.get('ram_gib', '?')} GiB, "
+          f"{host.get('os', '?')} {host.get('kernel', '?')}")
+    print(f"  {'ok  ' if not hostbad else 'FAIL'}  machine matches the one this profile was proved on")
     for feat, want in (d.get("dispatch_required") or {}).items():
         mark = "ok  " if str(got.get(feat)) == str(want) else "FAIL"
         print(f"  {mark}  {feat:<22} required {want!s:<14} resolved {got.get(feat)}")
