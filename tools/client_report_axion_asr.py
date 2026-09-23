@@ -6,7 +6,7 @@ the artefacts it reads are benchmark dumps that must never be committed, but thi
 generator is source for a deliverable. Data in, code tracked.
 
 The visual language is deliberately the same as the PocketTTS report of
-2026-09-21 (mynah-tts tools/client_report_pocket.py): same palette, same band,
+2026-09-21 (the sibling mynah-tts repo's client report): same palette, same band,
 same table and chart idiom, so a reader who has seen one can read the other
 without relearning it. The content is entirely different -- that document
 measures synthesis, this one measures recognition.

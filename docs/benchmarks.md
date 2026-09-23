@@ -223,3 +223,62 @@ about the pool's occupancy during it.
 including C=120 at 1.3 s of lag, and transcript parity passed at every one: the
 same clip played by different streams produced the same text, identical to the
 unloaded reference. This fleet degrades by getting slow.
+
+## Parakeet TDT 110m vs Nemotron 0.6b, identical corpus — Axion c4a-highcpu-32 — 2026-09-23
+
+498 clips / 6585.2 s from the C=80 qualification's own `bank.txt` (per-clip
+sha256), commit `5b934b7`, same box and same session for every column, and the
+same scorers (`wer`/`cer`/`wer_format_free`/`normalise` from
+`tools/bench/streaming_metrics.py`). Thread invariance gated at 8 clips per
+model, 0 mismatches. **Serving semantics differ and the columns are not
+interchangeable**: Parakeet has no streaming mode in this runtime
+(`mynah_asr_stream_unsupported()` refuses it) — its column is whole-file
+offline. The Nemotron streaming column is the frozen run's unloaded reference
+transcripts, scored, not recomputed.
+
+| | Parakeet TDT 110m Q4_K_M, offline | Nemotron 0.6b int8, offline | Nemotron 0.6b int8, streaming `[56,3]` |
+|---|---|---|---|
+| WER mean / p50 | **0.0916 / 0.0556** | 0.1045 / 0.0714 | 0.1063 / 0.0714 |
+| WER corpus-weighted | **0.1306** | 0.1443 | 0.1462 |
+| WER format-free, mean | **0.0641** | 0.0759 | 0.0774 |
+| CER mean / format-free | **0.0622 / 0.0303** | 0.0674 / 0.0349 | 0.0688 / 0.0357 |
+| errors / empty | 0 / 0 | 0 / 0 | 0 / 0 |
+| wall, 24 x 1 thread | **26.3 s** | 135.9 s | — |
+
+FLEURS original (349) vs synthetic concatenations (149), WER mean: 0.0907 /
+0.0937 Parakeet, 0.1014 / 0.1116 Nemotron — the stress bank does not distort
+the comparison. Caveats this table does not isolate: Parakeet 110m is
+English-only against Nemotron's 40 locales, and the quantisation schemes differ.
+
+### Parakeet offline capacity, REST (`rest_load.py`) — SCREEN, promotes nothing
+
+Fresh 6 x 5 fleet per rung on cpus 0-29, generator on 30-31, affinity proven per
+rung, 60 clips. `xRT` = audio seconds accepted per wall second.
+
+| C | requests | refused | errors | xRT | lat p50 ms | lat p95 ms | cores measured | RSS total MB |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 60 | 0 | 0 | 40.3 | 283 | 802 | 3.78 | 1249 |
+| 4 | 32 | 0 | 0 | 148.2 | 603 | 859 | 13.84 | 1323 |
+| 8 | 64 | 0 | 0 | 198.4 | 614 | 1423 | 18.67 | 1453 |
+| 16 | 128 | 0 | 0 | 207.3 | 1361 | 2708 | 18.79 | 1865 |
+| 32 | 256 | 0 | 0 | 227.3 | 2529 | 3161 | 19.82 | 2251 |
+
+Throughput saturates between C=4 and C=8; from C=8 to C=32 it gains 15 % while
+median latency grows 4.1x. **0 errors and 0 refusals at every rung**, so this
+ladder located a knee, not a limit. Cores plateau at 18.7-19.8 of the 30 pinned
+from C=8 upward — the same shape as S12-7c on Nemotron, on a different model
+and a different code path.
+
+## First-word latency decomposition, Nemotron `[56,3]` — Axion — 2026-09-23
+
+From the frozen C=80 artefacts; see `docs/serving-findings.md` F32.
+
+| | unloaded C=4, 498 clips | C=80 soak 1 | C=80 soak 2 |
+|---|---|---|---|
+| TTFP from speech start, p50 / p95 ms | 821 / 1921 | 864 / 1967 | 868 / 1973 |
+| speech consumed at 1st word, p50 / p95 ms | 876 / 1996 | 816 / 1986 | 816 / 1986 |
+| server lateness on that frame, p50 / p95 ms | 20.0 / 21.5 | 44.2 / 104.9 | 44.6 / 106.2 |
+
+Paired per clip, `ttfp_from_speech - speech_consumed` is within [-78, +7] ms.
+First publication is quantised to `0.256 + 0.32k` with no exception over 498
+clips, and `k <= 1` never occurs.

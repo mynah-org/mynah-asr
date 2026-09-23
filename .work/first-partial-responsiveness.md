@@ -1220,3 +1220,202 @@ so the next step can test it rather than inherit it.
 
 R-13 stops here: the boundary is localised with a reproducible contrast across
 four languages, and the instrumentation is not expanded further.
+
+---
+
+# R-14 — The C=80 qualification decomposes its own first-word latency
+
+Status: **RESULT 2026-09-23** (Axion c4a-highcpu-32, commit `5b934b7`, binary
+`37df098d…`). Re-opened by the client report, which recorded
+`speech → first partial` p95 **1969 ms** and marked it BAD against the 1800 ms
+UX guardrail while the paired load penalty was only **+86 ms**. The question was
+where the other ~1.9 s goes.
+
+## The first cut needed no new measurement
+
+R-1 specified four per-utterance fields and `v2_qualify.sh` has been writing
+them ever since: `ttfp_ms`, `ttfp_from_onset_ms`, `first_delta_audio_s` (the
+audio the MODEL had consumed when it published) and `first_delta_lag_ms` (the
+server's own lateness on that frame). The qualified run
+`20260923T122705Z` therefore already contains an unloaded 498-clip pass and two
+loaded 30-minute soaks with all four. Nothing below re-runs the model; the
+frozen artefacts are read and scored, never recomputed.
+
+Derived quantity used throughout:
+`speech_consumed = first_delta_audio_s − onset_s`, the SPEECH (not audio) the
+model heard before its first publishable token. Leading silence cancels out of
+it by construction, which is what makes it comparable across clips.
+
+## RESULT — the table
+
+All milliseconds. Unloaded = the run's own reference pass at C=4 over 498 clips;
+loaded = the two 1800 s soaks at C=80, 10865 and 10854 utterances.
+
+| | unloaded p50 | p95 | soak1 p50 | p95 | soak2 p50 | p95 |
+|---|---|---|---|---|---|---|
+| leading silence (onset) | 600 | 1800 | — | — | — | — |
+| TTFP from stream open | 1521 | 2821 | 1568 | 2846 | 1568 | 2847 |
+| **TTFP from speech start** | **821** | **1921** | **864** | **1967** | **868** | **1973** |
+| **speech consumed at 1st** | **876** | **1996** | **816** | **1986** | **816** | **1986** |
+| server lateness on that frame | 20.0 | 21.5 | 44.2 | 104.9 | 44.6 | 106.2 |
+
+**FACT 1 — the wait before the first word IS the speech the model consumes.**
+Paired per clip, unloaded, `ttfp_from_speech − speech_consumed` lies in
+**[−78, +7] ms** over all 498 clips (p50 −16, mean −26). These are not two
+quantities that happen to have similar percentiles; they are the same quantity
+measured on two sides of the socket, and the small negative offset is the
+pacing of the client's own onset second.
+
+**FACT 2 — load does not move it.** `speech_consumed` p95 is 1996 ms unloaded
+and 1986 ms in both soaks: a 0.5 % difference across a 1 → 80 concurrency
+range. The only term load moves is the server's lateness, 20 → 105 ms at p95,
+which is the same +86 ms the paired TTFP gate measured independently.
+
+**FACT 3 — publication is quantised to the encoder chunk grid, exactly.**
+`first_delta_audio_s` takes **12 distinct values over 498 clips, every one of
+them on `0.256 + 0.32·k`** — the first chunk's 256 ms plus `(lookahead+1)×80`
+per chunk. Distribution of `k`:
+
+| k | audio_s | clips | % | cum % | median speech consumed |
+|---|---|---|---|---|---|
+| 2 | 0.896 | 23 | 4.6 | 4.6 | 496 ms |
+| 3 | 1.216 | 121 | 24.3 | 28.9 | 716 ms |
+| 4 | 1.536 | 130 | 26.1 | 55.0 | 836 ms |
+| 5 | 1.856 | 101 | 20.3 | 75.3 | 956 ms |
+| 6 | 2.176 | 47 | 9.4 | 84.7 | 876 ms |
+| 7 | 2.496 | 41 | 8.2 | 93.0 | 896 ms |
+| 8 | 2.816 | 19 | 3.8 | 96.8 | 916 ms |
+| 9–15 | 3.136–5.056 | 16 | 3.2 | 100.0 | 1336–4236 ms |
+
+`k = 0` and `k = 1` are never observed: **no clip in this corpus published
+before 0.896 s of audio.** 93 % publish by `k = 7`.
+
+**FACT 4 — the p95 is a tail, not the body.** Median speech consumed is flat at
+~500–960 ms for `k = 2..8` (96.8 % of clips) — a larger `k` there mostly means
+more leading silence, not more speech. Only at `k ≥ 10` (1.6 % of clips) does
+speech consumed jump to 3.2–4.2 s. The 1986 ms p95 is produced by that tail.
+
+## What this rules in and out, against the four components
+
+- **D. COMPUTE / SERVING — closed, 20 ms idle, 105 ms at C=80.** Consistent with
+  R-4/F30's `publication_delay` of 0.08–0.10 ms and with the paired penalty.
+  There is nothing here to win.
+- **A + B. MODEL / DECODER — owns essentially all of it**, and is invariant
+  under load, which is what FACT 2 establishes. A and B are not yet separated
+  from each other: `first_delta_audio_s` is the first PUBLISHED delta, and the
+  audit of 2026-09-23 confirms the decoder's internal state (`s->tokens`,
+  `s->detok.buf`, `src/mynah_asr.c:764-769`) advances on every non-blank
+  independently of the publication gate at `src/mynah_asr.c:1004`.
+- **C. PUBLICATION POLICY — NOT YET MEASURED.** It is measurable today without
+  touching the model: `MYNAH_ASR_TRACE_RNNT` prints
+  `[RNNT] emit q= audio_s= tokens_added= chars= chars_emitted=` and its
+  `<-- DECODED A TOKEN, PUBLISHED NOTHING` branch exists precisely to expose
+  this gap. Until that is read, no claim may be made that the append-only
+  contract does or does not withhold an early hypothesis.
+
+## NOT established
+
+- That the ~840 ms median is irreducible acoustic evidence. FACT 3 says the
+  model publishes on a 320 ms grid; it does not say the grid is what binds.
+  R-10 already showed the grid cannot be cheaply shortened — `[56,0]` buys a
+  measured median of only **100 ms** (the derivation gives `(q−1)/2 × 80` =
+  120 ms, not the 240 ms once assumed) and costs mean CER 0.0405 → 0.0525.
+- That the `k ≥ 10` tail has the same cause as the body. 16 clips; not
+  characterised.
+- Any statement about *why* `k = 0` and `k = 1` never win. R-10's finding that
+  the left cache needs **4480 ms of audio in every preset** means every first
+  token in this corpus is decided with a partially filled cache; whether that is
+  what forbids `k ≤ 1` is a hypothesis, not a result.
+
+## Next, in the order that cannot mislead
+
+1. **R-15** — read the publication gate. Separates C from A+B and is a
+   read-only trace run, no model or protocol change.
+2. Only then, any Pareto experiment. R-10 and R-8 already stand as recorded
+   negatives and must not be re-run without a different mechanism.
+
+---
+
+# R-15 — The publication gate holds nothing. Component C is zero.
+
+Status: **RESULT 2026-09-23.** 120 clips (40 per length class) from the
+qualification bank, Axion, commit `5b934b7`, Nemotron 0.6b int8, pack-default
+preset, `MYNAH_ASR_TRACE_RNNT=1`, unloaded, offline `mynah-asr stream`.
+
+## Method
+
+Measured in AUDIO time, never wall time: `mynah-asr stream` runs faster than
+real time so its wall clock says nothing about a live stream, while `audio_s`
+is the same quantity `first_delta_audio_s` reports and is therefore directly
+comparable to F32. Two independent sources were read from one run and
+cross-checked: the per-decision `[RNNT] frame= audio_s= ... chose=` lines on
+stderr, and the `--deltas` JSON a client would have seen on stdout.
+
+Caveat recorded rather than hidden: the CLI feeds on its own `--chunk-ms` grid,
+so its audio quantisation is not byte-identical to the server's
+`0.256 + 0.32k`. The two harnesses agree anyway — see below — which is the
+cross-validation, not a coincidence to be glossed over.
+
+## RESULT
+
+| | p50 | p95 | p99 | min | max | mean |
+|---|---|---|---|---|---|---|
+| speech -> first NON-BLANK decision, ms | 860 | 1990 | 2960 | 380 | 4250 | 1041 |
+| speech -> first PUBLISHED delta, ms | 860 | 1990 | 2960 | 380 | 4250 | 1041 |
+| **publication gate, ms** | **0.0** | **0.0** | **0.0** | **0.0** | **0.0** | **0.0** |
+| blank decisions before the first non-blank | 17 | 36 | 36 | 8 | 56 | 19.5 |
+
+**FACT — component C is exactly zero, on 120 of 120 clips.** The first published
+delta lands in the same chunk as the decoder's first non-blank decision. The
+append-only contract at `src/mynah_asr.c:1004` does not withhold the first word
+by so much as one chunk.
+
+**DECISION — the two-tier provisional/stable API branch is killed.** It was
+worth asking because the decoder's internal state does advance independently of
+the gate, but there is no early hypothesis for a provisional channel to carry:
+the gate opens on the same chunk the decoder commits. No protocol change, no
+revision channel, nothing to design. B2 closes here.
+
+**Cross-validation with F32.** This harness reads speech-to-first-word p50
+**860 ms** and p95 **1990 ms**; the server, on its own grid and a different
+(498-clip) sample, read `speech_consumed` p50 816-876 and p95 1986-1996. Two
+harnesses, two grids, two samples, the same answer.
+
+**The decoder decides once per encoder frame and needs about 17 of them.** At
+80 ms per frame that is ~1360 ms of audio; with the corpus median onset at
+600 ms, roughly 7-8 of those decisions fall in leading silence and ~10 in
+speech, which reconciles with the 860 ms speech-relative median.
+
+## Withdrawn before it was reported
+
+The first version of this experiment also counted "chunks that decoded a token
+but published nothing" and read **1 for every clip**. That is a parser artefact,
+not a finding: `chars_emitted` on the `[RNNT] emit` line is the counter as it
+stood *before* that chunk's publication, so the chunk that first decodes a token
+always shows `chars_emitted=0` and publishes it in the same breath — the next
+line's `chars_emitted` proves it. The column is removed rather than explained
+away. The `publication_gate_ms` figure above does not depend on it: it compares
+the trace's first non-blank against the delta the client actually received.
+
+## Where the first word now stands, all four components
+
+| component | owns | evidence |
+|---|---|---|
+| **D. compute / serving** | 20 ms idle, ~105 ms at C=80 | F30, F32 |
+| **C. publication policy** | **0 ms** | R-15, 120/120 clips |
+| **A + B. model / decoder** | everything else: p50 ~860 ms, p95 ~1990 ms of speech | F32, R-15 |
+
+A and B remain unseparated from each other and that is the only live question
+left in this campaign. R-8 rejected a predictor-state emission lock; R-10 showed
+the chunk grid cannot be cheaply shortened (`[56,0]` buys a measured 100 ms and
+costs mean CER 0.0405 -> 0.0525); R-11 and R-13 localised a high-norm encoder
+regime on early frames without establishing that it is harmful.
+
+## Next action
+
+Nothing is started. The honest statement of the remaining question is: **of the
+~17 blank decisions before the first word, how many are the model having no
+evidence yet, and how many are it having evidence and not committing?** R-9's
+trace already records, per decision, the blank logit, the best lexical token,
+its rank and both margins — so this is an analysis of existing traces before it
+is ever an experiment on the model.

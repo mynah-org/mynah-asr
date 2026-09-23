@@ -1700,3 +1700,58 @@ of wall and says nothing about the pool's occupancy during it. Measured
 cpu-seconds later put 6x5 at 23.1 cores where that arithmetic said 27.6.
 
 **Every one of the three came from comparing at a single point.**
+
+## F32 — The wait before the first word is the speech the model consumes, and load does not move it
+
+RESULT, 2026-09-23, GCP c4a-highcpu-32 (Neoverse-V2), commit `5b934b7`,
+Nemotron 0.6b int8 at `[56,3]`. Derived entirely from the artefacts of the
+qualified C=80 run; nothing was re-run and no frozen artefact was rewritten.
+
+The client report recorded `speech -> first partial` p95 **1969 ms** against an
+1800 ms UX guardrail, while the paired loaded-vs-unloaded penalty was only
+**+86 ms**. That pair of numbers is not a contradiction and it is not a serving
+defect. It decomposes.
+
+Definitions used, both already written per utterance by `v2_qualify.sh` since
+R-1: `first_delta_audio_s` is the audio the MODEL had consumed when it published
+its first word, and `speech_consumed = first_delta_audio_s - onset_s` removes
+that clip's own leading silence.
+
+| | unloaded C=4, 498 clips | C=80 soak 1, 10865 utt | C=80 soak 2, 10854 utt |
+|---|---|---|---|
+| TTFP from speech start, p50 / p95 | 821 / 1921 | 864 / 1967 | 868 / 1973 |
+| speech consumed at 1st, p50 / p95 | 876 / 1996 | 816 / 1986 | 816 / 1986 |
+| server lateness on that frame, p50 / p95 | 20.0 / 21.5 | 44.2 / 104.9 | 44.6 / 106.2 |
+
+**The two are the same quantity, not two similar ones.** Paired per clip on the
+unloaded pass, `ttfp_from_speech - speech_consumed` lies within **[-78, +7] ms**
+over all 498 clips (p50 -16). The client is measuring, on its side of the
+socket, the audio the model ate on the other side.
+
+**Load moves only the lateness term.** `speech_consumed` p95 is 1996 ms unloaded
+and 1986 ms in both soaks — 0.5 % across a 1 -> 80 concurrency range — while
+server lateness goes 20 -> 105 ms at p95, independently reproducing the +86 ms
+the paired TTFP gate measured. Combined with F30's `publication_delay` of
+0.08-0.10 ms, **the serving path is closed as a contributor: it owns 20 ms on
+an idle fleet and ~105 ms at the qualified operating point.**
+
+**Publication is quantised to the encoder chunk grid, with no exceptions.**
+`first_delta_audio_s` takes **12 distinct values over 498 clips and every one
+lies on `0.256 + 0.32k`** — the first chunk's 256 ms plus `(lookahead+1) x 80`
+per chunk thereafter. `k = 0` and `k = 1` never occur: nothing in this corpus
+published before **0.896 s of audio**. 55 % of clips publish by `k = 4`
+(1.536 s) and 93 % by `k = 7` (2.496 s).
+
+**The p95 is a tail, not the body.** Median speech consumed is flat at
+~500-960 ms across `k = 2..8`, which is 96.8 % of the corpus — a larger `k`
+there means more leading silence, not more speech. Only the 1.6 % of clips at
+`k >= 10` consume 3.2-4.2 s of speech, and they are what produces the 1986 ms
+p95.
+
+**What this does NOT establish.** That the ~840 ms median is irreducible
+acoustic evidence; that the 320 ms grid is what binds; or that the publication
+gate at `src/mynah_asr.c:1004` never withholds an already-decoded token — the
+decoder's own state advances on every non-blank independently of that gate, and
+the gap between decoding and publishing has not been read. R-10 already showed
+the grid is not cheaply shortened: `[56,0]` buys a measured median of 100 ms
+and costs mean CER 0.0405 -> 0.0525.
