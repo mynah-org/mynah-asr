@@ -541,3 +541,152 @@ upgraded to a result **for the config layer only**.
 
 **NEXT.** Write the builder, then take those four in order. A failure at any of
 them is a finding and is recorded, not worked around.
+
+---
+
+# S13-3b — RESULT: it converts, it loads, it streams. Engine unchanged.
+
+**EXPERIMENT.** Extend `tools/convert_nemo.py` with the missing cell — a
+cache-aware builder on the `.nemo` route — and run it. **No change to `src/`.**
+
+**RESULT.**
+
+```
+OK parakeet-realtime-eou-120m [nemotron-streaming] from .nemo:
+   465 tensors f32, 1027 pieces, mel fb (1, 128, 257) from the checkpoint
+```
+
+- **FACT — `_NEMO_RENAMES` covered every tensor.** No key was unmatched. The
+  argument from shared NeMo classes is now a result, for the naming layer.
+- **FACT — it transcribes offline**: 7.4 s clip, RTF 0.139 f32 on the
+  development host, *"the satellite in space gets the call and then reflects it
+  back down almost instantly"*.
+- **FACT — it streams cache-aware**: 18 incremental deltas, and the streaming
+  final text is identical to the offline text.
+- **FACT — int8 matches f32** on all three committed English clips, and the
+  int8 pack is 150 MB against 460 MB.
+- **FACT — it runs on the Axion** on a stress-bank clip from the qualification
+  corpus.
+- **FACT — the output is lowercase and unpunctuated**, which is exactly what
+  NVIDIA's card says this model does. That is a cheap identity check: we are
+  running the model we think we are, not a mis-shaped copy of something else.
+
+**FACT — the first delta on `fleurs_1521.wav` lands at `t1 = 0.600 s`** with
+the text `"the"`. For Nemotron on the qualification corpus the EARLIEST
+publication ever observed over 498 clips was 0.896 s of audio, and the median
+was 1.536 s. **OBSERVATION.** One clip is an anecdote, and it is recorded as
+one; the distribution is what decides, and it is being measured on the same 120
+clips that produced the Nemotron baseline.
+
+## What this is NOT
+
+- **Numeric parity against the Python oracle has NOT been run.** Rule 3 is not
+  suspended on a research branch. Plausible text from a brand-new importer is
+  the weakest evidence in this repo, not the strongest: the offline and
+  streaming paths agreeing shows they agree with *each other*, not with NeMo.
+- No WER has been measured on any corpus for this model here.
+- No concurrency, no capacity, no soak. Nothing about this may be promoted.
+- `<EOU>` was not observed in the output on the clips tried so far. That is
+  expected-ish — the card's EOU latency is measured with trailing silence and
+  these clips end near the last word — but it is **UNKNOWN**, not explained.
+
+## What it cost
+
+One builder, about eighty lines, in an offline tool. The inference engine, the
+server and the scheduler were not touched. That is the answer to S13-3's
+question C, and it is worth stating plainly because the S13-2 analysis
+predicted it before the code was written.
+
+---
+
+# S13-9 — Ranked backlog, by evidence and cost
+
+Ranked by **information per unit of cost**, not by how interesting the model is.
+EN+FR is the product minimum throughout, so nothing English-only is ever
+proposed as a Nemotron replacement.
+
+## QUICK EXPERIMENT
+
+**Q1. Oracle parity for the 120M pack.** *Gain: decisive — it is the only thing
+standing between "it produces plausible text" and "it is correct", and every
+claim in S13-3b depends on it. Effort: small, the oracle and the per-stage
+harness exist. Axion: none, development host. Disk: already paid. EN only.
+Reuse: total. Unknown: whether `tools/oracle/` covers this arch without work.*
+**This is the top item and nothing downstream of it should be believed until it
+passes.** Rule 3 is not suspended on a research branch.
+
+**Q2. The 120M as the first-word control** (running). *Gain: high — it is the
+experiment S13-5 was set up for, and the FastEmit finding makes either outcome
+informative. Effort: none, the tool and the corpus exist. Axion: minutes.*
+
+**Q3. Read NeMo-Speech.cpp.** *Gain: high and cheap — NVIDIA ships a first-party
+C++ runtime for the exact GGUF checkpoints this repo targets, documented on the
+model cards we use. Effort: a few hours of reading. Axion: none. Unknown:
+everything; we have not looked. Not a threat assessment, an intelligence gap.*
+
+**Q4. TDT v3 prefix ladder, EN and FR.** *Gain: moderate and bounded — NVIDIA's
+own figures already say a TDT Parakeet under chunking reads WER 22.83 at 1.12 s
+and 95.12 at 0.40 s, so this locates where usable output ends rather than
+discovering a mode. Effort: small. Axion: under an hour. EN+FR: directly
+relevant, this is the only multilingual offline pack we hold.*
+
+## SMALL IMPLEMENTATION
+
+**S1. The silence-run endpointer, in C.** *Gain: high and PRODUCT-facing.
+Effort: ~50 lines plus a test. Axion: a short soak to show it costs nothing.
+EN+FR: full — it is model-agnostic integer bookkeeping over decoded token ids
+and works on the Nemotron we already qualified, with no new checkpoint and no
+retrain.* NVIDIA's shipped parameters are `stop_history_eou: 800` ms,
+`residue_tokens_at_end: 2`, `word_boundary_tolerance: 4`, snapping to a word
+boundary. **This is the best value item on the list**: it buys voice-agent
+turn-taking on the multilingual model, which the English-only EOU 120M cannot.
+
+**S2. A bit-exactness oracle for the streaming cache.** *Gain: high for
+confidence, zero for performance. Effort: small. Axion: none.* NeMo ships
+`streaming.use_cache: false` — keep the left context as audio, re-encode every
+chunk, drop the first `left_context` output frames. It needs no retrain and no
+new model, and it is an independent check on the one piece of streaming state
+mynah currently has no gate for. Rule 4 asks for exactly this.
+
+## MEDIUM IMPLEMENTATION
+
+**M1. Surface EOU as an event distinct from text.** *Gain: moderate, and it is
+the contract half of S1. Effort: protocol plus server plus client. Unknown:
+whether the event belongs on the same channel as deltas.* **Not before S1**:
+the endpointer is what produces the event on the model we actually serve.
+
+**M2. Capability descriptors instead of model-name special cases.** *Gain:
+removes future special cases; buys nothing today. Effort: medium and it touches
+the server. Rejection condition: if it would weaken an optimised path, it does
+not ship.* S13-6 is a design study and stays one until S1 and Q1 are done.
+
+## RESEARCH
+
+**R1. `parakeet-unified-en-0.6b`.** NVIDIA's own answer to "one checkpoint,
+both modes": offline 5.91 WER, 6.29 at 1.12 s, 8.44 at 0.16 s, 15.63 at 0.08 s,
+buffered-only because the left context is recomputed per chunk. English-only,
+`.nemo` only. *Worth understanding before anyone proposes a unified mode here.*
+
+**R2. Streaming fine-tune feasibility for a multilingual Parakeet.** S13-2
+showed the encoder difference is configuration, which makes this architecturally
+plausible and says nothing about cost. *No training is started.*
+
+## NOT CURRENTLY JUSTIFIED
+
+**N1. Multitalker as an implementation.** NVIDIA's own design replicates the
+whole cache-aware encoder state and forward pass **per active speaker**: "the
+real batch size for inference is at most B * N". At our qualified C=80 that is
+C=20 sessions at four speakers, plus a second model (a streaming Sortformer
+diarizer) in the fleet. *It is a capacity decision before it is an architecture
+decision, and the capacity is not there.* Keep it as the read-only study S13-8.
+
+**N2. Replacing Nemotron with the EOU 120M.** English-only. Its documented WER
+is 9.30 at 160 ms against Nemotron English 7.67 at 160 ms, and it emits no
+punctuation or capitalisation — a product-visible difference our own corpus
+scoring would hide, because `normalise()` strips both. **It is a control and
+possibly a lightweight English lane. It is not a replacement.**
+
+**N3. Optimising the attention cache "like NeMo".** NeMo caches pre-projection
+activations and recomputes Q/K/V over the history every step; mynah already
+caches projected K/V. Moving toward the reference here would be strictly more
+work for identical numbers.
