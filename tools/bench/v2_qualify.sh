@@ -25,6 +25,11 @@
 #       [--reference-file <reference.json from an earlier run of this tool>]
 #       [--http-threads 32]   per worker; W x this is the fleet's CONNECTION
 #                             ceiling, NOT its compute width
+#       --phase genscale [--gen-arms "24-31 24-27 24-25"] [--genscale-c 32]
+#                             how few cpus the LOAD GENERATOR needs. The server
+#                             is identical in every arm and the cpus the
+#                             generator gives up are left EMPTY -- this is an
+#                             attribution experiment, not a capacity one
 #       [--server-cpus 0-23] [--gen-cpus 24-31] [-W 3] [-T 8] [-C 96]
 #
 # It refuses rather than produce a number it cannot support: a dirty tree, a
@@ -35,6 +40,7 @@ set -u
 MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
 W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3; HTTP_T=32
 LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
+GEN_ARMS="24-31 24-27 24-25"; GENSCALE_C=32; GENSCALE_S=180
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
 SERVER_CPUS="0-23"; GEN_CPUS="24-31"; REF_IN=""
 while [ $# -gt 0 ]; do
@@ -55,6 +61,9 @@ while [ $# -gt 0 ]; do
         --soaks) SOAKS="$2"; shift 2 ;;
         --server-cpus) SERVER_CPUS="$2"; shift 2 ;;
         --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
+        --gen-arms) GEN_ARMS="$2"; shift 2 ;;
+        --genscale-c) GENSCALE_C="$2"; shift 2 ;;
+        --genscale-seconds) GENSCALE_S="$2"; shift 2 ;;
         --reference-file) REF_IN="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "v2_qualify: unknown option: $1" >&2; exit 2 ;;
@@ -306,6 +315,68 @@ if [ "$PHASE" = all ] || [ "$PHASE" = ladder ]; then
              | grep -E "TTFP|emission lag|finaliz|backlog|drift|verdict|utterances|pacing|REFERENCE|identity" || true
         dumper_stop
         stop_fleet "ladder-C$C"
+    done
+fi
+
+# ------------------------------------------------- 3b. how much does the GENERATOR need
+#
+# Eight physical cores are withheld from the server so the Python load generator
+# cannot contend with it. That reservation may be far larger than the generator
+# needs, and in production this generator does not run on the inference host at
+# all -- so withholding a quarter of the machine may be understating the server.
+#
+# This measures the generator ALONE. The server stays byte-identical at 3x8 on
+# the same cpus in every arm, and the cpus the generator gives up are left
+# EMPTY. Handing them to the server in the same experiment would change two
+# things at once and attribute the result to whichever one we preferred.
+if [ "$PHASE" = genscale ]; then
+    say "--- G1 generator headroom: server FROZEN at ${W}x${T} on $SERVER_CPUS, \
+recovered cpus deliberately left idle"
+    for ARM in $GEN_ARMS; do
+        check_ceiling "$GENSCALE_C"
+        tag="gen$ARM"
+        start_fleet "$tag"
+        dumper_start "$tag"
+        grep -E '^cpu[0-9]+ ' /proc/stat > "$RUN/cpu-before-$tag.txt"
+        say "--- GENSCALE arm $ARM (C=$GENSCALE_C, ${GENSCALE_S}s)"
+        GEN_CPUS="$ARM" load --mode soak --streams "$GENSCALE_C" --duration "$GENSCALE_S" \
+             --warmup 20 --window 30 --seed 42 --clips $BANK \
+             ${REFJSON:+--reference "$REFJSON"} \
+             --json "$RUN/genscale-$tag.json" 2>&1 | tee -a "$RUN/run.log" \
+             | grep -E "emission lag|backlog|verdict|utterances|pacing|late|REFERENCE|identity" || true
+        grep -E '^cpu[0-9]+ ' /proc/stat > "$RUN/cpu-after-$tag.txt"
+        dumper_stop
+        stop_fleet "$tag"
+        python3 - "$RUN/cpu-before-$tag.txt" "$RUN/cpu-after-$tag.txt" "$ARM" <<'CPUD' | tee -a "$RUN/run.log"
+import sys
+def load(p):
+    out = {}
+    for line in open(p):
+        f = line.split()
+        if f and f[0].startswith("cpu") and f[0][3:].isdigit():
+            v = [int(x) for x in f[1:]]
+            out[int(f[0][3:])] = (sum(v), v[3] + (v[4] if len(v) > 4 else 0))
+    return out
+def expand(spec):
+    out = []
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-"); out += list(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+a, b, cpus = load(sys.argv[1]), load(sys.argv[2]), expand(sys.argv[3])
+busy = []
+for c in cpus:
+    if c not in a or c not in b:
+        continue
+    dt, di = b[c][0] - a[c][0], b[c][1] - a[c][1]
+    busy.append(0.0 if dt <= 0 else 1.0 - di / dt)
+if busy:
+    print("    generator cpu busy: " + "  ".join(f"cpu{c} {u*100:.1f}%"
+          for c, u in zip(cpus, busy))
+          + f"   mean {sum(busy)/len(busy)*100:.1f}%  total {sum(busy):.2f} cores")
+CPUD
     done
 fi
 

@@ -937,6 +937,13 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
         "per utterance (server lateness on the first frame)", "ms", rep, lbl)
     m["max_delta_gap_ms"] = stat([u["max_gap_ms"] for u in ok if u.get("max_gap_ms") is not None],
                                  "per utterance (longest silence in each)", "ms", rep, lbl)
+    # The CLIENT's own lateness, distributed rather than reduced to a flag. `paced`
+    # says whether any utterance missed its schedule by more than half a frame;
+    # this says by how much, across the population, which is what an experiment
+    # on the generator's own resources has to compare between arms. Reported
+    # ALWAYS, including on a run that did not pace -- there it is the evidence.
+    m["send_late_ms"] = stat([u["max_late_ms"] for u in ok if u.get("max_late_ms") is not None],
+                             "per utterance (worst frame in each)", "ms", True, "MEASURED")
 
     # Fairness. A fleet p95 hides one starved stream among thirty healthy ones,
     # and a starved stream is a person hearing nothing. Per stream, the p95 of
