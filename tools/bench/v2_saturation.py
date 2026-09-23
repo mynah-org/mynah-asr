@@ -81,12 +81,40 @@ def dump_tail(path):
     return per
 
 
+def cores_used(path):
+    """Cores each worker actually used, from cumulative cpu-seconds.
+
+    model_duty is the SCHEDULER thread's fraction of wall spent in the model.
+    Multiplying it by the pool width assumes every thread was equally busy for
+    that whole fraction, which nothing here measures. This does measure it:
+    (cpu_seconds_end - cpu_seconds_start) / (elapsed_end - elapsed_start)."""
+    if not os.path.exists(path):
+        return None
+    first, last = {}, {}
+    for line in open(path, errors="replace"):
+        f = line.split()
+        # pid rss stat etimes cputimes -- cputimes only in samples taken after
+        # 2026-09-23, so an older run simply reports nothing here.
+        if len(f) < 5 or not f[0].isdigit() or not f[3].isdigit() or not f[4].isdigit():
+            continue
+        pid, el, cpu = f[0], int(f[3]), int(f[4])
+        first.setdefault(pid, (el, cpu))
+        last[pid] = (el, cpu)
+    out = []
+    for pid, (el0, c0) in first.items():
+        el1, c1 = last[pid]
+        if el1 > el0:
+            out.append((c1 - c0) / (el1 - el0))
+    return out or None
+
+
 def rung(path, log):
     d = json.load(open(path))
     s, m, cnt = d["summary"], d["summary"]["metrics"], d["summary"]["counts"]
     man = d.get("manifest") or {}
     cm = man.get("chunk_period_ms") or chunk_period_ms(int(man.get("lookahead", 3)))
     per = dump_tail(log)
+    cores = cores_used(log.replace("server-", "procsample-").replace(".log", ".txt"))
     def avg(k):
         v = [r[k] for r in per.values() if k in r]
         return sum(v) / len(v) if v else None
@@ -101,6 +129,7 @@ def rung(path, log):
         "lagmax": g("emission_lag_ms", "max"),
         "backlog": g("backlog_max_s", "max"), "fin95": g("finalization_lag_ms"),
         "ttfp95": g("ttfp_ms"), "workers": len(per),
+        "cores": sum(cores) if cores else None,
         # Streams the fleet actually held. A rung whose peak x workers falls
         # short of C did not run C: it ran what its connection ceiling allowed,
         # and its throughput and duty belong to that number, not to C.
@@ -126,13 +155,14 @@ def main(dirs):
     f = lambda v, n=2: "  -  " if v is None else f"{v:.{n}f}"
     print(f"{'C':>4} {'utt':>6} {'lost':>5} {'a/wall':>7} {'duty':>6} {'idle':>6} "
           f"{'nowork':>7} {'lag95':>6} {'lag99':>6} {'lagmax':>7} "
-          f"{'backlog':>8} {'fin95':>6} {'held':>6} {'paced':>6}")
+          f"{'backlog':>8} {'fin95':>6} {'cores':>6} {'held':>6} {'paced':>6}")
     for r in rows:
         print(f"{r['C'] if r['C'] is not None else '?':>4} {r['utt']:>6} {r['lost']:>5} "
               f"{f(r['audio_per_wall']):>7} {f(r['model_duty'], 3):>6} "
               f"{f(r['runnable_idle'], 3):>6} {f(r['no_work'], 3):>7} "
               f"{f(r['lag95'], 0):>6} {f(r['lag99'], 0):>6} "
               f"{f(r['lagmax'], 0):>7} {f(r['backlog'], 3):>8} {f(r['fin95'], 0):>6} "
+              f"{f(r['cores'], 1):>6} "
               f"{(str(r['held']) + ('*' if r['held'] and r['C'] and r['held'] < r['C'] else '')) if r['held'] else '-':>6} "
               f"{'yes' if r['paced'] else 'NO':>6}")
     short = [r for r in rows if r["held"] and r["C"] and r["held"] < r["C"]]

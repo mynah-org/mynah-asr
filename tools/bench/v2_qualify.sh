@@ -271,7 +271,14 @@ dumper_start() {   # dumper_start <tag>
           kill -USR1 $SRV 2>/dev/null
           printf 't=%s pids=%s\n' "$(date -u +%H:%M:%S)" "$(pgrep -P $SRV 2>/dev/null | tr '\n' ',')" \
               >> "$RUN/procsample-$1.txt"
-          ps -o pid=,rss=,stat=,etimes= -p "$(pgrep -P $SRV 2>/dev/null | tr '\n' ',' | sed 's/,$//')" \
+          # cputimes is CUMULATIVE cpu-seconds for the process, threads
+          # included. Differenced between two samples and divided by the wall
+          # time between them it gives the CORES that worker actually used --
+          # the thing `model_duty x threads` only ever approximated, since duty
+          # is the scheduler thread's own fraction and says nothing about how
+          # busy the pool was during it.
+          ps -o pid=,rss=,stat=,etimes=,cputimes= \
+              -p "$(pgrep -P $SRV 2>/dev/null | tr '\n' ',' | sed 's/,$//')" \
               2>/dev/null >> "$RUN/procsample-$1.txt"
       done ) & DUMPER=$!; }
 dumper_stop()  { kill $DUMPER 2>/dev/null; DUMPER=""; }
