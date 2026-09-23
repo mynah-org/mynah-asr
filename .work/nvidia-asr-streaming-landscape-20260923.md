@@ -470,3 +470,74 @@ throughput scheduling and is documented as result-equivalent to the scalar
 reference, so a C port is bit-compatible with the batched path by construction.
 Everything else in the streaming, decoding, EOU and multitalker paths is plain
 tensor and integer work that transfers to CPU.
+
+---
+
+# S13-3a — RESULT: the converter refuses, and names exactly what is missing
+
+**EXPERIMENT, run 2026-09-23 on the development host** (never on the Axion). The
+460 MB `.nemo` was downloaded to the Mac — 460,062,720 bytes, the size the HF API
+declares — the oracle environment installed (`torch 2.13.0`), and
+`tools/convert_nemo.py` run against it.
+
+**RESULT — a named refusal, not a crash:**
+
+```
+tools/convert_nemo.py:306, in yaml_encoder_section
+AssertionError: only non-causal offline encoders from .nemo (for now)
+```
+
+**FACT — the gap is a matrix hole, and it is one cell.** The converter has two
+independent builders:
+
+| | HF-native (`config.json` + safetensors) | `.nemo` archive |
+|---|---|---|
+| **offline, non-causal** | `build_parakeet_tdt` | `build_parakeet_tdt_from_yaml` |
+| **streaming, causal** | `build_nemotron` | **nothing** |
+
+Nemotron reached mynah through the HF-native path, because NVIDIA publishes
+`config.json` and `model.safetensors` for it. The EOU 120M publishes **only a
+`.nemo`** (confirmed against the repo file list) and is **causal +
+chunked_limited**. It is the one combination with no route.
+
+**FACT — the precise field delta**, read by diffing `build_nemotron` (the
+streaming builder that works) against `yaml_encoder_section` (the `.nemo` reader
+that refuses), with the 120M's own yaml values in the last column:
+
+| mynah.json field | present in the yaml reader? | source in the 120M yaml | value |
+|---|---|---|---|
+| `arch` / `engine` | writes the offline pair | — | `fastconformer_rnnt_streaming` |
+| `encoder.subsampling` | passes `dw_striding` through | derive from `causal_downsampling: true` | **`dw_striding_causal`** |
+| `encoder.att_context_style` | asserted `regular` | `att_context_style` | `chunked_limited` |
+| `encoder.conv_norm` | passed through | `conv_norm_type` | `layer_norm` (already right) |
+| `encoder.use_bias` | passed through | `use_bias` | `false` (already right) |
+| `features.normalize` | passed through | `preprocessor.normalize` | `NA` (already right) |
+| `streaming.att_context_presets` | **absent** | `att_context_size` | `[[70, 1]]` |
+| `streaming.default_preset_index` | **absent** | — | `0` (one preset) |
+| `streaming.encoder_frame_ms` | **absent** | `hop/sr x subsampling x 1000` | `80.0` |
+| `prompt` | **absent** | — | correctly omitted: this model has none |
+
+**OBSERVATION.** Nine of those ten rows are either already produced correctly by
+the yaml reader or are a direct copy of a field the yaml already carries. The
+only derivation is `causal_downsampling: true -> dw_striding_causal`, and the
+only genuinely new block is `streaming`, which `build_nemotron` already knows
+how to shape.
+
+**DECISION.** S13-3's question C is answered with evidence: support for this
+checkpoint is **importer work**, not new inference machinery, and the importer
+work is one builder in `tools/convert_nemo.py`. The earlier hypothesis is
+upgraded to a result **for the config layer only**.
+
+**Still NOT established, and the order matters:**
+1. That the `.nemo` tensor names match what `_NEMO_RENAMES` expects — argued in
+   the addendum above from the shared NeMo classes, not yet observed.
+2. That the tokenizer extracts (the 120M's SPE files sit **after** the 460 MB
+   weights in the tar, so they cost a full read, unlike the config).
+3. That the runtime loads the pack and `mynah_asr_stream_unsupported()` returns
+   NULL in practice rather than on paper.
+4. **That any transcript it produces is correct.** Rule 3 is not suspended on a
+   research branch: numeric parity against the Python oracle is a separate gate
+   and a pack that loads is not a pack that works.
+
+**NEXT.** Write the builder, then take those four in order. A failure at any of
+them is a finding and is recorded, not worked around.
