@@ -134,3 +134,40 @@ first treatment in this campaign that moves the core plateau materially
 per-stream loops as a real part of the S12-7c mechanism. Kept, default off.
 
 **NEXT.** Level 2 measured as 1 vs 2, not 0 vs 2.
+
+### Level 2 — RESULT, measured as 1 vs 2 (commit `249e6a5`, C=112, ABBA x2)
+
+Level 2 = level 1 + SiLU per stream + each residual add fused into the
+following layer norm, row-parallel. Bit-exact on Nemotron on the box
+(`test_stream_batch`, `test_kv_layout`), and a planted 0.5 -> 0.5001 in the
+fused add fails the gate, so the new path is exercised.
+
+| level | rep | audio/wall | cores | a/w per core | lag p50/p95/p99 | backlog max | fin p95 | ready B | disp/s/w | worker_spin % |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 83.90 | 24.79 | 3.38 | 94 / 246 / 353 | 0.584 | 513 | 3.7 | 5747 | 74.0 |
+| 2 | 1 | 82.68 | 25.59 | 3.23 | 67 / 185 / 257 | 0.484 | 377 | 2.6 | 9671 | 91.5 |
+| 2 | 2 | 82.43 | 25.63 | 3.22 | 67 / 187 / 274 | 0.544 | 368 | 2.6 | 9743 | 91.5 |
+| 1 | 2 | 83.69 | 24.77 | 3.38 | 97 / 243 / 340 | 0.564 | 488 | 3.8 | 5688 | 73.8 |
+
+- Level 2 over level 1: **lag p95 -24 %** (2 x spread = 6 ms) MATERIAL; fin
+  p95 -26 %, lag p99 -23 %. Backlog -13 % (inside 2 x spread) and audio/wall
+  -1.5 % not material; cores +0.8; throughput per core -5 %.
+- **Cumulative against shift** (shift at C=112: five runs today, lag p95
+  537-581, all failing the lag and finalization gates): lag p95 ~549 -> 186
+  (-66 %), fin p95 ~1058 -> 373 (-65 %). Level 2 passes every serving gate at
+  C=112 in both reps (TTFP excepted, the corpus-onset artefact that fails at
+  every C). That is the registered safe-concurrency step. Caveat: the shift
+  arm was not interleaved with the level-2 reps; it was interleaved with level
+  1, and it has been stable across five runs on this box today.
+- **Cost**: throughput per core 3.80 (shift) -> 3.38 (1) -> 3.22 (2). The
+  latency is bought with pool threads doing work that was serial, plus four
+  times the dispatches (2480 -> 9700 per second per worker), each a barrier.
+  The fleet is not doing MORE audio per second at C=112, because C=112 is
+  still mostly paced; what changes is that it stops falling behind.
+
+**DECISION.** Level 2 kept as an incremental SMALL WIN on top of level 1, and
+together they are the first treatment that WINS by the registered rules (a
+safe-concurrency step at C=112). Default stays off: promotion is a product
+decision and needs its own qualification.
+
+**NEXT.** Where does the knee move? C=128, shift against level 2.
