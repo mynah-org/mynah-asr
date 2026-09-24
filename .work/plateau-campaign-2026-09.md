@@ -240,3 +240,21 @@ exact, times are a dev signal only.
 The serial quantisation passes disappear entirely; q/k/v share one pass (7680
 -> 6144 rows); no dispatch is added (level 2 had added 9 per layer). The
 server dump carries the same counters as an `actq` line.
+
+### Level 4 — RESULT at C=112, measured as 2 vs 4 without level 3 (commit `758a10c`, ABBA x2)
+
+| arm | rep | audio/wall | cores | a/w per core | lag p50/p95/p99 | fin p95 | backlog max | disp/s/w | caller act-quant ms / worker / 120 s |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 82.31 | 25.60 | 3.22 | 67 / 184 / 271 | 390 | 0.644 | 9780 | ~3670 |
+| 4 | 1 | 82.84 | 25.38 | 3.26 | 62 / 175 / 247 | 340 | 0.584 | 10114 | ~430 |
+| 4 | 2 | 83.03 | 25.37 | 3.27 | 62 / 175 / 247 | 346 | 0.384 | 10069 | ~425 |
+| 2 | 2 | 82.66 | 25.52 | 3.24 | 68 / 189 / 276 | 391 | 0.564 | 9622 | ~3680 |
+
+- **Mechanism on the box**: caller-side activation quantisation falls 88 %
+  (the rest is B=1 steps, finalization and the decoder, which level 4 does not
+  touch); ~3.2 s of scheduler time per worker per 120 s removed (~2.7 %).
+- System level: audio/wall +0.5 %, lag p95 -6 % (2 x spread = 10 ms, so
+  outside noise but under the 20 % threshold), fin p95 -12 %, lag p99 -10 %,
+  cores -0.2. **NOT MATERIAL at C=112** by the registered rules.
+- C=112 no longer discriminates: both arms pass every gate with ready B ~2.6,
+  i.e. neither is saturated. C=128 (level 2's knee) is the discriminating rung.
