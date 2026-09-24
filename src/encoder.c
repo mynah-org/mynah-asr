@@ -1314,6 +1314,57 @@ int mynah_asr_enc_batch_f32_ok(void) {
 }
 
 
+/* S10-3: the per-stream stages of the batched step on the pool, over streams.
+ * Each stream's attention core, K/V commit and conv mid touch only that
+ * stream's scratch, caches and rows of the stacked buffers, so running stream i
+ * on another thread computes the same floats in the same order: bit-exact by
+ * construction, and gated by tests/test_stream_batch and tests/test_kv_layout
+ * with the flag on. A GEMM a task issues finds the pool busy and runs inline,
+ * which the DOT family keeps bit-identical (sgemm.c, row strips fixed by SG_MR).
+ * MYNAH_ASR_STREAM_PAR=1 turns it on; RESEARCH A/B, default off. */
+static int stream_par_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_STREAM_PAR");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+typedef struct {
+    mynah_asr_enc_batch *bb;
+    mynah_asr_enc_stream *const *ess;
+    const mynah_asr_enc_layer *L;
+    int li, d, ck, k_sh;
+    const float *kn, *vn, *rk_sh;
+} stream_par_ctx;
+
+static void stream_par_attn(void *vctx, int i) {
+    const stream_par_ctx *c = vctx;
+    mynah_asr_enc_batch *bb = c->bb;
+    mynah_asr_enc_stream *es = c->ess[i];
+    const size_t off = (size_t)bb->offs[i] * (size_t)c->d;
+    const int Q = bb->qq[i];
+    const float *rk_tab = mynah_asr_enc_relpos_rows(es->enc, c->li, bb->kks[i]);
+    const float *kk, *vv;
+    kv_windows(es, c->li, c->kn + off, c->vn + off, Q, &kk, &vv);
+    stream_attention_core(es, c->L, bb->qs + off, kk, vv, es->sa_pe, bb->ctxs + off, Q,
+                          es->kv.valid,
+                          rk_tab ? rk_tab : (bb->kks[i] == c->k_sh ? c->rk_sh : NULL),
+                          rk_tab ? MYNAH_ASR_RELPOS_TABLE : MYNAH_ASR_RELPOS_SHARED);
+    mynah_asr_kv_commit(&es->kv, c->li, 0, c->kn + off, Q);
+    mynah_asr_kv_commit(&es->kv, c->li, 1, c->vn + off, Q);
+}
+
+static void stream_par_conv(void *vctx, int i) {
+    const stream_par_ctx *c = vctx;
+    mynah_asr_enc_batch *bb = c->bb;
+    mynah_asr_enc_stream *es = c->ess[i];
+    const size_t off = (size_t)bb->offs[i] * (size_t)c->d;
+    float *cc = es->conv_cache + (size_t)c->li * (size_t)(c->ck - 1) * (size_t)c->d;
+    stream_conv_mid(es, c->L, bb->tmp2 + 2u * off, bb->cin + off, bb->qq[i], cc);
+}
+
 /* Rows that took the shared rel-pos projection, against all rows stacked. */
 static _Atomic unsigned long long g_share_rows, g_share_total;
 
@@ -1437,7 +1488,17 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
          * clean timer boundary would have changed the locality of the thing
          * being measured, which is how a profiler ends up measuring itself. */
         unsigned long long attn_ns_ = 0, kv_ns_ = 0;
-        for (int i = 0; i < B; i++) {
+        const int par = B > 1 && stream_par_on();
+        stream_par_ctx pc = {bb, ess, L, li, d, ck, k_sh, kn, vn, rk_sh};
+        if (par) {
+            /* one region: `attn` gets its WALL, commit included and kv_cache
+             * none -- the split cannot be timed across threads without
+             * summing thread-time into a wall-time table */
+            const unsigned long long a_ = ep_ns();
+            mynah_asr_parallel_for(B, stream_par_attn, &pc);
+            attn_ns_ = ep_ns() - a_;
+        }
+        for (int i = 0; i < B && !par; i++) {
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
             const int Q = bb->qq[i];
@@ -1473,7 +1534,8 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
          * per stream. tmp2 holds the stacked pointwise_conv1 output [R, 2d]. */
         layer_norm_f(xs, L->ln_conv_w, L->ln_conv_b, xn, R, d);
         mynah_asr_qmat_mul_rows(&L->pw1_w, xn, tmp2, R, qx, sx);
-        for (int i = 0; i < B; i++) {
+        if (par) mynah_asr_parallel_for(B, stream_par_conv, &pc);
+        for (int i = 0; i < B && !par; i++) {
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
             float *cc = es->conv_cache + (size_t)li * (size_t)(ck - 1) * (size_t)d;

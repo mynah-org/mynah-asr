@@ -124,6 +124,13 @@ static const mynah_asr_flag g_flags[] = {
      " contents, same floats: tests/test_kv_layout gates it with memcmp. RESEARCH A/B (S13-1d)",
      NULL, NULL},
 
+    {"MYNAH_ASR_STREAM_PAR", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
+     "1/0: run the per-stream stages of the batched encoder step (attention core + K/V commit,"
+     " conv mid) over streams on the pool instead of serially on the scheduler thread. Each stream"
+     " touches only its own state, so the floats are the same: tests/test_stream_batch and"
+     " tests/test_kv_layout gate it. RESEARCH A/B (S10-3)",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"
