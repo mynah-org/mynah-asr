@@ -55,6 +55,7 @@ applied to one task at a time.
 | [axion-first-run.md](axion-first-run.md) | Campaign — first build and baseline on the 32-core Neoverse-V2 box |
 | [cache-ring-1.md](cache-ring-1.md) | S13-1d / S10-5 — three K/V cache layouts (shift/ring/slide), the cache lifecycle, the registered A/B and its verdict |
 | [plateau-campaign-2026-09.md](plateau-campaign-2026-09.md) | S12-7c / S10-4 / S10-3 — where the idle cores go at saturation: serial-fraction map, pool spin (rejected), per-stream stages on the pool |
+| [failure-accounting-and-cancellation.md](failure-accounting-and-cancellation.md) | **P0 for 2026-09-25**: harness failure-accounting gaps, granular counters and conservation invariant, cancellation lifecycle audit, fault injection |
 | [repo-hygiene.md](repo-hygiene.md) | Small integrity items the checkers found |
 | [serving-audit-metrics-tests-hotpath.md](serving-audit-metrics-tests-hotpath.md) | Audit of 2026-09-20: what the hot path wastes beyond F27, what the harness measures and misses, quality as a regression system, the three test tiers, what the sibling still teaches |
 | `private/archive-2026-07-v1-plan.md`, `private/archive-2026-07-v1-todo.md` | The v1 plan and TODO (Italian, July 2026), local untracked history; superseded by the board |
