@@ -317,3 +317,23 @@ runs its last chunks through the SINGLE-stream path, one slot at a time on the
 scheduler thread (~61 ms per call, 8 % of wall at C=112, `phase finalize`),
 while every other stream waits. That is the next evidence-backed candidate.
 Cores used are back at ~21 of 30 at C=128.
+
+## FIN-STACK — finalization through the stacked path (registered before the run)
+
+- **FACT** (C=128, levels 2+3+4, worker 0 dumps): `finalize model_mean_ms`
+  58.9-59.9 over 183-205 calls, 9 % of worker wall, all of it `model_solo`
+  (the rest of the worker waits). A finalizing stream's last pieces and its
+  padded tail go through `stream_flush_chunk` -> the single-stream step, whose
+  int8 products take the serial small-T path (`QC_DOT`) on the scheduler
+  thread: one core busy, four pool threads idle, for ~59 ms.
+- **HYPOTHESIS.** Routing those chunks through the stacked B=1 path (measured
+  4.5x faster per step than the GEMV chain in the S1 work) shortens every
+  finalization and every solo block, and moves fin p95 and lag at C=128.
+- **TREATMENT.** `MYNAH_ASR_FIN_STACK=1` (commit `3afcb07`) on top of
+  `MYNAH_ASR_STREAM_PAR=4` (levels 2+3+4), C=128, ABBA x2. Gate before the
+  run: CLI deltas byte-identical flag off/on (12 local runs + 6 corpus clips
+  on the box), and a planted `is_last=0` in the batched step changes deltas.
+- **Mechanism proof expected in the dump**: `finalize model_mean_ms` well
+  below 59.
+- **Thresholds** as registered for the campaign (lag p95 or backlog >= 20 % and
+  > 2 x spread; throughput >= 3 %; the fin p95 gate at 500 ms is reported).
