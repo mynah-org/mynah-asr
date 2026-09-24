@@ -111,6 +111,16 @@ enum {
     MYNAH_ASR_QC__N
 };
 unsigned long long mynah_asr_qmat_counter(int which);
+
+/* Activation quantisation, by WHERE it ran (S10-3 level 4 mechanism proof):
+ * rows quantised by mul_rows on the calling thread and the wall they took,
+ * rows quantised by producers through quant_row, and GEMMs that consumed
+ * pre-quantised rows (mul_rows_q). Relaxed atomics, reset with the counters. */
+typedef struct {
+    unsigned long long caller_rows, caller_ns, caller_calls;
+    unsigned long long producer_rows, prequant_gemms;
+} mynah_asr_actq_stats;
+void mynah_asr_qmat_actq_stats(mynah_asr_actq_stats *out);
 void mynah_asr_qmat_counters_reset(void);
 
 /* ------------------------------------------------ which int8 MICRO-KERNEL ran

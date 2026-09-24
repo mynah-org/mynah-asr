@@ -644,6 +644,16 @@ void mynah_asr_obs_dump(void) {
                 ww ? 100.0 * (double)ps.worker_spin / (double)ww : 0.0,
                 cc ? 100.0 * (double)ps.caller_spin / (double)cc : 0.0);
     }
+    {   /* where int8 activation quantisation ran: on the scheduler thread inside
+         * mul_rows (and how long it took there), or inside the producing
+         * parallel regions (STREAM_PAR >= 4) */
+        mynah_asr_actq_stats aq;
+        mynah_asr_qmat_actq_stats(&aq);
+        OBS_ADD("[DUMP] worker=%d seq=%lu actq caller_calls=%llu caller_rows=%llu "
+                "caller_ms=%.1f producer_rows=%llu prequant_gemms=%llu\n",
+                widx, n, aq.caller_calls, aq.caller_rows, (double)aq.caller_ns / 1e6,
+                aq.producer_rows, aq.prequant_gemms);
+    }
     {   /* Per-slot, because a stall is a property of PARTICULAR streams. The
          * aggregate says the fleet is behind; this says which ones, how much
          * audio is waiting in each ring, and whether the scheduler can even see
