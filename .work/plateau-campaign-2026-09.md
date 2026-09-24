@@ -403,3 +403,49 @@ not a qualification.
   changes production and needs its own qualification (v2_qualify soak pair at
   the new operating point, v2_promote). The research configuration is
   `MYNAH_ASR_STREAM_PAR=4 MYNAH_ASR_FIN_STACK=1`.
+
+## QUALIFICATION of the research candidate (registered bounds, v2_qualify / v2_verdict)
+
+Candidate frozen at commit `dbae3fe` (dirty 0), `MYNAH_ASR_STREAM_PAR=4
+MYNAH_ASR_FIN_STACK=1`, every other flag unset; Nemotron int8 pack
+2f5e1434..., lookahead 3, batch window 0, 6x5 on cpus 0-29, generator 30-31,
+stress-en 500-clip sample (bank 04a7753aa1e80f9a, 498 clips), fresh server per
+soak, soak seeds 43/44. Provenance per run in the evidence (untracked,
+`.work/evidence/qual-20260924/`).
+
+### C=128 — QUALIFIED (both soaks)
+
+| bound | soak 1 | soak 2 | limit |
+|---|---|---|---|
+| utterances / established streams lost | 17007 / 0 | 17005 / 0 | 0 |
+| emission lag p95 | 129 ms | 129 ms | 320 ms |
+| finalization p95 | 221 ms | 221 ms | 500 ms |
+| backlog max | 0.284 s | 0.284 s | 0.640 s |
+| 503 refusals | 0 | 0 | — |
+| worst steady 60 s window p95 / trend | 132 ms / +0.2 % | 132 ms / +0.5 % | 320 ms / +50 % |
+| stalls >640 ms over published deltas | 0 / 467968 | 0 / 467879 | — |
+| TTFP load penalty, paired p50/p95/p99 | +59 / +103 / +124 ms | +59 / +102 / +126 ms | GOOD <= 250 |
+| worker RSS growth | 1.034x | 1.025x | 1.15x |
+| transcript parity (every stream = unloaded reference) | PASS | PASS | — |
+| audio/wall | 123.68x | 123.65x | — |
+
+The raw stream_load screen "TTFP p95 2881 vs 1160" fails at every C including
+the unloaded C=4 pass (2821 ms): it is the corpus onset, not a registered
+bound, and v2_verdict's paired bound 13 is the gate (as for the frozen C=80).
+
+### Quality regression gate — PASS, by identity
+
+The candidate's unloaded transcripts (C=4 pass of this qualification) are
+byte-identical to the FROZEN shipped-build reference (2026-09-23 C=80
+qualification) on 498 of 498 clips. Scored with streaming_metrics (the scorer
+reproduces the frozen S13-3c numbers exactly first):
+
+| subset | n | WER mean | corpus WER | p50 / p95 | CER mean | WER-ff | empty / truncated |
+|---|---|---|---|---|---|---|---|
+| all | 498 | 0.10634 | 0.14618 | 0.0714 / 0.3333 | 0.06878 | 0.07736 | 0 / 1 |
+| original | 349 | 0.10398 | 0.10856 | 0.0667 / 0.3333 | 0.06866 | 0.07435 | 0 / 0 |
+| composed | 149 | 0.11186 | 0.18436 | 0.0789 / 0.2778 | 0.06906 | 0.08441 | 0 / 1 |
+
+Paired per-clip delta against the frozen result: 0 worse, 0 better, 0.00000.
+Under load the soaks' parity bound compares every stream to this same
+reference, so the loaded transcripts are identical to the shipped build too.
