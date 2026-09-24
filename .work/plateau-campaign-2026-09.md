@@ -90,4 +90,47 @@ encoder time at C=120; the LN/SiLU/residual share is hidden inside ffn/conv.
   never a win. Upper bound of the direct gain: attn + kv + conv-mid serial time
   at B ~ 10 shared over 5 threads.
 
-(results pending)
+### Level 1 — RESULT (commit `bdeefc9`, C=112 x2 in ABBA order, C=80 x1)
+
+| STREAM_PAR | C | rep | audio/wall | cores | a/w per core | lag p50/p95/p99 | backlog max | fin p95 | ready B | disp/s/w | worker_spin % | lost |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 112 | 1 | 82.19 | 21.56 | 3.81 | 296 / 546 / 744 | 0.744 | 1051 | 10.7 | 2483 | 48.6 | 0 |
+| 0 | 112 | 2 | 81.51 | 21.56 | 3.78 | 298 / 552 / 739 | 0.824 | 1065 | 9.0 | 2477 | 48.5 | 0 |
+| 1 | 112 | 1 | 83.81 | 24.79 | 3.38 | 93 / 247 / 350 | 0.684 | 506 | 3.8 | 5761 | 73.9 | 0 |
+| 1 | 112 | 2 | 82.23 | 24.77 | 3.32 | 93 / 242 / 341 | 0.504 | 499 | 3.7 | 5703 | 73.9 | 0 |
+| 0 | 80 | 1 | 56.16 | 17.78 | 3.16 | 43 / 109 / 163 | 0.384 | 215 | 1.58 | 6435 | 80.0 | 0 |
+| 1 | 80 | 1 | 56.10 | 17.68 | 3.17 | 40 / 99 / 156 | 0.284 | 209 | 1.40 | 7052 | 85.3 | 0 |
+
+Parity `identity_fail 0, reference_fail 0` on every rung; the banner names
+`MYNAH_ASR_STREAM_PAR` on each. Component `attn` 1.39 -> 0.63 ms/row of wall
+at C=112 (the region now runs on five threads).
+
+Against the registered thresholds, C=112, means of two reps:
+
+- **lag p95 546/552 -> 247/242: -55 %**, 2 x spread = 12 ms. MATERIAL.
+- lag p99 -53 %, fin p95 -52 %, lag p50 297 -> 93.
+- backlog max 0.784 -> 0.594: -24 %, but 2 x spread = 0.36 s. Not material.
+- audio/wall +1.4 %: not material (C=112 is still largely paced: a/w / C =
+  0.73, the same ratio as C=80, so throughput has little room to move).
+- cores +3.2: real, and not a win by itself.
+- **Serving gates** (v2_qualify's own bounds; TTFP fails on every rung at
+  every C including C=80, the known corpus-onset artefact with no registered
+  bound): shift FAILS emission lag and finalization at C=112 in both reps;
+  level 1 PASSES all of them in rep 2 and misses finalization (506 against
+  500) and backlog (0.684 against 0.640) by a hair in rep 1. So the
+  registered safe-concurrency step (bad in both reps -> clean in both reps) is
+  NOT met — it is 3 of 4.
+- **Throughput per core FALLS 12 %** at C=112 (3.80 -> 3.35 audio-s per
+  core-s): the fleet buys its latency with ~3 more cores, most of it pool
+  threads now busy (and spinning between the doubled dispatches: 2480 -> 5730
+  per second per worker) inside a region that used to be serial. At C=80
+  it is flat (3.16 / 3.17) and nothing material moves.
+
+**DECISION.** Level 1 is a **SMALL WIN** by the registered rules: a large,
+reproducible overload-latency gain (-55 % p95, a near step in safe
+concurrency), at a cost in efficiency, with no throughput gain. It is the
+first treatment in this campaign that moves the core plateau materially
+(21.6 -> 24.8 cores doing work that was serial), which confirms the serial
+per-stream loops as a real part of the S12-7c mechanism. Kept, default off.
+
+**NEXT.** Level 2 measured as 1 vs 2, not 0 vs 2.
