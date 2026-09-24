@@ -1,6 +1,6 @@
 # Plateau campaign, Axion 2026-09-24 — why ~8 of 30 cores sit idle at saturation
 
-Status: IN PROGRESS
+Status: IN PROGRESS — S10-4 REJECTED; S10-3 levels 1+2 WIN (safe-concurrency step at C=112, +7.6 % throughput at C=128), default off pending a product decision
 
 Task: S12-7c, S10-4, S10-3
 
@@ -171,3 +171,41 @@ safe-concurrency step at C=112). Default stays off: promotion is a product
 decision and needs its own qualification.
 
 **NEXT.** Where does the knee move? C=128, shift against level 2.
+
+### Knee probe — C=128, shift against level 2 (one pair)
+
+| arm | audio/wall | cores | a/w per core | lag p50/p95/p99 | backlog max | fin p95 | utterances | ready B |
+|---|---|---|---|---|---|---|---|---|
+| shift | 77.49 | 20.97 | 3.70 | 1116 / 2781 / 3467 | 5.944 | 4219 | 862 | 12.8 |
+| level 2 | **83.41** | 20.91 | **3.99** | 196 / 422 / 566 | 0.764 | 855 | 996 | 8.6 |
+
+**RESULT.** Both arms are past their knee (level 2 fails finalization, 855
+against 500, and lag p95 422 against 320). Shift COLLAPSES — a 5.9 s backlog,
+lag p95 2.8 s, 862 utterances completed; level 2 degrades gracefully with
+**+7.6 % audio/wall, +16 % completed utterances and +8 % throughput per core at
+the same cores**. One pair only: the effect is an order of magnitude beyond any
+spread measured today, so it was not repeated.
+
+**Reading.** At C=112 the treatment bought latency with cores (per-core
+efficiency down) because the fleet was still keeping up; at C=128 the serial
+path is the binding constraint, and removing part of it is pure capacity. The
+knee moves from between C=96 and C=104 (shift, S12-7) to between C=112 and
+C=128 (level 2). Parity intact on every rung.
+
+## Conclusion so far
+
+- **S12-7c, mechanism.** The plateau is mostly the scheduler thread running
+  per-stream and elementwise stages alone while the pool waits: the evidence
+  mining derives a serial fraction of ~0.24 of wall at C=96 and 0.38-0.47 at
+  C=120; spinning the pool (S10-4) fills the idle cores without doing work;
+  moving the per-stream loops onto the pool (S10-3) moves cores, latency and,
+  past the knee, throughput. The K/V memmove (CACHE-RING-1) and the batch
+  window (S13-1e) are ruled out.
+- **Product decision pending, not taken here:** promoting
+  `MYNAH_ASR_STREAM_PAR=2` to default changes production behaviour and needs
+  its own qualification (C=112 soak pair under v2_qualify/v2_promote).
+- **Remaining serial stages, planned but not built** (read-only plan): the
+  tail stacked across streams (~0.3 ms/row, low risk), the mel/VAD front end
+  over streams (low risk), subsampling over streams (its GEMMs are already
+  pooled: measure first), decode + emit split into a parallel decode and an
+  ordered publish (largest, medium risk: trace statics, head bandwidth).
