@@ -1091,3 +1091,47 @@ original recordings with the existing scorers (`streaming_metrics`,
 `earliness_cost.py` paired against delta 0) and first-word correctness with
 `partial_quality.py`. The first-token identity changes above are the risk to
 watch: a biased commit that emits a DIFFERENT token is the hallucination case.
+
+---
+
+# S13-5c — The live blank bias: first TEXT earlier, first WORD not; REJECTED as a product lever (2026-09-24)
+
+**Build** `ef66143` (the frozen qualification build plus the default-off
+`MYNAH_ASR_BLANK_BIAS` knob), Axion, the 349 ORIGINAL recordings of the
+qualification bank, CLI stream `--deltas`, int8, default lookahead, RNNT trace
+on (shown not to alter a single delta). Definitions registered before the run:
+first text = audio consumed at the first published delta, first complete word =
+audio consumed when the first word is closed by a following separator (or the
+stream ends), both from speech onset; WER/CER/WER-ff with streaming_metrics.
+
+**Gates.** (1) unset == bias 0 byte-identical (EOU and Nemotron geometry,
+locally) and delta 0 on the box reproduces the frozen WER of the 349 originals
+(0.10398); (2) **the live first frame equals the replay prediction on every
+clip at every delta: 0 mismatches**; (3) the trace changes no delta.
+
+| delta | first text p50/p95/p99 ms | first complete word p50/p95/p99 ms | WER mean | CER mean | WER-ff | first token changed | final identical | catastrophic |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 840 / 1820 / 2490 | 1140 / 2330 / 2890 | 0.10398 | 0.06866 | 0.07435 | 0 | 349 | 0 |
+| 0.5 | 820 / 1730 / 2490 | 1140 / 2330 / 2890 | 0.10357 | 0.06808 | 0.07404 | 1 | 347 | 0 |
+| 1 | 810 / 1690 / 2490 | 1140 / 2310 / 2890 | 0.10512 | 0.06968 | 0.07559 | 7 | 340 | 1 |
+| 2 | 760 / 1590 / 2190 | 1140 / 2310 / 2890 | 0.10572 | 0.06983 | 0.07619 | 8 | 336 | 1 |
+| 3 | 710 / 1520 / 2030 | 1140 / 2330 / 2960 | 0.10743 | 0.07095 | 0.07793 | 15 | 323 | 1 |
+| 4 | 660 / 1430 / 1980 | 1140 / 2330 / 2960 | 0.10845 | 0.07165 | 0.07893 | 28 | 312 | 2 |
+
+**RESULT.** The bias moves the first text FRAGMENT forward (p50 -180 ms, p95
+-390 ms at delta 4) and never moves the first COMPLETE word (p50 1140 ms at
+every delta), while WER rises monotonically (+0.0045 at delta 4) and no clip
+becomes faster with an identical final transcript. The early commit is
+usually a word piece ("Hel" + "lo" instead of "Hello"): the evidence that
+completes the word arrives when it arrives.
+
+**The p95 tail** (35 slowest clips by first word, 1970-4250 ms): on most, the
+eventual first token was already the best non-blank 300-600 ms earlier (some
+1.3-4.5 s earlier, margins 0.1-3 nats), yet the first word closed when it
+closed. The tail is bound by completing the word, not by the first commitment.
+
+**DECISION.** Commitment policy is not a first-word lever for this checkpoint;
+the knob stays default off and research only. What would still move the first
+WORD is upstream of the decoder (cadence/lookahead, checkpoint), which S13-5
+already located on the checkpoint side. Evidence:
+`.work/evidence/report-bundle-20260924/raw/first-text-*` (untracked).

@@ -1,6 +1,6 @@
 # Plateau campaign, Axion 2026-09-24 — why ~8 of 30 cores sit idle at saturation
 
-Status: RESEARCH COMPLETE 2026-09-24 — the plateau is explained and removed in the research build (28.3 of 30 cores at C=144, knee C=96-104 -> C=144-160); every treatment default OFF pending a product decision and its own qualification
+Status: DONE 2026-09-24 — plateau explained and removed; research candidate QUALIFIED at C=128 and C=144 (2 x 30 min each); default OFF pending a product decision (see DECISION RECORD at the end)
 
 Task: S12-7c, S10-4, S10-3
 
@@ -476,3 +476,46 @@ build, byte-identical file), which v2_qualify's `--reference-file` supports.
 | 144 | 2 | 27.36 | 135.63 | 4.96 | 165 / 243 / 344 | 304 / 429 / 478 | 0.284 / 0.464 |
 
 `v2_promote` dry-run (no `--apply`, nothing written) accepts both runs.
+
+## DECISION RECORD (immutable, 2026-09-24)
+
+Three different claims, kept apart:
+
+**1. Research capacity (screening, short runs).**
+- Shipped build: last clean C=96, first bad C=104 (S12-7), 21.5-23.5 of 30
+  cores near the knee.
+- Research stack `MYNAH_ASR_STREAM_PAR=4 MYNAH_ASR_FIN_STACK=1`: screening
+  last good **C=144**, first bad **C=160**; 28.3-28.5 of 30 cores; throughput
+  saturates at ~110 audio-s per second in the 2-minute screen.
+
+**2. Qualified serving capacity (2 x 30 min soaks, fresh server each,
+registered bounds, v2_verdict).**
+- C=128: QUALIFIED x2. lag p95 129 ms (bound 320), fin p95 221 ms (500),
+  backlog max 0.284 s (0.640), 0 lost, parity PASS, 123.7 audio-s/s,
+  26.2 cores.
+- C=144: QUALIFIED x2. lag p95 243 ms, fin p95 428/429 ms, backlog max
+  0.384/0.464 s, TTFP penalty p95 +205/+206 ms (GOOD <= 250), 0 lost, parity
+  PASS, 135.2-135.6 audio-s/s, 26.9-27.4 cores.
+- **qualified_safe_concurrency = 144** for the research candidate (was 80
+  for the shipped build, 2026-09-23). Margins at 144 are thin on
+  finalization (86 % of the bound) and the TTFP penalty (82 % of GOOD); 128
+  has wide margins everywhere. C=160 is the first failed screening point.
+- Production flags of the candidate: `MYNAH_ASR_STREAM_PAR=4
+  MYNAH_ASR_FIN_STACK=1`, everything else as the frozen C=80 profile (6x5 on
+  cpus 0-29, generator 30-31, int8, lookahead 3, batch window 0,
+  `--http-threads 32`). Build `dbae3fe`.
+
+**3. Model/ASR quality.** Serving is transcript-preserving: the candidate's
+transcripts are byte-identical to the shipped build on 498/498 clips and every
+loaded stream matches them. WER mean 0.10634 / corpus 0.14618 on the 498;
+0.10398 / 0.10856 on the 349 originals — unchanged, by identity. First-text
+latency is a separate matter (S13-5c): unchanged by serving work, and the
+blank bias is rejected.
+
+**Still default OFF / research only.** Every flag above: making them the
+default is a product decision, not taken. `v2_promote` dry-run accepts both
+runs; nothing was applied. Also research-only: `MYNAH_ASR_KV_LAYOUT`
+(ring/slide), `MYNAH_ASR_STREAM_PAR_DECODE`, `MYNAH_ASR_BLANK_BIAS`.
+
+**The plateau campaign is closed.** No further micro-optimisation unless a
+qualification exposes a concrete failure mechanism.
