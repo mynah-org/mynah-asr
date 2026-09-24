@@ -283,3 +283,37 @@ server dump carries the same counters as an `actq` line.
 - **Consistency check queued**: level 3 was judged neutral only at C=112, the
   rung shown here not to discriminate. It is re-measured at C=128 on top of
   level 4 (`STREAM_PAR_DECODE` 1 vs 0).
+
+### Level 3 re-measured at C=128, on top of level 4 (`STREAM_PAR_DECODE` 1 vs 0, ABBA x2)
+
+| arm | rep | audio/wall | utt | cores | a/w per core | lag p50/p95/p99 | fin p95 | backlog max | ready B |
+|---|---|---|---|---|---|---|---|---|---|
+| 4 + 3 | 1 | 86.30 | 1014 | 21.16 | 4.08 | 111 / 261 / 366 | 515 | 0.584 | 5.1 |
+| 4 | 1 | 84.99 | 1005 | 21.03 | 4.04 | 144 / 340 / 491 | 719 | 0.644 | 6.9 |
+| 4 | 2 | 85.01 | 1005 | 21.10 | 4.03 | 142 / 337 / 465 | 703 | 0.584 | 7.0 |
+| 4 + 3 | 2 | 86.04 | 1013 | 21.14 | 4.07 | 111 / 261 / 370 | 516 | 0.584 | 5.0 |
+
+- lag p95 **-22.9 %** (2 x spread = 6 ms): **MATERIAL**; fin p95 -27.5 %, lag
+  p99 -23 %, audio/wall +1.4 % (outside 2 x spread, under 3 %), cores flat.
+- **The C=112 verdict on level 3 is superseded**: that rung did not saturate
+  level 2, so it could not see a per-stream decode that only binds when B is
+  wide (ready B 7 at C=128 against 2.7 at C=112). Recorded as a method lesson:
+  a treatment of a B-scaling serial stage is judged at a rung where B is wide.
+- With levels 2+3+4 the C=128 fleet passes the emission-lag gate (261 < 320)
+  and backlog, and misses finalization by 15 ms (515 / 516 against 500).
+
+### The ladder so far, C=128 (lag p95 / fin p95 / audio/wall)
+
+| config | lag p95 | fin p95 | audio/wall | source |
+|---|---|---|---|---|
+| shift (off) | 2781 | 4219 | 77.49 | one pair |
+| level 2 | 413 | 853 | 83.68 | ABBA x2 |
+| level 2 + 4 | 334 | 672 | 84.52 | ABBA x2 |
+| level 2 + 3 + 4 | **261** | **515** | **86.17** | ABBA x2 |
+
+**Where the frontier is now.** Finalization is the gate that still fails at
+C=128, and it is the one path none of the levels touches: a finishing stream
+runs its last chunks through the SINGLE-stream path, one slot at a time on the
+scheduler thread (~61 ms per call, 8 % of wall at C=112, `phase finalize`),
+while every other stream waits. That is the next evidence-backed candidate.
+Cores used are back at ~21 of 30 at C=128.
