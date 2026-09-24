@@ -961,15 +961,20 @@ static int stream_pull_mel(mynah_asr_stream *s, const float *audio, size_t n) {
 /* Decode the q encoder frames already in s->enc_buf, append them to the
  * incremental transcript and emit the delta. Shared by the single and the
  * batched step: the text a stream produces cannot depend on which one ran. */
-static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb, void *ud) {
+/* Split in two for MYNAH_ASR_STREAM_PAR >= 3: `stream_decode` touches only
+ * this stream (decoder state, tokens, detokeniser) and may run on a pool
+ * thread; `stream_publish` calls the callback and must run on the caller, in
+ * stream order. Returns the incremental text (NULL on failure) through *text. */
+static int stream_decode(mynah_asr_stream *s, int q, int trace_audio, const char **text_out) {
     mynah_asr_model *m = s->m;
+    *text_out = NULL;
     if (s->n_tokens + q * m->dec.max_symbols > s->cap_tokens) {
         s->cap_tokens = (s->cap_tokens + q * m->dec.max_symbols) * 2;
         int *nb = realloc(s->tokens, (size_t)s->cap_tokens * sizeof(int));
         if (!nb) return -1;
         s->tokens = nb;
     }
-    mynah_asr_dec_trace_audio((double)s->samples_fed / (double)m->feat.sample_rate);
+    if (trace_audio) mynah_asr_dec_trace_audio((double)s->samples_fed / (double)m->feat.sample_rate);
     const int added = mynah_asr_greedy_decode_scratch(&m->dec, &s->dec, s->enc_buf, q,
                                                  s->tokens + s->n_tokens, NULL,
                                                  s->cap_tokens - s->n_tokens, s->dec_scr);
@@ -995,7 +1000,13 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
     s->n_tokens += added;
     if (!text) return -1;
     if (lang_tmp[0]) memcpy(s->lang, lang_tmp, sizeof(s->lang));
+    *text_out = text;
+    return 0;
+}
 
+static void stream_publish(mynah_asr_stream *s, const char *text, mynah_asr_result_cb cb,
+                           void *ud) {
+    mynah_asr_model *m = s->m;
     if (cb) {
         const size_t total = strlen(text);
         if (total > s->chars_emitted) {
@@ -1019,6 +1030,40 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
             s->emitted_t1 = t1;
         }
     }
+}
+
+/* MYNAH_ASR_STREAM_PAR >= 3: the per-stream front end and decode of a batched
+ * step on the pool, one task per stream; publication stays on the caller in
+ * stream order, so deltas, their t0/t1 and the callback order are unchanged. */
+static void stream_vad_scan(mynah_asr_stream *s, const float *samples, size_t n);
+
+typedef struct {
+    mynah_asr_stream *const *streams;
+    const float *const *samples;
+    const size_t *n_samples;
+    const int *idx;          /* decode: ready[] indices of the group */
+    const int *q;            /* decode: frames per group member      */
+    int rc[MYNAH_ASR_STREAM_BATCH_MAX];
+    const char *text[MYNAH_ASR_STREAM_BATCH_MAX];
+} stream_par3_ctx;
+
+static void par3_ingest(void *vctx, int i) {
+    stream_par3_ctx *c = vctx;
+    mynah_asr_stream *s = c->streams[i];
+    stream_vad_scan(s, c->samples[i], c->n_samples[i]);
+    s->samples_fed += c->n_samples[i];
+    stream_pull_mel(s, c->samples[i], c->n_samples[i]);
+}
+
+static void par3_decode(void *vctx, int j) {
+    stream_par3_ctx *c = vctx;
+    c->rc[j] = stream_decode(c->streams[c->idx[j]], c->q[j], 0, &c->text[j]);
+}
+
+static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb, void *ud) {
+    const char *text;
+    if (stream_decode(s, q, 1, &text) != 0) return -1;
+    stream_publish(s, text, cb, ud);
     return 0;
 }
 
@@ -1212,8 +1257,13 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
     for (int i = 1; i < B; i++)
         if (streams[i]->m != m) return -1;      /* a batch is drawn from one model */
 
-    /* 1. per-stream ingest: VAD and mel, exactly as a feed does */
-    for (int i = 0; i < B; i++) {
+    /* 1. per-stream ingest: VAD and mel, exactly as a feed does (over streams
+     * on the pool at STREAM_PAR >= 3: each touches only its own stream) */
+    const int par3 = B > 1 && mynah_asr_enc_stream_par_level() >= 3 &&
+                     !mynah_asr_dec_diag_prime();
+    stream_par3_ctx p3 = {.streams = streams, .samples = samples, .n_samples = n_samples};
+    if (par3) mynah_asr_parallel_for(B, par3_ingest, &p3);
+    for (int i = 0; i < B && !par3; i++) {
         stream_vad_scan(streams[i], samples[i], n_samples[i]);
         streams[i]->samples_fed += n_samples[i];
         stream_pull_mel(streams[i], samples[i], n_samples[i]);
@@ -1268,6 +1318,22 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
                 if (mynah_asr_enc_stream_step_batch(m->batch, ess, g, mels, n_mel_in,
                                                 m->feat.n_mels, prompts, outs, qout) != 0)
                     return -1;
+                if (par3 && g > 1) {
+                    /* decode in parallel, publish serially in group order; a
+                     * failed decode stops publication at that stream, as the
+                     * serial loop's early return did */
+                    p3.idx = ready + done;
+                    p3.q = qout;
+                    mynah_asr_parallel_for(g, par3_decode, &p3);
+                    for (int j = 0; j < g; j++) {
+                        const int i = ready[done + j];
+                        atomic_fetch_add_explicit(&g_batch_rows, (unsigned long long)qout[j],
+                                                  memory_order_relaxed);
+                        if (p3.rc[j] != 0) return -1;
+                        stream_publish(streams[i], p3.text[j], cb,
+                                       userdata ? userdata[i] : NULL);
+                    }
+                } else
                 for (int j = 0; j < g; j++) {
                     const int i = ready[done + j];
                     atomic_fetch_add_explicit(&g_batch_rows, (unsigned long long)qout[j],

@@ -248,6 +248,7 @@ typedef struct {
     long frame, at;
 } inject_cfg;
 enum { INJ_BLANK = 0, INJ_WMARK, INJ_BEST, INJ_LEX, INJ_ID };
+static inject_cfg *inject_conf(void);
 
 static inject_cfg *inject_conf(void) {
     static inject_cfg c;
@@ -573,4 +574,12 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
 int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                         const float *enc, int T, int *tokens, int *frames, int cap) {
     return mynah_asr_greedy_decode_scratch(dec, s, enc, T, tokens, frames, cap, NULL);
+}
+
+int mynah_asr_dec_diag_prime(void) {
+    const int t = dec_trace(), p = pred_trace();
+    const inject_cfg *c = inject_conf();
+    const char *e = getenv("MYNAH_ASR_RNNT_INJECT");
+    (void)c;
+    return t || p || (e && *e);
 }

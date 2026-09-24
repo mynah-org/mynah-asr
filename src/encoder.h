@@ -127,6 +127,8 @@ typedef struct {
 
 int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
                           int left_ctx, int right_ctx, int n_mels);
+/* MYNAH_ASR_STREAM_PAR as resolved (0 off, 1..3 research levels, S10-3). */
+int mynah_asr_enc_stream_par_level(void);
 /* The same with an explicit K/V layout (MYNAH_ASR_KV_*), so a test can hold
  * every layout in one process; the plain init uses mynah_asr_kv_layout_default(). */
 int mynah_asr_enc_stream_init_layout(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,

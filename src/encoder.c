@@ -1332,6 +1332,8 @@ static int stream_par_on(void) {
     return v;
 }
 
+int mynah_asr_enc_stream_par_level(void) { return stream_par_on(); }
+
 typedef struct {
     mynah_asr_enc_batch *bb;
     mynah_asr_enc_stream *const *ess;
