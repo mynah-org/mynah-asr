@@ -125,8 +125,9 @@ static const mynah_asr_flag g_flags[] = {
      NULL, NULL},
 
     {"MYNAH_ASR_STREAM_PAR", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
-     "1/0: run the per-stream stages of the batched encoder step (attention core + K/V commit,"
-     " conv mid) over streams on the pool instead of serially on the scheduler thread. Each stream"
+     "0/1/2: 1 runs the per-stream stages of the batched encoder step (attention core + K/V commit,"
+     " conv mid) over streams on the pool instead of serially on the scheduler thread; 2 also runs"
+     " SiLU per stream and each residual add + layer norm fused per row block. Each stream/row"
      " touches only its own state, so the floats are the same: tests/test_stream_batch and"
      " tests/test_kv_layout gate it. RESEARCH A/B (S10-3)",
      NULL, NULL},

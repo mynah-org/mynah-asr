@@ -1326,7 +1326,8 @@ static int stream_par_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("MYNAH_ASR_STREAM_PAR");
-        v = (e && e[0] == '1') ? 1 : 0;
+        v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
     }
     return v;
 }
@@ -1354,6 +1355,69 @@ static void stream_par_attn(void *vctx, int i) {
                           rk_tab ? MYNAH_ASR_RELPOS_TABLE : MYNAH_ASR_RELPOS_SHARED);
     mynah_asr_kv_commit(&es->kv, c->li, 0, c->kn + off, Q);
     mynah_asr_kv_commit(&es->kv, c->li, 1, c->vn + off, Q);
+}
+
+/* Level 2: the residual add that precedes a layer norm, the norm itself, and
+ * the output norm's copy-back, fused per row; SiLU per stream. Every row is
+ * independent and keeps its exact per-element operations, so this is
+ * bit-exact too (the add is written in the two shapes the serial code uses,
+ * so -ffast-math contracts it the same way). */
+typedef struct {
+    float *xs; const float *add; int half;
+    const float *w, *b; float *out; int copy_back, R, d, rows;
+} rowln_ctx;
+
+static void rowln_task(void *vctx, int t) {
+    const rowln_ctx *c = vctx;
+    const int r0 = t * c->rows, r1 = r0 + c->rows < c->R ? r0 + c->rows : c->R;
+    for (int r = r0; r < r1; r++) {
+        float *x = c->xs + (size_t)r * (size_t)c->d;
+        if (c->add) {
+            const float *a = c->add + (size_t)r * (size_t)c->d;
+            if (c->half) for (int j = 0; j < c->d; j++) x[j] += 0.5f * a[j];
+            else         for (int j = 0; j < c->d; j++) x[j] += a[j];
+        }
+        float *o = c->out + (size_t)r * (size_t)c->d;
+        layer_norm_f(x, c->w, c->b, o, 1, c->d);
+        if (c->copy_back) memcpy(x, o, (size_t)c->d * sizeof(float));
+    }
+}
+
+/* xs += (half ? 0.5 : 1) * add (when add != NULL), out = LN(xs), and xs = out
+ * when copy_back: the serial path exactly as it was, or row blocks on the pool. */
+static void add_ln_rows(int par, float *xs, const float *add, int half, const float *w,
+                        const float *b, float *out, int copy_back, int R, int d) {
+    if (par && R >= 8) {
+        rowln_ctx c = {xs, add, half, w, b, out, copy_back, R, d, 2};
+        mynah_asr_parallel_for((R + 1) / 2, rowln_task, &c);
+        return;
+    }
+    const size_t nd = (size_t)R * (size_t)d;
+    if (add) {
+        if (half) for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * add[j];
+        else      for (size_t j = 0; j < nd; j++) xs[j] += add[j];
+    }
+    layer_norm_f(xs, w, b, out, R, d);
+    if (copy_back) memcpy(xs, out, nd * sizeof(float));
+}
+
+typedef struct {
+    mynah_asr_enc_batch *bb;
+    mynah_asr_enc_stream *const *ess;
+    int ffn;
+} silu_par_ctx;
+
+static void silu_par_task(void *vctx, int i) {
+    const silu_par_ctx *c = vctx;
+    mynah_asr_silu_scratch(c->bb->tmp2 + (size_t)c->bb->offs[i] * (size_t)c->ffn,
+                           (size_t)c->bb->qq[i] * (size_t)c->ffn, c->ess[i]->ssilu);
+}
+
+static void silu_streams(int par, mynah_asr_enc_batch *bb, mynah_asr_enc_stream *const *ess,
+                         int B, int ffn) {
+    silu_par_ctx c = {bb, ess, ffn};
+    if (par && B > 1) { mynah_asr_parallel_for(B, silu_par_task, &c); return; }
+    for (int i = 0; i < B; i++) silu_par_task(&c, i);
 }
 
 static void stream_par_conv(void *vctx, int i) {
@@ -1453,18 +1517,19 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
     for (int li = 0; li < enc->n_layers; li++) {
         const mynah_asr_enc_layer *L = &enc->layers[li];
 
-        /* ½ FFN1 — stacked */
-        layer_norm_f(xs, L->ln_ff1_w, L->ln_ff1_b, tmp, R, d);
+        /* ½ FFN1 — stacked. With STREAM_PAR >= 2 each residual add moves
+         * into the row-parallel norm that follows it, so its time is charged
+         * to the next component instead of this one. */
+        const int par2 = stream_par_on() >= 2;
+        add_ln_rows(par2, xs, NULL, 0, L->ln_ff1_w, L->ln_ff1_b, tmp, 0, R, d);
         mynah_asr_qmat_mul_rows(&L->ff1_w1, tmp, tmp2, R, qx, sx);
-        for (int i = 0; i < B; i++)
-            mynah_asr_silu_scratch(tmp2 + (size_t)bb->offs[i] * (size_t)ffn,
-                               (size_t)bb->qq[i] * (size_t)ffn, ess[i]->ssilu);
+        silu_streams(par2, bb, ess, B, ffn);
         mynah_asr_qmat_mul_rows(&L->ff1_w2, tmp2, tmp, R, qx, sx);
-        for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
+        if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
         EP_ADD(EP_FFN1);
 
         /* MHSA — q/k/v/o stacked, the cache and the rel-pos softmax per stream */
-        layer_norm_f(xs, L->ln_att_w, L->ln_att_b, xn, R, d);
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 1, L->ln_att_w, L->ln_att_b, xn, 0, R, d);
         mynah_asr_qmat_mul_rows(&L->k_w, xn, kn, R, qx, sx);
         mynah_asr_qmat_mul_rows(&L->v_w, xn, vn, R, qx, sx);
         mynah_asr_qmat_mul_rows(&L->q_w, xn, bb->qs, R, qx, sx);
@@ -1527,12 +1592,12 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         atomic_fetch_add_explicit(&g_ep_ns[EP_KVCACHE], kv_ns_, memory_order_relaxed);
         t_ = ep_ns();
         mynah_asr_qmat_mul_rows(&L->o_w, bb->ctxs, tmp, R, qx, sx);
-        for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
+        if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
         EP_ADD(EP_OPROJ);
 
         /* Conv — the two pointwise convolutions stacked, the cached depthwise
          * per stream. tmp2 holds the stacked pointwise_conv1 output [R, 2d]. */
-        layer_norm_f(xs, L->ln_conv_w, L->ln_conv_b, xn, R, d);
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_conv_w, L->ln_conv_b, xn, 0, R, d);
         mynah_asr_qmat_mul_rows(&L->pw1_w, xn, tmp2, R, qx, sx);
         if (par) mynah_asr_parallel_for(B, stream_par_conv, &pc);
         for (int i = 0; i < B && !par; i++) {
@@ -1542,19 +1607,16 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             stream_conv_mid(es, L, tmp2 + 2u * off, bb->cin + off, bb->qq[i], cc);
         }
         mynah_asr_qmat_mul_rows(&L->pw2_w, bb->cin, tmp, R, qx, sx);
-        for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
+        if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
         EP_ADD(EP_CONV);
 
-        /* ½ FFN2 + output LN — stacked */
-        layer_norm_f(xs, L->ln_ff2_w, L->ln_ff2_b, tmp, R, d);
+        /* ½ FFN2 + output LN — stacked. The add reads a row of tmp before the
+         * norm overwrites that same row, in both paths. */
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_ff2_w, L->ln_ff2_b, tmp, 0, R, d);
         mynah_asr_qmat_mul_rows(&L->ff2_w1, tmp, tmp2, R, qx, sx);
-        for (int i = 0; i < B; i++)
-            mynah_asr_silu_scratch(tmp2 + (size_t)bb->offs[i] * (size_t)ffn,
-                               (size_t)bb->qq[i] * (size_t)ffn, ess[i]->ssilu);
+        silu_streams(par2, bb, ess, B, ffn);
         mynah_asr_qmat_mul_rows(&L->ff2_w2, tmp2, tmp, R, qx, sx);
-        for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
-        layer_norm_f(xs, L->ln_out_w, L->ln_out_b, xn, R, d);
-        memcpy(xs, xn, nd * sizeof(float));
+        add_ln_rows(par2, xs, tmp, 1, L->ln_out_w, L->ln_out_b, xn, 1, R, d);
         EP_ADD(EP_FFN2);
     }
 
