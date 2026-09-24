@@ -65,6 +65,7 @@ tests/test_vadseg
 tests/test_tokenize
 tests/test_stream_out
 tests/test_stream_batch
+tests/test_kv_layout
 tests/test_vad
 tests/bench_throughput
 tests/bench_gemm_shapes

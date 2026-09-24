@@ -116,6 +116,14 @@ static const mynah_asr_flag g_flags[] = {
      " probe window does not match a direct projection byte for byte",
      NULL, NULL},
 
+    {"MYNAH_ASR_KV_LAYOUT", MYNAH_ASR_FLAG_KERNEL, "shift (the pre-CACHE-RING-1 layout)",
+     "shift|ring|slide: the physical layout of the streaming attention K/V cache (src/kvcache.h)."
+     " shift memmoves the kept rows down every chunk and gathers the window every layer; ring"
+     " advances a head and writes only the fresh rows, still gathering; slide keeps left+slack rows"
+     " so the window is the arena itself, compacting once every ~slack/Q chunks. Same logical"
+     " contents, same floats: tests/test_kv_layout gates it with memcmp. RESEARCH A/B (S13-1d)",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"

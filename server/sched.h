@@ -222,6 +222,8 @@ typedef struct {
     unsigned long pos_bsum[41];
     /* rows that took the shared rel-pos projection, against all rows stacked */
     unsigned long long share_rows, share_total;
+    const char *kv_layout;              /* CACHE-RING-1: which layout ran ... */
+    unsigned long long kv_bytes;        /* ... and what it copied */
     /* the batched step split by component, ns, with its rows and steps */
     unsigned long long comp_ns[11], comp_rows, comp_frames, comp_steps;
     unsigned long long relpos_priv, relpos_shared, relpos_group;

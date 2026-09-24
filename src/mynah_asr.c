@@ -1112,6 +1112,12 @@ void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
     mynah_asr_enc_batch_share_stats(shared, total);
 }
 
+void mynah_asr_stream_kv_stats(const char **layout, unsigned long long *bytes) {
+    const int l = mynah_asr_kv_layout_last();
+    *layout = l < 0 ? "none" : mynah_asr_kv_layout_name(l);
+    *bytes = mynah_asr_kv_bytes_total();
+}
+
 void mynah_asr_stream_step_profile(unsigned long long *ns, int n, unsigned long long *rows,
                                unsigned long long *frames, unsigned long long *steps) {
     mynah_asr_enc_profile(ns, n, rows, frames, steps);

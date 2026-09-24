@@ -572,6 +572,9 @@ void mynah_asr_obs_dump(void) {
                     "ns_per_row=%8.0f rows=%llu frames=%llu steps=%llu\n",
                     widx, n, tot, (double)tot / (double)st.comp_rows,
                     st.comp_rows, st.comp_frames, st.comp_steps);
+            OBS_ADD("[DUMP] worker=%d seq=%lu kv_copy layout=%s bytes=%llu "
+                    "bytes_per_row=%.0f\n", widx, n, st.kv_layout, st.kv_bytes,
+                    (double)st.kv_bytes / (double)st.comp_rows);
             OBS_ADD("[DUMP] worker=%d seq=%lu relpos_calls private=%llu shared=%llu "
                     "group=%llu\n", widx, n, st.relpos_priv, st.relpos_shared,
                     st.relpos_group);

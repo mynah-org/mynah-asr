@@ -647,6 +647,12 @@ void mynah_asr_encoder_post(const mynah_asr_encoder *enc, const float *x, int T,
 
 int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
                           int left_ctx, int right_ctx, int n_mels) {
+    return mynah_asr_enc_stream_init_layout(es, enc, left_ctx, right_ctx, n_mels,
+                                            mynah_asr_kv_layout_default());
+}
+
+int mynah_asr_enc_stream_init_layout(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
+                                     int left_ctx, int right_ctx, int n_mels, int kv_layout) {
     memset(es, 0, sizeof(*es));
     es->enc = enc;
     es->left = left_ctx;
@@ -656,12 +662,12 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
      * 1 + sub*right on the first chunk, sub*(right+1) afterwards) */
     const int max_n_mel = enc->ss.sub_factor * (right_ctx + 1) + 1;
     if (mynah_asr_ss_stream_init(&es->ss, &enc->ss, n_mels, max_n_mel) != 0) return -1;
-    const size_t kv = (size_t)enc->n_layers * (size_t)left_ctx * (size_t)enc->d_model;
     const size_t cv = (size_t)enc->n_layers * (size_t)(enc->conv_k - 1) * (size_t)enc->d_model;
-    es->k_cache = calloc(kv, sizeof(float));
-    es->v_cache = calloc(kv, sizeof(float));
+    /* qmax = q + 2: the same Qmax the scratch below is sized for */
+    if (mynah_asr_kv_init(&es->kv, kv_layout, enc->n_layers, left_ctx, es->q + 2,
+                          enc->d_model) != 0) return -1;
     es->conv_cache = calloc(cv, sizeof(float));
-    if (!es->k_cache || !es->v_cache || !es->conv_cache) return -1;
+    if (!es->conv_cache) return -1;
 
     /* single scratch for the hot path (max sizes, reused on every chunk) */
     const size_t d = (size_t)enc->d_model, ck = (size_t)enc->conv_k;
@@ -717,25 +723,23 @@ int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder 
 
 void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es) {
     mynah_asr_ss_stream_free(&es->ss);
-    free(es->k_cache); free(es->v_cache); free(es->conv_cache); free(es->scr);
-    es->k_cache = es->v_cache = es->conv_cache = es->scr = NULL;
+    mynah_asr_kv_free(&es->kv);
+    free(es->conv_cache); free(es->scr);
+    es->conv_cache = es->scr = NULL;
 }
 
 void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es) {
     const mynah_asr_encoder *enc = es->enc;
-    const size_t kv = (size_t)enc->n_layers * (size_t)es->left * (size_t)enc->d_model;
     const size_t cv = (size_t)enc->n_layers * (size_t)(enc->conv_k - 1) * (size_t)enc->d_model;
     mynah_asr_ss_stream_reset(&es->ss);
-    memset(es->k_cache, 0, kv * sizeof(float));
-    memset(es->v_cache, 0, kv * sizeof(float));
+    mynah_asr_kv_reset(&es->kv);
     memset(es->conv_cache, 0, cv * sizeof(float));
-    es->cache_valid = 0;
     es->sa_pe_K = 0;
 }
 
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
     const int sub = es->enc->ss.sub_factor;
-    return es->cache_valid == 0 && es->ss.first ? 1 + sub * es->right
+    return es->kv.valid == 0 && es->ss.first ? 1 + sub * es->right
                                                 : sub * (es->right + 1);
 }
 
@@ -895,9 +899,8 @@ int mynah_asr_enc_relpos_table_init(mynah_asr_encoder *enc, int kmax) {
  * pure function of K, relk_w is the layer's, so the two matmul_wt calls have
  * bit-identical inputs and the same shape. */
 static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L,
-                                  const float *q, const float *kn, const float *vn,
-                                  const float *pe, float *ctx, int Q,
-                                  const float *k_cache, const float *v_cache, int valid,
+                                  const float *q, const float *kk, const float *vv,
+                                  const float *pe, float *ctx, int Q, int valid,
                                   const float *rk_in, int rk_kind) {
     const mynah_asr_encoder *enc = es->enc;
     const int d = enc->d_model, H = enc->n_heads, dk = enc->d_head;
@@ -915,14 +918,8 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
     float *qb = es->sa_qb;
 
     {
-        float *kk = es->sa_keys, *vv = es->sa_keys + (size_t)K * (size_t)d;
-
-        /* keys = valid cache ++ new ones (the caller updates the cache) */
-        memcpy(kk, k_cache, (size_t)valid * (size_t)d * sizeof(float));
-        memcpy(kk + (size_t)valid * (size_t)d, kn, (size_t)Q * (size_t)d * sizeof(float));
-        memcpy(vv, v_cache, (size_t)valid * (size_t)d * sizeof(float));
-        memcpy(vv + (size_t)valid * (size_t)d, vn, (size_t)Q * (size_t)d * sizeof(float));
-
+        /* kk, vv [K, d] = valid cache ++ the chunk's rows: the window
+         * mynah_asr_kv_window() built, contiguous in every K/V layout */
         if (rk_in) {
             relpos_count(rk_kind);
         } else {
@@ -980,36 +977,30 @@ static void stream_attention_core(mynah_asr_enc_stream *es, const mynah_asr_enc_
     }
 }
 
+/* The K and V windows of layer li for this chunk (src/kvcache.h): shift and ring
+ * gather into sa_keys, slide hands back its own arena. */
+static void kv_windows(mynah_asr_enc_stream *es, int li, const float *kn, const float *vn,
+                       int Q, const float **kk, const float **vv) {
+    const size_t km = (size_t)(es->left + es->q + 2) * (size_t)es->enc->d_model;
+    *kk = mynah_asr_kv_window(&es->kv, li, 0, kn, Q, es->sa_keys);
+    *vv = mynah_asr_kv_window(&es->kv, li, 1, vn, Q, es->sa_keys + km);
+}
+
 /* Single-stream attention: the two hoisted linears around the core, in the same
  * order as before the split. */
 static void stream_attention(mynah_asr_enc_stream *es, const mynah_asr_enc_layer *L, int li,
                              const float *x, const float *kn, const float *vn,
-                             const float *pe, float *out, int Q,
-                             const float *k_cache, const float *v_cache, int valid) {
+                             const float *pe, float *out, int Q, int valid) {
     mynah_asr_qmat_mul(&L->q_w, x, es->sa_q, Q);
     /* S1-7 never touched the single path; S10-1 does, because the table is not
      * about the streams of one pass but about the model. NULL when there is no
      * table and the core projects for itself, exactly as before. */
     const float *rk_tab = mynah_asr_enc_relpos_rows(es->enc, li, valid + Q);
-    stream_attention_core(es, L, es->sa_q, kn, vn, pe, es->sa_ctx, Q,
-                          k_cache, v_cache, valid, rk_tab, MYNAH_ASR_RELPOS_TABLE);
+    const float *kk, *vv;
+    kv_windows(es, li, kn, vn, Q, &kk, &vv);
+    stream_attention_core(es, L, es->sa_q, kk, vv, pe, es->sa_ctx, Q, valid,
+                          rk_tab, MYNAH_ASR_RELPOS_TABLE);
     mynah_asr_qmat_mul(&L->o_w, es->sa_ctx, out, Q);
-}
-
-/* update a layer's K/V cache with the new k/v rows of the chunk */
-static void update_kv_cache(float *cache, const float *fresh, int valid, int Q,
-                            int left, int d) {
-    const int total = valid + Q;
-    const int keep = total < left ? total : left;
-    const int from_old = keep - Q > 0 ? keep - Q : 0;      /* old rows to keep */
-    const int drop_old = valid - from_old;                  /* old rows to drop */
-    if (from_old > 0 && drop_old > 0)
-        memmove(cache, cache + (size_t)drop_old * (size_t)d,
-                (size_t)from_old * (size_t)d * sizeof(float));
-    const int fresh_keep = keep - from_old;                 /* new rows to keep (<= Q) */
-    memcpy(cache + (size_t)from_old * (size_t)d,
-           fresh + (size_t)(Q - fresh_keep) * (size_t)d,
-           (size_t)fresh_keep * (size_t)d * sizeof(float));
 }
 
 /* Streaming conv module WITHOUT the two pointwise convolutions (they are per-row
@@ -1093,7 +1084,7 @@ static void enc_probe(const mynah_asr_enc_stream *es, const char *point, int li,
         for (int i = 0; i < d; i++) n += (double)row[i] * row[i];
         fprintf(stderr, "[ENC] frame=%ld t=%d valid=%d point=%-10s li=%2d "
                         "norm=%.4f rms=%.6f\n",
-                es->t_abs + t, t, es->cache_valid, point, li,
+                es->t_abs + t, t, es->kv.valid, point, li,
                 sqrt(n), sqrt(n / (double)d));
     }
 }
@@ -1124,12 +1115,12 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
                 }
             fprintf(stderr, "[ENC] frame=%ld t=%d valid=%d point=%-10s li=%2d "
                             "norm=%.4f rms=%.6f\n",
-                    es->t_abs + t, t, es->cache_valid, "mel", -1,
+                    es->t_abs + t, t, es->kv.valid, "mel", -1,
                     sqrt(n), sqrt(n / (double)(rows * n_mels)));
         }
     }
     const int Q = mynah_asr_ss_stream_step(&enc->ss, &es->ss, mel, n_mel, n_mels, is_last, x);
-    if (Q <= 0) return -1;
+    if (Q <= 0 || mynah_asr_kv_prepare(&es->kv, Q) != 0) return -1;
     if (probe) enc_probe(es, "subsample", -1, x, Q, d);
 
     const size_t nd = (size_t)Q * (size_t)d;
@@ -1138,7 +1129,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
     /* pos emb for this step: depends only on K = valid + Q (the same for every
      * layer) and at steady state K is CONSTANT (cache full): recompute only when
      * it changes */
-    const int pe_K = es->cache_valid + Q;
+    const int pe_K = es->kv.valid + Q;
     if (pe_K != es->sa_pe_K) {
         mynah_asr_pos_emb(enc, pe_K, es->sa_pe);
         es->sa_pe_K = pe_K;
@@ -1146,8 +1137,6 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
 
     for (int li = 0; li < enc->n_layers; li++) {
         const mynah_asr_enc_layer *L = &enc->layers[li];
-        float *kc = es->k_cache + (size_t)li * (size_t)es->left * (size_t)d;
-        float *vc = es->v_cache + (size_t)li * (size_t)es->left * (size_t)d;
         float *cc = es->conv_cache + (size_t)li * (size_t)(enc->conv_k - 1) * (size_t)d;
 
         /* ½ FFN1 */
@@ -1161,10 +1150,9 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
         layer_norm_f(x, L->ln_att_w, L->ln_att_b, xn, Q, d);
         mynah_asr_qmat_mul(&L->k_w, xn, kn, Q);
         mynah_asr_qmat_mul(&L->v_w, xn, kn + nd, Q);
-        stream_attention(es, L, li, xn, kn, kn + nd, es->sa_pe, tmp, Q, kc, vc,
-                         es->cache_valid);
-        update_kv_cache(kc, kn, es->cache_valid, Q, es->left, d);
-        update_kv_cache(vc, kn + nd, es->cache_valid, Q, es->left, d);
+        stream_attention(es, L, li, xn, kn, kn + nd, es->sa_pe, tmp, Q, es->kv.valid);
+        mynah_asr_kv_commit(&es->kv, li, 0, kn, Q);
+        mynah_asr_kv_commit(&es->kv, li, 1, kn + nd, Q);
         for (size_t i = 0; i < nd; i++) x[i] += tmp[i];
 
         /* Conv with cache */
@@ -1184,7 +1172,7 @@ int mynah_asr_enc_stream_step(mynah_asr_enc_stream *es, const float *mel, int n_
     }
 
     if (probe) enc_probe(es, "pre_post", -1, x, Q, d);
-    es->cache_valid = (es->cache_valid + Q < es->left) ? es->cache_valid + Q : es->left;
+    mynah_asr_kv_advance(&es->kv, Q);
 
     if (probe) { g_probe_es = es; g_post_probe = post_probe_cb; }
     mynah_asr_encoder_post_scratch(enc, x, Q, prompt_id, out, es->spost);
@@ -1231,7 +1219,7 @@ mynah_asr_enc_batch *mynah_asr_enc_batch_new(const mynah_asr_encoder *enc, int m
     bb->enc = enc;
     bb->max_b = max_b;
     bb->max_q = max_q;
-    /* the shared rel-pos projection is [2K-1, d] with K = cache_valid + q, so
+    /* the shared rel-pos projection is [2K-1, d] with K = kv.valid + q, so
      * the largest it can be is the same Kmax mynah_asr_enc_stream_init uses */
     bb->max_p = 2 * (max_left + max_q + 2) - 1;
     /* +2 per stream: the same slack mynah_asr_enc_stream_init carves (Qm = q+2),
@@ -1351,13 +1339,13 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         if (es->enc != enc) return -1;
         const int Q = mynah_asr_ss_stream_step(&enc->ss, &es->ss, mel[i], n_mel[i],
                                            n_mels, 0, es->sx);
-        if (Q <= 0 || R + Q > bb->max_rows) return -1;
+        if (Q <= 0 || R + Q > bb->max_rows || mynah_asr_kv_prepare(&es->kv, Q) != 0) return -1;
         memcpy(bb->xs + (size_t)R * (size_t)d, es->sx, (size_t)Q * (size_t)d * sizeof(float));
         bb->offs[i] = R;
         bb->qq[i] = Q;
         q_out[i] = Q;
         R += Q;
-        const int pe_K = es->cache_valid + Q;
+        const int pe_K = es->kv.valid + Q;
         /* With the table there is no projection to feed, so there is no
          * position embedding to build either: `mynah_asr_pos_emb` is 2K-1 rows
          * of double pow/sin/cos and it ran on every step of every stream whose
@@ -1374,7 +1362,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
      * depends on nothing else, so that group computes it ONCE per layer and the
      * rest of the group reads it. Ties go to the lowest K so the choice does not
      * depend on the order the caller passed the streams in. A stream at another
-     * K — a slot on its first chunks, cache_valid still below left — keeps the
+     * K — a slot on its first chunks, kv.valid still below left — keeps the
      * private projection, exactly as before. */
     int k_sh = 0, k_sh_n = 0, lead = 0;
     for (int i = 0; i < B; i++) {
@@ -1389,7 +1377,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
     const int share = k_sh_n >= 2 && P_sh <= bb->max_p;
 
     /* How often the pass actually gets to share, and over how many rows.
-     * Sharing needs two streams at the SAME K, and K = cache_valid + Q is not
+     * Sharing needs two streams at the SAME K, and K = kv.valid + Q is not
      * the same until a stream's left cache has filled -- so a fleet of short
      * utterances, each of which restarts its encoder stream, can spend its
      * whole life with every row on the private projection. Counting it is the
@@ -1453,21 +1441,24 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             mynah_asr_enc_stream *es = ess[i];
             const size_t off = (size_t)bb->offs[i] * (size_t)d;
             const int Q = bb->qq[i];
-            float *kc = es->k_cache + (size_t)li * (size_t)es->left * (size_t)d;
-            float *vc = es->v_cache + (size_t)li * (size_t)es->left * (size_t)d;
             const unsigned long long a_ = ep_ns();
             const unsigned long long rp0_ =
                 atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);
             const float *rk_tab = mynah_asr_enc_relpos_rows(enc, li, bb->kks[i]);
-            stream_attention_core(es, L, bb->qs + off, kn + off, vn + off, es->sa_pe,
-                                  bb->ctxs + off, Q, kc, vc, es->cache_valid,
+            /* the window stays inside the attention's timer, where the gather
+             * always was, so `attn` and `kv_cache` keep their meaning across
+             * the K/V layouts and against every earlier profile */
+            const float *kk, *vv;
+            kv_windows(es, li, kn + off, vn + off, Q, &kk, &vv);
+            stream_attention_core(es, L, bb->qs + off, kk, vv, es->sa_pe,
+                                  bb->ctxs + off, Q, es->kv.valid,
                                   rk_tab ? rk_tab : (bb->kks[i] == k_sh ? rk_sh : NULL),
                                   rk_tab ? MYNAH_ASR_RELPOS_TABLE : MYNAH_ASR_RELPOS_SHARED);
             const unsigned long long b_ = ep_ns();
             const unsigned long long rp1_ =
                 atomic_load_explicit(&g_ep_ns[EP_RELPOS_PRIV], memory_order_relaxed);
-            update_kv_cache(kc, kn + off, es->cache_valid, Q, es->left, d);
-            update_kv_cache(vc, vn + off, es->cache_valid, Q, es->left, d);
+            mynah_asr_kv_commit(&es->kv, li, 0, kn + off, Q);
+            mynah_asr_kv_commit(&es->kv, li, 1, vn + off, Q);
             const unsigned long long c_ = ep_ns();
             attn_ns_ += (b_ - a_) - (rp1_ - rp0_); kv_ns_ += c_ - b_;
         }
@@ -1510,7 +1501,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
     for (int i = 0; i < B; i++) {
         mynah_asr_enc_stream *es = ess[i];
         const int Q = bb->qq[i];
-        es->cache_valid = (es->cache_valid + Q < es->left) ? es->cache_valid + Q : es->left;
+        mynah_asr_kv_advance(&es->kv, Q);
         mynah_asr_encoder_post_scratch(enc, xs + (size_t)bb->offs[i] * (size_t)d, Q,
                                    prompt_id[i], out[i], es->spost);
     }

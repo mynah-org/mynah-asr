@@ -1379,6 +1379,7 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
         out->pos_bsum[i] = g.pos_bsum[i];
     }
     mynah_asr_stream_batch_share_stats(&out->share_rows, &out->share_total);
+    mynah_asr_stream_kv_stats(&out->kv_layout, &out->kv_bytes);
     mynah_asr_stream_relpos_counts(&out->relpos_priv, &out->relpos_shared,
                                &out->relpos_group);
     mynah_asr_stream_step_profile(out->comp_ns, 11, &out->comp_rows,
