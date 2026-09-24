@@ -1,7 +1,7 @@
 # CACHE-RING-1 — does removing the K/V cache memmove matter?
 
-Status: IN PROGRESS (contract registered, implementation and local correctness
-done; Axion measurement pending)
+Status: DONE 2026-09-24 — hypothesis REJECTED for the plateau; `slide` is a
+SMALL WIN on overload latency, `ring` NEUTRAL. Default stays `shift`.
 
 Task: S13-1d, S10-5
 
@@ -203,4 +203,108 @@ Decision, per treatment arm against shift:
 
 ## RESULTS
 
-(pending)
+Axion (32 x Neoverse-V2, 62 GB), commit `161ae9f`, dirty 0, clean build.
+Raw evidence untracked under `.work/evidence/cache-ring-1/`.
+
+**Protocol deviations, recorded before the results were read.** (1) The first
+driver lost 11 of 12 rungs to `v2_qualify`'s freeze gate (loadavg >= 2.0 from
+the previous rung) and the C1 phase to a missing `/usr/bin/time`; one rung
+survived (shift C=96: a/w 75.76, 23.33 cores, lag p95 182 ms) and is used as a
+sanity range only. (2) The rungs became **C=80 + C=112** instead of C=96 +
+C=112: C=80 is the qualified point, C=112 the overload discriminator. (3) The
+decisive repeat was run for shift vs slide only; ring has one rep.
+
+### Correctness on the box — BIT-EXACT
+
+`tests/test_kv_layout` on Nemotron: 62 s input, 13 cache turnovers, Q=1 and
+Q=4, every encoder output and the full logical K/V after every chunk identical
+across the three layouts, single path and a mixed-layout batch.
+`tests/test_stream_batch` IDENTICAL under each layout (int8 and f32, B=2..8).
+C1 CLI on a 300 s clip: the 624 published deltas are byte-identical (same md5)
+across layouts. Under load: `identity_fail 0, reference_fail 0` on every rung,
+against the frozen C=80 reference. The dump's `kv_copy layout=` line and the
+`[EFFECTIVE-CONFIG]` banner name the arm on every run.
+
+### Phase A — the mechanism (single core, 5000 steps, Nemotron geometry)
+
+| layout | us/step | MB copied/step | predicted from geometry |
+|---|---|---|---|
+| shift | 815 | 22.81 | gather 11.80 + memmove 10.22 + fresh 0.79 |
+| ring | 430 | 12.58 | gather 11.80 + fresh 0.79 |
+| slide | 50 | 1.49-1.56 | fresh 0.79 + compaction 0.79 (every 14 chunks) |
+
+Identical at 16 and 80 round-robin streams. The copying did disappear.
+
+### Phase B — C1 control
+
+Wall on 300 s audio, 5 threads: 75.7 / 74.8 / 76.5 s (shift / ring / slide).
+No C1 effect, as expected.
+
+### Phase C — serving A/B (6x5 on 0-29, generator 30-31, 120 s, interleaved)
+
+| layout | C | rep | audio/wall | cores | lag p95 | backlog max | fin p95 | kv MB/row | kv GB/s | lost |
+|---|---|---|---|---|---|---|---|---|---|---|
+| shift | 80 | 1 | 56.31 | 17.93 | 106 | 0.304 | 206 | 17.89 | 3.15 | 0 |
+| ring | 80 | 1 | 56.17 | 17.84 | 104 | 0.464 | 222 | 10.87 | 1.91 | 0 |
+| slide | 80 | 1 | 56.43 | 17.75 | 103 | 0.284 | 202 | 1.18 | 0.21 | 0 |
+| shift | 112 | 1 | 81.47 | 21.51 | 537 | 0.904 | 1036 | 17.64 | 4.49 | 0 |
+| shift | 112 | 2 | 80.62 | 21.50 | 559 | 0.844 | 1062 | 17.66 | 4.45 | 0 |
+| ring | 112 | 1 | 81.81 | 21.90 | 478 | 0.724 | 937 | 10.76 | 2.75 | 0 |
+| slide | 112 | 1 | 83.03 | 22.17 | 447 | 0.704 | 903 | 1.17 | 0.30 | 0 |
+| slide | 112 | 2 | 81.87 | 22.14 | 445 | 0.684 | 884 | 1.17 | 0.30 | 0 |
+
+kv GB/s = measured bytes per row x (audio/wall / 0.32 s). Server rows copy
+~0.77x the saturated figure because short clips spend part of their life with
+the cache filling.
+
+Component profile, ms per row (C=80, mean of 6 workers):
+
+| | encoder | kv_cache | attn (includes the gather) |
+|---|---|---|---|
+| shift | 17.70 | 0.241 | 1.462 |
+| ring | 17.51 (-1.1 %) | 0.023 | 1.462 |
+| slide | 17.27 (-2.4 %) | 0.001 | 1.324 (-0.14) |
+
+**RESULT — ring** removes the memmove (kv_cache -0.22 ms/row) and nothing
+else; one rep at C=112 sits inside shift's own two-rep range on throughput and
+within ~11 % on lag. **NEUTRAL.**
+
+**RESULT — slide vs shift at C=112, two reps each, against the registered
+thresholds:** audio/wall **+1.7 %** (threshold 3 %, 2 x spread 2.3 %: not
+material); cores **+0.65** (threshold 1.0: not material, though outside the
+0.03 spread); lag p95 **-18.6 %** (threshold 20 %: not material); backlog max
+**-20.5 %**, > 2 x spread (**material, by 0.5 %**). Throughput per core
+unchanged: 3.77 against 3.72 audio-s per core-s. **SMALL WIN**, on overload
+latency only.
+
+**RESULT — the S12-7c plateau.** Removing 93 % of the cache copying (4.5 ->
+0.3 GB/s at C=112) moved cores used by 0.65 of the ~8 left idle, and the extra
+core bought proportional throughput — outcome B of the brief, at a small
+scale. The saving is fully explained by the DIRECT cost the profile already
+showed (~0.38 ms of 17.7 ms per row, 2.1-2.4 %); there is no sign of the
+indirect bandwidth-contention route that alone could have made this matter.
+**The K/V memmove is REJECTED as an important cause of the core plateau.**
+Memory bandwidth as a whole is not rejected by this experiment: 4.5 GB/s was a
+small fraction of it to begin with.
+
+**First-token latency**: ttfp p95 3176/3135 (shift) against 3083/3086 (slide)
+at C=112, identical at C=80. Not a first-word lever; none was claimed.
+
+## Conclusion
+
+Question by question: (1) yes, the shift can go, bit-exact; (2) BIT-EXACT at
+encoder output and logical cache, byte-identical deltas; (3) yes, 22.8 -> 12.6
+(ring) / 1.6 (slide) MB per saturated step, measured in the server too; (4)
+barely, +0.65 cores for slide; (5) +1.7 % throughput and -20 % backlog at
+overload for slide, nothing at C=80; (6) no; (7) `ring` adds a module for
+nothing measurable; `slide` buys ~2 % of encoder time and ~20 % overload tail
+for 2x the K/V memory (+1.1 GB RSS at C=112, 8.0 against 6.9 GB).
+
+## Next action
+
+- Default stays `shift`. Promoting `slide` is a separate decision: it would
+  need its own qualification, and the win is below the WIN bar.
+- If `slide` is promoted, delete `ring` and `shift` rather than carrying three
+  layouts; the module and `tests/test_kv_layout` make that a small change.
+- S12-7c stays open with one candidate fewer. Move to the next evidence-backed
+  S13 item (S13-1e, early batch release) rather than polishing this.
