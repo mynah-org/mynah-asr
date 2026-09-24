@@ -258,3 +258,28 @@ server dump carries the same counters as an `actq` line.
   cores -0.2. **NOT MATERIAL at C=112** by the registered rules.
 - C=112 no longer discriminates: both arms pass every gate with ready B ~2.6,
   i.e. neither is saturated. C=128 (level 2's knee) is the discriminating rung.
+
+### Level 4 — RESULT at C=128 (level 2's knee), 2 vs 4 without level 3, ABBA x2
+
+| arm | rep | audio/wall | utt | cores | a/w per core | lag p50/p95/p99 | fin p95 | backlog max | ready B |
+|---|---|---|---|---|---|---|---|---|---|
+| 4 | 1 | 84.91 | 1003 | 21.03 | 4.04 | 147 / 330 / 474 | 655 | 0.684 | 6.5 |
+| 2 | 1 | 84.03 | 994 | 20.90 | 4.02 | 198 / 413 / 555 | 849 | 0.684 | 8.4 |
+| 2 | 2 | 83.32 | 997 | 20.96 | 3.98 | 197 / 413 / 566 | 858 | 0.784 | 8.0 |
+| 4 | 2 | 84.12 | 1004 | 20.98 | 4.01 | 148 / 337 / 468 | 689 | 0.704 | 7.7 |
+
+- lag p95 **-19.3 %** (2 x spread = 14 ms, so outside noise) against a 20 %
+  threshold; fin p95 -21 %; lag p99 -16 %; audio/wall +1.0 % (inside 2 x
+  spread); backlog -5 %; cores and per-core efficiency unchanged. Both arms
+  still fail the lag and finalization gates at C=128: no safe-concurrency step.
+- **DECISION: NOT MATERIAL by the registered rules** — the threshold is not
+  moved after the fact. Recorded as directionally consistent at both rungs
+  (-6 % at C=112, -19 % at C=128) at no efficiency cost; kept in the tree,
+  default off.
+- **Observation for the next item**: at C=128 level 2 and level 4 both sit at
+  ~21 cores of 30 again (25.6 at C=112), with ready B 7-8. The plateau
+  reappears one rung later, consistent with per-step serial work that still
+  grows with B (decode, tail, finalization at B=1).
+- **Consistency check queued**: level 3 was judged neutral only at C=112, the
+  rung shown here not to discriminate. It is re-measured at C=128 on top of
+  level 4 (`STREAM_PAR_DECODE` 1 vs 0).
