@@ -148,6 +148,12 @@ static const mynah_asr_flag g_flags[] = {
      " by the S1-4 contract. RESEARCH A/B (plateau campaign: finalization)",
      NULL, NULL},
 
+    {"MYNAH_ASR_BLANK_BIAS", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "<delta> > 0: until a stream's first natural emission, a decision whose blank beats the best"
+     " non-blank by less than delta commits the non-blank. RESEARCH ONLY (S13-5b first-text"
+     " experiment); changes transcripts, never a default. RNNT greedy only",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"

@@ -343,6 +343,22 @@ static void dec_trace_line(const mynah_asr_decoder *dec, const mynah_asr_dec_sta
             chosen, blank_sc - lex_sc, blank_sc - nb_sc);
 }
 
+/* MYNAH_ASR_BLANK_BIAS=<delta> (RESEARCH, default off): until a stream's FIRST
+ * natural emission, a decision whose blank beats the best non-blank by less
+ * than delta commits that non-blank instead. It is the rule the S13-5b replay
+ * applied to stored logits, made live, so the replay is its gate: the live
+ * first frame must equal the replayed one. Unset or 0 leaves every decision
+ * untouched (the branch below is never taken). RNNT greedy only. */
+static float blank_bias(void) {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char *e = getenv("MYNAH_ASR_BLANK_BIAS");
+        v = e ? (float)atof(e) : 0.0f;
+        if (!(v > 0.0f)) v = 0.0f;
+    }
+    return v;
+}
+
 static int argmax_bias(const float *lg, const float *bias, int V) {
     int best = 0;
     float bv = lg[0] + bias[0];
@@ -493,7 +509,13 @@ int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_
 
         for (int b = 0; b < Bc; b++) {
             const float *lb = logits + (size_t)b * (size_t)V;
-            const int am = argmax_bias(lb, dec->head_b, V);
+            int am = argmax_bias(lb, dec->head_b, V);
+            if (am == dec->blank && s->n_emitted == 0 && blank_bias() > 0.0f) {
+                float nbs;
+                const int nb = best_excluding(lb, dec->head_b, V, dec->blank, &nbs);
+                if (nb >= 0 && (lb[dec->blank] + dec->head_b[dec->blank]) - nbs < blank_bias())
+                    am = nb;
+            }
             if (dec_trace())
                 dec_trace_line(dec, s, lb, (long)(s->t_abs + t + b), am,
                                (inj->armed && inj->done) ? 1 : 0,
@@ -577,6 +599,7 @@ int mynah_asr_greedy_decode(const mynah_asr_decoder *dec, mynah_asr_dec_state *s
 }
 
 int mynah_asr_dec_diag_prime(void) {
+    (void)blank_bias();                        /* resolve it before any parallel decode */
     const int t = dec_trace(), p = pred_trace();
     const inject_cfg *c = inject_conf();
     const char *e = getenv("MYNAH_ASR_RNNT_INJECT");
