@@ -209,3 +209,34 @@ C=128 (level 2). Parity intact on every rung.
   over streams (low risk), subsampling over streams (its GEMMs are already
   pooled: measure first), decode + emit split into a parallel decode and an
   ordered publish (largest, medium risk: trace statics, head bandwidth).
+
+### Level 3 — RESULT, measured as 2 vs 3 (commit `7accee0`, C=112, ABBA x2)
+
+| level | rep | audio/wall | utt | cores | a/w per core | lag p50/p95/p99 | fin p95 | backlog max | disp/s/w |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 82.30 | 899 | 25.61 | 3.21 | 67 / 184 / 270 | 367 | 0.564 | 9647 |
+| 3 | 1 | 82.34 | 900 | 25.01 | 3.29 | 71 / 183 / 264 | 357 | 0.564 | 9111 |
+| 3 | 2 | 82.86 | 900 | 24.99 | 3.32 | 72 / 184 / 258 | 349 | 0.464 | 8996 |
+| 2 | 2 | 82.74 | 899 | 25.57 | 3.24 | 67 / 187 / 268 | 372 | 0.544 | 9681 |
+
+Every serving gate passes in all four; parity intact. Level 3 over level 2:
+throughput flat, lag p95 -1 %, fin p95 -4.5 %, cores -0.6 at equal throughput
+(+2.4 % per core). Nothing clears a registered threshold: **NEUTRAL**. Kept in
+the tree (bit-exact, default off) but NOT carried into the level-4 measurement:
+`MYNAH_ASR_STREAM_PAR_DECODE=0` switches it off under level 4.
+
+### Level 4 — mechanism, measured before any benchmark
+
+Local probe, Nemotron geometry (24 x 1024, Q=4), B=8, 30 steps; counts are
+exact, times are a dev signal only.
+
+| level | act-quant calls on caller / step | rows on caller | caller ms / step | rows quantised in regions | GEMMs on pre-quantised rows | pool dispatches / step |
+|---|---|---|---|---|---|---|
+| 0 | 240 | 7680 | 3.5 | 0 | 0 | 240 |
+| 2 | 240 | 7680 | 4.7 | 0 | 0 | 456 |
+| 3 | 240 | 7680 | 4.7 | 0 | 0 | 456 |
+| 4 | **0** | **0** | **0** | 6144 | 240 | **456** |
+
+The serial quantisation passes disappear entirely; q/k/v share one pass (7680
+-> 6144 rows); no dispatch is added (level 2 had added 9 per layer). The
+server dump carries the same counters as an `actq` line.

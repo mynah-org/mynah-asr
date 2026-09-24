@@ -1013,3 +1013,81 @@ not as a new mechanism.
 ready_mean 1.52, 64 % of steps at B=1, step wall 20.9 / 36.9 / 52.6 / 69.1 ms
 at B = 1..4 — a fixed cost of roughly 5 ms and ~16 ms per row, so wider
 batches could save at most the fixed part.
+
+---
+
+# S13-5b — Is Nemotron's first token late because blank wins, or because the evidence is late?
+
+**Question.** On the 120 h2h clips Nemotron's first non-blank comes ~300 ms of
+audio after the EOU 120M's (S13-5). Does the token Nemotron eventually emits
+already compete earlier (A: commitment), or does it not (B: evidence)?
+
+**Correction carried in (read-only audit, 2026-09-24).** S13-5 split the gap
+into "2.2 fewer decisions, ~176 ms" plus "a finer grid, ~150 ms". Those are not
+independent: both models commit mostly on the FIRST frame of a newly arrived
+chunk (frame mod chunk = 0 on 90/120 Nemotron and 117/120 EOU clips), so
+decision count and grid overlap and must not be added.
+
+**Method.** Raw `MYNAH_ASR_TRACE_RNNT` traces of the same 120 clips, both models,
+exactly `first_emission.py`'s command (int8, default lookahead, 4 threads), on
+the box, 2026-09-24, commit `7accee0`; pack hashes 2f5e1434 (Nemotron) and
+5c533297 (EOU). The trace already carries, per decision, blank score, best
+non-blank id/score/rank and `margin_nb` (logit difference = log-probability
+difference). No instrumentation was added. Latency is measured in AUDIO
+CONSUMED at the decision (`audio_s`), never as frames x 80 ms: a decision is
+published when its chunk completes. Rule registered in the analyzer before it
+ran: `.work/evidence/ttfp-trace-20260924/ttfp_ab.py` (untracked, with traces).
+
+**FACT — the baseline reproduces.** Speech -> first non-blank p50: Nemotron
+860 ms, EOU 580 ms, paired difference p50 300 ms. 90 of 120 clips are
+contested (EOU first), 5 go the other way, 25 tie.
+
+**FACT — the eventual token is usually already there, one to three decisions
+early, a few nats under blank — in BOTH models.**
+
+| decisions before the first emission | Nemotron: eventual token is best non-blank | margin under blank (p50) | EOU: eventual token is best non-blank | margin (p50) |
+|---|---|---|---|---|
+| 1 | 71.7 % | 2.78 | 62.5 % | 3.30 |
+| 2 | 55.8 % | 2.21 | 53.3 % | 2.48 |
+| 3 | **41.7 %** | 2.59 | **16.7 %** | 3.82 |
+| 4 | **26.7 %** | 4.09 | **15.8 %** | 3.82 |
+
+In the contested window (from EOU's first frame to Nemotron's), Nemotron's
+eventual token is best non-blank within tau of blank on 11 / 24 / 47 / 74 % of
+clips for tau = 0.5 / 1 / 2 / 4. No window lies in the extreme |blank| > 100
+regime.
+
+**RESULT — mostly A, and not Nemotron-specific in kind.** "Right token, blank
+ahead by ~2-3 nats" is the normal state before a crossing in BOTH models; what
+differs is duration: Nemotron's eventual token is competitive three and four
+decisions ahead far more often (42 / 27 % against 17 / 16 %). The evidence is
+there; the commitment comes later.
+
+**Counterfactual (exact before the first emission).** Until the first token
+the predictor sits at SOS and the encoder does not depend on the decoder, so
+a blank bias `delta` applied only until the first token can be replayed on the
+stored logits exactly: first commit = first decision with margin_nb < delta.
+
+| delta | clips moved | first token CHANGED | audio saved p50 / mean | new speech -> first p50 | at or before EOU |
+|---|---|---|---|---|---|
+| 0 | — | — | — | 860 ms | — |
+| 1 | 27 | 2 | 0 / 65 ms | 820 ms | 14 / 120 |
+| 2 | 55 | 4 | 0 / 128 ms | 745 ms | 28 / 120 |
+| 3 | 73 | 7 | 150 / 180 ms | 710 ms | 41 / 120 |
+| 4 | 83 | 10 | 300 / 213 ms | 680 ms | 49 / 120 |
+
+About two thirds of the 300 ms gap is recoverable with delta = 3-4 at a cost
+of 6-8 % of clips starting with a DIFFERENT first token. What the replay cannot
+say: anything after the first token (predictor state changes), hence WER/CER.
+
+**NOT established.** Why Nemotron holds blank longer. FastEmit weight, context
+geometry and the prompt projector remain candidates; none is shown by this.
+
+**NEXT (plan only, nothing built).** A default-off debug knob
+`MYNAH_ASR_BLANK_BIAS=delta=<x>,scope=first` at the two argmax sites, gated by
+(i) delta 0 byte-identical and (ii) the live first frame equal to this replay
+on all 120 clips; then delta in {2, 3, 4} scored for WER/CER on the 349
+original recordings with the existing scorers (`streaming_metrics`,
+`earliness_cost.py` paired against delta 0) and first-word correctness with
+`partial_quality.py`. The first-token identity changes above are the risk to
+watch: a biased commit that emits a DIFFERENT token is the hallucination case.
