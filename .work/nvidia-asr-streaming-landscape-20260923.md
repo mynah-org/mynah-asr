@@ -982,3 +982,34 @@ exists.
 **Q3 is answered**; what remains is a `docs/prior-art.md` entry, because a
 first-party runtime in the same niche that independently reached the same cache
 decision belongs in the prior-art record and not only in a research ledger.
+
+---
+
+# S13-1e — early batch release: REJECTED 2026-09-24, premise absent
+
+**Question.** How much latency does the scheduler add by waiting after the
+complete due cohort is already ready?
+
+**FACT — zero in the qualified path, by construction.** The frozen C=80 fleet
+is started with `--batch-window-ms 0` (`tools/bench/v2_qualify.sh`), which the
+profile `configs/perf/axion-c4a-highcpu32-nemotron-streaming.json` justifies
+by measurement (40 ms took the mean ready set 3.69 -> 5.85 at c=16 without
+moving the ceiling; 80 ms cost a rung). `sched_collect()` in `server/sched.c`
+returns immediately when the window is 0: a step runs the moment any slot is
+ready. There is no window to close early.
+
+**FACT — early release already exists when a window IS configured.** The
+collect loop breaks on `ready >= live`, is woken by every arrival, and exempts
+a stream's first chunk and any finalizing stream. The only residual gap from
+NVIDIA's ingress cohort coordinator is the target: all LIVE slots rather than
+the slots DUE this period, so a live but not-yet-due stream would hold the
+window to its deadline. That matters only with a non-zero window.
+
+**DECISION.** Rejected without code and without Axion time. Reopen only if a
+non-zero batch window is ever re-adopted, and then as "target the due count",
+not as a new mechanism.
+
+**OBSERVATION carried forward (one worker, C=80, CACHE-RING-1 shift rung):**
+ready_mean 1.52, 64 % of steps at B=1, step wall 20.9 / 36.9 / 52.6 / 69.1 ms
+at B = 1..4 — a fixed cost of roughly 5 ms and ~16 ms per row, so wider
+batches could save at most the fixed part.
