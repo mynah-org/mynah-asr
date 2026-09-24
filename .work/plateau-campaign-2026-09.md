@@ -449,3 +449,30 @@ reproduces the frozen S13-3c numbers exactly first):
 Paired per-clip delta against the frozen result: 0 worse, 0 better, 0.00000.
 Under load the soaks' parity bound compares every stream to this same
 reference, so the loaded transcripts are identical to the shipped build too.
+
+### C=144 — QUALIFIED (both soaks), with thin finalization margin
+
+Same frozen build and flags; the unloaded reference is the C=128 one (same
+build, byte-identical file), which v2_qualify's `--reference-file` supports.
+
+| bound | soak 1 | soak 2 | limit |
+|---|---|---|---|
+| utterances / established streams lost | 23371 / 0 | 23367 / 0 | 0 |
+| emission lag p95 | 243 ms | 243 ms | 320 ms |
+| finalization p95 | **428 ms** | **429 ms** | 500 ms |
+| backlog max | 0.384 s | 0.464 s | 0.640 s |
+| TTFP load penalty, paired p50/p95/p99 | +142 / +205 / +229 ms | +142 / +206 / +230 ms | GOOD <= 250 |
+| deltas late >320 ms / >640 ms (of ~531k) | 7494 / 0 (worst 582) | 7729 / 0 (worst 581) | — |
+| transcript parity | PASS | PASS | — |
+| audio/wall | 135.16x | 135.63x | — |
+
+### Both points, per soak
+
+| C | soak | cores of 30 | audio/wall | a/w per core | lag p50/p95/p99 | fin p50/p95/p99 | backlog p95/max |
+|---|---|---|---|---|---|---|---|
+| 128 | 1 | 26.21 | 123.68 | 4.72 | 78 / 129 / 164 | 145 / 221 / 256 | 0.184 / 0.284 |
+| 128 | 2 | 26.20 | 123.65 | 4.72 | 78 / 129 / 164 | 146 / 221 / 256 | 0.184 / 0.284 |
+| 144 | 1 | 26.93 | 135.16 | 5.02 | 165 / 243 / 343 | 303 / 428 / 476 | 0.284 / 0.384 |
+| 144 | 2 | 27.36 | 135.63 | 4.96 | 165 / 243 / 344 | 304 / 429 / 478 | 0.284 / 0.464 |
+
+`v2_promote` dry-run (no `--apply`, nothing written) accepts both runs.
