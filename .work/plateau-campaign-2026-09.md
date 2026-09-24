@@ -1,6 +1,6 @@
 # Plateau campaign, Axion 2026-09-24 — why ~8 of 30 cores sit idle at saturation
 
-Status: IN PROGRESS — S10-4 REJECTED; S10-3 levels 1+2 WIN (safe-concurrency step at C=112, +7.6 % throughput at C=128), default off pending a product decision
+Status: RESEARCH COMPLETE 2026-09-24 — the plateau is explained and removed in the research build (28.3 of 30 cores at C=144, knee C=96-104 -> C=144-160); every treatment default OFF pending a product decision and its own qualification
 
 Task: S12-7c, S10-4, S10-3
 
@@ -364,3 +364,42 @@ finalization held the scheduler thread for ~60 ms on one core while the rest
 of the worker's streams waited, and at C=128 a worker finalizes ~1.7 streams
 per second. Both the finalizing stream and everyone queued behind it paid for
 it.
+
+### Knee re-measured with the full stack (STREAM_PAR=4 + FIN_STACK=1, one rep per rung)
+
+| C | audio/wall | utt | cores (of 30) | lag p95 | fin p95 | backlog max | ready B | gates |
+|---|---|---|---|---|---|---|---|---|
+| 144 | 110.12 | 1441 | **28.31** | 241 | 429 | 0.384 | 6.8 | all PASS |
+| 160 | 109.74 | 1196 | 28.49 | 761 | 1338 | 1.084 | 15.0 | lag, fin, backlog FAIL |
+
+Throughput saturates at ~110 audio-s per second (C=144 and C=160 agree), with
+the fleet using 28.3-28.5 of its 30 cpus. One rep per rung: a screening point,
+not a qualification.
+
+## Campaign conclusion
+
+| config | knee (last clean rung / first bad) | cores used near the knee | source |
+|---|---|---|---|
+| shipped (shift, all off) | C=96 / C=104 | 21.5-23.5 of 30 | S12-7, today's shift rungs |
+| STREAM_PAR=2 | C=112 / C=128 | 25.6 at C=112 | ABBA x2 |
+| STREAM_PAR=4 | (C=128 fails finalization) | 21 at C=128 | ABBA x2 |
+| STREAM_PAR=4 + FIN_STACK | **C=144 / C=160** | **28.3** | ABBA x2 at C=128, one rep at 144/160 |
+
+- **S12-7c is answered**: the ~8 idle cores were serial work on each worker's
+  scheduler thread — per-stream encoder stages, per-stream front end and
+  decode, activation quantisation, and above all finalization on the
+  single-stream path — while the pool waited. Every treatment that moved it
+  onto the pool moved the plateau; the ones that did not (K/V memmove, pool
+  spin, batch window) did not.
+- Per treatment, at the rung that discriminates it: level 2 WIN (C=112 step),
+  level 3 MATERIAL at C=128 (neutral at C=112), level 4 -19 % lag p95 at C=128
+  (just under the bar), FIN-STACK WIN (C=128 step). Parity intact on every
+  rung of the campaign; bit-exact gates for each level, each mutation-checked.
+- **Method lessons.** (1) A treatment of a stage that scales with B must be
+  judged at a rung where B is wide; C=112 hid level 3 once level 2 had made it
+  unsaturated. (2) Throughput per core is reported beside cores: level 2 bought
+  C=112 latency with -15 % efficiency, FIN-STACK at C=128 with -4 %.
+- **Not done, needs a decision**: promoting any of these flags to default
+  changes production and needs its own qualification (v2_qualify soak pair at
+  the new operating point, v2_promote). The research configuration is
+  `MYNAH_ASR_STREAM_PAR=4 MYNAH_ASR_FIN_STACK=1`.
