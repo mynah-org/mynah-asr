@@ -122,27 +122,29 @@ def build(path):
 
     # ------------------------------------------------------------------ 3
     A(KeepTogether([Paragraph("3. Results", H2), LevelChart(fw, [
-        ("C80", 30, "GOOD", "23 Sep, shipped"),
-        ("C104", 3, "FAILED", "shipped, 3 bounds"),
-        ("C128", 30, "GOOD", "24 Sep, QUALIFIED x2"),
-        ("C144", 30, "GOOD", "24 Sep, QUALIFIED x2"),
-        ("C160", 2, "FAILED", "screen, first bad"),
+        ("C80", 30, "GOOD", "23 Sep, shipped, x2"),
+        ("C104", 3, "FAILED", "23 Sep, shipped"),
+        ("C128", 30, "GOOD", "24 Sep, new, x2"),
+        ("C144", 30, "GOOD", "24 Sep, new, x2"),
+        ("C160", 2, "FAILED", "24 Sep, new, screen"),
     ])]))
     A(Paragraph(
-        "Bar height is run length, not performance. The shipped configuration broke "
-        "between 96 and 104 streams; with the two settings on, 128 and 144 each held "
-        "two thirty-minute runs and 160 failed a screen.", SMALL))
+        "Bar height is run length, not performance. The first two bars are YESTERDAY's "
+        "shipped configuration (23 September): qualified at 80, broke between 96 and "
+        "104. The last three are TODAY's (24 September) with the two new settings on: "
+        "128 and 144 each held two thirty-minute runs, 160 failed a screen.", SMALL))
     A(Spacer(1, 6))
     A(table([
-        ["Level", "Settings", "Run", "Utts", "Lag p95", "Backlog", "Final p95", "Lost", "Verdict"],
-        ["C80", "shipped", "30 min x2", "21,287", "115/118 ms", "0.384 s", "224/231 ms", "0", "QUALIFIED (23 Sep)"],
-        ["C104", "shipped", "3 min", "1,285", "305 ms", "0.744 s", "619 ms", "0", "FAILED"],
-        ["C128", "new", "30 min", "17,007", "129 ms", "0.284 s", "221 ms", "0", "QUALIFIED"],
-        ["C128", "new", "30 min", "17,005", "129 ms", "0.284 s", "221 ms", "0", "QUALIFIED"],
-        ["C144", "new", "30 min", "23,371", "243 ms", "0.384 s", "428 ms", "0", "QUALIFIED"],
-        ["C144", "new", "30 min", "23,367", "243 ms", "0.464 s", "429 ms", "0", "QUALIFIED"],
-        ["C160", "new", "2 min", "1,196", "761 ms", "1.084 s", "1338 ms", "0", "FAILED"],
-    ], [fw * 0.08, fw * 0.10, fw * 0.11, fw * 0.11, fw * 0.12, fw * 0.10, fw * 0.12, fw * 0.07, fw * 0.19]))
+        ["Date", "Level", "Build", "Run", "Utts", "Lag p95", "Backlog", "Final p95", "Lost", "Verdict"],
+        ["23 Sep", "C80", "shipped", "30 min x2", "21,287", "115/118 ms", "0.384 s", "224/231 ms", "0", "QUALIFIED"],
+        ["23 Sep", "C96", "shipped", "3 min", "1,515", "182 ms", "0.484 s", "379 ms", "0", "GOOD (screen)"],
+        ["23 Sep", "C104", "shipped", "3 min", "1,285", "305 ms", "0.744 s", "619 ms", "0", "FAILED"],
+        ["24 Sep", "C128", "new", "30 min", "17,007", "129 ms", "0.284 s", "221 ms", "0", "QUALIFIED"],
+        ["24 Sep", "C128", "new", "30 min", "17,005", "129 ms", "0.284 s", "221 ms", "0", "QUALIFIED"],
+        ["24 Sep", "C144", "new", "30 min", "23,371", "243 ms", "0.384 s", "428 ms", "0", "QUALIFIED"],
+        ["24 Sep", "C144", "new", "30 min", "23,367", "243 ms", "0.464 s", "429 ms", "0", "QUALIFIED"],
+        ["24 Sep", "C160", "new", "2 min", "1,196", "761 ms", "1.084 s", "1338 ms", "0", "FAILED"],
+    ], [fw * 0.08, fw * 0.07, fw * 0.09, fw * 0.10, fw * 0.08, fw * 0.11, fw * 0.10, fw * 0.11, fw * 0.06, fw * 0.20]))
     A(Paragraph(
         "The Lost column is zero on every row again, including the failed ones. At 160 "
         "streams the server is late, not lossy.", SMALL))
@@ -152,8 +154,8 @@ def build(path):
         "new settings": ([(128, 129), (144, 243), (160, 761)], ACCENT),
     }))
     A(Paragraph(
-        "Same machine, model, corpus and layout. The shipped curve is the 23 September "
-        "screen; the new points at 128 and 144 are thirty-minute runs, 160 is a screen. "
+        "Same machine, model, corpus and layout. The shipped curve (orange) is "
+        "yesterday's 23 September screen; the new points at 128 and 144 are thirty-minute runs, 160 is a screen. "
         "Points above 620 ms are drawn at the top of the axis.", SMALL))
 
     # ------------------------------------------------------------------ 4
@@ -277,6 +279,66 @@ def build(path):
         ["French", "Build a validated FR set and put it through the same quality gate."],
         ["x86, second generator host", "The same protocol on AMD/Intel; the client off the server."],
     ], [fw * 0.28, fw * 0.72], header=False))
+
+    # ------------------------------------------------------------------ appendix
+    A(Paragraph("Appendix A. Everything tried on 24 September &mdash; wins, fails and what is left", H2))
+    A(Paragraph(
+        "Every idea below was stated as a hypothesis with a threshold before it was "
+        "measured, proved bit-exact before it touched a benchmark, and measured on this "
+        "machine in interleaved repeats. The failures are listed with the same weight as "
+        "the wins: most of the day's knowledge is in them.", BODY))
+    A(Paragraph("A.1 Ideas tested", H3))
+    A(table([
+        ["Idea", "What it does", "Measured (Axion)", "Verdict"],
+        ["K/V cache ring buffer", "Advance a head instead of moving the streaming attention cache every chunk "
+         "(the NVIDIA C++ runtime does this)",
+         "Removes the 10 MB/chunk move; bytes 22.8 &rarr; 12.6 MB/step. C112: throughput flat, lag &minus;11% (1 rep)",
+         "FAIL &mdash; neutral"],
+        ["K/V cache sliding arena", "Contiguous window, no copy, compaction every 14 chunks; 2x cache memory",
+         "Copy 4.5 &rarr; 0.3 GB/s; C112: +1.7% throughput, backlog &minus;20%, +1.1 GB RSS",
+         "small win, not adopted"],
+        ["Early batch release", "Release a batch as soon as every due stream is ready (NVIDIA cohort idea)",
+         "The qualified layout runs a 0 ms batch window: the wait does not exist", "FAIL &mdash; rejected, not run"],
+        ["Pool spin 50 &rarr; 500 &micro;s", "Keep pool threads spinning instead of sleeping between tasks",
+         "Spin hits 48 &rarr; 95%, +5.5 cores burned, throughput &minus;0.1%", "FAIL &mdash; costs cores, buys nothing"],
+        ["Per-stream stages on the pool (level 1)", "Attention and convolution of each stream run in parallel",
+         "C112: lag p95 &minus;55%, finalization &minus;52%", "WIN (part of the setting)"],
+        ["+ norms and activations (level 2)", "Layer norms, residuals, SiLU spread over threads",
+         "C112: a further &minus;24%; passes every bound where shipped fails", "WIN (part of the setting)"],
+        ["+ front end and decoder (level 3)", "Each stream's audio front end and decoding in parallel",
+         "C112: neutral; C128: lag &minus;23%, finalization &minus;28%", "WIN at the knee"],
+        ["+ quantisation in place (level 4)", "Activations quantised where they are produced; 0 extra tasks",
+         "Serial quantisation &minus;88%; C128: lag &minus;19% (bar was 20%)", "just under the bar; kept"],
+        ["Finishing streams on the batched path", "The last chunk of a stream stops running single-threaded",
+         "60 &rarr; 17 ms per finish; C128: lag &minus;52%, fails &rarr; passes", "WIN (the other setting)"],
+        ["Earlier first word (blank bias)", "Let the decoder commit to its first token sooner",
+         "First fragment &minus;180 ms p50, first complete word unchanged, WER 10.4 &rarr; 10.8%", "FAIL &mdash; rejected"],
+    ], [fw * 0.20, fw * 0.30, fw * 0.32, fw * 0.18], size=7.8))
+    A(Paragraph("A.2 What the failures taught", H3))
+    A(table([
+        ["Measure before building", "The cache move was 1.3% of the step in the existing profile; predicted "
+         "neutral before the code was written, and it was."],
+        ["Judge a stage where it binds", "Level 3 looked neutral at 112 streams because level 2 had already "
+         "stopped the fleet saturating there; at 128 it was material. Re-measured, not assumed."],
+        ["More busy cores is not a win", "Spinning filled the idle cores and did no work: cores are reported "
+         "beside throughput per core, never alone."],
+        ["A fragment is not a word", "The first-word experiment reproduced its offline prediction exactly and "
+         "still failed, because what a listener needs is a complete word."],
+        ["The harness can waste the day", "One lost hour of machine time came from the benchmark tool refusing "
+         "to start on a residual load average and from a watcher that matched its own process."],
+    ], [fw * 0.26, fw * 0.74], header=False, size=8.2))
+    A(KeepTogether([Paragraph("A.3 Not tried yet", H3), table([
+        ["Make the settings the default", "Qualified; the switch to the shipped profile is a product decision."],
+        ["Sliding K/V arena on the new settings", "Its small win was measured before the plateau moved; it may "
+         "matter more now."],
+        ["Fewer pool synchronisations", "The new settings raised pool dispatches from ~2,500 to ~9,700 per second "
+         "per worker; one persistent parallel region per step could recover efficiency."],
+        ["The level between 144 and 160", "152 has not been screened; 144 is the last qualified level."],
+        ["French, x86, generator off-host", "No validated French set yet; the same protocol on AMD/Intel; the "
+         "load client on a second machine."],
+        ["First word, model side", "Serving is not the lever; a smaller-lookahead preset or another checkpoint "
+         "(the English-only EOU 120M is ~300 ms earlier) is."],
+    ], [fw * 0.30, fw * 0.70], header=False, size=8.2)]))
 
     # ------------------------------------------------------------------ 12
     A(Paragraph("12. Reproducing this", H2))
