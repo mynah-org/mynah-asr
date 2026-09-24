@@ -337,3 +337,30 @@ Cores used are back at ~21 of 30 at C=128.
   below 59.
 - **Thresholds** as registered for the campaign (lag p95 or backlog >= 20 % and
   > 2 x spread; throughput >= 3 %; the fin p95 gate at 500 ms is reported).
+
+### FIN-STACK — RESULT (commit `3afcb07`, C=128, on STREAM_PAR=4, ABBA x2)
+
+Box gate first: CLI deltas byte-identical with the flag off and on for 6
+corpus clips on the qualified Nemotron pack.
+
+| FIN_STACK | rep | finalize model ms / call | audio/wall | utt | cores | a/w per core | lag p50/p95/p99 | fin p95 | backlog max | ready B |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 17.0 | 88.53 | 1036 | 22.54 | 3.93 | 76 / 126 / 161 | 220 | 0.184 | 3.4 |
+| 0 | 1 | 61.0 | 85.93 | 1012 | 21.04 | 4.08 | 111 / 264 / 369 | 541 | 0.584 | 5.2 |
+| 0 | 2 | 59.6 | 85.99 | 1010 | 21.04 | 4.09 | 112 / 269 / 381 | 537 | 0.784 | 5.1 |
+| 1 | 2 | 17.5 | 88.50 | 1034 | 22.49 | 3.94 | 76 / 128 / 164 | 220 | 0.244 | 3.3 |
+
+- **Mechanism**: a finalization's model time 60 -> 17 ms (-71 %).
+- lag p95 **-52 %** (2 x spread = 10 ms), fin p95 -59 %, backlog max -69 %,
+  lag p99 -57 %: MATERIAL. Audio/wall +3.0 % (2.97 %, on the bar; +2.4 %
+  completed utterances); cores +1.5; throughput per core -3.8 %.
+- **Serving gates**: without the flag the fleet fails finalization at C=128 in
+  both reps; with it, it passes EVERY gate in both. That is the registered
+  safe-concurrency step: **WIN**.
+- Parity `identity_fail 0, reference_fail 0` on all four; no stream lost.
+
+**Reading.** The single-stream step was the last big serial block: every
+finalization held the scheduler thread for ~60 ms on one core while the rest
+of the worker's streams waited, and at C=128 a worker finalizes ~1.7 streams
+per second. Both the finalizing stream and everyone queued behind it paid for
+it.
