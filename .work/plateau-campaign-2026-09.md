@@ -519,3 +519,43 @@ runs; nothing was applied. Also research-only: `MYNAH_ASR_KV_LAYOUT`
 
 **The plateau campaign is closed.** No further micro-optimisation unless a
 qualification exposes a concrete failure mechanism.
+
+## AUDIT 2026-09-24 — is "0 lost, 0 errors" real? (read after the decision record)
+
+**Question.** Does the harness actually count every way a streaming utterance
+can fail, or could the qualification's zeros be an accounting artefact?
+
+**Gaps found in the counting code** (`tools/bench/stream_load.py`,
+`tools/bench/streaming_metrics.py`):
+1. `ok` = no error and not rejected. An utterance where the server closes the
+   socket WITHOUT a `done` frame (the reader breaks on opcode 0x8 and sets no
+   error), or that receives no event at all, counts as OK; its finalization
+   silently leaves the percentiles.
+2. Warm-up hides errors: `aggregate()` drops the first `--warmup` seconds
+   BEFORE counting `errored`, so a failure in the first 30 s of a soak is not
+   in `counts.errors` (v2_verdict bound 1 reads that count).
+3. In SOAK mode nothing checks that every stream process lived to the end: a
+   stream process that dies stops producing records silently (`expected` is
+   only set in WAVE mode).
+4. Harness artefact, not a failure: the schedule gives stream i the clips
+   i, i+C, i+2C... of a bank that alternates the three length classes, so
+   when C is a multiple of 3 (96, 120, **144**) every stream plays ONE class
+   for the whole run (C=144: stream 62 only long clips, 81 utterances; stream 99
+   only short, 261). The fleet mix stays one third per class; the per-
+   utterance mix shifts toward short clips, i.e. more opens and finalizations
+   per second — a harder load, not an easier one.
+
+**FACT — none of 1-3 happened in the qualification.** Re-counted from the raw
+per-utterance records of all four soaks, INCLUDING warm-up:
+
+| soak | utterances (all) | errors | rejected | OK without done / fin | empty text | streams alive to the end |
+|---|---|---|---|---|---|---|
+| C128 #1 | 17348 | 0 | 0 | 0 | 0 | 128 / 128 |
+| C128 #2 | 17347 | 0 | 0 | 0 | 0 | 128 / 128 |
+| C144 #1 | 23844 | 0 | 0 | 0 | 0 | 144 / 144 |
+| C144 #2 | 23839 | 0 | 0 | 0 | 0 | 144 / 144 |
+
+Every stream sent 1735-1822 s of audio in 1800 s (no stream starved); the
+slowest stream's lag p95 is 273 ms against a median stream of 245 ms at C=144
+(141 vs 128 at C=128). The zeros stand; the counting is still to be fixed so
+that the NEXT run cannot hide them (S12-17).
