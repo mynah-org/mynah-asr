@@ -1259,7 +1259,14 @@ int mynah_asr_stream_step_batch(mynah_asr_stream *const *streams, int B,
 
     /* 1. per-stream ingest: VAD and mel, exactly as a feed does (over streams
      * on the pool at STREAM_PAR >= 3: each touches only its own stream) */
-    const int par3 = B > 1 && mynah_asr_enc_stream_par_level() >= 3 &&
+    /* MYNAH_ASR_STREAM_PAR_DECODE=0 keeps this level off while the encoder
+     * levels above it stay on, so level 4 can be measured without level 3 */
+    static int dec_flag = -1;
+    if (dec_flag < 0) {
+        const char *e = getenv("MYNAH_ASR_STREAM_PAR_DECODE");
+        dec_flag = (e && e[0] == '0') ? 0 : 1;
+    }
+    const int par3 = B > 1 && dec_flag && mynah_asr_enc_stream_par_level() >= 3 &&
                      !mynah_asr_dec_diag_prime();
     stream_par3_ctx p3 = {.streams = streams, .samples = samples, .n_samples = n_samples};
     if (par3) mynah_asr_parallel_for(B, par3_ingest, &p3);
