@@ -1340,7 +1340,26 @@ typedef struct {
     const mynah_asr_enc_layer *L;
     int li, d, ck, k_sh;
     const float *kn, *vn, *rk_sh;
+    int quant;               /* level 4: quantise the rows this task produced */
 } stream_par_ctx;
+
+static void quant_rows(mynah_asr_enc_batch *bb, const float *x, int r0, int n, int k);
+
+/* level 4: the GEMM over rows a producing task already quantised, or the
+ * ordinary call that quantises them itself */
+static void qrows(int pq, const mynah_asr_qmat *W, const float *x, float *out, int R,
+                  mynah_asr_enc_batch *bb) {
+    if (pq) mynah_asr_qmat_mul_rows_q(W, bb->qx, bb->sx, out, R);
+    else    mynah_asr_qmat_mul_rows(W, x, out, R, bb->qx, bb->sx);
+}
+
+/* every int8 GEMM of layer L can take pre-quantised rows */
+static int layer_prequant_ok(const mynah_asr_enc_layer *L) {
+    const mynah_asr_qmat *w[10] = {&L->ff1_w1, &L->ff1_w2, &L->k_w, &L->v_w, &L->q_w,
+                                   &L->o_w, &L->pw1_w, &L->pw2_w, &L->ff2_w1, &L->ff2_w2};
+    for (int i = 0; i < 10; i++) if (!mynah_asr_qmat_prequant_ok(w[i])) return 0;
+    return 1;
+}
 
 static void stream_par_attn(void *vctx, int i) {
     const stream_par_ctx *c = vctx;
@@ -1357,6 +1376,7 @@ static void stream_par_attn(void *vctx, int i) {
                           rk_tab ? MYNAH_ASR_RELPOS_TABLE : MYNAH_ASR_RELPOS_SHARED);
     mynah_asr_kv_commit(&es->kv, c->li, 0, c->kn + off, Q);
     mynah_asr_kv_commit(&es->kv, c->li, 1, c->vn + off, Q);
+    if (c->quant) quant_rows(bb, bb->ctxs, bb->offs[i], Q, c->d);
 }
 
 /* Level 2: the residual add that precedes a layer norm, the norm itself, and
@@ -1367,6 +1387,7 @@ static void stream_par_attn(void *vctx, int i) {
 typedef struct {
     float *xs; const float *add; int half;
     const float *w, *b; float *out; int copy_back, R, d, rows;
+    int8_t *qx; float *sx;   /* level 4: quantise each normed row here too */
 } rowln_ctx;
 
 static void rowln_task(void *vctx, int t) {
@@ -1382,15 +1403,18 @@ static void rowln_task(void *vctx, int t) {
         float *o = c->out + (size_t)r * (size_t)c->d;
         layer_norm_f(x, c->w, c->b, o, 1, c->d);
         if (c->copy_back) memcpy(x, o, (size_t)c->d * sizeof(float));
+        if (c->qx)
+            c->sx[r] = mynah_asr_qmat_quant_row(c->qx + (size_t)r * (size_t)c->d, o, c->d);
     }
 }
 
 /* xs += (half ? 0.5 : 1) * add (when add != NULL), out = LN(xs), and xs = out
  * when copy_back: the serial path exactly as it was, or row blocks on the pool. */
 static void add_ln_rows(int par, float *xs, const float *add, int half, const float *w,
-                        const float *b, float *out, int copy_back, int R, int d) {
+                        const float *b, float *out, int copy_back, int R, int d,
+                        int8_t *qx, float *sx) {
     if (par && R >= 8) {
-        rowln_ctx c = {xs, add, half, w, b, out, copy_back, R, d, 2};
+        rowln_ctx c = {xs, add, half, w, b, out, copy_back, R, d, 2, qx, sx};
         mynah_asr_parallel_for((R + 1) / 2, rowln_task, &c);
         return;
     }
@@ -1401,23 +1425,33 @@ static void add_ln_rows(int par, float *xs, const float *add, int half, const fl
     }
     layer_norm_f(xs, w, b, out, R, d);
     if (copy_back) memcpy(xs, out, nd * sizeof(float));
+    for (int r = 0; qx && r < R; r++)
+        sx[r] = mynah_asr_qmat_quant_row(qx + (size_t)r * (size_t)d, out + (size_t)r * (size_t)d, d);
 }
 
 typedef struct {
     mynah_asr_enc_batch *bb;
     mynah_asr_enc_stream *const *ess;
-    int ffn;
+    int ffn, quant;
 } silu_par_ctx;
+
+/* quantise rows [r0, r0+n) of x [*, k] into the batch's qx/sx (level 4) */
+static void quant_rows(mynah_asr_enc_batch *bb, const float *x, int r0, int n, int k) {
+    for (int r = r0; r < r0 + n; r++)
+        bb->sx[r] = mynah_asr_qmat_quant_row(bb->qx + (size_t)r * (size_t)k,
+                                             x + (size_t)r * (size_t)k, k);
+}
 
 static void silu_par_task(void *vctx, int i) {
     const silu_par_ctx *c = vctx;
     mynah_asr_silu_scratch(c->bb->tmp2 + (size_t)c->bb->offs[i] * (size_t)c->ffn,
                            (size_t)c->bb->qq[i] * (size_t)c->ffn, c->ess[i]->ssilu);
+    if (c->quant) quant_rows(c->bb, c->bb->tmp2, c->bb->offs[i], c->bb->qq[i], c->ffn);
 }
 
 static void silu_streams(int par, mynah_asr_enc_batch *bb, mynah_asr_enc_stream *const *ess,
-                         int B, int ffn) {
-    silu_par_ctx c = {bb, ess, ffn};
+                         int B, int ffn, int quant) {
+    silu_par_ctx c = {bb, ess, ffn, quant};
     if (par && B > 1) { mynah_asr_parallel_for(B, silu_par_task, &c); return; }
     for (int i = 0; i < B; i++) silu_par_task(&c, i);
 }
@@ -1429,6 +1463,7 @@ static void stream_par_conv(void *vctx, int i) {
     const size_t off = (size_t)bb->offs[i] * (size_t)c->d;
     float *cc = es->conv_cache + (size_t)c->li * (size_t)(c->ck - 1) * (size_t)c->d;
     stream_conv_mid(es, c->L, bb->tmp2 + 2u * off, bb->cin + off, bb->qq[i], cc);
+    if (c->quant) quant_rows(bb, bb->cin, bb->offs[i], bb->qq[i], c->d);
 }
 
 /* Rows that took the shared rel-pos projection, against all rows stacked. */
@@ -1523,18 +1558,27 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
          * into the row-parallel norm that follows it, so its time is charged
          * to the next component instead of this one. */
         const int par2 = stream_par_on() >= 2;
-        add_ln_rows(par2, xs, NULL, 0, L->ln_ff1_w, L->ln_ff1_b, tmp, 0, R, d);
-        mynah_asr_qmat_mul_rows(&L->ff1_w1, tmp, tmp2, R, qx, sx);
-        silu_streams(par2, bb, ess, B, ffn);
-        mynah_asr_qmat_mul_rows(&L->ff1_w2, tmp2, tmp, R, qx, sx);
+        /* Level 4: every activation quantisation moves into the parallel
+         * region that produced its rows (norms, SiLU, attention, conv mid),
+         * so the ten serial passes per layer go and no dispatch is added;
+         * q/k/v share one. Needs B > 1 (the per-stream regions) and every
+         * GEMM of the layer on the native int8 path. */
+        const int pq = B > 1 && stream_par_on() >= 4 && layer_prequant_ok(L);
+        int8_t *pqx = pq ? qx : NULL;
+        float *psx = pq ? sx : NULL;
+        add_ln_rows(par2, xs, NULL, 0, L->ln_ff1_w, L->ln_ff1_b, tmp, 0, R, d, pqx, psx);
+        qrows(pq, &L->ff1_w1, tmp, tmp2, R, bb);
+        silu_streams(par2, bb, ess, B, ffn, pq);
+        qrows(pq, &L->ff1_w2, tmp2, tmp, R, bb);
         if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += 0.5f * tmp[j];
         EP_ADD(EP_FFN1);
 
         /* MHSA — q/k/v/o stacked, the cache and the rel-pos softmax per stream */
-        add_ln_rows(par2, xs, par2 ? tmp : NULL, 1, L->ln_att_w, L->ln_att_b, xn, 0, R, d);
-        mynah_asr_qmat_mul_rows(&L->k_w, xn, kn, R, qx, sx);
-        mynah_asr_qmat_mul_rows(&L->v_w, xn, vn, R, qx, sx);
-        mynah_asr_qmat_mul_rows(&L->q_w, xn, bb->qs, R, qx, sx);
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 1, L->ln_att_w, L->ln_att_b, xn, 0, R, d,
+                    pqx, psx);
+        qrows(pq, &L->k_w, xn, kn, R, bb);
+        qrows(pq, &L->v_w, xn, vn, R, bb);
+        qrows(pq, &L->q_w, xn, bb->qs, R, bb);
         /* the group's rel-pos projection, once for this layer (S1-7). ess[lead]
          * is at K = k_sh, so its sa_pe holds pos_emb(k_sh) — the same bytes every
          * other member of the group would have fed to the same matmul_wt. */
@@ -1556,7 +1600,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
          * being measured, which is how a profiler ends up measuring itself. */
         unsigned long long attn_ns_ = 0, kv_ns_ = 0;
         const int par = B > 1 && stream_par_on();
-        stream_par_ctx pc = {bb, ess, L, li, d, ck, k_sh, kn, vn, rk_sh};
+        stream_par_ctx pc = {bb, ess, L, li, d, ck, k_sh, kn, vn, rk_sh, pq};
         if (par) {
             /* one region: `attn` gets its WALL, commit included and kv_cache
              * none -- the split cannot be timed across threads without
@@ -1593,14 +1637,15 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         atomic_fetch_add_explicit(&g_ep_ns[EP_ATTN], attn_ns_, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_ep_ns[EP_KVCACHE], kv_ns_, memory_order_relaxed);
         t_ = ep_ns();
-        mynah_asr_qmat_mul_rows(&L->o_w, bb->ctxs, tmp, R, qx, sx);
+        qrows(pq, &L->o_w, bb->ctxs, tmp, R, bb);
         if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
         EP_ADD(EP_OPROJ);
 
         /* Conv — the two pointwise convolutions stacked, the cached depthwise
          * per stream. tmp2 holds the stacked pointwise_conv1 output [R, 2d]. */
-        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_conv_w, L->ln_conv_b, xn, 0, R, d);
-        mynah_asr_qmat_mul_rows(&L->pw1_w, xn, tmp2, R, qx, sx);
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_conv_w, L->ln_conv_b, xn, 0, R, d,
+                    pqx, psx);
+        qrows(pq, &L->pw1_w, xn, tmp2, R, bb);
         if (par) mynah_asr_parallel_for(B, stream_par_conv, &pc);
         for (int i = 0; i < B && !par; i++) {
             mynah_asr_enc_stream *es = ess[i];
@@ -1608,17 +1653,18 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
             float *cc = es->conv_cache + (size_t)li * (size_t)(ck - 1) * (size_t)d;
             stream_conv_mid(es, L, tmp2 + 2u * off, bb->cin + off, bb->qq[i], cc);
         }
-        mynah_asr_qmat_mul_rows(&L->pw2_w, bb->cin, tmp, R, qx, sx);
+        qrows(pq, &L->pw2_w, bb->cin, tmp, R, bb);
         if (!par2) for (size_t j = 0; j < nd; j++) xs[j] += tmp[j];
         EP_ADD(EP_CONV);
 
         /* ½ FFN2 + output LN — stacked. The add reads a row of tmp before the
          * norm overwrites that same row, in both paths. */
-        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_ff2_w, L->ln_ff2_b, tmp, 0, R, d);
-        mynah_asr_qmat_mul_rows(&L->ff2_w1, tmp, tmp2, R, qx, sx);
-        silu_streams(par2, bb, ess, B, ffn);
-        mynah_asr_qmat_mul_rows(&L->ff2_w2, tmp2, tmp, R, qx, sx);
-        add_ln_rows(par2, xs, tmp, 1, L->ln_out_w, L->ln_out_b, xn, 1, R, d);
+        add_ln_rows(par2, xs, par2 ? tmp : NULL, 0, L->ln_ff2_w, L->ln_ff2_b, tmp, 0, R, d,
+                    pqx, psx);
+        qrows(pq, &L->ff2_w1, tmp, tmp2, R, bb);
+        silu_streams(par2, bb, ess, B, ffn, pq);
+        qrows(pq, &L->ff2_w2, tmp2, tmp, R, bb);
+        add_ln_rows(par2, xs, tmp, 1, L->ln_out_w, L->ln_out_b, xn, 1, R, d, NULL, NULL);
         EP_ADD(EP_FFN2);
     }
 

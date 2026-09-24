@@ -86,6 +86,19 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
 int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out, int T,
                         int8_t *qx, float *sx);
 
+/* PRE-QUANTISED activations (S10-3 level 4). mynah_asr_qmat_mul_rows on an
+ * int8 matrix with a native kernel quantises each row on its own (per-row
+ * absmax) and then runs the GEMM. These split the two, so the row can be
+ * quantised by whichever parallel task produced it:
+ *   _prequant_ok  1 when mul_rows would take that native int8 path for m
+ *   _quant_row    the SAME per-row quantisation, returning the row's scale
+ *   _mul_rows_q   the SAME GEMM, over rows already in qx/sx
+ * Same bytes into the same kernel: bit-identical to mul_rows by construction. */
+int   mynah_asr_qmat_prequant_ok(const mynah_asr_qmat *m);
+float mynah_asr_qmat_quant_row(int8_t *qx, const float *x, int k);
+int   mynah_asr_qmat_mul_rows_q(const mynah_asr_qmat *m, const int8_t *qx, const float *sx,
+                                float *out, int T);
+
 /* Which implementation ran, counted per call (ENGINEERING.md §6: a fallback is
  * visible). Cheap relaxed atomics; read with mynah_asr_qmat_counter. */
 enum {

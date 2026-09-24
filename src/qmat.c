@@ -1521,6 +1521,40 @@ int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out,
     return MYNAH_ASR_QC_GENERIC;
 }
 
+int mynah_asr_qmat_prequant_ok(const mynah_asr_qmat *m) {
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    if (m->qtype != MYNAH_ASR_Q_INT8 || m->k > QMAT_K_MAX) return 0;
+    if (q8_leaf() == MYNAH_ASR_QK_SCALAR) return 0;
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_caps() >= MYNAH_ASR_CAPS_AVX2;
+#else
+    return arm_caps() >= MYNAH_ASR_ARM_SDOT;
+#endif
+#else
+    (void)m;
+    return 0;
+#endif
+}
+
+float mynah_asr_qmat_quant_row(int8_t *qx, const float *x, int k) {
+    return quantize_act_int8(qx, x, k);
+}
+
+int mynah_asr_qmat_mul_rows_q(const mynah_asr_qmat *m, const int8_t *qx, const float *sx,
+                              float *out, int T) {
+    if (T <= 0) return MYNAH_ASR_QC_DOT_ROWS;
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    qc(MYNAH_ASR_QC_DOT_ROWS);
+    qgemm_ctx c = {.m = m, .qx = (int8_t *)qx, .sx = (float *)sx, .out = out, .T = T,
+                   .leaf = q8_leaf()};
+    mynah_asr_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
+    return MYNAH_ASR_QC_DOT_ROWS;
+#else
+    (void)m; (void)qx; (void)sx; (void)out;
+    return -1;
+#endif
+}
+
 /* ---------------------------------------------------------- fused helpers */
 void mynah_asr_qmat_ffn(const mynah_asr_qmat *w1, const mynah_asr_qmat *w2, const float *x,
                     float *out, int T, float *scratch) {

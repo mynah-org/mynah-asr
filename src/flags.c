@@ -129,7 +129,9 @@ static const mynah_asr_flag g_flags[] = {
      " conv mid) over streams on the pool instead of serially on the scheduler thread; 2 also runs"
      " SiLU per stream and each residual add + layer norm fused per row block; 3 also runs the"
      " per-stream VAD/mel front end and the greedy decode over streams, publishing deltas on the"
-     " caller in stream order (serial whenever a decoder trace or injection is set). Each stream/row"
+     " caller in stream order (serial whenever a decoder trace or injection is set); 4 also moves every"
+     " int8 activation quantisation into the parallel region that produced its rows (no new dispatch)."
+     " Each stream/row"
      " touches only its own state, so the floats are the same: tests/test_stream_batch and"
      " tests/test_kv_layout gate it. RESEARCH A/B (S10-3)",
      NULL, NULL},
