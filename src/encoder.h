@@ -182,6 +182,15 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                 mynah_asr_enc_stream *const *ess, int B,
                                 const float *const *mel, const int *n_mel, int n_mels,
                                 const int *prompt_id, float *const *out, int *q_out);
+/* The same with a per-stream is_last (NULL = none), so a stream's LAST, short
+ * chunk -- the causal right pad the single step applies -- can take the stacked
+ * path too (MYNAH_ASR_FIN_STACK). The subsampling step is the one that reads it;
+ * everything after it is shape-agnostic in Q. */
+int mynah_asr_enc_stream_step_batch_last(mynah_asr_enc_batch *bb,
+                                         mynah_asr_enc_stream *const *ess, int B,
+                                         const float *const *mel, const int *n_mel, int n_mels,
+                                         const int *prompt_id, const int *is_last,
+                                         float *const *out, int *q_out);
 
 /* f32 only: whether the batched path is allowed to stack the rows. A vendor
  * cblas_sgemm is not contractually row-stable in M, so for those the answer is

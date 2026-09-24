@@ -1479,6 +1479,15 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                 mynah_asr_enc_stream *const *ess, int B,
                                 const float *const *mel, const int *n_mel, int n_mels,
                                 const int *prompt_id, float *const *out, int *q_out) {
+    return mynah_asr_enc_stream_step_batch_last(bb, ess, B, mel, n_mel, n_mels, prompt_id,
+                                                NULL, out, q_out);
+}
+
+int mynah_asr_enc_stream_step_batch_last(mynah_asr_enc_batch *bb,
+                                         mynah_asr_enc_stream *const *ess, int B,
+                                         const float *const *mel, const int *n_mel, int n_mels,
+                                         const int *prompt_id, const int *is_last,
+                                         float *const *out, int *q_out) {
     if (!bb || B < 1 || B > bb->max_b) return -1;
     const mynah_asr_encoder *enc = bb->enc;
     const int d = enc->d_model, ffn = enc->ffn_dim, ck = enc->conv_k;
@@ -1490,7 +1499,7 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
         mynah_asr_enc_stream *es = ess[i];
         if (es->enc != enc) return -1;
         const int Q = mynah_asr_ss_stream_step(&enc->ss, &es->ss, mel[i], n_mel[i],
-                                           n_mels, 0, es->sx);
+                                           n_mels, is_last ? is_last[i] : 0, es->sx);
         if (Q <= 0 || R + Q > bb->max_rows || mynah_asr_kv_prepare(&es->kv, Q) != 0) return -1;
         memcpy(bb->xs + (size_t)R * (size_t)d, es->sx, (size_t)Q * (size_t)d * sizeof(float));
         bb->offs[i] = R;

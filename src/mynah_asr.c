@@ -1068,8 +1068,37 @@ static int stream_decode_emit(mynah_asr_stream *s, int q, mynah_asr_result_cb cb
 }
 
 /* Encode the current mel chunk, decode it, emit the text delta. */
+static int model_batch_ready(mynah_asr_model *m, int max_b);
+static int batch_path_allowed(const mynah_asr_model *m);
+
+/* MYNAH_ASR_FIN_STACK=1 (research): a chunk flushed one stream at a time --
+ * a finalizing stream's last pieces and its padded tail, and every chunk of a
+ * plain feed -- takes the stacked path at B=1 instead of the single step, whose
+ * small-T products run serially on the calling thread. Same floats: the
+ * stacked B=1 step is gated bit-exact against the single one. */
+static int fin_stack_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MYNAH_ASR_FIN_STACK");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 static int stream_flush_chunk(mynah_asr_stream *s, int n_mel, int is_last,
                               mynah_asr_result_cb cb, void *ud) {
+    mynah_asr_model *m = s->m;
+    if (fin_stack_on() && batch_path_allowed(m) && model_batch_ready(m, 1) == 0) {
+        mynah_asr_enc_stream *es = &s->es;
+        const float *mel = s->mel_buf;
+        float *out = s->enc_buf;
+        int q = 0;
+        if (mynah_asr_enc_stream_step_batch_last(m->batch, &es, 1, &mel, &n_mel,
+                                                 m->feat.n_mels, &s->prompt, &is_last,
+                                                 &out, &q) != 0)
+            return -1;
+        return stream_decode_emit(s, q, cb, ud);
+    }
     const int q = mynah_asr_enc_stream_step(&s->es, s->mel_buf, n_mel, s->m->feat.n_mels,
                                         s->prompt, is_last, s->enc_buf);
     if (q < 0) return -1;

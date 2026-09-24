@@ -141,6 +141,13 @@ static const mynah_asr_flag g_flags[] = {
      " levels stay on, so level 4 can be measured on top of level 2 without level 3. RESEARCH A/B",
      NULL, NULL},
 
+    {"MYNAH_ASR_FIN_STACK", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
+     "1: a chunk flushed one stream at a time (a finalizing stream's last pieces and padded"
+     " tail, and every chunk of a plain feed) takes the stacked encoder path at B=1 instead of"
+     " the single step, whose small-T products run serially on the calling thread. Same floats"
+     " by the S1-4 contract. RESEARCH A/B (plateau campaign: finalization)",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"
