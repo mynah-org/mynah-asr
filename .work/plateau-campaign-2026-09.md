@@ -376,6 +376,13 @@ Throughput saturates at ~110 audio-s per second (C=144 and C=160 agree), with
 the fleet using 28.3-28.5 of its 30 cpus. One rep per rung: a screening point,
 not a qualification.
 
+**C=152 screened 2026-09-25 (S12-26), same flags and method, one 180 s rep,
+reference = the C=128 qualification's:** audio/wall 110.36 (saturated, like
+144 and 160), lag p95 **509 ms**, finalization p95 **970 ms**, backlog max
+**0.704 s** -- rows 2, 3, 4, 6 and 14 FAIL; 0 streams lost, books balanced,
+498/498 transcripts identical. The knee is exactly C=144: past it only the
+queue grows. Evidence: `.work/evidence/c152-20260925/` (untracked).
+
 ## Campaign conclusion
 
 | config | knee (last clean rung / first bad) | cores used near the knee | source |
