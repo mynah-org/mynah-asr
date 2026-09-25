@@ -1025,7 +1025,10 @@ def _self_test_faults(check, port) -> None:
     check(res.get("ok") is True and abs(res.get("residual_s", 9)) < 0.01,
           f"residual model work: the fake feeds exactly what was sent ({res.get('residual_s')} s, "
           f"bound {res.get('bound_s')} s)")
-    check(r.returncode in (0, 1) and "fault injection:" in r.stdout
+    # The exit code is not what this checks: a slow runner that cannot pace at 1x makes
+    # the run INVALID (exit 2; seen on the macOS CI runner) while the fault section is
+    # printed all the same. What must hold is that the report runs to its end.
+    check(r.returncode in (0, 1, 2) and "fault injection:" in r.stdout
           and "residual model work:" in r.stdout,
           f"the report prints the fault section (exit {r.returncode}"
           + "".join("; " + ln.strip() for ln in r.stdout.splitlines()
@@ -1101,7 +1104,13 @@ def self_test() -> int:
     # assignment would read `bad` BEFORE the call and overwrite what the call counted
     _self_test_faults(check, port)
     close()
-    A.port = port                                  # nobody listens there any more
+    # A port nobody listens on. NOT the fake server's own port: on Linux the stream
+    # processes are forked and inherit its listening socket, so a straggler can keep
+    # that port accepting after close() (seen on CI, ubuntu x86 and arm). A port taken
+    # from a fresh socket and released at once is closed on every platform.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        A.port = probe.getsockname()[1]
     A.lang = "done"
     rec = run_utterance(A, "x.wav", pcm, "short")
     check(M.outcome(rec) == "connect_error", f"closed port  -> {M.outcome(rec)}")
