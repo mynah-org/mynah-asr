@@ -18,6 +18,15 @@ Three properties on purpose:
     at minute 23 failed, however good its average.
   * Thresholds come from the registered note and from the manifest's own
     lookahead, never from the run being judged.
+
+Bound 1 reads the WHOLE-run error count (`errors_total`, warm-up included) and row
+"A" checks the harness's own accounting: every started utterance accounted for
+(conservation) and every client stream alive to the end. Both were added on
+2026-09-25 (S12-17); a run recorded before then is judged as it always was, with
+a printed warning that those facts are unknown. Row "B" is the SERVER's side of
+the same question (S12-18): every worker dump states sessions = completed +
+cancelled + aborted + active, and one unbalanced line, or an abandoned slot never
+recovered, fails the run. A server older than that prints no books: NOT REGISTERED.
 """
 from __future__ import annotations
 
@@ -74,7 +83,7 @@ STALL_MULTIPLES = (1.0, 2.0, 4.0)
 # has, and RSS over three samples is noise. So --pick judges a rung on the
 # bounds a SCREEN can actually carry, and says so. This selects a candidate to
 # soak; it promotes nothing. WAVE screens, SOAK promotes (ENGINEERING.md §8).
-SCREEN_BOUNDS = (1, 2, 3, 4, 6, 9, 10)
+SCREEN_BOUNDS = (1, "A", "B", 2, 3, 4, 6, 9, 10)
 
 
 def chunk_ms(lookahead):
@@ -153,7 +162,44 @@ def parse_dumps(path):
         b = re.search(r"split model_busy_s=([\d.]+)", line)
         if b:
             rec["busy"] = float(b.group(1))
+        k = re.search(r"books sessions=(\d+) completed=(\d+) cancelled=(\d+) aborted=(\d+) "
+                      r"active=(\d+) balanced=(\d) abandoned=(\d+) recovered=(\d+)", line)
+        if k:
+            rec["books"] = dict(zip(("sessions", "completed", "cancelled", "aborted", "active",
+                                     "balanced", "abandoned", "recovered"),
+                                    (int(x) for x in k.groups())))
     return by
+
+
+def books_check(dumps):
+    """Row "B": the SERVER's session books (S12-18), from every worker's dumps.
+
+    Each dump line states sessions == completed + cancelled + aborted + active, read
+    in one critical section with claim and release, so a single unbalanced line is a
+    session the server lost track of -- a counting bug, never load. An abandoned slot
+    not recovered by the worker's last dump is capacity the run lost. A server built
+    before the books existed prints no such line: NOT REGISTERED, stated."""
+    lines = [(w, seq, r["books"]) for w, seqs in sorted(dumps.items())
+             for seq, r in sorted(seqs.items()) if "books" in r]
+    if not lines:
+        return NA, "no books line in the dumps: the server predates S12-18 (2026-09-25)"
+    unbal = [f"worker {w} seq {seq}: {b}" for w, seq, b in lines if not b["balanced"]]
+    last = {}
+    for w, seq, b in lines:
+        last[w] = b
+    leaked = {w: b["abandoned"] - b["recovered"] for w, b in last.items()
+              if b["abandoned"] > b["recovered"]}
+    tot = {k: sum(b[k] for b in last.values())
+           for k in ("sessions", "completed", "cancelled", "aborted", "abandoned")}
+    msg = (f"{len(lines)} dump line(s) over {len(last)} worker(s); at the last: "
+           f"{tot['sessions']} sessions = {tot['completed']} completed + {tot['cancelled']} "
+           f"cancelled + {tot['aborted']} aborted + active")
+    if unbal:
+        return BAD, msg + f"; UNBALANCED in {len(unbal)} line(s): " + "; ".join(unbal[:3])
+    if leaked:
+        return BAD, msg + f"; abandoned slots never recovered: {leaked}"
+    return OK, msg + "; balanced in every line" + (
+        f", {tot['abandoned']} abandoned slot(s) all recovered" if tot["abandoned"] else "")
 
 
 def stall_check(dumps):
@@ -298,6 +344,61 @@ def window_check(d, limit):
     return (OK if not bad else BAD), msg, worst
 
 
+def accounting_rows(s, c, warnings):
+    """Bound 1 over the WHOLE run, and the harness accounting row "A".
+
+    Since 2026-09-25 (AUDIT 2026-09-24, S12-17) stream_load counts errors inside the
+    warm-up too (`errors_total`), classifies each one (`error_kinds`), checks that every
+    started utterance is accounted for (`accounting.conservation`) and that every stream
+    process lived to the end (`stream_deaths`). A run recorded before that carries none
+    of these: it is judged exactly as before, and the verdict SAYS the new facts are
+    unknown instead of passing them silently."""
+    total = c.get("errors_total")
+    if total is None:
+        total = c["errors"]
+        warnings.append("run predates errors_total: bound 1 reads the post-warm-up count "
+                        "only, so an error inside the warm-up is UNKNOWN, not zero")
+        b1 = (f"{c['errors']} error(s) over {c['ok']} completed utterance(s) "
+              f"(post-warm-up only: this run predates the whole-run count)")
+    else:
+        kinds = ", ".join(f"{k} {v}" for k, v in (c.get("error_kinds") or {}).items())
+        b1 = (f"{total} error(s) over the whole run ({c.get('errors_warmup', 0)} in the "
+              f"warm-up), {c['ok']} completed utterance(s) after it"
+              + (f"; by kind: {kinds}" if kinds else ""))
+    one = (1, "established streams lost", OK if total == 0 else BAD, b1)
+
+    acct = s.get("accounting")
+    deaths = c.get("stream_deaths")
+    if acct is None and deaths is None:
+        warnings.append("run predates the accounting invariant: conservation and stream "
+                        "deaths are UNKNOWN")
+        return one, ("A", "harness accounting", NA,
+                     "run predates the start/end marks (2026-09-25): conservation and "
+                     "stream deaths were not recorded")
+    bits, state = [], OK
+    cons = (acct or {}).get("conservation")
+    if cons is False:
+        state = BAD
+        bits.append(f"conservation FAILS: {acct.get('conservation_detail')}")
+    elif cons is None:
+        state = NOEV if state == OK else state
+        bits.append("conservation not checked (no start marks)")
+    else:
+        bits.append(f"conservation holds: {acct.get('started')} started = {acct.get('ok')} ok "
+                    f"+ {acct.get('rejected')} rejected + {acct.get('cut_at_deadline')} cut "
+                    f"at deadline + {acct.get('errors')} error(s)")
+    if deaths is None:
+        state = NOEV if state == OK else state
+        bits.append("stream liveness not recorded")
+    elif deaths:
+        state = BAD
+        dead = (s.get("streams") or {}).get("dead") or []
+        bits.append(f"{deaths} client stream(s) died before the end: {dead[:8]}")
+    else:
+        bits.append("every client stream lived to the end")
+    return one, ("A", "harness accounting", state, "; ".join(bits))
+
+
 def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=None):
     d = json.load(open(path))
     s = d["summary"]
@@ -305,13 +406,14 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=Non
     la = man.get("lookahead", 3)
     cm = chunk_ms(la)
     m, c = s["metrics"], s["counts"]
-    rows = []
+    rows, warnings = [], []
 
     def row(n, name, state, detail):
         rows.append({"bound": n, "name": name, "state": state, "detail": detail})
 
-    row(1, "established streams lost", OK if c["errors"] == 0 else BAD,
-        f"{c['errors']} error(s) over {c['ok']} completed utterance(s)")
+    one, acc = accounting_rows(s, c, warnings)
+    row(*one)
+    row(*acc)
     p95 = g(m, "emission_lag_ms", "p95")
     row(2, "emission lag p95", NOEV if p95 is None else (OK if p95 <= cm else BAD),
         "no sample" if p95 is None else f"{p95:.0f} ms vs bound {cm:.0f} ms ((lookahead+1)x80)")
@@ -332,6 +434,8 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=Non
     dumps = parse_dumps(dump_path)
     st, msg, viol = stall_check(dumps)
     row(8, "server-side stall", st, msg + ("; " + "; ".join(viol[:3]) if viol else ""))
+    st, msg = books_check(dumps)
+    row("B", "server session books", st, msg)
     lmax = g(m, "emission_lag_ms", "max")
     row(9, "client-observable stall", NOEV if lmax is None else (OK if lmax <= LAG_MAX_MS else BAD),
         "no sample" if lmax is None else f"max emission lag {lmax:.0f} ms vs bound {LAG_MAX_MS:.0f} ms")
@@ -395,7 +499,7 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=Non
     missing = [r for r in rows if r["state"] == NOEV]
     ux = g(m, "ttfp_from_onset_ms", "p95")
     return {
-        "invalid": invalid, "peak_active_slots": peak_slots,
+        "invalid": invalid, "peak_active_slots": peak_slots, "warnings": warnings,
         "ttfp_penalty": ttfp_pen, "ready_penalty": ready_pen,
         "speech_ttfp_p50_ms": g(m, "ttfp_from_onset_ms", "p50"),
         "speech_ttfp_p95_ms": ux,
@@ -439,7 +543,9 @@ def pick(run):
                         os.path.join(run, f"procsample-{tag}.txt"),
                         json.load(open(mp)) if os.path.exists(mp) else None,
                         json.load(open(bp)) if os.path.exists(bp) else None)
-        bad = [r for r in v["rows"] if r["bound"] in SCREEN_BOUNDS and r["state"] != OK]
+        # an older rung has no accounting row to judge: NOT REGISTERED is stated, not failed
+        bad = [r for r in v["rows"] if r["bound"] in SCREEN_BOUNDS and r["state"] != OK
+               and not (r["bound"] in ("A", "B") and r["state"] == NA)]
         if v.get("invalid"):
             bad = [{"bound": 0, "name": "INVALID: " + v["invalid"]}] + bad
         rungs.append((v["streams"], not bad, v, bad))
@@ -497,6 +603,9 @@ def main():
         print("-" * len(head))
         if v.get("invalid"):
             print(f"  !!  INVALID RUN: {v['invalid']}")
+        for w in v.get("warnings") or []:
+            print(f"  !!  warning: {w}")
+            print(f"warning: {v['file']}: {w}", file=sys.stderr)
         for r in v["rows"]:
             b = r["bound"]
             tag = b if isinstance(b, str) else f"{b:2d}"
