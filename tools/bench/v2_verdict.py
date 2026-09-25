@@ -27,6 +27,17 @@ a printed warning that those facts are unknown. Row "B" is the SERVER's side of
 the same question (S12-18): every worker dump states sessions = completed +
 cancelled + aborted + active, and one unbalanced line, or an abandoned slot never
 recovered, fails the run. A server older than that prints no books: NOT REGISTERED.
+
+A FAULT-INJECTION run (`stream_load.py --abort-pct`, P0-d) aborts a planned share of its
+utterances on purpose. Those are `aborted_by_client`: never a loss for bound 1, and kept
+out of every latency and quality number, so bounds 2-4, 6, 9 and 10 judge the healthy
+streams alone. Row "F" shows the plan against what happened, per abort point, and checks
+the server's counters against it -- cancellation buckets, sessions opened (a session
+missing on either side fails) and the residual model work (audio fed minus audio the
+clients sent, at most one chunk step per abort) -- from stream_load's own /v1/health
+cross-check when it could make one, otherwise from the workers' last `[DUMP]` lines
+(sampled: upper bounds only). A run without a plan has no row F and is judged exactly
+as before.
 """
 from __future__ import annotations
 
@@ -41,7 +52,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # The percentile comes from the metrics module, never from a second definition
 # here: two harnesses with two definitions of p95 produce two numbers that
 # cannot be compared (ENGINEERING.md §8).
-from streaming_metrics import pct                       # noqa: E402
+from streaming_metrics import (pct, abort_crosscheck, ABORT_POINTS,   # noqa: E402
+                               CANCEL_UNPLANNED)
 
 # Registered in .work/server-v2-qualification.md V2-2. Bounds 2 and 4 are
 # expressed in chunk periods, as the profile expresses them, so they move with
@@ -83,7 +95,7 @@ STALL_MULTIPLES = (1.0, 2.0, 4.0)
 # has, and RSS over three samples is noise. So --pick judges a rung on the
 # bounds a SCREEN can actually carry, and says so. This selects a candidate to
 # soak; it promotes nothing. WAVE screens, SOAK promotes (ENGINEERING.md §8).
-SCREEN_BOUNDS = (1, "A", "B", 2, 3, 4, 6, 9, 10)
+SCREEN_BOUNDS = (1, "A", "B", "F", 2, 3, 4, 6, 9, 10)
 
 
 def chunk_ms(lookahead):
@@ -159,9 +171,16 @@ def parse_dumps(path):
         a = re.search(r"slots active=(\d+) cap=(\d+) sessions=(\d+) steps=(\d+)", line)
         if a:
             rec["active"], rec["steps"] = int(a.group(1)), int(a.group(4))
+            au = re.search(r" audio_s=([\d.]+)", line)
+            if au:
+                rec["audio_s"] = float(au.group(1))
         b = re.search(r"split model_busy_s=([\d.]+)", line)
         if b:
             rec["busy"] = float(b.group(1))
+        cb = re.search(r"seq=\d+ cancelled=(\d+)((?: [a-z_]+=\d+)*)\s*$", line)
+        if cb:
+            rec["cancel_by"] = {k: int(v) for k, v in
+                                re.findall(r"([a-z_]+)=(\d+)", cb.group(2))}
         k = re.search(r"books sessions=(\d+) completed=(\d+) cancelled=(\d+) aborted=(\d+) "
                       r"active=(\d+) balanced=(\d) abandoned=(\d+) recovered=(\d+)", line)
         if k:
@@ -200,6 +219,87 @@ def books_check(dumps):
         return BAD, msg + f"; abandoned slots never recovered: {leaked}"
     return OK, msg + "; balanced in every line" + (
         f", {tot['abandoned']} abandoned slot(s) all recovered" if tot["abandoned"] else "")
+
+
+def dump_server_totals(dumps):
+    """Whole-fleet counters from every worker's LAST dump: the cancellation buckets, the
+    books and the audio fed to the model. {} when no dump carries a cancelled line."""
+    last = {}
+    for w, seqs in sorted(dumps.items()):
+        for seq, r in sorted(seqs.items()):
+            for k in ("cancel_by", "books", "audio_s"):
+                if k in r:
+                    last.setdefault(w, {})[k] = r[k]
+    if not any("cancel_by" in v for v in last.values()):
+        return {}, 0
+    srv = {k: sum((v.get("cancel_by") or {}).get(k, 0) for v in last.values())
+           for k in ("peer_gone", "idle_timeout", "protocol_error")}
+    srv["other_cancel"] = sum((v.get("cancel_by") or {}).get(k, 0)
+                              for v in last.values() for k in CANCEL_UNPLANNED)
+    if all("books" in v for v in last.values()):
+        for k in ("sessions", "completed", "aborted"):
+            srv[k] = sum(v["books"][k] for v in last.values())
+    if all("audio_s" in v for v in last.values()):
+        srv["audio_s"] = sum(v["audio_s"] for v in last.values())
+    return srv, len(last)
+
+
+def fault_row(s, c, dumps, cm=None):
+    """Row "F", only for a fault-injection run: the planned aborts, per point, against
+    what the client executed and what the SERVER counted (streaming_metrics
+    .abort_crosscheck), plus the residual-model-work bound. None for a run without a
+    plan, which then has no row at all.
+
+    The server side comes from stream_load's own cross-check when it made one (a single
+    process server whose /v1/health speaks for all of it). Otherwise from every worker's
+    LAST `[DUMP]` lines (cancelled, books, slots audio_s): a fresh fleet per soak
+    (v2_qualify starts one) makes those whole-run totals, but a dump is periodic and can
+    predate the run's end, so only the upper bounds are judged there."""
+    f = s.get("faults")
+    if not f:
+        return None
+    pts = []
+    for p in ABORT_POINTS:
+        pre = sum((f.get("preempted") or {}).get(p, {}).values())
+        pts.append(f"{p} {f['aborted'].get(p, 0)}/{f['planned'].get(p, 0)}"
+                   + (f" ({pre} not reached)" if pre else ""))
+    bits = [f"{f['aborted_total']}/{f['planned_total']} planned aborts executed: "
+            + ", ".join(pts)]
+    state = OK
+    if f.get("violations"):
+        state = BAD
+        bits.append(f"{len(f['violations'])} accounting violation(s): {f['violations'][0]}")
+    xc = f.get("server") or {}
+    source = "server /v1/health delta"
+    if not xc.get("checked"):
+        srv, n_workers = dump_server_totals(dumps)
+        if srv:
+            # a dump prints audio_s with one decimal: half a tenth per worker of rounding
+            xc = abort_crosscheck(f, s.get("accounting") or {}, srv, sampled=True,
+                                  chunk_ms=cm, tol_s=0.01 + 0.05 * n_workers)
+            source = f"last [DUMP] of {n_workers} worker(s), sampled"
+    if not xc.get("checked"):
+        if state == OK:
+            state = NOEV
+        bits.append("no server evidence to cross-check ("
+                    + (xc.get("detail") or "no cancelled line in the dumps") + ")")
+    else:
+        rows = ", ".join(f"{r['bucket']} {r['server']}"
+                         + (f" <= {r['hi']}" if r["lo"] is None else f" in [{r['lo']},{r['hi']}]")
+                         for r in xc["rows"])
+        bits.append(f"{source}: {rows}"
+                    + ("" if xc["match"] else f" -- MISMATCH: {xc['detail']}"))
+        if not xc["match"]:
+            state = BAD
+    r = xc.get("residual")
+    if r:
+        bits.append(f"residual model work {r['residual_s']:+.2f} s (server fed "
+                    f"{r['server_audio_s']:.1f} s, clients sent {r['client_sent_s']:.1f} s) vs "
+                    f"bound {r['aborts']} x {r['chunk_ms']:.0f} ms = {r['bound_s']:.2f} s"
+                    + ("" if r["ok"] else " EXCEEDED"))
+    elif xc.get("checked"):
+        bits.append("residual model work not bounded (no server audio counter)")
+    return ("F", "fault injection", state, "; ".join(bits))
 
 
 def stall_check(dumps):
@@ -310,7 +410,8 @@ def paired_ttfp(d, baseline, field):
 
 def stall_counts(d, cm):
     """How many published deltas crossed each threshold, and over how many."""
-    utts = d.get("utterances") or []
+    # a planned abort's deltas are not the healthy streams' (fault injection, row F)
+    utts = [u for u in d.get("utterances") or [] if u.get("outcome") != "aborted_by_client"]
     lags = [v for u in utts for _, v in (u.get("lag_marks") or [])]
     if not lags:
         return None
@@ -364,7 +465,10 @@ def accounting_rows(s, c, warnings):
         kinds = ", ".join(f"{k} {v}" for k, v in (c.get("error_kinds") or {}).items())
         b1 = (f"{total} error(s) over the whole run ({c.get('errors_warmup', 0)} in the "
               f"warm-up), {c['ok']} completed utterance(s) after it"
-              + (f"; by kind: {kinds}" if kinds else ""))
+              + (f"; by kind: {kinds}" if kinds else "")
+              # fault injection: planned aborts are not losses (row F accounts them)
+              + (f"; {c['aborted_by_client']} planned client abort(s) not counted"
+                 if c.get("aborted_by_client") else ""))
     one = (1, "established streams lost", OK if total == 0 else BAD, b1)
 
     acct = s.get("accounting")
@@ -386,7 +490,10 @@ def accounting_rows(s, c, warnings):
     else:
         bits.append(f"conservation holds: {acct.get('started')} started = {acct.get('ok')} ok "
                     f"+ {acct.get('rejected')} rejected + {acct.get('cut_at_deadline')} cut "
-                    f"at deadline + {acct.get('errors')} error(s)")
+                    f"at deadline + "
+                    + (f"{acct['aborted_by_client']} aborted by the client (planned) + "
+                       if acct.get("aborted_by_client") else "")
+                    + f"{acct.get('errors')} error(s)")
     if deaths is None:
         state = NOEV if state == OK else state
         bits.append("stream liveness not recorded")
@@ -436,6 +543,9 @@ def verdict_for(path, dump_path, proc_path, run_manifest=None, ttfp_baseline=Non
     row(8, "server-side stall", st, msg + ("; " + "; ".join(viol[:3]) if viol else ""))
     st, msg = books_check(dumps)
     row("B", "server session books", st, msg)
+    fr = fault_row(s, c, dumps, cm)
+    if fr is not None:
+        row(*fr)
     lmax = g(m, "emission_lag_ms", "max")
     row(9, "client-observable stall", NOEV if lmax is None else (OK if lmax <= LAG_MAX_MS else BAD),
         "no sample" if lmax is None else f"max emission lag {lmax:.0f} ms vs bound {LAG_MAX_MS:.0f} ms")

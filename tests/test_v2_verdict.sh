@@ -79,6 +79,8 @@ with open(dir + "/server-soak1.log", "w") as f:
             f.write(f"[DUMP] worker={w} seq={seq} split model_busy_s={seq*20.0:.2f} (0.800) x\n")
             f.write(f"[DUMP] worker={w} seq={seq} books sessions={10 + seq} completed={seq} "
                     f"cancelled=2 aborted=0 active=8 balanced=1 abandoned=0 recovered=0\n")
+            f.write(f"[DUMP] worker={w} seq={seq} cancelled=2 idle_timeout=1 peer_gone=1 "
+                    f"frame_too_large=0 protocol_error=0 other=0\n")
 with open(dir + "/procsample-soak1.txt", "w") as f:
     for seq in range(6):
         f.write("t=10:00:0%d pids=101,102,103,\n" % seq)
@@ -235,6 +237,95 @@ sed -i.bak '/ books sessions=/d' "$TMP/oldserver/server-soak1.log"
 [ "$(verdict oldserver)" = "QUALIFIED" ] && [ "$(state oldserver B)" = "NOT REGISTERED" ] \
     && ok "a server that predates the books keeps its verdict, row B not registered" \
     || bad "an old server log changed verdict: $(verdict oldserver) / B $(state oldserver B)"
+
+# --- fault injection (P0-d): 70 of 690 utterances aborted on purpose, 10 per point.
+# They are not losses, and the healthy streams are judged alone; row F accounts them.
+FAULTS="d['summary']['counts']['aborted_by_client'] = 70
+d['summary']['accounting'].update(aborted_by_client=70, started=690)
+pts = ['before_first_partial', 'before_first_partial_silence', 'mid_utterance',
+       'mid_utterance_silence', 'partial_frame', 'during_finalization', 'idle_open']
+d['summary']['faults'] = {'planned': {p: 10 for p in pts}, 'aborted': {p: 10 for p in pts},
+    'preempted': {p: {} for p in pts}, 'methods': {p: {} for p in pts},
+    'server_end': {p: ({'idle_timeout': 10} if p == 'idle_open' else {}) for p in pts},
+    'planned_total': 70, 'aborted_total': 70, 'early_delta': 0, 'violations': [],
+    'client': {'sessions': 690, 'sessions_unknown': 0, 'audio_sent_s': 5500.0,
+               'audio_ok_s': 5220.0, 'audio_aborted_s': 280.0, 'audio_unknown_s': 0.0}}"
+SRV_OK="d['summary']['faults']['server'] = {'checked': True, 'match': True, 'mismatches': 0,
+    'rows': [{'bucket': 'peer_gone', 'server': 25, 'lo': 20, 'hi': 30, 'ok': True}],
+    'residual': {'server_audio_s': 5499.0, 'client_sent_s': 5500.0, 'unknown_s': 0.0,
+                 'residual_s': -1.0, 'bound_s': 22.4, 'aborts': 70, 'chunk_ms': 320.0,
+                 'ok': True, 'aborted_consumed_s': 279.0, 'aborted_sent_s': 280.0},
+    'detail': 'every bucket inside its interval'}"
+[ -z "$(state healthy F)" ] && ok "a run without a fault plan has no row F" \
+    || bad "row F appeared on a run with no plan: $(state healthy F)"
+mk faults "$FAULTS
+$SRV_OK"
+[ "$(verdict faults)" = "QUALIFIED" ] && [ "$(state faults F)" = "PASS" ] \
+    && [ "$(state faults 1)" = "PASS" ] && [ "$(state faults A)" = "PASS" ] \
+    && ok "70 planned aborts are not losses; the healthy streams qualify and row F passes" \
+    || bad "planned aborts were judged as losses: $(verdict faults) / 1 $(state faults 1) / F $(state faults F)"
+FOUT=$(python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/faults" 2>/dev/null)
+echo "$FOUT" | grep -q "mid_utterance_silence 10/10.*partial_frame 10/10.*server /v1/health delta: peer_gone 25 in \[20,30\]" \
+    && ok "row F shows planned vs executed per point, silent and partial-frame included, and the server's count" \
+    || bad "row F does not show the per-point accounting"
+echo "$FOUT" | grep -q "residual model work -1.00 s.*bound 70 x 320 ms = 22.40 s" \
+    && ok "row F shows the residual-model-work bound" \
+    || bad "row F does not show the residual-model-work bound"
+mk faults_srvbad "$FAULTS
+$SRV_OK
+d['summary']['faults']['server'].update(match=False, mismatches=1, detail='server peer_gone 12 outside [20, 30]')"
+[ "$(verdict faults_srvbad)" = "NOT QUALIFIED" ] && [ "$(state faults_srvbad F)" = "FAIL" ] \
+    && ok "a server that did not count the client's RSTs fails row F" \
+    || bad "a server/client abort mismatch passed: $(verdict faults_srvbad)"
+mk faults_viol "$FAULTS
+$SRV_OK
+d['summary']['faults']['violations'] = ['stream 3 rep 7: aborted_by_client without an executed plan']"
+[ "$(state faults_viol F)" = "FAIL" ] && [ "$(verdict faults_viol)" = "NOT QUALIFIED" ] \
+    && ok "an abort the harness cannot account for fails row F" \
+    || bad "a fault accounting violation passed: $(state faults_viol F)"
+mk faults_pre "$FAULTS
+$SRV_OK
+d['summary']['faults']['preempted']['mid_utterance'] = {'server_disconnect': 1}
+d['summary']['counts'].update(errors_total=1, error_kinds={'server_disconnect': 1})"
+[ "$(state faults_pre 1)" = "FAIL" ] && [ "$(verdict faults_pre)" = "NOT QUALIFIED" ] \
+    && ok "an error BEFORE the abort point is a real loss for bound 1" \
+    || bad "a failure before the abort point was excused by the plan: $(state faults_pre 1)"
+# prefork: no /v1/health cross-check; the workers' dumps are the server's evidence
+mk faults_dump "$FAULTS"
+[ "$(verdict faults_dump)" = "QUALIFIED" ] && [ "$(state faults_dump F)" = "PASS" ] \
+    && ok "prefork: the [DUMP] lines cross-check the aborts, sessions and audio (upper bounds)" \
+    || bad "the dump cross-check failed a consistent run: $(verdict faults_dump) / F $(state faults_dump F)"
+mk faults_dumpbad "$FAULTS"
+sed -i.bak 's/worker=1 seq=6 cancelled=2 idle_timeout=1 peer_gone=1/worker=1 seq=6 cancelled=101 idle_timeout=1 peer_gone=100/' \
+    "$TMP/faults_dumpbad/server-soak1.log"
+[ "$(state faults_dumpbad F)" = "FAIL" ] && [ "$(verdict faults_dumpbad)" = "NOT QUALIFIED" ] \
+    && ok "more peer_gone in the dumps than the client could have caused fails row F" \
+    || bad "a server over-count passed: $(state faults_dumpbad F)"
+mk faults_proto "$FAULTS"
+sed -i.bak 's/worker=1 seq=6 cancelled=2 idle_timeout=1 peer_gone=1 frame_too_large=0 protocol_error=0/worker=1 seq=6 cancelled=3 idle_timeout=1 peer_gone=1 frame_too_large=0 protocol_error=1/' \
+    "$TMP/faults_proto/server-soak1.log"
+[ "$(state faults_proto F)" = "FAIL" ] \
+    && ok "a protocol_error no planned abort can cause fails row F" \
+    || bad "an unplanned protocol_error in the dumps passed: $(state faults_proto F)"
+mk faults_sess "$FAULTS
+d['summary']['faults']['client']['sessions'] = 40"
+[ "$(state faults_sess F)" = "FAIL" ] \
+    && ok "more server sessions than the client opened (a session missing client-side) fails row F" \
+    || bad "a session count the client cannot explain passed: $(state faults_sess F)"
+# the dumps say 100 + 100 + 5400 = 5600 s fed; the clients sent 5500 s, + 70 x 320 ms
+mk faults_resid "$FAULTS"
+sed -i.bak 's/\(worker=2 seq=6 slots .*\) audio_s=100.0/\1 audio_s=5400.0/' \
+    "$TMP/faults_resid/server-soak1.log"
+[ "$(state faults_resid F)" = "FAIL" ] \
+    && python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/faults_resid" 2>/dev/null | grep -q "EXCEEDED" \
+    && ok "model work beyond the audio the clients sent (+ one step per abort) fails row F" \
+    || bad "residual model work over the bound passed: $(state faults_resid F)"
+mk faults_nosrv "$FAULTS"
+sed -i.bak '/ seq=[0-9]* cancelled=/d' "$TMP/faults_nosrv/server-soak1.log"
+[ "$(state faults_nosrv F)" = "NO EVIDENCE" ] \
+    && [ "$(verdict faults_nosrv)" = "INCONCLUSIVE (missing evidence)" ] \
+    && ok "a fault run with no server evidence is inconclusive, never qualified" \
+    || bad "an unchecked fault run qualified: $(verdict faults_nosrv) / F $(state faults_nosrv F)"
 
 mk lag "d['summary']['metrics']['emission_lag_ms']['p95'] = 321.0"
 [ "$(verdict lag)" = "NOT QUALIFIED" ] && ok "emission lag p95 one ms over the chunk period disqualifies" \

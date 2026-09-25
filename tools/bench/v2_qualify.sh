@@ -22,6 +22,12 @@
 #   tools/bench/v2_qualify.sh -m models/nemotron-3.5-asr-streaming-0.6b \
 #       [--phase freeze|reference|ladder|soak|all] [-o ~/asr-evidence/v2]
 #       [--ladder "8 16 24 32"] [--soak-c 16] [--soak-seconds 1800] [--soaks 2]
+#       [--abort-pct P] [--abort-seed S]
+#                             FAULT-INJECTION SOAK (S12-20): P% of the soak's
+#                             utterances abort on purpose at seven lifecycle
+#                             points (stream_load --abort-pct); the healthy rest
+#                             is judged as usual and v2_verdict row F checks the
+#                             server's books against the planned aborts.
 #       [--reference-file <reference.json from an earlier run of this tool>]
 #       [--corpus samples/stress-en/manifest.json] [--min-peak-dbfs -30]
 #       [--corpus-sample 500] [--corpus-seed 42]
@@ -46,7 +52,7 @@ set -u
 
 MODEL=""; OUT="$HOME/asr-evidence/v2"; PORT=8600; PHASE=all
 W=3; T=8; CAP=96; QUANT=int8; LOOKAHEAD=3; HTTP_T=32
-LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2
+LADDER="8 16 24 32"; SOAK_C=16; SOAK_S=1800; SOAKS=2; ABORT_PCT=""; ABORT_SEED=""
 GEN_ARMS="24-31 24-27 24-25"; GENSCALE_C=32; GENSCALE_S=180
 CORPUS=""; MIN_PEAK_DBFS=-30; CLASSES=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; REF_C=1
 LADDER_S=90; WARMUP=30; WINDOW=60; DUMP_EVERY=30
@@ -67,6 +73,8 @@ while [ $# -gt 0 ]; do
         --soak-c) SOAK_C="$2"; shift 2 ;;
         --soak-seconds) SOAK_S="$2"; shift 2 ;;
         --soaks) SOAKS="$2"; shift 2 ;;
+        --abort-pct) ABORT_PCT="$2"; shift 2 ;;
+        --abort-seed) ABORT_SEED="$2"; shift 2 ;;
         --server-cpus) SERVER_CPUS="$2"; shift 2 ;;
         --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
         --gen-arms) GEN_ARMS="$2"; shift 2 ;;
@@ -512,6 +520,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = soak ]; then
         # be an order of magnitude larger for no reader.
         load --mode soak --streams "$SOAK_C" --duration "$SOAK_S" --warmup "$WARMUP" \
              --window "$WINDOW" --seed $(( 42 + n )) --clips $BANK --keep-events 25 \
+             ${ABORT_PCT:+--abort-pct "$ABORT_PCT"} ${ABORT_SEED:+--abort-seed "$ABORT_SEED"} \
              ${REFJSON:+--reference "$REFJSON"} \
              ${CORPUS:+--transcripts "$CORPUS"} \
              --json "$RUN/soak$n-C$SOAK_C.json" 2>&1 | tee -a "$RUN/run.log" \

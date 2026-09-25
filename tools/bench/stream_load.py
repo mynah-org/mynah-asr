@@ -10,6 +10,12 @@
         --warmup 30 --window 60 --bank short,medium,long --seed 42 \
         --clips samples/*/*.wav tests/audio/*.wav --port 8090 --json soak.json
 
+    # FAULT-INJECTION SOAK: the same, with 20% of the utterances aborted on purpose at seven
+    # lifecycle points (deterministic in seed, stream and utterance; see `fault_plan`).
+    # The healthy 80% are measured as usual; the server's books are cross-checked.
+    python3 tools/bench/stream_load.py --mode soak --streams 64 --duration 900 \
+        --abort-pct 20 --abort-seed 7 --clips samples/*/*.wav --port 8090 --json fault.json
+
 Standard library only, so it runs on a bare box with no venv.  One PROCESS per stream (a
 thread cannot pace many streams under the GIL).  Each stream plays its clip in `--frame-ms`
 frames on a monotonic schedule and records the send time of every frame, the arrival time
@@ -36,6 +42,7 @@ import multiprocessing as mp
 import os
 import platform
 import random
+import shutil
 import socket
 import struct
 import subprocess
@@ -80,6 +87,21 @@ def ws_send(sock: socket.socket, opcode: int, payload: bytes) -> None:
         header += bytes([0x80 | 127]) + struct.pack(">Q", n)
     masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
     sock.sendall(header + mask + masked)
+
+
+def ws_send_partial(sock: socket.socket, opcode: int, payload: bytes) -> None:
+    """Fault injection: a frame header for all of `payload`, then only half of it."""
+    n = len(payload)
+    header = bytes([0x80 | opcode])
+    if n < 126:
+        header += bytes([0x80 | n])
+    elif n < 65536:
+        header += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:
+        header += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    mask = os.urandom(4)
+    half = bytes(b ^ mask[i % 4] for i, b in enumerate(payload[:max(1, n // 2)]))
+    sock.sendall(header + mask + half)
 
 
 def ws_recv(sock: socket.socket) -> "tuple[int, bytes]":
@@ -262,6 +284,104 @@ def schedule_clip(schedule, idx: int, k: int, stride: int):
     """The clip stream `idx` plays as its k-th utterance."""
     return schedule[(idx + k * stride) % len(schedule)]
 
+# --------------------------------------------------------------------- fault injection
+#
+# `--abort-pct P` (P0-d): a deterministic share of the utterances is aborted ON PURPOSE by
+# the client, while every other utterance is measured as usual. Whether utterance `rep` of
+# stream `stream` aborts is a hash of (seed, stream, rep) against P. The j-th abort of a
+# stream takes point ABORT_POINTS[(stream + j) mod 7] and, with the default
+# `--abort-method mixed`, closes with RST when ((stream + j) div 7) is even and with FIN
+# when it is odd: over the fleet the (point, method) pairs cycle through all 14, and a
+# stream's aborts are staggered against its neighbours'. The plan depends on nothing else
+# -- not on timing, not on the server -- so a run replays its faults exactly, and every
+# record carries its plan.
+#
+#   before_first_partial(_silence)  after ABORT_EARLY_S of audio: RST or FIN
+#   mid_utterance(_silence)         after ABORT_MID_FRACTION of the audio: RST or FIN
+#   partial_frame                   after ABORT_MID_FRACTION of the audio, a frame header
+#                                   and half its payload, then RST or FIN
+#   during_finalization             right after the close frame, before `done`: RST or FIN
+#   idle_open                       after ABORT_MID_FRACTION of the audio, stop sending and
+#                                   never pong; wait for the server to cancel
+#                                   (idle_timeout) or for --abort-idle-max-s, then close
+#
+# The _silence variants send zeros instead of the clip for the whole utterance: the server
+# then writes nothing, so no failed write can tell it the client is gone and only its
+# INPUT side can (the zombie of 2026-09-25, docs/server.md "How a session ends").
+#
+# An executed abort is outcome `aborted_by_client` with its point: not OK, not an error
+# (streaming_metrics.ABORTED). An utterance that failed BEFORE its abort point keeps its
+# real error: the plan never excuses a failure that happened first.
+
+ABORT_EARLY_S = 0.3
+ABORT_MID_FRACTION = 0.5
+ABORT_METHODS = ("mixed", "rst", "fin")
+
+
+def _abort_draw(seed: int, stream: int, rep: int) -> float:
+    """A uniform draw in [0, 1) that is a pure function of (seed, stream, rep)."""
+    h = hashlib.sha256(f"abort:{seed}:{stream}:{rep}".encode()).digest()
+    return int.from_bytes(h[:8], "big") / float(1 << 64)
+
+
+def fault_plan(seed: int, pct: float, stream: int, rep: int, method: str = "mixed"):
+    """The planned abort of utterance `rep` of stream `stream`, or None."""
+    if pct <= 0:
+        return None
+    p = pct / 100.0
+    if _abort_draw(seed, stream, rep) >= p:
+        return None
+    j = sum(1 for r in range(rep) if _abort_draw(seed, stream, r) < p)
+    n = len(M.ABORT_POINTS)
+    point = M.ABORT_POINTS[(stream + j) % n]
+    if point == "idle_open":
+        how = "idle"
+    elif method == "mixed":
+        how = "fin" if ((stream + j) // n) % 2 == 1 else "rst"
+    else:
+        how = method
+    return {"point": point, "method": how, "index": j,
+            "audio": "silence" if point in M.ABORT_SILENT else "speech", "executed": False}
+
+
+def _hard_close(sock: socket.socket, method: str) -> None:
+    """Drop the connection the way a vanished client does: RST (SO_LINGER {1, 0}) or FIN.
+
+    SHUT_RD first wakes this process's own reader thread, blocked in recv(), and puts
+    nothing on the wire; the close() after it is what the server sees."""
+    try:
+        sock.shutdown(socket.SHUT_RD)
+    except OSError:
+        pass
+    if method == "rst":
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        except OSError:
+            pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _mark_abort(rec: dict) -> bool:
+    """The abort point is reached: record it as executed, unless the utterance already
+    failed, in which case its real error stands and the abort is not executed."""
+    ab = rec["abort"]
+    if rec["error"]:
+        return False
+    ab["executed"] = True
+    ab["t"] = mono()
+    ab["audio_sent_s"] = rec["sends"][-1][1] if rec["sends"] else 0.0
+    ab["deltas_before"] = sum(1 for e in rec["events"] if e["type"] == "delta" and e["text"])
+    return True
+
+
+def _set_aborted(rec: dict) -> None:
+    ab = rec["abort"]
+    rec["error"] = (f"aborted by the client at {ab['point']} ({ab['method']}, planned)")
+    rec["error_kind"] = M.ABORTED
+
 # ---------------------------------------------------------------- one stream (one process)
 
 
@@ -283,7 +403,22 @@ def _kind_of_oserror(e: BaseException) -> str:
     return "client_exception"
 
 
-def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
+def stream_path(a) -> str:
+    """The WebSocket request path. An empty --lang or --lookahead is OMITTED, not sent
+    empty: an English-only model refuses any `lang` key (`language_not_served`)."""
+    q = []
+    if a.lang:
+        q.append(f"lang={a.lang}")
+    if a.lookahead not in (None, ""):
+        q.append(f"lookahead={a.lookahead}")
+    # `model=` names a WORKER GROUP in a multi-model fleet (S2-6). Sent only when
+    # asked for, so a single-model server sees exactly the query it always saw.
+    if getattr(a, "model", None):
+        q.append(f"model={a.model}")
+    return "/v1/audio/stream" + ("?" + "&".join(q) if q else "")
+
+
+def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
     """One utterance, recorded in the input format of `streaming_metrics`.
 
     Nothing is aggregated here: the record is raw marks.  `mono()` is CLOCK_MONOTONIC, which is
@@ -292,17 +427,22 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
 
     Every way this can end without a `done` frame sets `error` AND `error_kind`. Until
     2026-09-25 a close frame before `done` made the reader stop without recording
-    anything, and the utterance counted as OK (AUDIT 2026-09-24, gap 1)."""
+    anything, and the utterance counted as OK (AUDIT 2026-09-24, gap 1).
+
+    `plan` (fault injection, `fault_plan`) makes the utterance abort at its planned point;
+    the record then carries `abort` with what actually happened."""
     frame_bytes = int(16000 * a.frame_ms / 1000) * 2
     n_frames = max(1, (len(pcm) + frame_bytes - 1) // frame_bytes)
     rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
            "events": [], "done_t": None, "t_start": mono(), "error": None, "error_kind": None,
            "rejected": False, "status": None, "lang": None, "retry_after": None}
-    # `model=` names a WORKER GROUP in a multi-model fleet (S2-6). Sent only when
-    # asked for, so a single-model server sees exactly the query it always saw.
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
-    if a.model:
-        path += f"&model={a.model}"
+    point = None
+    if plan:
+        rec["abort"] = dict(plan, executed=False)
+        point = plan["point"]
+        if point in M.ABORT_SILENT:
+            pcm = bytes(len(pcm))                  # zeros: the server will write nothing
+    path = stream_path(a)
     try:
         sock, status, headers = ws_connect(a.host, a.port, path, timeout=a.connect_timeout)
     except OSError as e:
@@ -326,11 +466,12 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
                 if op == 0x8:
                     # the server closed before `done`: a lost utterance, never an OK one
                     code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else None
+                    rec["server_code"] = rec.get("server_code") or f"close {code}"
                     _fail(rec, "server_disconnect",
                           f"server close frame without done (code {code})")
                     break
                 if op != 0x1:
-                    continue
+                    continue                         # a ping is never answered
                 try:
                     msg = json.loads(payload)
                 except ValueError as e:
@@ -351,6 +492,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
                     rec["lang"] = msg.get("lang") or msg.get("language")
                     break
                 if kind == "error":
+                    rec["server_code"] = str(msg.get("code"))
                     _fail(rec, "server_error",
                           f"server error: {msg.get('code')} {msg.get('message')}")
                     break
@@ -361,13 +503,22 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
             if not stop.is_set():
                 _fail(rec, "client_exception", f"reader: {type(e).__name__}: {e}")
 
-    sock.settimeout(a.done_timeout)
+    # an idle-open abort waits for the server's idle_timeout: the reader must not time
+    # out first (a recv already blocked keeps the timeout it started with)
+    sock.settimeout(max(a.done_timeout, a.abort_idle_max_s + 1.0) if point == "idle_open"
+                    else a.done_timeout)
     th = threading.Thread(target=reader, daemon=True)
     th.start()
     period = a.frame_ms / 1000.0 / a.pace
+    # how many frames go out before an abort that happens inside the audio
+    n_send = n_frames
+    if point in ("before_first_partial", "before_first_partial_silence"):
+        n_send = min(n_frames, max(1, math.ceil(ABORT_EARLY_S * 1000.0 / a.frame_ms - 1e-9)))
+    elif point in ("mid_utterance", "mid_utterance_silence", "partial_frame", "idle_open"):
+        n_send = min(n_frames, max(1, math.ceil(n_frames * ABORT_MID_FRACTION)))
     t0 = mono()
     try:
-        for i in range(n_frames):
+        for i in range(n_send):
             due = t0 + i * period
             now = mono()
             if due > now:
@@ -376,10 +527,44 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
             t_sent = mono()
             rec["sends"].append([t_sent, min((i + 1) * frame_bytes, len(pcm)) / 32000.0])
             rec["late_ms"].append(max(0.0, (t_sent - due) * 1000.0))
-        ws_send(sock, 0x8, b"")                    # close = finalize, then `done`
-        th.join(a.done_timeout)
-        if th.is_alive():
-            _fail(rec, "timeout", "timeout waiting for done")
+        if point == "partial_frame" and not rec["error"]:
+            # a header announcing a whole frame, the mask and half of its payload: the
+            # server is left inside ws_read_exact when the connection drops
+            ws_send_partial(sock, 0x2, pcm[n_send * frame_bytes:(n_send + 1) * frame_bytes]
+                            or bytes(frame_bytes))
+        if point in M.ABORT_HANGUP:
+            if _mark_abort(rec):
+                stop.set()
+                _hard_close(sock, plan["method"])
+                _set_aborted(rec)
+        elif point == "idle_open":
+            if _mark_abort(rec):
+                # silence on an open socket: no audio, no close, no pong. The reader keeps
+                # listening, so the server's own verdict (idle_timeout) is what ends it.
+                th.join(a.abort_idle_max_s)
+                ab = rec["abort"]
+                if th.is_alive() or rec.get("error_kind") == "timeout":
+                    ab["server_end"] = "client_bound"      # we gave up first, and close
+                elif rec.get("server_code") == "idle_timeout":
+                    ab["server_end"] = "idle_timeout"
+                else:
+                    ab["server_end"] = rec.get("server_code") or rec.get("error_kind") or "eof"
+                ab["server_said"] = rec["error"]
+                ab["t_end"] = mono()
+                stop.set()
+                rec["error"] = None                 # the server's reply to our silence
+                _set_aborted(rec)
+        else:
+            ws_send(sock, 0x8, b"")                # close = finalize, then `done`
+            if point == "during_finalization":
+                if _mark_abort(rec):
+                    stop.set()
+                    _hard_close(sock, plan["method"])
+                    _set_aborted(rec)
+            else:
+                th.join(a.done_timeout)
+                if th.is_alive():
+                    _fail(rec, "timeout", "timeout waiting for done")
     except OSError as e:
         th.join(0.5)                               # let the reader name the cause first
         _fail(rec, _kind_of_oserror(e), f"send: {e}")
@@ -389,6 +574,9 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
             sock.close()
         except OSError:
             pass
+    if rec["error_kind"] == M.ABORTED:
+        th.join(1.0)                               # the reader was woken by SHUT_RD
+        return rec
     if rec["done_t"] is None:
         # the net under every path above: no `done` is never OK
         if rec["events"]:
@@ -413,6 +601,12 @@ def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
     harness must be counted, not turned into a silently dead stream."""
     stride = a.streams if stride is None else stride
     pcms = {}
+    clip_s = {}
+    for c in set(schedule):
+        try:
+            clip_s[c] = wav_audio_s(c)
+        except (OSError, EOFError, wave.Error, SystemExit):
+            clip_s[c] = None
     deadline = a._t0 + a.duration if a.mode == "soak" else None
     k = 0
     reason = "repeat"
@@ -424,17 +618,22 @@ def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
             break
         clip = schedule_clip(schedule, idx, k, stride)
         cls = classes_of.get(clip, "n/a")
+        plan = fault_plan(a.abort_seed, a.abort_pct, idx, k, a.abort_method) \
+            if getattr(a, "abort_pct", 0) > 0 else None
+        # the plan rides on the start mark too, so an utterance that never reports (a
+        # dead or terminated stream) is still accounted against its planned abort; so
+        # does the clip's length, the most such an utterance can have sent
         q.put({"_mark": "start", "stream": idx, "rep": k, "t": mono(), "clip": clip,
-               "class": cls})
+               "class": cls, "abort": plan, "audio_s": clip_s.get(clip)})
         try:
             if clip not in pcms:
                 pcms[clip] = load_pcm(clip)
-            rec = run_utterance(a, clip, pcms[clip], cls)
+            rec = run_utterance(a, clip, pcms[clip], cls, plan)
         except Exception as e:                       # noqa: BLE001 — counted, not raised
             rec = {"clip": clip, "class": cls, "audio_s": 0.0, "sends": [], "late_ms": [],
                    "events": [], "done_t": None, "t_start": mono(), "rejected": False,
                    "error": f"client: {type(e).__name__}: {e}",
-                   "error_kind": "client_exception"}
+                   "error_kind": "client_exception", "abort": plan}
         rec["stream"] = idx
         rec["rep"] = k
         q.put(rec)
@@ -470,6 +669,63 @@ def health(host, port, timeout=2.0):
     except Exception as e:                          # noqa: BLE001
         return {"unreachable": str(e)}
 
+def settle_health(host, port, before, timeout=15.0):
+    """/v1/health once the server's active slots are back to where they were before the
+    run (or `timeout` seconds passed); `settle_s` says how long that took."""
+    t0 = mono()
+    base = ((before or {}).get("slots") or {}).get("active")
+    while True:
+        h = health(host, port)
+        act = (h.get("slots") or {}).get("active")
+        if "unreachable" in h or base is None or act is None or act <= base \
+                or mono() - t0 >= timeout:
+            h["settle_s"] = round(mono() - t0, 2)
+            return h
+        time.sleep(0.25)
+
+
+def server_delta(before, after):
+    """The server's counter deltas over a run, from two /v1/health snapshots: what
+    streaming_metrics.abort_crosscheck compares (None where a counter is missing)."""
+    def delta(*path):
+        v0, v1 = before, after
+        for k in path:
+            v0, v1 = (v0 or {}).get(k), (v1 or {}).get(k)
+        return None if v0 is None or v1 is None else v1 - v0
+    other = [delta("cancelled_by", k) for k in M.CANCEL_UNPLANNED]
+    return {"sessions": delta("sessions"), "completed": delta("completed"),
+            "aborted": delta("aborted"), "cancelled": delta("cancelled"),
+            "peer_gone": delta("cancelled_by", "peer_gone"),
+            "idle_timeout": delta("cancelled_by", "idle_timeout"),
+            "protocol_error": delta("cancelled_by", "protocol_error"),
+            "other_cancel": None if all(v is None for v in other)
+            else sum(v or 0 for v in other),
+            "audio_s": delta("audio_seconds"),
+            "active_before": (before.get("slots") or {}).get("active"),
+            "active_after": (after.get("slots") or {}).get("active"),
+            "balanced": after.get("balanced")}
+
+
+def server_crosscheck(before, after, summary, chunk_ms=None):
+    """The server's counter deltas over the run against the client's aborts, sessions and
+    sent audio (streaming_metrics.abort_crosscheck). Only where /v1/health speaks for the
+    whole server: in prefork it answers for ONE worker, and v2_verdict then cross-checks
+    from every worker's `[DUMP]` lines instead."""
+    def not_checked(why):
+        return {"checked": False, "match": None, "detail": why}
+    if not before or not after or "unreachable" in before or "unreachable" in after:
+        return not_checked("/v1/health unreachable")
+    worker = after.get("worker", (after.get("process") or {}).get("worker"))
+    if worker is not None and worker >= 0:
+        return not_checked(f"prefork: /v1/health answered for worker {worker} only; "
+                           f"v2_verdict cross-checks from the [DUMP] lines")
+    if "cancelled_by" not in after or "completed" not in after:
+        return not_checked("the server predates the session books (S12-18)")
+    srv = server_delta(before, after)
+    xc = M.abort_crosscheck(summary["faults"], summary["accounting"], srv, chunk_ms=chunk_ms)
+    xc["server_delta"] = dict(srv, settle_s=after.get("settle_s"))
+    return xc
+
 # ------------------------------------------------------------------------------ self-test
 #
 # `python3 tools/bench/stream_load.py --self-test` (part of `make check`): no model, no
@@ -479,7 +735,17 @@ def health(host, port, timeout=2.0):
 
 
 def _fake_ws_server():
-    """(port, closer). The scenario is the `lang=` of the query string."""
+    """(port, closer). The scenario is the `lang=` of the query string.
+
+    Scenario `soak` behaves like a small real server and keeps its books like one, which
+    it serves on /v1/health: a stream that disconnects without a close frame is
+    `peer_gone`, one silent for 0.6 s gets `error idle_timeout`, a close frame is answered
+    with a delta and `done` (`completed`, or `peer_gone` when that write fails). Like the
+    real server it writes nothing for silence, and it feeds only whole frames to its
+    `audio_seconds`."""
+    books = {"sessions": 0, "completed": 0, "active": 0, "peer_gone": 0, "idle_timeout": 0,
+             "resets": 0, "samples": 0, "silent": 0}
+    lock = threading.Lock()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -504,8 +770,9 @@ def _fake_ws_server():
             n = struct.unpack(">H", rd(2))[0]
         elif n == 127:
             n = struct.unpack(">Q", rd(8))[0]
-        rd(4 + n)                                  # mask + payload, not needed
-        return h[0] & 0x0F
+        mask = rd(4)
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(rd(n)))
+        return h[0] & 0x0F, payload
 
     def serve(c):
         try:
@@ -516,7 +783,27 @@ def _fake_ws_server():
                     return
                 req += part
             line = req.split(b"\r\n", 1)[0].decode()
-            if "lang=" not in line:                # e.g. the /v1/health probe
+            if line.startswith("GET /v1/health"):
+                with lock:
+                    cb = {"idle_timeout": books["idle_timeout"],
+                          "peer_gone": books["peer_gone"], "protocol_error": 0}
+                    cb.update({k: 0 for k in M.CANCEL_UNPLANNED})
+                    body = json.dumps({
+                        "status": "ok", "worker": -1,
+                        "slots": {"active": books["active"], "cap": 64},
+                        "sessions": books["sessions"], "completed": books["completed"],
+                        "cancelled": books["peer_gone"] + books["idle_timeout"],
+                        "aborted": 0,
+                        "balanced": books["sessions"] == books["completed"] + books["active"]
+                        + books["peer_gone"] + books["idle_timeout"],
+                        "cancelled_by": cb,
+                        "audio_seconds": books["samples"] / 16000.0,
+                        "x_resets_seen": books["resets"],
+                        "x_silent_sessions": books["silent"]}).encode()
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                return
+            if "lang=" not in line:                # any other probe
                 c.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 return
             scen = line.split("lang=", 1)[1].split("&", 1)[0].split(" ", 1)[0]
@@ -526,13 +813,56 @@ def _fake_ws_server():
                 return
             c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                       b"Connection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+            if scen == "soak":
+                with lock:
+                    books["sessions"] += 1
+                    books["active"] += 1
+                end, n, loud = "peer_gone", 0, False
+                c.settimeout(0.6)
+                try:
+                    while True:
+                        try:
+                            op, payload = read_frame(c)
+                        except socket.timeout:
+                            end = "idle_timeout"
+                            c.sendall(frame(0x1, b'{"type":"error","code":"idle_timeout"}'))
+                            c.sendall(frame(0x8, struct.pack(">H", 1008)))
+                            break
+                        if op == 0x8:
+                            time.sleep(0.05)       # the tail
+                            if loud:
+                                c.sendall(frame(0x1, b'{"type":"delta","text":" tail",'
+                                                     b'"audio_s":0.9}'))
+                            c.sendall(frame(0x1, b'{"type":"done","text":"hi tail"}'))
+                            end = "completed"
+                            break
+                        # only a WHOLE frame reaches the model, as in the real server
+                        with lock:
+                            books["samples"] += len(payload) // 2
+                        loud = loud or any(payload)
+                        n += 1
+                        if n == 4 and loud:        # the first partial, after 0.4 s of speech
+                            c.sendall(frame(0x1, b'{"type":"delta","text":"hi",'
+                                                 b'"audio_s":0.4}'))
+                except ConnectionResetError:
+                    with lock:
+                        books["resets"] += 1       # the client's RST, as the wire shows it
+                except OSError:
+                    pass                           # EOF / a failed write: peer_gone
+                finally:
+                    with lock:
+                        books[end] += 1
+                        books["active"] -= 1
+                        books["silent"] += 1 if n and not loud else 0
+                time.sleep(0.1)
+                return
             if scen == "close_early":              # close frame after the first audio frame
                 read_frame(c)
                 c.sendall(frame(0x1, b'{"type":"delta","text":"hi","audio_s":0.1}'))
                 c.sendall(frame(0x8, struct.pack(">H", 1011)))
                 time.sleep(0.2)
                 return
-            while read_frame(c) != 0x8:            # the whole utterance, up to the close
+            while read_frame(c)[0] != 0x8:         # the whole utterance, up to the close
                 pass
             if scen == "done":
                 c.sendall(frame(0x1, b'{"type":"delta","text":"hi","audio_s":0.1}'))
@@ -569,6 +899,138 @@ def _fake_ws_server():
 
     threading.Thread(target=accept, daemon=True).start()
     return port, srv.close
+
+
+def _self_test_faults(check, port) -> None:
+    """Fault injection: the plan is deterministic and spread, and a short soak with half of
+    its utterances aborted accounts every abort at its point, keeps conservation, leaves
+    the healthy utterances OK, and matches the fake server's books, sessions and audio.
+    Failures are counted through `check`."""
+    import tempfile
+    print("fault plan: deterministic in (seed, stream, rep), spread over the seven points")
+    plans = [[fault_plan(7, 30.0, i, k) for k in range(400)] for i in range(8)]
+    again = [[fault_plan(7, 30.0, i, k) for k in range(400)] for i in range(8)]
+    check(plans == again, "the same (seed, stream, rep) gives the same plan")
+    share = sum(1 for p in plans for x in p if x) / (8 * 400.0)
+    check(abs(share - 0.30) < 0.03, f"30% asked, {share:.1%} planned")
+    per = {pt: sum(1 for p in plans for x in p if x and x["point"] == pt)
+           for pt in M.ABORT_POINTS}
+    check(max(per.values()) - min(per.values()) <= 8, f"points spread evenly: {per}")
+    check(all(fault_plan(7, 0.0, i, k) is None for i in range(4) for k in range(50))
+          and all(fault_plan(7, 100.0, i, k) for i in range(4) for k in range(50)),
+          "0% plans nothing, 100% plans everything")
+    check([fault_plan(8, 30.0, 0, k) for k in range(400)] != plans[0], "the seed is an input")
+    for pt in M.ABORT_POINTS:
+        if pt == "idle_open":
+            continue
+        meth = {m: sum(1 for p in plans for x in p if x and x["point"] == pt
+                       and x["method"] == m) for m in ("rst", "fin")}
+        check(meth["fin"] > 0 and abs(meth["fin"] - meth["rst"]) <= 8,
+              f"{pt:<28} RST and FIN alternate: {meth}")
+    check(all(x["method"] == "idle" for p in plans for x in p if x and x["point"] == "idle_open"),
+          "idle_open never closes on its own")
+    check(all(x["audio"] == ("silence" if x["point"] in M.ABORT_SILENT else "speech")
+              for p in plans for x in p if x), "the silent points, and only they, send zeros")
+    only = [fault_plan(7, 30.0, 1, k, method="rst") for k in range(400)]
+    check({x["method"] for x in only if x} == {"rst", "idle"}, "--abort-method rst: no FIN")
+
+    n_streams, dur = 4, 9
+    print(f"fault soak: {n_streams} streams, {dur} s, 50% aborted, against the fake server")
+    tmp = tempfile.mkdtemp(prefix="stream_load_selftest_")
+    clips = []
+    for j, secs in enumerate((1.0, 1.2, 1.4)):
+        path = os.path.join(tmp, f"c{j}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x11\x01" * int(16000 * secs))   # "speech": never zero
+        clips.append(path)
+    out = os.path.join(tmp, "soak.json")
+    cmd = [sys.executable, os.path.abspath(__file__), "--mode", "soak",
+           "--streams", str(n_streams), "--duration", str(dur), "--warmup", "0",
+           "--window", "2", "--bank", "short", "--host", "127.0.0.1", "--port", str(port),
+           "--lang", "soak", "--done-timeout", "5", "--abort-pct", "50",
+           "--abort-seed", "11", "--abort-idle-max-s", "3", "--json", out, "--clips"] + clips
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if not os.path.exists(out):
+        check(False, f"the soak wrote its JSON (exit {r.returncode}): {r.stderr[-400:]}")
+        return
+    d = json.load(open(out))
+    s, utts = d["summary"], d["utterances"]
+    f = s.get("faults") or {}
+    acct = s["accounting"]
+    planned = [u for u in utts if u.get("abort")]
+    aborted = [u for u in utts if u["outcome"] == M.ABORTED]
+    healthy = [u for u in utts if not u.get("abort")]
+    check(d["manifest"]["fault_injection"]["abort_seed"] == 11
+          and d["manifest"]["fault_injection"]["method"] == "mixed",
+          "the manifest records the plan")
+    check(len(planned) > 0 and len(healthy) > 0,
+          f"{len(utts)} utterances: {len(planned)} planned aborts, {len(healthy)} healthy")
+    # (one in flight when the soak's collection closed is cut_at_deadline, not executed)
+    check(all(u["outcome"] == M.ABORTED and u["abort"]["executed"]
+              and u["abort"]["point"] in M.ABORT_POINTS for u in planned
+              if u["outcome"] != "cut_at_deadline"),
+          "every planned abort is recorded aborted_by_client with its point")
+
+    def key(x):
+        return None if x is None else (x["point"], x["method"], x["index"])
+    check(all(key(u["abort"]) == key(fault_plan(11, 50.0, u["stream"], u["rep"]))
+              for u in utts),
+          "each utterance carries exactly the plan of its (stream, rep), or none")
+    pts = sorted({u["abort"]["point"] for u in aborted})
+    check(pts == sorted(M.ABORT_POINTS), f"all seven points exercised: {pts}")
+    # Method coverage is a property of the PLAN, checked on the plan itself: how many
+    # utterances a 9 s soak gets through depends on the machine, and the FIN half of
+    # the rotation only comes up from each stream's 8th abort on. The live run is held
+    # to the plan utterance by utterance above (`key`), which is the stronger check.
+    plan_meths = sorted({fault_plan(11, 50.0, i, k)["method"] for i in range(4)
+                         for k in range(60) if fault_plan(11, 50.0, i, k)})
+    check(plan_meths == ["fin", "idle", "rst"], f"the plan rotates RST, FIN and idle: {plan_meths}")
+    check(all(u["outcome"] in ("ok", "cut_at_deadline") for u in healthy),
+          f"healthy utterances are OK: {sorted({u['outcome'] for u in healthy})}")
+    check(s["counts"]["errors_total"] == 0, f"errors_total {s['counts']['errors_total']}")
+    check(acct["conservation"] is True,
+          f"conservation holds: {acct['started']} started = {acct['ok']} ok + "
+          f"{acct['aborted_by_client']} aborted + {acct['cut_at_deadline']} cut"
+          + (f" ({acct['conservation_detail']})" if acct.get("conservation_detail") else ""))
+    check(f.get("aborted_total") == len(aborted) and not f.get("violations"),
+          f"fault accounting: {f.get('aborted')} no violation")
+    idle = [u for u in aborted if u["abort"]["point"] == "idle_open"]
+    check(all(u["abort"].get("server_end") == "idle_timeout" for u in idle),
+          f"idle-open aborts end with the server's idle_timeout ({len(idle)})")
+    early = [u for u in aborted if u["abort"]["point"].startswith("before_first_partial")]
+    check(all(u["abort"]["deltas_before"] == 0 for u in early),
+          f"before_first_partial aborts saw no delta ({len(early)})")
+    check(s["metrics"]["ttfp_ms"]["n"] == sum(1 for u in utts if u["outcome"] == "ok"),
+          "TTFP counts the healthy utterances only")
+    ha = d["manifest"].get("health_after") or {}
+    rst = sum(1 for u in aborted if u["abort"]["method"] == "rst"
+              and u["abort"]["point"] in M.ABORT_HANGUP)
+    seen = ha.get("x_resets_seen")
+    check(seen is not None and seen >= rst,
+          f"an RST abort is a reset on the wire: the server saw {seen} for {rst} RST hangups")
+    silent = sum(1 for u in aborted if u["abort"]["point"] in M.ABORT_SILENT)
+    check(ha.get("x_silent_sessions") == silent and silent > 0,
+          f"the silent points sent zeros, and only they: the server saw "
+          f"{ha.get('x_silent_sessions')} silent sessions for {silent} planned")
+    xc = f.get("server") or {}
+    check(xc.get("checked") and xc.get("match"),
+          f"server cross-check against the fake server's books: {xc.get('detail')}")
+    rows = {row["bucket"]: row for row in xc.get("rows") or []}
+    check("sessions" in rows and rows["sessions"]["ok"],
+          f"every session on both sides: {rows.get('sessions')}")
+    res = xc.get("residual") or {}
+    check(res.get("ok") is True and abs(res.get("residual_s", 9)) < 0.01,
+          f"residual model work: the fake feeds exactly what was sent ({res.get('residual_s')} s, "
+          f"bound {res.get('bound_s')} s)")
+    check(r.returncode in (0, 1) and "fault injection:" in r.stdout
+          and "residual model work:" in r.stdout,
+          f"the report prints the fault section (exit {r.returncode}"
+          + "".join("; " + ln.strip() for ln in r.stdout.splitlines()
+                    if "INVALID" in ln or "FAIL" in ln)[:600] + ")")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def self_test() -> int:
@@ -609,6 +1071,7 @@ def self_test() -> int:
     class A:
         host, lookahead, model = "127.0.0.1", "3", None
         connect_timeout, done_timeout, frame_ms, pace = 2.0, 0.7, 100, 50.0
+        abort_idle_max_s = 3.0
     A.port = port
     pcm = b"\x00\x00" * 4800                        # 0.3 s: three frames
     for scen, want in (("done", None), ("close", "server_disconnect"),
@@ -629,6 +1092,14 @@ def self_test() -> int:
             # already raised and was already an error)
             check(rec["done_t"] is None and bool(rec["error"]),
                   f"{scen:<13} has no done and now carries an error (it used to count OK)")
+    A.lang, A.lookahead = "", ""
+    check(stream_path(A) == "/v1/audio/stream",
+          "--lang '' --lookahead '': no query key at all (English-only models refuse `lang`)")
+    A.lang, A.lookahead = "en", "3"
+    check(stream_path(A) == "/v1/audio/stream?lang=en&lookahead=3", "the default query is unchanged")
+    # a statement, not `bad += ...`: `check` counts into `bad` itself, and an augmented
+    # assignment would read `bad` BEFORE the call and overwrite what the call counted
+    _self_test_faults(check, port)
     close()
     A.port = port                                  # nobody listens there any more
     A.lang = "done"
@@ -648,11 +1119,12 @@ def build_args():
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--streams", type=int, default=1, help="concurrency (streams in flight)")
     ap.add_argument("--clips", nargs="+", required=True, help="16 kHz mono s16 WAVs")
-    ap.add_argument("--lang", default="auto")
+    ap.add_argument("--lang", default="auto",
+                    help="'' omits the key: an English-only model refuses any `lang`")
     ap.add_argument("--model", default=None,
                     help="the worker group to stream to, in a multi-model fleet "
                          "(?model=); omitted, the server's default group answers")
-    ap.add_argument("--lookahead", default="3")
+    ap.add_argument("--lookahead", default="3", help="'' omits the key")
     ap.add_argument("--frame-ms", type=int, default=100)
     ap.add_argument("--pace", type=float, default=1.0, help="1.0 = real time; 2.0 = twice as fast")
     ap.add_argument("--repeat", type=int, default=1, help="WAVE: utterances per stream, back to back")
@@ -684,6 +1156,21 @@ def build_args():
                     help="seconds: short < b0 <= medium < b1 <= long")
     ap.add_argument("--seed", type=int, default=42, help="SOAK: schedule seed")
 
+    ap.add_argument("--abort-pct", type=float, default=0.0, metavar="P",
+                    help="FAULT INJECTION: abort P%% of the utterances on purpose, spread "
+                         "evenly over seven points (before the first partial and "
+                         "mid-utterance, each with speech and with silence; inside a frame; "
+                         "during finalization; idle-open). Deterministic in (seed, stream, "
+                         "utterance); the rest are measured as usual. 0 = off")
+    ap.add_argument("--abort-seed", type=int, default=None,
+                    help="seed of the abort plan; default --seed")
+    ap.add_argument("--abort-method", choices=ABORT_METHODS, default="mixed",
+                    help="how an abort drops the connection: RST (SO_LINGER {1,0}), FIN, "
+                         "or mixed (both, deterministically alternated per point)")
+    ap.add_argument("--abort-idle-max-s", type=float, default=75.0,
+                    help="idle-open: how long to wait for the server's idle_timeout "
+                         "before the client closes (keep it above the server's --idle-ms)")
+
     ap.add_argument("--chunk-ms", type=float, default=None,
                     help="server encoder chunk period; default 80 x (lookahead+1) ms")
     ap.add_argument("--ttfp-p95-ms", type=float, default=None, help="envelope: default chunk + 200")
@@ -702,6 +1189,10 @@ def main() -> int:
     a = build_args().parse_args()
     if a.streams < 1 or a.frame_ms < 1 or a.pace <= 0:
         raise SystemExit("--streams and --frame-ms must be >= 1 and --pace > 0")
+    if not 0.0 <= a.abort_pct <= 100.0:
+        raise SystemExit("--abort-pct is a percentage, 0..100")
+    if a.abort_seed is None:
+        a.abort_seed = a.seed
     try:
         b0, b1 = (float(x) for x in a.class_bounds.split(","))
     except ValueError:
@@ -726,7 +1217,7 @@ def main() -> int:
         stride = a.streams
     classes_of = {c: classify(d, (b0, b1)) for v in bank.values() for c, d in v}
 
-    chunk_ms = a.chunk_ms if a.chunk_ms else M.chunk_period_ms(int(a.lookahead))
+    chunk_ms = a.chunk_ms if a.chunk_ms else M.chunk_period_ms(int(a.lookahead or 3))
     thr = M.default_thresholds(chunk_ms)
     if a.ttfp_p95_ms is not None:
         thr["ttfp_p95_ms"] = a.ttfp_p95_ms
@@ -797,13 +1288,20 @@ def main() -> int:
     # "one utterance" of tolerance: the longest clip at this pace, plus the longest
     # Retry-After sleep a rejected stream takes before it looks at the clock again
     tol_s = longest / a.pace + 5.0
+    if a.abort_pct > 0:
+        tol_s += a.abort_idle_max_s                 # an idle-open abort waits this long
     n_reported = len(records)
     synth, streams_report = M.reconcile(
         records, starts, status, n_streams=a.streams,
         deadline=(a._t0 + a.duration) if a.mode == "soak" else None,
         tol_s=tol_s, repeat=a.repeat if a.mode == "wave" else None)
     records.extend(synth)
-    health_after = health(a.host, a.port)
+    if a.abort_pct > 0:
+        # the aborted sessions are cancelled server-side within a step; wait for the
+        # slots to come back before reading the counters the cross-check compares
+        health_after = settle_health(a.host, a.port, health_before)
+    else:
+        health_after = health(a.host, a.port)
 
     # The onset map is READ FIRST: analyze_utterance takes it, and until R-2 ran
     # the harness for real it was loaded after the call that needs it, which made
@@ -843,6 +1341,9 @@ def main() -> int:
                           streams=streams_report)
     if expected is not None and n_reported < expected:
         summary["counts"]["missing"] = expected - n_reported
+    if summary.get("faults"):
+        summary["faults"]["server"] = server_crosscheck(health_before, health_after, summary,
+                                                        chunk_ms=chunk_ms)
     env = M.envelope_verdict(summary, thr)
     if expected is not None and n_reported < expected:
         env["invalid_reasons"].append(f"{expected - n_reported} utterance(s) never reported")
@@ -867,6 +1368,17 @@ def main() -> int:
         "chunk_period_ms": chunk_ms, "thresholds": thr,
         "health_before": health_before, "health_after": health_after,
         "wall_s": wall,
+        # the rule that decides every abort, so the run's faults can be replayed
+        "fault_injection": None if a.abort_pct <= 0 else {
+            "abort_pct": a.abort_pct, "abort_seed": a.abort_seed, "method": a.abort_method,
+            "points": list(M.ABORT_POINTS), "silent_points": list(M.ABORT_SILENT),
+            "early_s": ABORT_EARLY_S, "mid_fraction": ABORT_MID_FRACTION,
+            "idle_max_s": a.abort_idle_max_s,
+            "rule": "abort iff sha256('abort:seed:stream:rep')[:8]/2^64 < pct/100; the j-th "
+                    "abort of stream i is points[(i + j) mod 7]; with method mixed, "
+                    "((i + j) // 7) odd closes with FIN, even with RST; idle_open never "
+                    "closes until the server does (or idle_max_s)",
+        },
     }
 
     tag = "WAVE (screening: may disqualify, never promotes)" if a.mode == "wave" \
