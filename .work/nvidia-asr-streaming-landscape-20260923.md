@@ -1309,3 +1309,36 @@ Close rule: if no candidate moves the ~600 ms model term by >= 150 ms at p50 or
 recovers >= 10 of the 28 first-word errors, WITHOUT final WER mean worse by more
 than +0.005, S13-10 is closed as "no model-side lever among compatible
 checkpoints".
+
+## S13-10 — inside Nemotron: the first-word lifecycle (REGISTERED 2026-09-25, before the analysis)
+
+Scope change by the user (2026-09-25): Nemotron 3.5 streaming 0.6B is a fixed
+requirement; no model selection. The checkpoint/config diagnostic above stops
+(candidate B, the EOU 120M, was not run; candidate A, `--lang en`, finished and
+is reported only as a Nemotron configuration note).
+
+Question: where are the ~600 ms between the acoustic end of the first word and
+its publication spent, and is any part a runtime/decoder policy that can be
+reduced without changing Nemotron or its WER/CER?
+
+Data: the existing per-decision RNNT traces (`MYNAH_ASR_TRACE_RNNT=1`, S13-5c
+delta 0: the 349 originals, transcripts identical to the gated L=3 control) and
+their deltas; word times from the offline aligner. No new run.
+
+Per clip, for the LAST token of the first word (the token that completes it):
+- `t_end`     acoustic end of the first word (aligner t1)
+- `t_evid`    first encoder frame at which that token is the best non-blank
+              (the model already ranks it first after blank)
+- `t_frame`   the frame at which the decoder EMITS it; frame k is dated at the
+              end of its 80 ms window, (k+1) x 80 ms (+-80 ms)
+- `t_decode`  audio consumed when that decision was made (the step's input)
+- `t_pub`     audio consumed at the delta that carries it
+- `t_close`   the separator that closes the word (S13-5c definition)
+Components: alignment delay = t_frame - t_end (where Nemotron places the token;
+intrinsic to the checkpoint), of which blank-won = t_frame - t_evid (the token
+was already top non-blank but blank scored higher: a decision-rule quantity);
+geometry = t_decode - t_frame (lookahead + chunk wait: fixed by the preset);
+publication = t_pub - t_decode (expected 0, R-15); closing = t_close - t_pub.
+For the first-word errors: whether the reference's first word's tokens were
+ever the best non-blank before the wrong emission, and whether the error clips
+emit later than the correct ones.
