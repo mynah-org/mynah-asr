@@ -1283,3 +1283,29 @@ serving nor lookahead moves either (S13-5c, S13-10 presets). The raw KPI stays
 the reported number; the lexical-onset figure is its attribution.
 Evidence: `.work/evidence/la-20260925/lexical.txt`, `lexical_attribution.json`,
 `lex_attr.py` (untracked).
+
+## S13-10 final diagnostic — checkpoint / config variants (REGISTERED 2026-09-25, before the run)
+
+Diagnostic, not an optimisation: serving, scheduling, lookahead, VAD and the KPI
+definition are untouched. Control: the gated L=3 run (Nemotron 3.5, `--lang
+auto`, the CLI default). Same 349 clips, same onsets, same aligner times.
+
+Inventory of compatible candidates (from S13-2 forensics and docs/models.md):
+- A. Nemotron 3.5, same checkpoint, language prompt `en` instead of `auto`
+  (several first-word errors are non-English tokens: "la", "alpha", "det", "es").
+- B. Parakeet Realtime EOU 120M (converted, English only, [70,1]).
+- C. nemotron-speech-streaming-en-0.6b (same family, [70,R]); never imported:
+  download + conversion + parity gate, run only if A and B leave the question open.
+- Excluded: parakeet-unified-en-0.6b (buffered streaming only, not cache-aware),
+  multitalker-parakeet-streaming (another task).
+
+Per candidate, paired with the control: raw (energy onset) and lexical-onset
+first complete word p50/p90/p95/p99; word-end -> emission and closing on the
+clips where its first word matches the aligner; first-word correctness against
+the human reference's first word; final WER/CER; on the control's 28 first-word
+errors and on the 19 raw-p95 tail clips: recovered / introduced / changed.
+
+Close rule: if no candidate moves the ~600 ms model term by >= 150 ms at p50 or
+recovers >= 10 of the 28 first-word errors, WITHOUT final WER mean worse by more
+than +0.005, S13-10 is closed as "no model-side lever among compatible
+checkpoints".
