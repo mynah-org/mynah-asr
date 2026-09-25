@@ -338,8 +338,15 @@ cpus 0-29 / generator 30-31, 900 s, 20 % of utterances aborted at seven points
 | worker RSS growth / deaths | 1.038x / 0 | 1.034x / 0 |
 | verdict | QUALIFIED | QUALIFIED |
 
-Negative residual work: the model consumed LESS than the clients sent -- the
-audio still queued when a client vanished is dropped, not fed.
+Wording for any external report (the residual is a difference, and "negative
+work after disconnect" reads wrong): "No evidence of post-disconnect inference;
+processed audio was 141 s (C=64) / 189 s (C=80) lower than client-sent audio
+because queued audio belonging to aborted sessions was discarded."
+
+Scope, kept apart on purpose: C=144 remains the NOMINAL serving qualification
+(2026-09-24, no faults); C=64 and C=80 are the FAULT-INJECTION qualification
+(20 % aborts). Nothing here says anything about C=144 under faults -- a
+fault soak at C=144 has not been run.
 
 Harness defect found by the run (fixed, commit "Count a stall only when a slot
 had runnable work"): bound 8 failed both soaks on ONE interval each -- an
