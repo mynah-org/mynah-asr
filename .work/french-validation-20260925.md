@@ -1,6 +1,6 @@
 # French validation on the qualified serving configuration
 
-Status: OPEN (registered 2026-09-25, before any French measurement)
+Status: DONE 2026-09-25 (registered before any French measurement; results below)
 
 Task: S12-16
 
@@ -59,10 +59,75 @@ sending the recommended language, judged by `v2_verdict` (all rows incl. A, B).
 This is a French CONSISTENCY soak at the qualified level, not a new
 qualification (one 15-minute soak, not two 30-minute ones).
 
-## Evidence
+## Evidence (2026-09-25, Axion c4a-highcpu-32, Nemotron 3.5 int8, clean tree ac21e26)
 
-(none yet)
+Raw: `.work/evidence/fr-20260925/` (untracked: chain log, trust record, both
+lang_gate runs, both v2_qualify runs with dumps/metrics/procsamples, verdicts).
+
+**1. Trust checks, stress-fr (1587 clips).** 1143 kept, 444 excluded, every
+exclusion counted: peak below -30 dBFS 306 (FLEURS levels vary; the builder
+warned of the same count), no language tag emitted under `auto` 129 (the model
+declined to tag, which is NOT a detection of another language; counted as
+registered), reference without French orthography 35, offline `lang=fr` WER
+above 0.5 19, detected English 1. Under `auto`: fr-FR 1457, no tag 129, en-US 1.
+Offline `lang=fr` WER mean 0.0976 over all 1587, 0.0928 over the kept 1143.
+
+**2. Quality A/B, eval-bank FR (FLEURS test, 200 clips), stream int8 L=3.**
+Gate: explicit `fr` reproduces the frozen baseline within its interval (WER
+0.1320 vs 0.1316 frozen in cc28e08, interval [0.1149, 0.1498]; the small
+difference is FACT, not investigated -- the bank was re-fetched and the code
+moved since 09-22, all flags off).
+
+| | explicit `fr` | `auto` |
+|---|---|---|
+| WER mean [95 % CI] | **0.1320** [0.1149, 0.1498] | 0.1347 [0.1174, 0.1535] |
+| WER format-free | **0.1033** | 0.1058 |
+| CER mean | **0.0656** | 0.0666 |
+| S / D / I (5283 ref words) | 482 / 53 / 135 | 497 / 59 / 132 |
+| first published word correct | **86.0 %** (172) | 85.0 % (170) |
+| speech before the first word, p95 | **1.46 s** | 1.51 s |
+
+Paired per clip: explicit better on 14, worse on 3, equal on 183 (165/200
+transcripts identical); first word right only with explicit 2, only with auto
+0. Same direction as English (S13-10: `lang=en` recovered 9/36 first-word
+errors, introduced 0).
+
+**3. French under load, qualified flags, 6x5, clients `lang=fr`, corpus = 498
+of the 1143 validated clips (sample 500, seed 42), one 900 s soak each.**
+
+| | C=144 | C=128 |
+|---|---|---|
+| verdict (v2_verdict, all rows incl. A, B) | **NOT QUALIFIED** | **QUALIFIED** |
+| failing row | 3: finalization p95 **504 ms** vs 500 | none |
+| emission lag p95 / worst window | 278 / 280 ms | 153 / 158 ms |
+| finalization p95 | 504 ms | 261 ms |
+| backlog max | 0.384 s | 0.284 s |
+| streams lost / books | 0 of 9386 / balanced every dump | 0 of 8459 / balanced |
+| transcripts identical to unloaded | 498/498 | 498/498 |
+| stalls > 640 ms / max lag | 0 / 638 ms | 0 / 421 ms |
+| worker RSS growth | 1.024x | 1.033x |
+| audio/wall | 132.6x | 119.4x |
+| TTFP load penalty p95 | +241 ms | +123 ms |
+
+English at the same flags for reference (2026-09-24, 2 x 30 min each): C=144
+lag p95 243 / fin p95 428 ms, C=128 129 / 221 ms. French sits ~35 ms (lag) and
+~40-75 ms (finalization) above English at the same concurrency; at C=144 that
+takes finalization 4 ms over the registered bound. The bound was not moved.
 
 ## Conclusion
 
-(open)
+- The French set is validated with its exclusions stated (1143 of 1587).
+- French quality on the frozen test bank reproduces (WER 0.132); **explicit
+  `lang=fr` is recommended over `auto`** by the registered rule (better on
+  every aggregate, 14 vs 3 clips, +2 first words, 0 lost) -- the same finding
+  as English, so the recommendation for production is: **send the language when
+  the client knows it**.
+- Under load the engine is correct in French at both levels (0 lost, books
+  balanced, transcripts byte-identical to unloaded). **French is consistent at
+  C=128 (wide margins) and NOT at C=144**, where finalization p95 is 4 ms over
+  the bound. For an EN+FR fleet the operating point that holds for both
+  languages is **C=128**; C=144 stays an English-only qualified level. This
+  bears on the pending promotion decision (S12-13: 144 vs 128).
+- Scope: one 15-minute consistency soak per level, not a two-soak
+  qualification; the English nominal (C=144/128) and fault (C=64/80)
+  qualifications are unchanged by this work.
