@@ -125,9 +125,16 @@ takes finalization 4 ms over the registered bound. The bound was not moved.
 - Under load the engine is correct in French at both levels (0 lost, books
   balanced, transcripts byte-identical to unloaded). **French is consistent at
   C=128 (wide margins) and NOT at C=144**, where finalization p95 is 4 ms over
-  the bound. For an EN+FR fleet the operating point that holds for both
-  languages is **C=128**; C=144 stays an English-only qualified level. This
-  bears on the pending promotion decision (S12-13: 144 vs 128).
+  the bound. Nomenclature, kept exact so it cannot drift:
+  - **EN nominal qualification:** C=144 (2 x 30 min, 2026-09-24).
+  - **FR consistency (one 15-minute soak per level, NOT a qualification):**
+    C=128 PASS with wide margins; C=144 FAIL on finalization p95, 504 vs 500 ms
+    (0.8 % over), with 0 sessions lost, identical transcripts and balanced
+    books. This says "C=144 did not pass this run under the registered
+    protocol", not that French is structurally unable to hold C=144; two
+    independent reps would settle the variance if FR C=144 were ever needed.
+  - **Recommended conservative EN+FR operating point:** C=128 -- a prudent
+    choice, not a new `qualified_safe_concurrency`. Bears on S12-13.
 - Scope: one 15-minute consistency soak per level, not a two-soak
   qualification; the English nominal (C=144/128) and fault (C=64/80)
   qualifications are unchanged by this work.
