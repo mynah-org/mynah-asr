@@ -1238,3 +1238,48 @@ onset stays the reported KPI; the lexical-onset figure is reported beside it.
   misrecognition by the model); both wrong; stream inserted a word before the
   reference's first; stream dropped the reference's first word; non-English or
   garbage first token.
+
+## S13-10 point 1 result (2026-09-25, as registered above)
+
+All 349 clips kept; the aligner transcribed all 349; stream and aligner agree on
+the first word on 318.
+
+**Paired distributions (ms), first complete word:**
+
+| | p50 | p90 | p95 | p99 | mean |
+|---|---|---|---|---|---|
+| **raw KPI, from the energy onset (unchanged)** | 1140 | 1970 | 2330 | 2890 | 1254 |
+| from the lexical onset | 1020 | 1480 | 1680 | 2120 | 1067 |
+| from the lexical onset, sensitivity (9 clips whose lead-in holds words keep the energy onset) | 1040 | 1500 | 1730 | 2360 | 1082 |
+| lead-in (energy -> lexical onset) | 40 | 710 | 930 | 1480 | 187 |
+| first-word duration | 160 | 560 | 640 | 880 | 234 |
+| after the word (model + closing), all 349 | 800 | 1120 | 1260 | 1600 | 833 |
+| model: word end -> word emitted (318 matched) | 620 | 840 | 940 | 1060 | 602 |
+| closing: -> the separator (318 matched) | 300 | 400 | 600 | 700 | 206 |
+
+**RESULT — attribution of the raw p95 (2330 ms), over the 19 clips at or above
+it (all 349 considered, excluded clips included):** lead-in 1097 ms (41 %),
+first-word duration 417 ms (15 %), after the word 1191 ms (44 %); on the 12 tail
+clips whose first word matches, the after-word part splits into model 658 ms and
+closing 517 ms. Lead-in spans with words: 9 of the 98 clips with a lead-in over
+250 ms ("Oh", "So", "and", "Yeah.", "Correct." ...), 2 of them in the tail.
+
+**RESULT — the 31 first-word disagreements, against the human reference:** 28
+are the STREAMING MODEL getting the first word wrong -- a different or inserted
+word 14, a near miss 5 (their -> the, of -> off, pronunciation -> prounciation),
+both it and the aligner wrong 6, a non-English token 2 ("là", "α"), the first
+word dropped 1 -- and only 3 are aligner errors. 7 of the 31 sit in the raw p95
+tail: 7 of those 19 tail clips (37 %) begin with a misrecognised first word, a
+quality tail inside the latency tail.
+
+**Conclusion (attribution, no optimisation made).** Of the ~2.3 s p95:
+~1.1 s is non-lexical lead-in that the energy onset counts (breath, noise; a
+discourse word on 2 of 19), ~0.4 s is the user saying the first word, ~0.65 s is
+the model's word-end -> emission delay, ~0.5 s is waiting for the next word to
+begin. From the lexical onset the p95 is 1680 ms (1730 in the sensitivity arm).
+The only model-side terms are the ~0.6-0.65 s emission delay (flat across the
+distribution) and the first-word misrecognitions (37 % of the tail). Neither
+serving nor lookahead moves either (S13-5c, S13-10 presets). The raw KPI stays
+the reported number; the lexical-onset figure is its attribution.
+Evidence: `.work/evidence/la-20260925/lexical.txt`, `lexical_attribution.json`,
+`lex_attr.py` (untracked).
