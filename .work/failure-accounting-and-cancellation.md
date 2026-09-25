@@ -1,9 +1,9 @@
 # Failure accounting, cancellation lifecycle and fault injection
 
-Status: IN PROGRESS (2026-09-25). P0-a, P0-b, P0-c and the single-fault half of
-P0-d done on macOS; open: the fault-injection soak on the box, the Nemotron
-re-run of the fault suite, the full protocol/stream tests with Nemotron, and
-qwen-tts.
+Status: ASR PART DONE (2026-09-25). P0-a..d done and qualified on the box with
+Nemotron (fault suite + fault-injection soaks C=64 and C=80, both QUALIFIED).
+Open: qwen-tts (S12-23), worker respawn (S12-22, a decision), and the full
+Nemotron protocol/stream tests on the Mac (the box ran the fault suite).
 
 Task: S12-17, S12-18, S12-19, S12-20
 
@@ -303,6 +303,51 @@ with a fault test (SIGKILL a worker 4 times: 3 recoveries then exhausted, totals
 monotonic, capacity restored exactly on readiness); consider default ON only
 after that test and a box soak.
 
+### Box run, 2026-09-25 (GCP Axion c4a-highcpu-32, Nemotron 3.5 0.6B int8, commit 2aee1be)
+
+Evidence: `.work/evidence/ft-20260925/` (untracked; chain.log, build and fault
+suite logs, both v2_qualify runs with dumps, metrics, procsamples and the
+per-utterance JSON, verdicts before and after the bound-8 fix).
+
+`make test-server-faults` with Nemotron: all green. Every zombie case
+discriminating (27.4 s queued at the disconnect) and 0.00 s of audio fed after
+it; books 74 = 18 completed + 56 cancelled; fleet-metrics exact across two
+Nemotron workers; worker-kill green.
+
+FACT (refutes the macOS-derived HYPOTHESIS above): on Linux the `rst-unacked`
+RSTs all arrived -- 4 of 4 `peer_gone`, 0 `idle_timeout`. The half-open effect
+is a macOS behaviour here; the harness tolerance for it stays (the sum is still
+exact), and in both soaks every RST hangup ended `peer_gone`.
+
+Fault-injection soaks, candidate settings (STREAM_PAR=4 FIN_STACK=1), 6x5,
+cpus 0-29 / generator 30-31, 900 s, 20 % of utterances aborted at seven points
+(seed 7), reference = the C=128 qualification's unloaded transcripts:
+
+| | C=64 | C=80 |
+|---|---|---|
+| started = ok + planned aborts + errors | 4327 = 3493 + 834 + 0 | 5390 = 4346 + 1044 + 0 |
+| planned aborts executed | 834/834, every point | 1044/1044, every point |
+| server sessions (fleet /metrics) | 4327 | 5390 |
+| completed | 3551 = 3493 ok + 58 finalization aborts that got `done` | 4420 = 4346 + 74 |
+| idle_timeout | 123 = the 123 idle_open aborts | 157 = 157 |
+| peer_gone | 653 = 589 hangups + 64 finalization aborts | 813 = 736 + 77 |
+| books balanced / abandoned | every dump / 0 | every dump / 0 |
+| residual model work (fed - sent) | -141 s (bound +267 s) | -189 s (bound +334 s) |
+| healthy streams: errors, lag p95, fin p95 | 0, 64 ms, 99 ms | 0, 77 ms, 121 ms |
+| stalls > 320 ms / quality parity | 0 / 498 clips identical | 0 / 498 identical |
+| worker RSS growth / deaths | 1.038x / 0 | 1.034x / 0 |
+| verdict | QUALIFIED | QUALIFIED |
+
+Negative residual work: the model consumed LESS than the clients sent -- the
+audio still queued when a client vanished is dropped, not fed.
+
+Harness defect found by the run (fixed, commit "Count a stall only when a slot
+had runnable work"): bound 8 failed both soaks on ONE interval each -- an
+idle_open client holding its slot with an empty ring (52.6 s since its last
+audio) while that worker had nothing else to do. A stall now needs a slot with
+a whole chunk queued; re-judged, both runs QUALIFIED. The verdicts from the
+old rule are kept in the evidence (`verdict-c64.txt`, `verdict-c80.txt`).
+
 ## Conclusion (so far)
 
 The qualification zeros were real, but the server had a genuine zombie: a
@@ -313,11 +358,10 @@ now exact on both sides, and a verdict fails when either side loses a session.
 
 ## Next action
 
-1. Fault-injection SOAK mode in stream_load (abort percentage and points) —
-   in progress; then 10-15 min at C=64/80 on the box, with Nemotron, the
-   fleet metrics scraped before/after and compared with the client's books.
-2. Re-run `make test-server-faults`, test-server-protocol and
-   test-server-stream with the Nemotron pack (mount the models volume).
+1. DONE: fault-injection soaks C=64 and C=80 on the box, QUALIFIED, books
+   reconciled exactly client vs server (table above).
+2. Re-run test-server-protocol and test-server-stream with the Nemotron pack
+   on the Mac (mount the models volume); the fault suite already ran with it.
 3. qwen-tts: the same suite shape (silent-audio zombie, books, abandon), and
    decide with the user whether cancel-on-disconnect becomes its default.
 4. Worker respawn in the prefork router: a decision, not a fix — ask.
