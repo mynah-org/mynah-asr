@@ -27,10 +27,27 @@ One utterance is a plain dict (picklable, JSON-serialisable), recorded by the cl
       "done_t":   float|None,          # arrival of the `done` frame
       "t_start":  float,               # monotonic start of the utterance (windowing)
       "error":    str|None,
+      "error_kind": str|None,          # one of OUTCOMES (below); absent in old records
       "rejected": bool,                # HTTP 503 before the upgrade: a legitimate outcome
     }
 
-`sends[0][0]` is the first-audio-sent time.  Nothing here reads a socket or a clock: the
+`sends[0][0]` is the first-audio-sent time.
+
+------------------------------------------------------------------------- accounting
+Every utterance a stream STARTED ends in exactly one outcome of `OUTCOMES`: `ok`,
+`rejected` (a 503: counted, never a loss), `cut_at_deadline` (in flight when a soak's
+collection closed: counted, never a loss, never dropped) or one ERROR kind. `ok` needs a
+`done` frame: an utterance the server closed without one, or that received nothing at
+all, is an error (`server_disconnect` / `no_done` / `no_events`), never a success whose
+finalization quietly left the percentiles. Errors are counted over the WHOLE run, warm-up
+included; only the latency percentiles skip the warm-up. `aggregate()` then checks the
+conservation invariant
+
+    started = ok + rejected + cut_at_deadline + sum(errors by kind)
+
+and a run where it does not hold is INVALID: an utterance that vanished from the
+statistics is a failure of the harness, and a harness that loses utterances can also
+lose the errors in them.  Nothing here reads a socket or a clock: the
 module is pure arithmetic over that record, which is why it can have a known-answer test.
 
 ------------------------------------------------------------------------------- metrics
@@ -651,16 +668,96 @@ def partial_quality_summary(rows):
     return s
 
 
+# ------------------------------------------------------------------ outcome taxonomy
+#
+# A fixed set, so that "0 errors" can be read back as "0 of each of these" and a new way
+# of failing has to be named here before it can be counted. `unclassified` exists so that
+# an error string this module does not recognise is still an ERROR, never an OK.
+
+OK_OUTCOME = "ok"
+NOT_ERRORS = ("ok", "rejected", "cut_at_deadline")
+ERROR_KINDS = (
+    "connect_error",         # TCP connect / handshake failed before any HTTP status
+    "http_error",            # refused before the upgrade with a status other than 503
+    "timeout",               # no `done` within --done-timeout, or a socket read timed out
+    "server_disconnect",     # the server closed (close frame, EOF, reset) before `done`
+    "server_error",          # the server sent an `error` frame
+    "no_done",               # events arrived, the utterance ended, `done` never came
+    "no_events",             # the utterance ended and not one server frame arrived
+    "protocol_error",        # a frame the client could not parse
+    "client_exception",      # the harness itself raised while running the utterance
+    "client_process_death",  # the stream process died with this utterance in flight
+    "unclassified",          # an error string no rule below recognises
+)
+OUTCOMES = NOT_ERRORS + ERROR_KINDS
+
+
+def _kind_from_message(err, rejected=False):
+    """Classify an error string written by a harness that predates `error_kind`.
+
+    Only used for old records: the client now names the kind where the failure happens."""
+    e = (err or "").lower()
+    if rejected:
+        return "rejected"
+    if e.startswith("refused"):
+        return "http_error"
+    if e.startswith("connect"):
+        return "connect_error"
+    if "timed out" in e or "timeout" in e:
+        return "timeout"
+    if e.startswith("server error"):
+        return "server_error"
+    if any(s in e for s in ("connection closed", "reset", "broken pipe", "close frame",
+                            "aborted", "without done")):
+        return "server_disconnect"
+    if "expecting" in e or "json" in e or "decode" in e:
+        return "protocol_error"
+    return "unclassified"
+
+
+def outcome(rec):
+    """The one outcome of an utterance record (raw or analysed), from `OUTCOMES`.
+
+    `ok` requires a `done`: an utterance with no error string and no `done` frame used to
+    count as OK -- the reader broke on a close frame and recorded nothing -- and its
+    finalization silently left the percentiles (AUDIT 2026-09-24, gap 1)."""
+    if rec.get("outcome") in OUTCOMES:
+        return rec["outcome"]                     # already decided by analyze_utterance
+    if rec.get("rejected"):
+        return "rejected"
+    k = rec.get("error_kind")
+    if k:
+        return k if k in OUTCOMES else "unclassified"
+    if rec.get("error"):
+        return _kind_from_message(rec["error"])
+    if rec.get("done_t") is None:
+        return "no_events" if not rec.get("events") else "no_done"
+    return OK_OUTCOME
+
+
+def is_error(kind):
+    return kind not in NOT_ERRORS
+
+
 def analyze_utterance(rec, frame_ms=100.0, pace=1.0, onsets=None):
     """Every per-utterance metric.  Marks are [t, value] so they can be windowed later."""
     sends = [list(s) for s in rec.get("sends") or []]
     events = rec.get("events") or []
     late = [float(x) for x in (rec.get("late_ms") or [])]
+    kind = outcome(rec)
+    err = rec.get("error")
+    if kind != OK_OUTCOME and not err:
+        # an outcome that is not OK always carries an error string too, so that every
+        # consumer that filters on `error` (text identity, paired TTFP, event keeping)
+        # drops it without having to know the taxonomy
+        err = {"no_done": "no done frame before the utterance ended",
+               "no_events": "no server frame at all"}.get(kind, kind)
     out = {
         "clip": rec.get("clip"), "audio_s": float(rec.get("audio_s") or 0.0),
         "stream": rec.get("stream"), "rep": rec.get("rep"),
         "t_start": rec.get("t_start"), "frames": len(sends),
-        "error": rec.get("error"), "rejected": bool(rec.get("rejected")),
+        "error": err, "error_kind": None if kind == OK_OUTCOME else kind, "outcome": kind,
+        "rejected": bool(rec.get("rejected")),
         "class": rec.get("class"),
         "ttfb_ms": None, "ttfp_ms": None, "fin_ms": None, "text": "", "deltas": 0, "eous": 0,
         "lag_marks": [], "server_lag_marks": [], "backlog_marks": [],
@@ -816,6 +913,100 @@ def drift(win, pooled_p95):
             "windows": win, "trend_pct": trend, "excluded": excluded, "reason": None}
 
 
+# ---------------------------------------------------------------------------- reconcile
+#
+# The client side of the conservation invariant. A stream process announces every
+# utterance BEFORE it plays it (a start mark: stream, rep, t, clip) and announces its own
+# end when it leaves its loop (an end mark: stream, t, started, reason). The parent adds
+# what only it can see: the exit code, and whether it had to terminate a process that
+# was still alive when collection closed. From those three sources nothing can vanish:
+#
+#   * a start with no record, from a stream the parent terminated after a SOAK's
+#     collection closed, is `cut_at_deadline` -- counted, not an error;
+#   * any other start with no record is `client_process_death` -- an ERROR;
+#   * a stream with no end mark that the parent did not terminate died; so did one that
+#     exited non-zero; in SOAK so did one whose last sign of life came earlier than the
+#     deadline minus one utterance (`tol_s`). WAVE's analogue is a stream that started
+#     fewer than `repeat` utterances.
+
+
+def reconcile(records, starts, status=None, n_streams=None, deadline=None, tol_s=0.0,
+              repeat=None):
+    """(synthetic records for every start that produced none, the per-stream report).
+
+    `records` are raw (or analysed) utterance dicts carrying `stream` and `rep`;
+    `starts` is [{"stream", "rep", "t", "clip"}]; `status` is
+    {stream: {"end_t": float|None, "started": int|None, "exitcode": int|None,
+              "terminated": bool}}. `deadline` is ABSOLUTE (same clock as the marks) and
+    only given in SOAK; `repeat` only in WAVE. Pure arithmetic, so the self-test can
+    plant every fault."""
+    status = status or {}
+    have = {(r.get("stream"), r.get("rep")) for r in records}
+    synth = []
+    for s in starts:
+        key = (s.get("stream"), s.get("rep"))
+        if key in have:
+            continue
+        st = status.get(s.get("stream")) or {}
+        cut = bool(st.get("terminated")) and deadline is not None
+        kind = "cut_at_deadline" if cut else "client_process_death"
+        synth.append({"clip": s.get("clip"), "class": s.get("class"), "stream": key[0],
+                      "rep": key[1], "t_start": s.get("t"), "audio_s": 0.0, "sends": [],
+                      "late_ms": [], "events": [], "done_t": None, "rejected": False,
+                      "error": ("in flight when the soak's collection closed" if cut else
+                                "the stream process ended with this utterance in flight"),
+                      "error_kind": kind, "synthetic": True})
+        have.add(key)
+
+    ids = sorted(set(range(n_streams)) if n_streams is not None else
+                 {s.get("stream") for s in starts} | set(status))
+    last_seen, n_started = {}, {}
+    for s in starts:
+        sid = s.get("stream")
+        n_started[sid] = n_started.get(sid, 0) + 1
+        if s.get("t") is not None:
+            last_seen[sid] = max(last_seen.get(sid, s["t"]), s["t"])
+    for r in records:
+        sid = r.get("stream")
+        for t in (r.get("t_end"), r.get("done_t"), r.get("t_start")):
+            if t is not None:
+                last_seen[sid] = max(last_seen.get(sid, t), t)
+    dead, short, terminated, rows = [], [], [], {}
+    for sid in ids:
+        st = status.get(sid)
+        end_t = (st or {}).get("end_t")
+        if end_t is not None:
+            last_seen[sid] = max(last_seen.get(sid, end_t), end_t)
+        why = None
+        if st is not None:
+            term = bool(st.get("terminated"))
+            if term:
+                terminated.append(sid)
+            code = st.get("exitcode")
+            if end_t is None and not term:
+                why = "exited without its end mark"
+            elif code not in (0, None) and not term:
+                why = f"exit code {code}"
+        elif status:
+            why = "no status: the process was never seen"
+        if why is None and deadline is not None and not (st or {}).get("terminated"):
+            seen = last_seen.get(sid)
+            if seen is None or seen < deadline - tol_s:
+                why = ("no sign of life at all" if seen is None else
+                       f"last sign of life {deadline - seen:.1f} s before the deadline")
+        if why is None and repeat is not None and n_started.get(sid, 0) < repeat:
+            why = f"started {n_started.get(sid, 0)} of {repeat} utterance(s)"
+        if why is not None:
+            (short if st is not None and end_t is not None else dead).append(sid)
+        rows[sid] = {"started": n_started.get(sid, 0), "last_seen": last_seen.get(sid),
+                     "died": why}
+    report = {"expected": len(ids), "dead": sorted(dead + short),
+              "exited_early": sorted(short), "terminated_at_deadline": sorted(terminated),
+              "started": sum(n_started.values()), "per_stream": rows,
+              "tol_s": tol_s}
+    return synth, report
+
+
 # ----------------------------------------------------------------------------- aggregate
 
 
@@ -829,19 +1020,69 @@ def group_texts(utts):
     return {c: sorted(t) for c, t in by_clip.items()}
 
 
+def accounting(utts, started=None, streams=None, warmup_s=0.0, t0=0.0):
+    """Outcome counts over the WHOLE run, the warm-up split, and the conservation check.
+
+    The warm-up is a KPI window, not an amnesty: until 2026-09-25 `aggregate()` dropped the
+    first `--warmup` seconds BEFORE counting errors, so a failure in the first 30 s of a
+    soak never reached `counts.errors` (AUDIT 2026-09-24, gap 2). Here nothing is dropped;
+    the warm-up share is reported beside the total."""
+    by_kind, by_kind_warm = {}, {}
+    n = {k: 0 for k in NOT_ERRORS}
+    n_warm = {k: 0 for k in NOT_ERRORS}
+    for u in utts:
+        k = outcome(u)
+        in_warm = u.get("t_start") is not None and u["t_start"] - t0 < warmup_s - EPS
+        if is_error(k):
+            by_kind[k] = by_kind.get(k, 0) + 1
+            if in_warm:
+                by_kind_warm[k] = by_kind_warm.get(k, 0) + 1
+        else:
+            n[k] += 1
+            if in_warm:
+                n_warm[k] += 1
+    errors = sum(by_kind.values())
+    total = n["ok"] + n["rejected"] + n["cut_at_deadline"] + errors
+    if started is None:
+        holds, reason = None, "no start marks (a caller or harness that predates them)"
+    elif total == started and len(utts) == started:
+        holds, reason = True, None
+    else:
+        holds = False
+        reason = (f"started {started} != ok {n['ok']} + rejected {n['rejected']} + "
+                  f"cut {n['cut_at_deadline']} + errors {errors} = {total}"
+                  + (f" ({len(utts)} records)" if len(utts) != total else ""))
+    deaths = None if streams is None else len(streams.get("dead") or [])
+    return {
+        "started": started, "ok": n["ok"], "rejected": n["rejected"],
+        "cut_at_deadline": n["cut_at_deadline"], "errors": errors,
+        "error_kinds": dict(sorted(by_kind.items())),
+        "errors_warmup": sum(by_kind_warm.values()),
+        "error_kinds_warmup": dict(sorted(by_kind_warm.items())),
+        "rejected_warmup": n_warm["rejected"], "ok_warmup": n_warm["ok"],
+        "stream_deaths": deaths, "conservation": holds, "conservation_detail": reason,
+    }
+
+
 def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=None,
-              reference=None, transcripts=None):
-    """Every run-level number.  `utts` are the dicts `analyze_utterance` returned."""
+              reference=None, transcripts=None, started=None, streams=None):
+    """Every run-level number.  `utts` are the dicts `analyze_utterance` returned.
+
+    `started` is the number of utterances the streams announced (their start marks) and
+    `streams` the report of `reconcile()`; both None for a caller that has neither, in
+    which case the conservation check reports itself as not checked instead of passing."""
     if t0 is None:
         starts = [u["t_start"] for u in utts if u.get("t_start") is not None]
         t0 = min(starts) if starts else 0.0
 
+    acct = accounting(utts, started=started, streams=streams, warmup_s=warmup_s, t0=t0)
     counted = [u for u in utts
                if u.get("t_start") is None or u["t_start"] - t0 >= warmup_s - EPS]
     warm = len(utts) - len(counted)
-    rejected = [u for u in counted if u.get("rejected")]
-    errored = [u for u in counted if u.get("error") and not u.get("rejected")]
-    ok = [u for u in counted if not u.get("error") and not u.get("rejected")]
+    kinds = [outcome(u) for u in counted]
+    rejected = [u for u, k in zip(counted, kinds) if k == "rejected"]
+    errored = [u for u, k in zip(counted, kinds) if is_error(k)]
+    ok = [u for u, k in zip(counted, kinds) if k == OK_OUTCOME]
 
     max_late = max([u["max_late_ms"] for u in counted], default=0.0)
     paced = all(u["paced"] for u in counted) and abs(pace - 1.0) < EPS if counted else False
@@ -974,10 +1215,23 @@ def aggregate(utts, frame_ms=100.0, pace=1.0, window_s=None, warmup_s=0.0, t0=No
                     "worst_over_median": (stream_p95[-1] / med) if med and med > EPS else None}
     # (fairness is not a stat dict: it goes in its own key of the summary)
     return {
+        # `errors` / `rejected` keep their old meaning (the KPI window, after warm-up) so
+        # that every reader of an old run still reads the same number. The loss gate reads
+        # `errors_total`: the whole run, warm-up included.
         "counts": {"utterances": len(counted), "ok": len(ok), "errors": len(errored),
                    "rejected": len(rejected), "warmup_excluded": warm,
+                   "errors_warmup": acct["errors_warmup"],
+                   "errors_total": acct["errors"],
+                   "rejected_warmup": acct["rejected_warmup"],
+                   "rejected_total": acct["rejected"],
+                   "cut_at_deadline": acct["cut_at_deadline"],
+                   "error_kinds": acct["error_kinds"],
+                   "error_kinds_warmup": acct["error_kinds_warmup"],
+                   "started": acct["started"], "stream_deaths": acct["stream_deaths"],
                    "deltas": sum(u["deltas"] for u in ok), "eous": sum(u["eous"] for u in ok),
                    "audio_s": audio_s, "span_s": span},
+        "accounting": acct,
+        "streams": streams,
         "pacing": {"max_late_ms": max_late, "half_frame_ms": frame_ms / 2.0, "pace": pace,
                    "paced": paced,
                    "verdict": "PACED" if paced else "NOT PACED (cadence is DIAGNOSTIC)"},
@@ -1059,6 +1313,9 @@ def envelope_verdict(summary, thr):
         invalid.append(f"reference: {len(summary['reference_fail'])} clip(s) differ from the reference")
     if c["ok"] == 0:
         invalid.append("no utterance completed")
+    acct = summary.get("accounting") or {}
+    if acct.get("conservation") is False:
+        invalid.append(f"accounting: {acct.get('conservation_detail')}")
     if not summary["pacing"]["paced"]:
         invalid.append("client could not pace at 1x: cadence percentiles are refused")
 
@@ -1090,7 +1347,13 @@ def envelope_verdict(summary, thr):
     # admission ladder working, and the whole design says a full machine must
     # refuse. Being refused at the door and being dropped mid-sentence are
     # different outcomes and must not share a verdict.
-    line("utterances lost", c["errors"], 0, "")
+    #
+    # Over the WHOLE run: the warm-up excludes latencies, never losses.
+    line("utterances lost", c.get("errors_total", c["errors"]), 0, "")
+    # A stream process that died stopped producing records silently; its absence is a
+    # loss the utterance count alone cannot show.
+    if c.get("stream_deaths") is not None:
+        line("client streams died", c["stream_deaths"], 0, "")
     line("TTFP p95", m["ttfp_ms"]["p95"], thr["ttfp_p95_ms"], "ms")
     # TTFB has no envelope limit and is printed as a FACT beside TTFP: the two together
     # say whether a wait is transport or model, and inventing a limit for it would be a
@@ -1140,6 +1403,22 @@ def format_summary(summary, env=None, indent="  "):
     out = []
     out.append(f"{indent}utterances {c['ok']}/{c['utterances']} ok, {c['errors']} errors, "
                f"{c['rejected']} rejected, {c['warmup_excluded']} excluded by warm-up")
+    a = summary.get("accounting")
+    if a:
+        kinds = ", ".join(f"{k} {v}" for k, v in a["error_kinds"].items()) or "none"
+        out.append(f"{indent}whole run: {a['started'] if a['started'] is not None else '?'} "
+                   f"started = {a['ok']} ok + {a['rejected']} rejected + "
+                   f"{a['cut_at_deadline']} cut at deadline + {a['errors']} errors "
+                   f"({a['errors_warmup']} in warm-up); errors by kind: {kinds}")
+        cons = {True: "holds", False: "FAILS", None: "not checked"}[a["conservation"]]
+        out.append(f"{indent}conservation {cons}"
+                   + (f": {a['conservation_detail']}" if a.get("conservation_detail") else ""))
+    st = summary.get("streams")
+    if st:
+        out.append(f"{indent}streams: {st['expected'] - len(st['dead'])}/{st['expected']} "
+                   f"alive to the end, {len(st['terminated_at_deadline'])} terminated at "
+                   f"collection close"
+                   + (f"; DIED: {st['dead'][:8]}" if st["dead"] else ""))
     out.append(f"{indent}audio {c['audio_s']:.1f} s, {c['deltas']} deltas, span {c['span_s']:.1f} s")
     out.append(f"{indent}pacing: max lateness {p['max_late_ms']:.1f} ms vs half a frame "
                f"{p['half_frame_ms']:.0f} ms -> {p['verdict']}")
@@ -1221,7 +1500,7 @@ def M_zero(v):
 def _eq(got, want, what, tol=1e-6):
     """Numbers compare within `tol`; anything else compares exactly. The normaliser and
     the text fields are strings, and a tolerance on a string is meaningless."""
-    if isinstance(want, str) or isinstance(got, str):
+    if isinstance(want, (str, list, dict)) or isinstance(got, (str, list, dict)):
         ok = got == want
     else:
         ok = (got is None and want is None) or (
@@ -1651,8 +1930,167 @@ def self_test():
     bad += not _eq(word_settled("Il "), True, "a trailing space settles it")
     bad += not _eq(word_settled("Il,"), True, "so does punctuation")
 
+    bad += _self_test_accounting(sends)
+
     print(f"\nstreaming_metrics self-test: {'FAIL' if bad else 'PASS'} ({int(bad)} failures)")
     return 1 if bad else 0
+
+
+def _old_ok(rec):
+    """The predicate `aggregate()` used for OK until 2026-09-25, kept ONLY so the planted
+    faults below can show that the old code accepted them."""
+    return not rec.get("error") and not rec.get("rejected")
+
+
+def _check(cond, what):
+    print(f"  {'ok  ' if cond else 'FAIL'} {what}")
+    return 0 if cond else 1
+
+
+def _self_test_accounting(sends):
+    """Planted faults for AUDIT 2026-09-24 gaps 1-3 and 5: each case is a record or a run
+    the OLD accounting counted as fine, and the assertion is that it is now an error."""
+    bad = 0
+    thr = default_thresholds(320.0)
+
+    print("planted fault: server closed without `done` (gap 1)")
+    #  the reader broke on a close frame and recorded no error: events, no done_t
+    rec_nd = _mk("a.wav", sends, [_ev(10.25, 0.2, "one")], None)
+    bad += _check(_old_ok(rec_nd), "the OLD predicate counted it OK")
+    u_nd = analyze_utterance(rec_nd, frame_ms=100.0)
+    bad += not _eq(u_nd["error_kind"], "no_done", "now classified no_done")
+    #  no event at all
+    rec_ne = _mk("a.wav", sends, [], None)
+    bad += _check(_old_ok(rec_ne), "a record with no event at all: the OLD predicate said OK")
+    bad += not _eq(analyze_utterance(rec_ne, frame_ms=100.0)["error_kind"], "no_events",
+                   "now classified no_events")
+    #  the client now names it where it happens
+    rec_sd = _mk("a.wav", sends, [_ev(10.25, 0.2, "one")], None,
+                 error_kind="server_disconnect")
+    bad += not _eq(analyze_utterance(rec_sd, frame_ms=100.0)["error_kind"],
+                   "server_disconnect", "a client-named kind is kept")
+    #  in a run: one good utterance and one closed without done
+    good = _mk("a.wav", sends, [_ev(10.25, 0.2, "one")], 10.6)
+    ag = aggregate([analyze_utterance(good, frame_ms=100.0), u_nd], frame_ms=100.0)
+    bad += not _eq(ag["counts"]["ok"], 1, "the run counts one OK, not two")
+    bad += not _eq(ag["counts"]["errors_total"], 1, "and one error")
+    bad += not _eq(ag["counts"]["error_kinds"].get("no_done"), 1, "of kind no_done")
+    ev = envelope_verdict(ag, thr)
+    lost = [l for l in ev["lines"] if l["line"] == "utterances lost"][0]
+    bad += not _eq(lost["status"], "FAIL", "and the loss line FAILs")
+
+    print("legacy error strings keep a kind, and an unknown one is still an error")
+    for msg, want in (("connect: [Errno 61] Connection refused", "connect_error"),
+                      ("refused: HTTP/1.1 500 Internal Server Error", "http_error"),
+                      ("reader: timed out", "timeout"),
+                      ("timeout waiting for done", "timeout"),
+                      ("reader: connection closed", "server_disconnect"),
+                      ("send: [Errno 32] Broken pipe", "server_disconnect"),
+                      ("server error: 500 boom", "server_error"),
+                      ("reader: Expecting value: line 1 column 1", "protocol_error"),
+                      ("something new", "unclassified")):
+        bad += not _eq(outcome({"error": msg, "done_t": None}), want, f"'{msg}'")
+    bad += not _eq(outcome({"error": "refused: HTTP/1.1 503", "rejected": True}), "rejected",
+                   "a 503 stays a rejection")
+
+    print("planted fault: an error inside the warm-up (gap 2)")
+    def at(t0, done=True, **kw):
+        snd = [[t0 + 0.1 * i, 0.1 * (i + 1)] for i in range(5)]
+        return analyze_utterance(_mk("w.wav", snd, [_ev(t0 + 0.25, 0.2, "x")],
+                                     t0 + 0.6 if done else None, t_start=t0, **kw),
+                                 frame_ms=100.0)
+    run_w = [at(0.0, done=False, error="reader: timed out", error_kind="timeout"),
+             at(20.0), at(40.0)]
+    agw = aggregate(run_w, frame_ms=100.0, warmup_s=10.0, t0=0.0)
+    bad += not _eq(agw["counts"]["errors"], 0,
+                   "the KPI-window count is 0 -- all the OLD gate ever read")
+    bad += not _eq(agw["counts"]["errors_warmup"], 1, "the warm-up error is counted")
+    bad += not _eq(agw["counts"]["errors_total"], 1, "and is in the total")
+    bad += not _eq(agw["counts"]["warmup_excluded"], 1, "latencies still skip the warm-up")
+    bad += not _eq(agw["metrics"]["ttfp_ms"]["n"], 2, "TTFP has the two steady utterances")
+    evw = envelope_verdict(agw, thr)
+    bad += not _eq([l["status"] for l in evw["lines"] if l["line"] == "utterances lost"][0],
+                   "FAIL", "the loss line reads the total and FAILs")
+    bad += not _eq(evw["verdict"], "NOT STREAMABLE", "the run is not streamable")
+    rej_w = aggregate([at(0.0, done=False, error="refused: 503", rejected=True), at(20.0),
+                       at(40.0)], frame_ms=100.0, warmup_s=10.0, t0=0.0)
+    bad += not _eq(rej_w["counts"]["rejected_warmup"], 1, "a warm-up 503 is counted too")
+    bad += not _eq(rej_w["counts"]["errors_total"], 0, "and is not a loss")
+
+    print("planted fault: a stream process that died (gap 3), reconciled against its marks")
+    #  soak: t0 = 0, deadline 100 s, three streams, tolerance one utterance (15 s)
+    recs = []
+    for sid in range(3):
+        for k in range(4):
+            recs.append({"stream": sid, "rep": k, "t_start": 30.0 * k, "done_t": 30.0 * k + 20,
+                         "t_end": 30.0 * k + 20, "error": None, "rejected": False})
+    #  stream 2 dies during its utterance 2 (started t=60): no record 2, 3, no end mark
+    recs = [r for r in recs if not (r["stream"] == 2 and r["rep"] >= 2)]
+    starts = [{"stream": r["stream"], "rep": r["rep"], "t": r["t_start"], "clip": "c.wav"}
+              for r in recs] + [{"stream": 2, "rep": 2, "t": 60.0, "clip": "c.wav"}]
+    status = {0: {"end_t": 110.0, "exitcode": 0, "terminated": False},
+              1: {"end_t": 110.0, "exitcode": 0, "terminated": False},
+              2: {"end_t": None, "exitcode": -9, "terminated": False}}
+    #  the OLD harness saw 10 records, all OK, and nothing asked about stream 2
+    bad += _check(all(_old_ok(r) for r in recs), "the OLD accounting saw only OK records")
+    synth, rep = reconcile(recs, starts, status, n_streams=3, deadline=100.0, tol_s=15.0)
+    bad += not _eq(len(synth), 1, "one start produced no record")
+    bad += not _eq(synth[0]["error_kind"], "client_process_death", "it is client_process_death")
+    bad += not _eq(rep["dead"], [2], "stream 2 is reported dead")
+    allu = [analyze_utterance(dict(r, sends=[[r["t_start"], 1.0]]), frame_ms=100.0)
+            for r in recs] + [analyze_utterance(s, frame_ms=100.0) for s in synth]
+    ag3 = aggregate(allu, frame_ms=100.0, t0=0.0, started=len(starts), streams=rep)
+    bad += not _eq(ag3["counts"]["stream_deaths"], 1, "the summary counts one dead stream")
+    bad += not _eq(ag3["counts"]["error_kinds"].get("client_process_death"), 1,
+                   "and its in-flight utterance as an error")
+    bad += _check(ag3["accounting"]["conservation"] is True,
+                  "conservation holds: the death is accounted, not lost")
+    ev3 = envelope_verdict(ag3, thr)
+    bad += not _eq([l["status"] for l in ev3["lines"] if l["line"] == "client streams died"][0],
+                   "FAIL", "the stream-death line FAILs")
+    #  a stream that ended cleanly but early: its last sign of life is before the deadline
+    status_e = dict(status)
+    status_e[2] = {"end_t": 50.0, "exitcode": 0, "terminated": False}
+    starts_e = [s for s in starts if not (s["stream"] == 2 and s["rep"] == 2)]
+    _, rep_e = reconcile(recs, starts_e, status_e, n_streams=3, deadline=100.0, tol_s=15.0)
+    bad += not _eq(rep_e["exited_early"], [2], "a stream that left its loop early is caught")
+    #  no status at all (records only): the last-activity rule still finds it
+    _, rep_r = reconcile(recs, starts_e, None, n_streams=3, deadline=100.0, tol_s=15.0)
+    bad += not _eq(rep_r["dead"], [2], "records alone: last activity 50 s < deadline - 15 s")
+    #  a stream that never produced anything at all
+    _, rep_n = reconcile(recs, starts_e, None, n_streams=4, deadline=100.0, tol_s=15.0)
+    bad += not _eq(rep_n["dead"], [2, 3], "a stream with no record at all is dead")
+    #  WAVE: a stream that started fewer than --repeat utterances
+    _, rep_w = reconcile(recs, starts_e, status_e, n_streams=3, repeat=4)
+    bad += not _eq(rep_w["dead"], [2], "WAVE: 2 of 4 started is a dead stream")
+
+    print("in flight at the deadline is cut_at_deadline: counted, not an error, not dropped")
+    status_c = dict(status)
+    status_c[2] = {"end_t": None, "exitcode": -15, "terminated": True}
+    synth_c, rep_c = reconcile(recs, starts, status_c, n_streams=3, deadline=100.0, tol_s=15.0)
+    bad += not _eq(synth_c[0]["error_kind"], "cut_at_deadline", "terminated after collection")
+    bad += not _eq(rep_c["dead"], [], "and the stream lived to the deadline")
+    allc = [analyze_utterance(dict(r, sends=[[r["t_start"], 1.0]]), frame_ms=100.0)
+            for r in recs] + [analyze_utterance(s, frame_ms=100.0) for s in synth_c]
+    agc = aggregate(allc, frame_ms=100.0, t0=0.0, started=len(starts), streams=rep_c)
+    bad += not _eq(agc["counts"]["cut_at_deadline"], 1, "one cut")
+    bad += not _eq(agc["counts"]["errors_total"], 0, "no error")
+    bad += _check(agc["accounting"]["conservation"] is True, "conservation holds")
+    bad += _check("c.wav" not in group_texts(allc), "a cut utterance never enters text identity")
+
+    print("planted fault: the conservation invariant itself (gap 5)")
+    #  one start more than the records: something vanished
+    agv = aggregate(allu, frame_ms=100.0, t0=0.0, started=len(starts) + 1, streams=rep)
+    bad += _check(agv["accounting"]["conservation"] is False, "started > accounted FAILS")
+    evv = envelope_verdict(agv, thr)
+    bad += not _eq(evv["verdict"], "INVALID", "and the run is INVALID")
+    #  a duplicated record (the same stream/rep twice) is not conservation either
+    agd = aggregate(allu + allu[:1], frame_ms=100.0, t0=0.0, started=len(starts), streams=rep)
+    bad += _check(agd["accounting"]["conservation"] is False, "a duplicated record FAILS it")
+    #  a caller with no start marks is told so, never told it passed
+    agn = aggregate(allu, frame_ms=100.0, t0=0.0)
+    bad += _check(agn["accounting"]["conservation"] is None, "no start marks -> not checked")
+    return bad
 
 
 def main():

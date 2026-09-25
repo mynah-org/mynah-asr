@@ -31,6 +31,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 import platform
@@ -233,7 +234,53 @@ def stratified_schedule(bank, classes, seed, n):
         order.append(clip)
     return order
 
+
+def schedule_stride(streams: int, period: int) -> int:
+    """The step between two utterances of ONE stream in the shared schedule.
+
+    Stream i plays positions i, i+s, i+2s, ... (mod the schedule length), and the
+    stratified schedule owns class `p mod period` at position p. Until 2026-09-25 the step
+    was s = streams, so when `streams` shared a factor with `period` every stream stayed
+    in a subset of the classes for the whole run -- with three classes and C a multiple
+    of 3 (96, 120, 144) each stream played ONE length class (AUDIT 2026-09-24, gap 4:
+    at C=144 stream 62 played 81 long utterances, stream 99 261 short ones).
+
+    Now s is the smallest step >= streams that is coprime with the period, so every
+    stream walks all the classes in turn (i + k*s mod period takes every value) while the
+    fleet still covers consecutive positions. Where `streams` was already coprime nothing
+    changes: s == streams and the run replays exactly the audio it played before, so the
+    C=128 and C=16 soaks stay reproducible; a C that is a multiple of 3 now gets
+    s = C+1. Deterministic in (streams, period): the manifest records it."""
+    s = max(1, int(streams))
+    p = max(1, int(period))
+    while math.gcd(s, p) != 1:
+        s += 1
+    return s
+
+
+def schedule_clip(schedule, idx: int, k: int, stride: int):
+    """The clip stream `idx` plays as its k-th utterance."""
+    return schedule[(idx + k * stride) % len(schedule)]
+
 # ---------------------------------------------------------------- one stream (one process)
+
+
+def _fail(rec: dict, kind: str, msg: str) -> None:
+    """Record the FIRST failure of an utterance and its kind (streaming_metrics.ERROR_KINDS).
+
+    The first one wins: a send that fails because the server already closed is the
+    consequence, and the close the reader saw is the cause."""
+    if not rec["error"]:
+        rec["error"] = msg
+        rec["error_kind"] = kind
+
+
+def _kind_of_oserror(e: BaseException) -> str:
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(e, (ConnectionError, BrokenPipeError)):
+        return "server_disconnect"      # EOF, reset, aborted, broken pipe
+    return "client_exception"
 
 
 def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
@@ -241,11 +288,15 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
 
     Nothing is aggregated here: the record is raw marks.  `mono()` is CLOCK_MONOTONIC, which is
     system-wide, so marks taken in different stream processes share one timeline and can be
-    windowed together by the parent -- and share it with the server's own stamps."""
+    windowed together by the parent -- and share it with the server's own stamps.
+
+    Every way this can end without a `done` frame sets `error` AND `error_kind`. Until
+    2026-09-25 a close frame before `done` made the reader stop without recording
+    anything, and the utterance counted as OK (AUDIT 2026-09-24, gap 1)."""
     frame_bytes = int(16000 * a.frame_ms / 1000) * 2
     n_frames = max(1, (len(pcm) + frame_bytes - 1) // frame_bytes)
     rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
-           "events": [], "done_t": None, "t_start": mono(), "error": None,
+           "events": [], "done_t": None, "t_start": mono(), "error": None, "error_kind": None,
            "rejected": False, "status": None, "lang": None, "retry_after": None}
     # `model=` names a WORKER GROUP in a multi-model fleet (S2-6). Sent only when
     # asked for, so a single-model server sees exactly the query it always saw.
@@ -255,14 +306,14 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
     try:
         sock, status, headers = ws_connect(a.host, a.port, path, timeout=a.connect_timeout)
     except OSError as e:
-        rec["error"] = f"connect: {e}"
+        _fail(rec, "connect_error", f"connect: {e}")
         return rec
     rec["status"] = status
     if sock is None:
         # a refusal before the upgrade is the admission ladder working, not a failure
         rec["rejected"] = " 503 " in status
         rec["retry_after"] = headers.get("retry-after")
-        rec["error"] = f"refused: {status}"
+        _fail(rec, "rejected" if rec["rejected"] else "http_error", f"refused: {status}")
         return rec
 
     stop = threading.Event()
@@ -273,10 +324,18 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
                 op, payload = ws_recv(sock)
                 now = mono()
                 if op == 0x8:
+                    # the server closed before `done`: a lost utterance, never an OK one
+                    code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else None
+                    _fail(rec, "server_disconnect",
+                          f"server close frame without done (code {code})")
                     break
                 if op != 0x1:
                     continue
-                msg = json.loads(payload)
+                try:
+                    msg = json.loads(payload)
+                except ValueError as e:
+                    _fail(rec, "protocol_error", f"reader: unparsable text frame: {e}")
+                    break
                 # v2 carries `type`/`seq`/`audio_s`/`lag_ms`; v1 carries `text`/`audio_seconds`
                 # and `{"done":true}`.  Both are normalised to the metrics module's event.
                 kind = msg.get("type")
@@ -292,11 +351,15 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
                     rec["lang"] = msg.get("lang") or msg.get("language")
                     break
                 if kind == "error":
-                    rec["error"] = rec["error"] or f"server error: {msg.get('code')} {msg.get('message')}"
+                    _fail(rec, "server_error",
+                          f"server error: {msg.get('code')} {msg.get('message')}")
                     break
+        except OSError as e:                         # timeout, EOF, reset
+            if not stop.is_set():
+                _fail(rec, _kind_of_oserror(e), f"reader: {e}")
         except Exception as e:                       # noqa: BLE001 — recorded, not raised
             if not stop.is_set():
-                rec["error"] = rec["error"] or f"reader: {e}"
+                _fail(rec, "client_exception", f"reader: {type(e).__name__}: {e}")
 
     sock.settimeout(a.done_timeout)
     th = threading.Thread(target=reader, daemon=True)
@@ -316,35 +379,62 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str) -> dict:
         ws_send(sock, 0x8, b"")                    # close = finalize, then `done`
         th.join(a.done_timeout)
         if th.is_alive():
-            rec["error"] = rec["error"] or "timeout waiting for done"
+            _fail(rec, "timeout", "timeout waiting for done")
     except OSError as e:
-        rec["error"] = f"send: {e}"
+        th.join(0.5)                               # let the reader name the cause first
+        _fail(rec, _kind_of_oserror(e), f"send: {e}")
     finally:
         stop.set()
         try:
             sock.close()
         except OSError:
             pass
+    if rec["done_t"] is None:
+        # the net under every path above: no `done` is never OK
+        if rec["events"]:
+            _fail(rec, "no_done", "the utterance ended without a done frame")
+        else:
+            _fail(rec, "no_events", "the utterance ended without any server frame")
     return rec
 
 
-def stream_main(a, idx: int, schedule, classes_of, q) -> None:
+def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
     """One stream process: WAVE plays `--repeat` utterances, SOAK loops until the deadline.
 
     The schedule is the parent's; this process only walks its own stride of it, so the audio
-    a given stream played is reproducible from (seed, bank, streams, index)."""
+    a given stream played is reproducible from (seed, bank, streams, index).
+
+    Accounting (AUDIT 2026-09-24, gaps 3 and 5): before each utterance the process puts a
+    START mark on the queue, and when it leaves its loop an END mark. The parent reconciles
+    the marks with the records (`streaming_metrics.reconcile`): a start with no record, or a
+    stream with no end mark, cannot disappear from the counts any more -- in SOAK nothing
+    used to check that a stream process lived to the deadline. A Python exception inside
+    one utterance becomes a `client_exception` record and the stream goes on: a bug in the
+    harness must be counted, not turned into a silently dead stream."""
+    stride = a.streams if stride is None else stride
     pcms = {}
     deadline = a._t0 + a.duration if a.mode == "soak" else None
     k = 0
+    reason = "repeat"
     while True:
         if a.mode == "wave" and k >= a.repeat:
             break
         if deadline is not None and mono() >= deadline:
+            reason = "deadline"
             break
-        clip = schedule[(idx + k * a.streams) % len(schedule)]
-        if clip not in pcms:
-            pcms[clip] = load_pcm(clip)
-        rec = run_utterance(a, clip, pcms[clip], classes_of.get(clip, "n/a"))
+        clip = schedule_clip(schedule, idx, k, stride)
+        cls = classes_of.get(clip, "n/a")
+        q.put({"_mark": "start", "stream": idx, "rep": k, "t": mono(), "clip": clip,
+               "class": cls})
+        try:
+            if clip not in pcms:
+                pcms[clip] = load_pcm(clip)
+            rec = run_utterance(a, clip, pcms[clip], cls)
+        except Exception as e:                       # noqa: BLE001 — counted, not raised
+            rec = {"clip": clip, "class": cls, "audio_s": 0.0, "sends": [], "late_ms": [],
+                   "events": [], "done_t": None, "t_start": mono(), "rejected": False,
+                   "error": f"client: {type(e).__name__}: {e}",
+                   "error_kind": "client_exception"}
         rec["stream"] = idx
         rec["rep"] = k
         q.put(rec)
@@ -356,6 +446,7 @@ def stream_main(a, idx: int, schedule, classes_of, q) -> None:
             except (TypeError, ValueError):
                 back = 0.25
             time.sleep(min(max(back, 0.05), 5.0))
+    q.put({"_mark": "end", "stream": idx, "t": mono(), "started": k, "reason": reason})
 
 # ------------------------------------------------------------------------------- manifest
 
@@ -378,6 +469,174 @@ def health(host, port, timeout=2.0):
             return json.loads(r.read().decode())
     except Exception as e:                          # noqa: BLE001
         return {"unreachable": str(e)}
+
+# ------------------------------------------------------------------------------ self-test
+#
+# `python3 tools/bench/stream_load.py --self-test` (part of `make check`): no model, no
+# server binary. The schedule is checked for the stride lock, and the client is run
+# against a fake WebSocket server on localhost that fails in each way the taxonomy names;
+# every failure has to come back as an error of the right kind, never as OK.
+
+
+def _fake_ws_server():
+    """(port, closer). The scenario is the `lang=` of the query string."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port = srv.getsockname()[1]
+
+    def frame(op: int, payload: bytes) -> bytes:
+        return bytes([0x80 | op, len(payload)]) + payload     # payloads here are < 126
+
+    def read_frame(c):
+        def rd(n):
+            buf = b""
+            while len(buf) < n:
+                part = c.recv(n - len(buf))
+                if not part:
+                    raise ConnectionError("eof")
+                buf += part
+            return buf
+        h = rd(2)
+        n = h[1] & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", rd(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", rd(8))[0]
+        rd(4 + n)                                  # mask + payload, not needed
+        return h[0] & 0x0F
+
+    def serve(c):
+        try:
+            req = b""
+            while b"\r\n\r\n" not in req:
+                part = c.recv(4096)
+                if not part:
+                    return
+                req += part
+            line = req.split(b"\r\n", 1)[0].decode()
+            if "lang=" not in line:                # e.g. the /v1/health probe
+                c.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                return
+            scen = line.split("lang=", 1)[1].split("&", 1)[0].split(" ", 1)[0]
+            if scen in ("503", "500"):
+                c.sendall((f"HTTP/1.1 {scen} X\r\nRetry-After: 0\r\n"
+                           f"Content-Length: 0\r\n\r\n").encode())
+                return
+            c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                      b"Connection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+            if scen == "close_early":              # close frame after the first audio frame
+                read_frame(c)
+                c.sendall(frame(0x1, b'{"type":"delta","text":"hi","audio_s":0.1}'))
+                c.sendall(frame(0x8, struct.pack(">H", 1011)))
+                time.sleep(0.2)
+                return
+            while read_frame(c) != 0x8:            # the whole utterance, up to the close
+                pass
+            if scen == "done":
+                c.sendall(frame(0x1, b'{"type":"delta","text":"hi","audio_s":0.1}'))
+                c.sendall(frame(0x1, b'{"type":"done","text":"hi"}'))
+            elif scen == "close":                  # a close frame where `done` belongs
+                c.sendall(frame(0x1, b'{"type":"delta","text":"hi","audio_s":0.1}'))
+                c.sendall(frame(0x8, struct.pack(">H", 1000)))
+            elif scen == "close_silent":           # a close frame and nothing else
+                c.sendall(frame(0x8, struct.pack(">H", 1000)))
+            elif scen == "eof":                    # TCP closed, no close frame
+                pass
+            elif scen == "error":
+                c.sendall(frame(0x1, b'{"type":"error","code":500,"message":"boom"}'))
+            elif scen == "garbage":
+                c.sendall(frame(0x1, b"this is not json"))
+            elif scen == "hang":                   # never answers
+                time.sleep(1.5)
+            time.sleep(0.1)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    def accept():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return port, srv.close
+
+
+def self_test() -> int:
+    bad = 0
+
+    def check(cond, what):
+        nonlocal bad
+        print(f"  {'ok  ' if cond else 'FAIL'} {what}")
+        bad += 0 if cond else 1
+
+    print("schedule: the stride cannot lock a stream to one length class (gap 4)")
+    classes = ["short", "medium", "long"]
+    bank = {k: [(f"{k}{j}.wav", 1.0) for j in range(7)] for k in classes}
+    cls_of = {c: k for k, v in bank.items() for c, _ in v}
+    for C in (3, 6, 16, 24, 64, 96, 120, 128, 144):
+        sched = stratified_schedule(bank, classes, 42, max(21 * 4, C * 8))
+        s = schedule_stride(C, len(classes))
+        per = [[cls_of[schedule_clip(sched, i, k, s)] for k in range(30)] for i in range(C)]
+        worst = min(min(p.count(k) for k in classes) for p in per)
+        old = [[cls_of[schedule_clip(sched, i, k, C)] for k in range(30)] for i in range(C)]
+        locked_old = sum(1 for p in old if len(set(p)) == 1)
+        check(worst >= 8, f"C={C:<3} stride {s:<3}: every stream plays every class, "
+                          f"rarest class {worst}/30 (old stride locked {locked_old}/{C})")
+        if C % 3 == 0:
+            check(locked_old == C, f"C={C:<3} planted: the OLD stride locks all {C} streams")
+        else:
+            check(s == C, f"C={C:<3} coprime with 3: stride unchanged, the run replays as before")
+        # the fleet still holds one third per class at every round
+        mix = [cls_of[schedule_clip(sched, i, 5, s)] for i in range(C)]
+        check(max(mix.count(k) for k in classes) - min(mix.count(k) for k in classes) <= 1,
+              f"C={C:<3} the fleet mix at a round stays balanced")
+    check(schedule_stride(144, 3) == 145 and schedule_stride(128, 3) == 128
+          and schedule_stride(7, 1) == 7, "stride values: 144 -> 145, 128 -> 128, WAVE unchanged")
+
+    print("client: every way an utterance ends without `done` is an error of a named kind")
+    port, close = _fake_ws_server()
+
+    class A:
+        host, lookahead, model = "127.0.0.1", "3", None
+        connect_timeout, done_timeout, frame_ms, pace = 2.0, 0.7, 100, 50.0
+    A.port = port
+    pcm = b"\x00\x00" * 4800                        # 0.3 s: three frames
+    for scen, want in (("done", None), ("close", "server_disconnect"),
+                       ("close_silent", "server_disconnect"),
+                       ("close_early", "server_disconnect"), ("eof", "server_disconnect"),
+                       ("error", "server_error"), ("garbage", "protocol_error"),
+                       ("hang", "timeout"), ("503", "rejected"), ("500", "http_error")):
+        A.lang = scen
+        rec = run_utterance(A, "x.wav", pcm, "short")
+        u = M.analyze_utterance(rec, frame_ms=100, pace=1.0)
+        got = M.outcome(u)
+        check(got == (want or "ok") and (want is None) == (rec["error"] is None),
+              f"{scen:<13} -> {got:<17} error={rec['error']!r}")
+        if scen in ("close", "close_silent", "close_early"):
+            # the planted fault of AUDIT gap 1: before 2026-09-25 the reader broke on the
+            # close frame without recording anything, and `aggregate` counted these OK
+            # (verified by running the old client against this server; EOF, by contrast,
+            # already raised and was already an error)
+            check(rec["done_t"] is None and bool(rec["error"]),
+                  f"{scen:<13} has no done and now carries an error (it used to count OK)")
+    close()
+    A.port = port                                  # nobody listens there any more
+    A.lang = "done"
+    rec = run_utterance(A, "x.wav", pcm, "short")
+    check(M.outcome(rec) == "connect_error", f"closed port  -> {M.outcome(rec)}")
+
+    print(f"\nstream_load self-test: {'FAIL' if bad else 'PASS'} ({bad} failures)")
+    return 1 if bad else 0
 
 # ----------------------------------------------------------------------------------- main
 
@@ -438,6 +697,8 @@ def build_args():
 
 
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
     a = build_args().parse_args()
     if a.streams < 1 or a.frame_ms < 1 or a.pace <= 0:
         raise SystemExit("--streams and --frame-ms must be >= 1 and --pace > 0")
@@ -455,12 +716,14 @@ def main() -> int:
         bank = build_bank(clips, classes, (b0, b1))
         n_sched = max(len(clips) * 4, a.streams * 8)
         schedule = stratified_schedule(bank, classes, a.seed, n_sched)
+        stride = schedule_stride(a.streams, len(classes))
     else:
         # WAVE keeps the v0 behaviour exactly: the clip list, cycled over streams and repeats
         bank = {classify(wav_audio_s(c), (b0, b1)): [] for c in clips}
         for c in clips:
             bank[classify(wav_audio_s(c), (b0, b1))].append((c, wav_audio_s(c)))
         schedule = clips
+        stride = a.streams
     classes_of = {c: classify(d, (b0, b1)) for v in bank.values() for c, d in v}
 
     chunk_ms = a.chunk_ms if a.chunk_ms else M.chunk_period_ms(int(a.lookahead))
@@ -478,12 +741,23 @@ def main() -> int:
     health_before = health(a.host, a.port)
     a._t0 = mono()
     q: mp.Queue = mp.Queue()
-    procs = [mp.Process(target=stream_main, args=(a, i, schedule, classes_of, q), daemon=True)
+    procs = [mp.Process(target=stream_main, args=(a, i, schedule, classes_of, q, stride),
+                        daemon=True)
              for i in range(a.streams)]
     for p in procs:
         p.start()
 
-    records = []
+    records, starts, ends = [], [], {}
+
+    def take(msg) -> None:
+        mark = msg.get("_mark") if isinstance(msg, dict) else None
+        if mark == "start":
+            starts.append(msg)
+        elif mark == "end":
+            ends[msg["stream"]] = msg
+        else:
+            records.append(msg)
+
     expected = a.streams * a.repeat if a.mode == "wave" else None
     # a blocking get with a timeout: the parent sleeps in the kernel, it never spins
     hard_deadline = a._t0 + (a.duration if a.mode == "soak" else a.repeat * a.done_timeout) \
@@ -492,22 +766,43 @@ def main() -> int:
         if expected is not None and len(records) >= expected:
             break
         try:
-            records.append(q.get(timeout=1.0))
+            take(q.get(timeout=1.0))
         except Exception:                           # noqa: BLE001 — queue.Empty
             if not any(p.is_alive() for p in procs):
                 break
     for p in procs:
         p.join(10)
-    for p in procs:
+    terminated = set()
+    for i, p in enumerate(procs):
         if p.is_alive():
+            # still running when collection closed: its utterance in flight is
+            # `cut_at_deadline` in SOAK, never silently dropped
+            terminated.add(i)
             p.terminate()
             p.join(5)
     while True:                                     # drain what landed during the join
         try:
-            records.append(q.get_nowait())
+            take(q.get_nowait())
         except Exception:                           # noqa: BLE001
             break
     wall = mono() - a._t0
+
+    # Reconcile the marks with the records: every started utterance ends in exactly one
+    # outcome, and every stream is accounted for (streaming_metrics.reconcile).
+    status = {i: {"end_t": (ends.get(i) or {}).get("t"),
+                  "started": (ends.get(i) or {}).get("started"),
+                  "exitcode": p.exitcode, "terminated": i in terminated}
+              for i, p in enumerate(procs)}
+    longest = max((d for v in bank.values() for _, d in v), default=0.0)
+    # "one utterance" of tolerance: the longest clip at this pace, plus the longest
+    # Retry-After sleep a rejected stream takes before it looks at the clock again
+    tol_s = longest / a.pace + 5.0
+    n_reported = len(records)
+    synth, streams_report = M.reconcile(
+        records, starts, status, n_streams=a.streams,
+        deadline=(a._t0 + a.duration) if a.mode == "soak" else None,
+        tol_s=tol_s, repeat=a.repeat if a.mode == "wave" else None)
+    records.extend(synth)
     health_after = health(a.host, a.port)
 
     # The onset map is READ FIRST: analyze_utterance takes it, and until R-2 ran
@@ -544,13 +839,13 @@ def main() -> int:
     transcripts = load_transcripts(a.transcripts) if a.transcripts else None
     summary = M.aggregate(utts, frame_ms=a.frame_ms, pace=a.pace, window_s=window,
                           warmup_s=warmup, t0=a._t0, reference=reference,
-                          transcripts=transcripts)
-    if expected is not None and len(records) < expected:
-        summary["identity_fail"] = dict(summary["identity_fail"])
-        summary["counts"]["missing"] = expected - len(records)
+                          transcripts=transcripts, started=len(starts),
+                          streams=streams_report)
+    if expected is not None and n_reported < expected:
+        summary["counts"]["missing"] = expected - n_reported
     env = M.envelope_verdict(summary, thr)
-    if expected is not None and len(records) < expected:
-        env["invalid_reasons"].append(f"{expected - len(records)} utterance(s) never reported")
+    if expected is not None and n_reported < expected:
+        env["invalid_reasons"].append(f"{expected - n_reported} utterance(s) never reported")
         env["verdict"] = "INVALID"
 
     manifest = {
@@ -565,6 +860,9 @@ def main() -> int:
                  for k, v in bank.items() if v},
         "bank_classes": classes if a.mode == "soak" else None,
         "class_bounds_s": [b0, b1], "seed": a.seed if a.mode == "soak" else None,
+        # stream i plays schedule positions i + k*stride (schedule_stride); recorded so
+        # a run says which of the two schedules it played
+        "schedule_stride": stride, "schedule_len": len(schedule),
         "frame_ms": a.frame_ms, "pace": a.pace, "lang": a.lang, "lookahead": a.lookahead,
         "chunk_period_ms": chunk_ms, "thresholds": thr,
         "health_before": health_before, "health_after": health_after,
@@ -590,9 +888,10 @@ def main() -> int:
             p50 = "n/a" if w["p50"] is None else f"{w['p50']:.0f}"
             p95 = "n/a" if w["p95"] is None else f"{w['p95']:.0f}"
             print(f"    [{w['t0_s']:6.0f}-{w['t1_s']:6.0f} s] n={w['n']:<5} {p50} / {p95}")
-    bad = [r for r in records if r.get("error") and not r.get("rejected")]
-    for r in bad[:5]:
-        print(f"  error stream {r.get('stream')} rep {r.get('rep')}: {r['error']}")
+    bad = [u for u in utts if M.is_error(M.outcome(u))]
+    for u in bad[:5]:
+        print(f"  error stream {u.get('stream')} rep {u.get('rep')} "
+              f"[{u.get('error_kind')}]: {u['error']}")
     if summary["counts"]["rejected"]:
         print(f"  rejections (503 before the upgrade, counted, not errors): "
               f"{summary['counts']['rejected']}")
