@@ -1162,3 +1162,53 @@ first-word p95 is at least 200 ms below L=3 AND its WER mean is at most
 Otherwise it is rejected as a first-word lever. Nothing is promoted from this
 run: a candidate goes to a serving qualification of its own (its cadence
 changes the capacity law).
+
+## S13-10 decomposition of the first-complete-word latency (2026-09-25)
+
+**Method.** L=3 deltas of the 349 originals (the gated run above). Word times from
+an independent offline model (parakeet-tdt_ctc-110m, TDT head, full context,
+80 ms resolution). Per clip, in audio time from the energy onset
+(`tools/bench/clip_onset.py`): `pre` = onset -> start of word 1; `word` = its
+duration; `model` = end of word 1 -> audio consumed when the stream first holds
+the whole word; `closing` = that -> the separator that closes it (the S13-5c
+definition). 318 clips analysed; 31 excluded because the stream and the aligner
+disagree on the first word.
+
+| component | p50 | p95 | p99 | fast half mean | p50-p90 mean | p95-p100 mean (share) |
+|---|---|---|---|---|---|---|
+| total | 1110 | 2060 | 2690 | 864 | 1358 | 2576 |
+| pre (onset -> word start) | 40 | 900 | 1480 | -5 | 218 | 1088 (42 %) |
+| word (duration) | 80 | 640 | 720 | 153 | 280 | 350 (14 %) |
+| model (word end -> emitted) | 620 | 940 | 1060 | 580 | 616 | 650 (25 %) |
+| closing (-> separator) | 300 | 600 | 700 | 136 | 245 | 487 (19 %) |
+
+**RESULT (robust to a constant aligner bias).** The model's own component is
+FLAT across the distribution: 580 ms in the fast half, 616 in p50-p90, 650 in
+the p95-p100 tail. The tail is not made by the model. In the body the model
+term dominates (67 % of the fast half); in the tail the term before the first
+word dominates (largest component on 11 of the 16 p95-p100 clips).
+
+**RESULT (what `pre` is).** On the 27 tail clips with `pre` > 250 ms, the span
+[energy onset, word start] transcribed ALONE is empty on 22 and holds a
+discourse word on 5 ("and", "So", "Oh", "Correct."): the energy onset fires
+0.7-3.4 s before lexical speech on breath, noise or room tone above the floor
+-- the limit `clip_onset.py` states in its own docstring.
+
+**Caveats, stated.** (1) The cross-check aligners were not independent: the
+CTC head gives no timestamps, and Nemotron offline reports EMISSION times
+(0.2-1.4 s later than TDT on every tail clip), so absolute word starts rest on
+one aligner. (2) The 31 excluded clips are enriched in the tail: 7 of them are
+at or above the all-349 p95 (2330 ms), so the decomposed tail misses about a
+third of the true tail -- the hard, misrecognised first words.
+
+**HYPOTHESIS (to test, not a claim).** The ~2.3 s first-word p95 measured
+from the ENERGY onset is inflated mostly by audio before the first lexical
+word, i.e. by the onset definition, not by the model; the model-side latency
+is ~0.6 s median, ~0.95 s p95 and flat. Tests: (a) re-measure the KPI from a
+lexical onset (aligned word start or a VAD span) and see whether the p95
+collapses toward ~1.5 s; (b) classify the 31 excluded clips (misrecognised
+first word = a quality tail, a different problem from latency).
+
+**DECISION.** No optimisation from this. The model-side target, if any, is the
+flat ~600 ms word-end -> emission term (checkpoint, not serving, not
+lookahead). Evidence: `.work/evidence/la-20260925/` (untracked).
