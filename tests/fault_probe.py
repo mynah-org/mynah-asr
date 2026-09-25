@@ -22,6 +22,8 @@ Cases (run by `suite`, in this order; each can also be run alone):
   close-then-rst   close frame (finalize) then an immediate RST
   close-then-rst-silent  the same with silence: only a hard-hangup check made
                    WHILE the tail is flushed can stop it
+  rst-unacked      RST with data still unsent: the server's kernel refuses it and
+                   the connection is half-open (a vanished network); bound = --idle-ms
   half-close-ok    finalize, then shutdown(SHUT_WR): LEGAL, must still get `done`
   idle-open        a few frames, then silence with the socket open
   stall-mid-frame  a frame header and part of its payload, then silence
@@ -33,6 +35,8 @@ Cases (run by `suite`, in this order; each can also be run alone):
   neighbours       a healthy stream running while three others are killed
                    around it: its transcript must equal the unloaded reference
   abort-loop       N mixed aborts, then RSS growth and the balance
+  fleet-metrics    (prefork only, not in `suite`) a deterministic mixed workload;
+                   the router's summed mynah_asr_fleet_* series must equal it
   worker-kill      (prefork only, not in `suite`) SIGKILL one worker under a live
                    stream: the router charges it to `lost`, its books balance,
                    the other worker's stream is untouched and new streams are served
@@ -301,6 +305,33 @@ class Suite:
         self.settle("close-then-rst-silent", before, {"cancel:peer_gone": 1}, fed_at,
                     self.a.zombie_s)
 
+    def case_rst_unacked(self):
+        # A RST sent while the client still has unsent data carries a sequence
+        # number the server has not reached; the server's kernel refuses it
+        # (RFC 5961) and the connection stays half-open on the server's side --
+        # exactly what a client whose network vanished looks like. No socket
+        # event will ever arrive, so the bound is --idle-ms (or the first ping
+        # that fails), and the outcome is whichever of the two the server saw
+        # first. Measured on macOS 2026-09-25: 4 of 6 such RSTs never arrived.
+        before = health(self.a.port)
+        n = 4
+        t0 = time.monotonic()
+        for _ in range(n):
+            s2 = raw_upgrade(self.a.port)
+            blast(s2, bytes(RATE * 2 * 5))
+            rst_close(s2)
+        h, waited = wait_quiet(self.a.port, 0, self.a.idle_ms / 1000.0 + self.a.settle)
+        took = time.monotonic() - t0
+        self.c.check(waited is not None and took <= self.a.idle_ms / 1000.0 + 5.0,
+                     f"rst-unacked: every slot back within --idle-ms + 5 s ({took:.1f} s)")
+        ob, oa = outcomes(before), outcomes(h)
+        d_gone = (oa.get("cancel:peer_gone") or 0) - (ob.get("cancel:peer_gone") or 0)
+        d_idle = (oa.get("cancel:idle_timeout") or 0) - (ob.get("cancel:idle_timeout") or 0)
+        self.c.check(d_gone + d_idle == n, f"rst-unacked: each ended once, as peer_gone "
+                                           f"({d_gone}) or idle_timeout ({d_idle})")
+        ok, txt = balance(h)
+        self.c.check(ok, f"rst-unacked: books balance ({txt})")
+
     def case_close_then_rst(self):
         # The client ASKED for the tail and then vanished. The work it asked for
         # may run, but only until the server learns the peer is gone -- the
@@ -520,6 +551,81 @@ class Suite:
                 out.setdefault(w[0], {})[name[len("mynah_asr_worker_"):]] = float(val)
         return out
 
+    def fleet_metrics(self) -> dict:
+        """The router's service-wide series: {name or name{labels}: value}."""
+        with urllib.request.urlopen(f"http://localhost:{self.a.metrics_port}/metrics",
+                                    timeout=5) as r:
+            text = r.read().decode()
+        out = {}
+        for line in text.splitlines():
+            if line.startswith("mynah_asr_fleet_"):
+                k, _, v = line.rpartition(" ")
+                out[k] = float(v)
+        return out
+
+    def case_fleet_metrics(self):
+        # A deterministic mixed workload across the workers, then the router's
+        # SUMMED series must equal it exactly: that is the claim "the router's
+        # /metrics describes the whole service", tested rather than asserted.
+        f0 = self.fleet_metrics()
+        self.c.check(f0.get("mynah_asr_fleet_workers_up") == f0.get("mynah_asr_fleet_workers") >= 2,
+                     f"fleet-metrics: every worker up ({f0.get('mynah_asr_fleet_workers_up')})")
+        n_ok = 3
+        for _ in range(n_ok):                          # completed
+            sess = Session("localhost", self.a.port, STREAM_PATH)
+            send_clip(sess, self.pcm)
+            sess.send_close()
+            collect_utterance(sess, 30.0)
+            sess.close()
+        for _ in range(2):                             # peer_gone, silent: the zombie shape
+            s2 = raw_upgrade(self.a.port)
+            blast(s2, bytes(RATE * 2 * 5))
+            time.sleep(0.3)                            # delivered, so the RST is in window
+            rst_close(s2)
+        s3 = raw_upgrade(self.a.port)                  # protocol_error
+        s3.sendall(bytes([0xF2, 0x80 | 4]) + b"\0" * 8)
+        drain(s3, 1.0)
+        s3.close()
+        s4 = raw_upgrade(self.a.port)                  # idle_timeout
+        drain(s4, self.a.idle_ms / 1000.0 + 3.0)
+        s4.close()
+        # every worker publishes within one period; wait for the slots to drain
+        deadline = time.monotonic() + self.a.settle
+        f1 = self.fleet_metrics()
+        while time.monotonic() < deadline and f1.get("mynah_asr_fleet_sessions_active", 1) != 0:
+            time.sleep(0.3)
+            f1 = self.fleet_metrics()
+        time.sleep(0.6)
+        f1 = self.fleet_metrics()
+        d = lambda k: f1.get(k, 0) - f0.get(k, 0)
+        want = {"mynah_asr_fleet_sessions_total": n_ok + 4,
+                "mynah_asr_fleet_sessions_completed_total": n_ok,
+                'mynah_asr_fleet_sessions_cancelled_total{reason="peer_gone"}': 2,
+                'mynah_asr_fleet_sessions_cancelled_total{reason="protocol_error"}': 1,
+                'mynah_asr_fleet_sessions_cancelled_total{reason="idle_timeout"}': 1,
+                "mynah_asr_fleet_sessions_aborted_total": 0,
+                "mynah_asr_fleet_finalization_seconds_count": n_ok,
+                "mynah_asr_fleet_session_seconds_count": n_ok + 4}
+        got = {k: d(k) for k in want}
+        self.c.check(got == want, f"fleet-metrics: summed totals equal the workload ({got})")
+        cancelled = sum(v for k, v in f1.items()
+                        if k.startswith("mynah_asr_fleet_sessions_cancelled_total{"))
+        lhs = f1.get("mynah_asr_fleet_sessions_total")
+        rhs = (f1.get("mynah_asr_fleet_sessions_completed_total", 0) + cancelled
+               + f1.get("mynah_asr_fleet_sessions_aborted_total", 0)
+               + f1.get("mynah_asr_fleet_sessions_active", 0)
+               + f1.get("mynah_asr_fleet_sessions_lost_total", 0))
+        self.c.check(lhs == rhs and f1.get("mynah_asr_fleet_books_balanced") == 1
+                     and f1.get("mynah_asr_fleet_books_unbalanced_total") == 0,
+                     f"fleet-metrics: service books balance ({lhs:.0f} = {rhs:.0f}, "
+                     f"balanced={f1.get('mynah_asr_fleet_books_balanced')})")
+        self.c.check(d("mynah_asr_fleet_audio_seconds_total") > 0 and
+                     d("mynah_asr_fleet_emission_lag_seconds_count") > 0,
+                     "fleet-metrics: audio and emission lag counted")
+        self.c.check(f1.get("mynah_asr_fleet_snapshot_age_seconds", 9) < 1.0,
+                     f"fleet-metrics: snapshots fresh "
+                     f"({f1.get('mynah_asr_fleet_snapshot_age_seconds')} s)")
+
     def case_worker_kill(self):
         kids = subprocess.run(["pgrep", "-P", str(self.a.server_pid)], capture_output=True,
                               text=True).stdout.split()
@@ -551,11 +657,26 @@ class Suite:
         m0 = self.router_metrics()
         busy = [w for w, v in m0.items() if v.get("inflight", 0) > 0]
         self.c.check(len(busy) == 2, f"worker-kill: both workers hold a stream ({m0})")
+        f_before = self.fleet_metrics()
         victim = kids[0]
         os.kill(int(victim), 9)
         for t in ts:
             t.join(60)
         m1 = self.router_metrics()
+        f_after = self.fleet_metrics()
+        # Monotonic across the death: a dead worker's last snapshot stays in
+        # the totals, so no fleet counter may go backwards.
+        back = [k for k, v in f_before.items() if k.endswith("_total")
+                and f_after.get(k, 0) < v]
+        self.c.check(not back, f"worker-kill: no service counter went backwards ({back})")
+        self.c.check(f_after.get("mynah_asr_fleet_workers_up") == f_before.get("mynah_asr_fleet_workers_up", 0) - 1
+                     and f_after.get("mynah_asr_fleet_worker_deaths_total") == 1,
+                     f"worker-kill: service metrics show the death (up "
+                     f"{f_after.get('mynah_asr_fleet_workers_up')}, deaths "
+                     f"{f_after.get('mynah_asr_fleet_worker_deaths_total')})")
+        self.c.check(f_after.get("mynah_asr_fleet_sessions_lost_total") == 1,
+                     f"worker-kill: the session the dead worker held is lost, not dropped "
+                     f"({f_after.get('mynah_asr_fleet_sessions_lost_total')})")
         dead = [w for w, v in m1.items() if v.get("up", 1) == 0]
         self.c.check(len(dead) == 1, f"worker-kill: the router sees exactly one worker down ({dead})")
         lost = sum(v.get("lost_total", 0) for v in m1.values())
@@ -579,7 +700,7 @@ class Suite:
         self.c.check(not errors and (self.ref is None or text == self.ref),
                      f"worker-kill: a new stream after the death is served correctly ({errors})")
 
-    CASES = ["rst-mid", "fin-mid", "rst-mid-silent", "fin-mid-silent", "close-then-rst", "close-then-rst-silent", "half-close-ok", "idle-open",
+    CASES = ["rst-mid", "fin-mid", "rst-mid-silent", "fin-mid-silent", "close-then-rst", "close-then-rst-silent", "rst-unacked", "half-close-ok", "idle-open",
              "stall-mid-frame", "oversize", "rsv-bits", "bad-control", "garbage",
              "capacity", "neighbours", "abort-loop"]
 
@@ -618,7 +739,7 @@ def main() -> int:
     names = Suite.CASES if a.cases == ["suite"] else a.cases
     for n in names:
         s.run(n)
-    if names != ["worker-kill"]:
+    if not a.metrics_port:
         h = health(a.port)
         ok, txt = balance(h)
         s.c.check(ok, f"final: books balance ({txt})")

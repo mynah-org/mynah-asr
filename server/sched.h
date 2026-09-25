@@ -172,6 +172,12 @@ typedef struct {
      * is lost right now. */
     unsigned long abandoned, abandoned_recovered;
     int balanced;
+    /* S12-21, for the service-wide metrics (server/fleet.h): the most slots this
+     * worker ever held at once, and three per-session latencies as counts per
+     * fleet edge (mynah_asr_fleet_ms_edges / _s_edges, last = past the edge). */
+    int active_peak;
+    unsigned long first_text_hist[14], finalize_hist[14], session_hist[13];
+    double first_text_sum_ms, finalize_sum_ms, session_sum_s;
     unsigned long offline_done;
     int  offline_pending, offline_max_pending;
     unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];

@@ -33,6 +33,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "fleet.h"
 #include "prefork.h"
 
 #include "metrics.h"
@@ -2003,6 +2004,23 @@ static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
             lbl, v->w[i].over_cap);
     }
 
+    {
+        /* The service-wide series: every worker's shared snapshot summed. */
+        int dead[256] = {0};
+        mynah_asr_fleet_router fr;
+        memset(&fr, 0, sizeof(fr));
+        fr.prefork = 1;
+        fr.workers = v->workers;
+        for (int i = 0; i < v->workers; ++i) {
+            if (i < 256) dead[i] = v->w[i].died;
+            if (v->w[i].died) fr.worker_deaths++;
+            else if (v->w[i].pid > 0) fr.workers_up++;
+            fr.router_lost += v->w[i].lost;
+        }
+        mynah_asr_fleet_stats fs;
+        mynah_asr_fleet_sum(&fs, dead, &fr);
+        mynah_asr_fleet_render(b, &fs, &fr);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_connections_dispatched_total connections routed to a worker.\n"
         "# TYPE mynah_asr_connections_dispatched_total counter\n"
@@ -2252,6 +2270,12 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
                     ? local.metrics_bind : "127.0.0.1", local.metrics_port);
         fflush(stderr);
     }
+
+    /* S12-21: one shared page per worker, mapped before the fork so every
+     * child inherits it, for the service-wide /metrics (server/fleet.h). */
+    if (mynah_asr_fleet_map(workers) != 0)
+        fprintf(stderr, "prefork: WARNING no shared fleet pages: /metrics will carry "
+                        "the router's view only\n");
 
     worker_state *w = (worker_state *)calloc((size_t)workers, sizeof(*w));
     if (w == NULL) return MYNAH_ASR_PREFORK_ERROR;

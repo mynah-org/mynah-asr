@@ -231,6 +231,78 @@ Findings not fixed (recorded, not assumed away):
   them). Its `tests/cancel_correctness.py` (K1-K9, "zombie seconds") is the
   model this suite follows.
 
+### S12-21 — service-wide metrics under prefork (2026-09-25)
+
+FACT (before): with `--prefork`, /metrics is answered by the router, which never
+enters the model; `main.c` opens a metrics port only when `prefork_workers == 0`.
+So the production topology exported connections, admission and per-worker
+up/inflight/assigned/completed, and NO session books, cancels, audio seconds,
+lag, backlog or finalization. Nobody could see a zombie or a lost session.
+
+RESULT (after): `server/fleet.{c,h}`. The router maps one MAP_SHARED page per
+worker before the fork; each worker publishes a compact snapshot every 250 ms
+under a seqlock (its own thread, nothing on a step); the router sums the pages
+per scrape. A dead worker's page stays mapped: its counters stay in the totals
+(monotonic), what it held becomes `mynah_asr_fleet_sessions_lost_total`. The
+single-process server renders the same `mynah_asr_fleet_*` names as a fleet of
+one. Series and a 7-question Grafana view: docs/server.md.
+
+Tested (`tests/fault_probe.py fleet-metrics`, `--prefork 2`): a deterministic
+workload of 3 completed + 2 RST (silence) + 1 protocol error + 1 idle ->
+summed deltas exactly {sessions 7, completed 3, peer_gone 2, protocol_error 1,
+idle_timeout 1, aborted 0, finalization count 3, session count 7}, books
+balanced, snapshots 0.04-0.23 s old. `worker-kill`: no fleet counter went
+backwards, workers_up 2 -> 1, worker_deaths_total 1, sessions_lost_total 1.
+
+FACT found on the way (macOS, 2026-09-25): a RST sent while the client still has
+UNSENT data carries a sequence number past what the server received; the
+server's kernel refuses it (RFC 5961, rate-limited challenge ACKs), and the
+connection stays half-open on the server side -- indistinguishable from a
+client whose network vanished. 4 of 6 such RSTs never arrived. The only bounds
+are `--idle-ms` (default 60 s) and the first server ping whose write fails
+(`--ping-ms`, default 20 s). Until then the server keeps consuming the audio it
+already holds for that stream (at most `--ring-seconds`). Case `rst-unacked`
+checks each such session ends exactly once, as `peer_gone` or `idle_timeout`,
+within `--idle-ms` + 5 s. HYPOTHESIS: the same on Linux (RFC 5961 is on by
+default there); to confirm on the box.
+
+### S12-22 — worker respawn, design (not implemented, not default)
+
+Current behaviour (FACT): a dead worker is reaped, its connections are charged
+to `lost`, it is marked down and the router routes to the rest; the fleet runs
+on with W-1 until restart. The router keeps every model mapped and has no
+thread of its own, which is what makes a fork from the router possible at all.
+
+Smallest safe policy:
+1. death -> `lost` += inflight; worker out of the routing and capacity tables
+   (already so).
+2. its fleet page's counters are RETIRED into a router-side accumulator before
+   the page is reused, so fleet totals stay monotonic across the replacement.
+3. fork the replacement from the router with the SAME cpu slice and model
+   group; in the child close every router-only descriptor (listener, other
+   channels, queued and lingering client fds, metrics listener) -- the same
+   list the initial fork closes, plus the router's runtime queues.
+4. NOT READY until it proves it: model resident, scheduler started, one warm-up
+   step, first fleet snapshot published, a ready byte on the channel. Only then
+   back into capacity.
+5. crash-loop guard: exponential backoff (1 s, 2 s, 4 s ... cap 60 s) and a
+   budget (e.g. 3 restarts per worker per 10 min); past it the worker stays down
+   and `mynah_asr_fleet_worker_respawn_exhausted` says so.
+6. observable after recovery: `worker_deaths_total` and `sessions_lost_total`
+   never reset; add `worker_respawns_total`.
+
+Concrete risks: the fork happens deep in the router loop with live client
+descriptors (they must all be closed in the child or a client socket stays
+open in a worker that will never serve it); per-worker lazy caches are rebuilt
+(first requests slower, bounded by the readiness warm-up); a poison request
+that kills whichever worker serves it will walk through the whole fleet --
+the budget must be per FLEET too, not only per worker.
+
+Recommendation (DECISION pending, user): implement behind a flag, default OFF,
+with a fault test (SIGKILL a worker 4 times: 3 recoveries then exhausted, totals
+monotonic, capacity restored exactly on readiness); consider default ON only
+after that test and a box soak.
+
 ## Conclusion (so far)
 
 The qualification zeros were real, but the server had a genuine zombie: a
@@ -242,7 +314,8 @@ now exact on both sides, and a verdict fails when either side loses a session.
 ## Next action
 
 1. Fault-injection SOAK mode in stream_load (abort percentage and points) —
-   in progress; then 10-15 min at C=64/80 on the box.
+   in progress; then 10-15 min at C=64/80 on the box, with Nemotron, the
+   fleet metrics scraped before/after and compared with the client's books.
 2. Re-run `make test-server-faults`, test-server-protocol and
    test-server-stream with the Nemotron pack (mount the models volume).
 3. qwen-tts: the same suite shape (silent-audio zombie, books, abandon), and

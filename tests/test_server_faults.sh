@@ -55,7 +55,7 @@ python3 -c 'import json,sys; json.dump({sys.argv[1]: sys.argv[2]}, open(sys.argv
     "$CLIP" "$ref" "$TMP/ref.json"
 
 rc=0
-if [ "$FAULT_CASES" != "worker-kill" ]; then
+if [ "$FAULT_CASES" != "worker-kill" ] && [ "$FAULT_CASES" != "fleet-metrics" ]; then
     python3 tests/fault_probe.py --port "$PORT" --clip "$CLIP" --reference "$TMP/ref.json" \
         --lang "$LANG_Q" --cap $CAP --idle-ms $IDLE --max-frame-bytes $MAXF \
         --server-pid "$SRV_PID" ${FAULT_CASES:-suite}
@@ -90,10 +90,10 @@ if grep -q "did not finish" "$TMP/srv.log"; then
 fi
 
 # ---- a worker process dies under a live stream (prefork) --------------------
-if [ -z "$FAULT_CASES" ] || [ "$FAULT_CASES" = "worker-kill" ]; then
+if [ -z "$FAULT_CASES" ] || [ "$FAULT_CASES" = "worker-kill" ] || [ "$FAULT_CASES" = "fleet-metrics" ]; then
 PORT2=$((PORT + 1)); MPORT=$((PORT + 2))
 ./mynah-asr-server -m "$MODEL_DIR" -p "$PORT2" --prefork 2 --prefork-threads 2 --threads 4 \
-    --cap 2 --idle-ms 5000 --ping-ms 0 --metrics-port "$MPORT" > "$TMP/pf.log" 2>&1 &
+    --cap 2 --idle-ms $IDLE --ping-ms 0 --metrics-port "$MPORT" > "$TMP/pf.log" 2>&1 &
 SRV_PID=$!
 ready=0
 for i in $(seq 1 150); do
@@ -105,7 +105,8 @@ for i in $(seq 1 150); do
 done
 if [ $ready -eq 1 ]; then
     python3 tests/fault_probe.py --port "$PORT2" --clip "$CLIP" --reference "$TMP/ref.json" \
-        --lang "$LANG_Q" --server-pid "$SRV_PID" --metrics-port "$MPORT" worker-kill || rc=1
+        --lang "$LANG_Q" --idle-ms $IDLE --server-pid "$SRV_PID" --metrics-port "$MPORT" \
+        fleet-metrics worker-kill || rc=1
 else
     echo "server-faults FAIL: prefork server never became ready"; tail -20 "$TMP/pf.log"; rc=1
 fi

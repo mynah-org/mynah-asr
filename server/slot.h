@@ -122,6 +122,7 @@ typedef struct mynah_asr_slot {
      * close the path from audio-in to bytes-out. Diagnostic: nothing in the
      * serving path reads them. */
     double t_first_audio, t_first_queued;
+    int first_text_counted;        /* S12-21: this session's first text is in the fleet histogram */
     double last_arrival;           /* of the newest sample the scheduler took */
     /* When the model last served this slot. `steps` says how many times; this
      * says how long ago, which is the only one of the two that can distinguish

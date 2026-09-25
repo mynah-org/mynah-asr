@@ -1,5 +1,6 @@
 /* The scheduler thread. See sched.h for why there is exactly one of it. */
 #include "sched.h"
+#include "fleet.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -194,6 +195,13 @@ static struct {
     pthread_mutex_t acct_mu;
     int acct_ready;                /* acct_mu initialised (start ran)          */
     _Atomic unsigned long completed, aborted, abandoned, abandoned_recovered;
+    /* S12-21. `active_now`/`active_peak` move under acct_mu with claim and
+     * release. The three histograms are per fleet edge; their sums in us/ms. */
+    int active_now, active_peak;
+    _Atomic unsigned long first_text_h[MYNAH_ASR_FLEET_MS_EDGES + 1];
+    _Atomic unsigned long finalize_h[MYNAH_ASR_FLEET_MS_EDGES + 1];
+    _Atomic unsigned long session_h[MYNAH_ASR_FLEET_S_EDGES + 1];
+    _Atomic unsigned long first_text_sum_us, finalize_sum_us, session_sum_ms;
     _Atomic unsigned long lag_hist[MYNAH_ASR_LAG_BUCKETS];
     _Atomic unsigned long lag_max_us;
     /* S3-3. Two more adds on paths that already do one, and one array indexed
@@ -303,9 +311,19 @@ static void count_outcome_locked(const char *outcome) {
 }
 
 void mynah_asr_sched_release(mynah_asr_slot *slot) {
+    /* Session duration, claim to release, for every outcome: a histogram of
+     * how long a slot is held is the capacity question in its own units. */
+    const double held = mynah_asr_now() - slot->t_open;
+    if (held >= 0.0) {
+        atomic_fetch_add_explicit(&g.session_h[mynah_asr_fleet_s_bucket(held)], 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&g.session_sum_ms, (unsigned long)(held * 1e3 + 0.5),
+                                  memory_order_relaxed);
+    }
     pthread_mutex_lock(&g.acct_mu);
     count_outcome_locked(mynah_asr_slot_outcome(slot));
     mynah_asr_slot_release(slot);
+    if (g.active_now > 0) g.active_now--;
     pthread_mutex_unlock(&g.acct_mu);
 }
 
@@ -435,6 +453,18 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
         cJSON_AddStringToObject(j, "language", lang);
         cJSON_AddNumberToObject(j, "audio_seconds", res->t1);
         if (s->t_first_delta == 0.0) s->t_first_delta = now;
+        /* Time to first text: the session's first audio entering the ring to
+         * its first delta. It INCLUDES the audio before the first word -- it is
+         * what a user waits, not a model latency -- and it is counted once per
+         * session, not again after a reset. */
+        if (!s->first_text_counted && s->t_first_audio > 0.0 && now >= s->t_first_audio) {
+            const double ms = (now - s->t_first_audio) * 1e3;
+            s->first_text_counted = 1;
+            atomic_fetch_add_explicit(&g.first_text_h[mynah_asr_fleet_ms_bucket(ms)], 1,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&g.first_text_sum_us, (unsigned long)(ms * 1e3 + 0.5),
+                                      memory_order_relaxed);
+        }
         s->deltas++;
         s->lag_sum_ms += lag_ms;
         if (lag_ms > s->lag_max_ms) s->lag_max_ms = lag_ms;
@@ -846,6 +876,18 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
     g.fin_model_s += t_fin1 - t_fin0;
     g.fin_calls++;
     sched_emit_done(s);
+    /* Finalization lag as the client measures it: the last sample's arrival to
+     * `done` being queued. Only utterances that were finalized, so a cancel
+     * can never make this look faster. */
+    if (s->last_arrival > 0.0) {
+        const double ms = (mynah_asr_now() - s->last_arrival) * 1e3;
+        if (ms >= 0.0) {
+            atomic_fetch_add_explicit(&g.finalize_h[mynah_asr_fleet_ms_bucket(ms)], 1,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&g.finalize_sum_us, (unsigned long)(ms * 1e3 + 0.5),
+                                      memory_order_relaxed);
+        }
+    }
     if (close_after) {
         sched_close_session(s, "completed");
     } else {
@@ -1304,6 +1346,7 @@ mynah_asr_slot *mynah_asr_sched_claim(const char *lang, int lookahead) {
     for (int i = 0; i < g.n_slots; i++) {
         if (mynah_asr_slot_claim(&g.slots[i], lang, lookahead, NULL, now) == 0) {
             atomic_fetch_add_explicit(&g.sessions, 1, memory_order_relaxed);
+            if (++g.active_now > g.active_peak) g.active_peak = g.active_now;
             pthread_mutex_unlock(&g.acct_mu);
             return &g.slots[i];
         }
@@ -1391,7 +1434,20 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
         out->cancel_by[i] = atomic_load_explicit(&g.cancel_by[i], memory_order_relaxed);
     out->completed = atomic_load_explicit(&g.completed, memory_order_relaxed);
     out->aborted = atomic_load_explicit(&g.aborted, memory_order_relaxed);
+    out->active_peak = g.active_peak;
     if (g.acct_ready) pthread_mutex_unlock(&g.acct_mu);
+    for (int i = 0; i <= MYNAH_ASR_FLEET_MS_EDGES; i++) {
+        out->first_text_hist[i] = atomic_load_explicit(&g.first_text_h[i], memory_order_relaxed);
+        out->finalize_hist[i] = atomic_load_explicit(&g.finalize_h[i], memory_order_relaxed);
+    }
+    for (int i = 0; i <= MYNAH_ASR_FLEET_S_EDGES; i++)
+        out->session_hist[i] = atomic_load_explicit(&g.session_h[i], memory_order_relaxed);
+    out->first_text_sum_ms =
+        (double)atomic_load_explicit(&g.first_text_sum_us, memory_order_relaxed) / 1e3;
+    out->finalize_sum_ms =
+        (double)atomic_load_explicit(&g.finalize_sum_us, memory_order_relaxed) / 1e3;
+    out->session_sum_s =
+        (double)atomic_load_explicit(&g.session_sum_ms, memory_order_relaxed) / 1e3;
     out->abandoned = atomic_load_explicit(&g.abandoned, memory_order_relaxed);
     out->abandoned_recovered =
         atomic_load_explicit(&g.abandoned_recovered, memory_order_relaxed);

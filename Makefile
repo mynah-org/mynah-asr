@@ -145,7 +145,7 @@ mynah-asr: $(OBJ) build/cli/main.o
 
 mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o \
                   build/server/stream_out.o build/server/slot.o build/server/sched.o \
-                  build/server/metrics.o build/server/obs.o
+                  build/server/metrics.o build/server/obs.o build/server/fleet.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
 # objects in build/ (never next to the sources: the variant builds — ubsan, cuda

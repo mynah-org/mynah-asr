@@ -39,6 +39,7 @@
 #include "../src/flags.h"     /* the [FLAGS]/[EFFECTIVE-CONFIG] banner lines */
 #include "../src/mynah_asr.h"
 #include "../src/qmat.h"      /* mynah_asr_set_caps (--caps) */
+#include "fleet.h"
 #include "../src/threads.h"   /* mynah_asr_blas_set_concurrency */
 #include "../vendor/cJSON.h"
 #include "http_util.h"
@@ -1991,6 +1992,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "mynah-asr-server: the scheduler failed to start\n");
         return 1;
     }
+    /* A prefork worker publishes its counters for the router's service-wide
+     * /metrics (server/fleet.h). No-op in a single-process server. */
+    if (chan_fd >= 0) mynah_asr_fleet_publisher_start(mynah_asr_prefork_worker_index());
 
     /* ENGINEERING.md §5: unconditionally, in the same process, before anything
      * is served -- what the environment asked for, what this build does with

@@ -558,12 +558,67 @@ not have them. In a **multi-model** fleet those per-worker series carry a second
 label, `model`, naming the group that worker serves, so a scrape separates "the
 parakeet group is saturated" from "the fleet is busy". It is added only there and
 only then, because its value set is exactly the configured groups — bounded by
-the CLI before the first request, which is what the cardinality rule asks. A worker's own scheduler counters are exported by that worker
-only if it is given a metrics port of its own. Per-worker series are never
-summed here: a fleet total hides the one worker that stopped.
+the CLI before the first request, which is what the cardinality rule asks. The
+per-worker ROUTER series stay per worker: a fleet total alone would hide the one
+worker that stopped.
 
-**What is deliberately NOT exported.** No client-side latency: no TTFP, no stall
-rate, no "safe play start". Those are measured at the far end of a socket this
+### The service-wide series: `mynah_asr_fleet_*` (S12-21)
+
+Until 2026-09-25 the production topology exported no scheduler fact at all: the
+router answered /metrics and the router never enters the model. Now every worker
+publishes a compact snapshot of its counters into a shared page (mapped by the
+router before the fork, written every 250 ms under a seqlock, never blocking a
+step), and the router **sums** them. A single-process server renders the same
+series as a fleet of one, so a dashboard never needs to know the topology. No
+worker label; the only labels are `reason` and `le`.
+
+| series | type | |
+|---|---|---|
+| `mynah_asr_fleet_workers` · `_workers_up` | gauge | configured / alive |
+| `mynah_asr_fleet_worker_deaths_total` | counter | workers that died (never respawned today) |
+| `mynah_asr_fleet_sessions_total` | counter | sessions accepted (a slot claimed) |
+| `mynah_asr_fleet_sessions_completed_total` | counter | `done` + close |
+| `mynah_asr_fleet_sessions_cancelled_total{reason}` | counter | the code the client was sent; `peer_gone` = the client disconnected |
+| `mynah_asr_fleet_sessions_aborted_total` | counter | claimed, released before it started |
+| `mynah_asr_fleet_sessions_lost_total` | counter | held by a worker when it died (from its last snapshot) |
+| `mynah_asr_fleet_sessions_active` · `_slots` · `_slots_peak` | gauge | now / capacity of the live workers / sum of per-worker peaks |
+| `mynah_asr_fleet_books_balanced` · `_books_unbalanced_total` | gauge / counter | sessions = completed + cancelled + aborted + active in every live snapshot; anything but 1 / 0 is a counting bug |
+| `mynah_asr_fleet_slots_abandoned_total` · `_abandoned_recovered_total` | counter | a difference that grows is capacity leaking |
+| `mynah_asr_fleet_audio_seconds_total` | counter | audio fed to the model: the throughput unit |
+| `mynah_asr_fleet_model_busy_seconds_total` | counter | `rate()` ÷ workers = model duty |
+| `mynah_asr_fleet_steps_total` · `_deltas_total` | counter | |
+| `mynah_asr_fleet_backlog_seconds` · `_backlog_max_seconds` | gauge | audio queued in the rings, total and the worst stream |
+| `mynah_asr_fleet_emission_lag_seconds` | histogram | EXACT: every edge is a multiple of the 8 ms bucket |
+| `mynah_asr_fleet_first_text_seconds` | histogram | per session, first audio in to first text out, measured in the scheduler. It INCLUDES the audio before the first word and the client's own pacing: what a user waits, not a model latency, and not a first-WORD latency |
+| `mynah_asr_fleet_finalization_seconds` | histogram | per finalized utterance, last sample's arrival to `done` |
+| `mynah_asr_fleet_session_seconds` | histogram | claim to release, every outcome |
+| `mynah_asr_fleet_snapshot_age_seconds` | gauge | the oldest live snapshot: the staleness, stated |
+
+Correctness, and what it costs: a dead worker's page stays mapped in the router,
+so its counters stay in the totals (**no fleet counter ever goes backwards**)
+and what it still held becomes `sessions_lost_total`. A worker killed with
+SIGKILL loses what it did after its last publish (≤ 250 ms); its connections are
+still counted by the router (`mynah_asr_worker_lost_total`). Tested:
+`tests/fault_probe.py fleet-metrics` runs a deterministic mixed workload across
+two workers and requires the summed series to equal it exactly, and
+`worker-kill` requires monotonic totals, `worker_deaths_total` 1 and the held
+session in `sessions_lost_total`.
+
+**A first view (Grafana), one panel per operational question:**
+
+| question | panel |
+|---|---|
+| Are requests being served? | `rate(mynah_asr_fleet_sessions_completed_total[1m])`, `rate(mynah_asr_fleet_audio_seconds_total[1m])` (seconds of audio per second = service RTF⁻¹) |
+| Are clients disconnecting or failing? | `sum by (reason) (rate(mynah_asr_fleet_sessions_cancelled_total[5m]))`, `rate(mynah_asr_refused_total[5m])` (router) |
+| Are sessions disappearing or becoming zombies? | `mynah_asr_fleet_books_balanced` (alert on 0), `increase(mynah_asr_fleet_books_unbalanced_total[1h])`, `mynah_asr_fleet_sessions_active` vs `mynah_asr_worker_inflight` summed |
+| Are slots being recovered? | `mynah_asr_fleet_slots_abandoned_total - mynah_asr_fleet_slots_abandoned_recovered_total` (alert on > 0 for 5 m) |
+| Is latency or backlog deteriorating? | `histogram_quantile(0.95, rate(mynah_asr_fleet_emission_lag_seconds_bucket[5m]))`, the same for finalization and first text, `mynah_asr_fleet_backlog_max_seconds` |
+| Did a worker die? | `mynah_asr_fleet_workers_up < mynah_asr_fleet_workers`, `increase(mynah_asr_fleet_worker_deaths_total[1h])`, `mynah_asr_fleet_sessions_lost_total` |
+| Is the fleet approaching saturation? | `mynah_asr_fleet_sessions_active / mynah_asr_fleet_slots`, `rate(mynah_asr_fleet_model_busy_seconds_total[1m]) / mynah_asr_fleet_workers_up`, 503s by code |
+
+**What is deliberately NOT exported.** No client-side latency: no TTFP as a
+client measures it, no stall rate, no "safe play start" (`first_text_seconds`
+above is the scheduler's own interval and says so). Those are measured at the far end of a socket this
 process does not own, and a server that reports them is reporting a guess. They
 belong to the benchmark harness (`tools/bench/`), which is the only thing that
 may quote them. **Cardinality** is a contract: the only labels are `worker`,

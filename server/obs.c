@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fleet.h"
 #include "../src/dispatch.h"
 #include "../src/flags.h"
 #include "../src/mynah_asr.h"
@@ -491,6 +492,15 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "# TYPE mynah_asr_slots_cap gauge\n"
         "mynah_asr_slots_cap{worker=\"%s\"} %d\n",
         wl, st.slots_active, wl, st.slots_cap);
+
+    /* The service-wide series, as a fleet of one: the same names a prefork
+     * router exports, so a dashboard never has to know the topology. */
+    mynah_asr_fleet_stats fs;
+    mynah_asr_fleet_collect(&fs);
+    mynah_asr_fleet_router fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.workers = fr.workers_up = 1;
+    mynah_asr_fleet_render(b, &fs, &fr);
 }
 
 /* ------------------------------------------------------------------- SIGUSR1 */
