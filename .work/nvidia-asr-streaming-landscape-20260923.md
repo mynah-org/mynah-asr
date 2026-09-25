@@ -1212,3 +1212,29 @@ first word = a quality tail, a different problem from latency).
 **DECISION.** No optimisation from this. The model-side target, if any, is the
 flat ~600 ms word-end -> emission term (checkpoint, not serving, not
 lookahead). Evidence: `.work/evidence/la-20260925/` (untracked).
+
+## S13-10 point 1 — lexical onset, all 349 (REGISTERED 2026-09-25, before the run)
+
+Attribution, not a new KPI: the raw first-complete-word latency from the ENERGY
+onset stays the reported KPI; the lexical-onset figure is reported beside it.
+
+- Population: all 349 originals, L=3 deltas of the gated run. Nothing dropped:
+  every clip gets the raw KPI; every clip the aligner transcribes gets a
+  lexical onset.
+- Lexical onset = start of the first aligned word (parakeet-tdt_ctc-110m TDT,
+  full context). Sensitivity: the span [energy onset, lexical onset] is
+  transcribed alone for EVERY clip with a gap > 250 ms; a non-empty span means
+  the aligner may have dropped a lead word, and those clips are reported both
+  ways (lexical onset at the aligner word, and at the energy onset).
+- Components per clip (ms): lead-in = lexical onset - energy onset; word =
+  duration of the first aligned word; model = word end -> the stream holds the
+  whole first word; closing = -> the separator. When the stream's first word
+  differs from the aligner's, model and closing are reported only as their SUM
+  (word end -> close) and the clip is flagged.
+- Tail attribution: the clips at or above the raw p95 over all 349 (not over a
+  subset), with the mean of each component and its share of the total.
+- Excluded-31 classification against the HUMAN reference's first word:
+  stream right / aligner wrong; aligner right / stream wrong (first-word
+  misrecognition by the model); both wrong; stream inserted a word before the
+  reference's first; stream dropped the reference's first word; non-English or
+  garbage first token.
