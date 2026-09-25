@@ -404,6 +404,43 @@ PY
 [ "$(verdict stalled)" = "NOT QUALIFIED" ] && ok "a worker whose step counter freezes while slots are active disqualifies" \
     || bad "a frozen worker passed"
 
+# With per-slot lines: frozen steps are a stall only if a slot held a whole chunk.
+# An idle client (ring 0, nothing ready) holding its slot until --idle-ms is not.
+# Found on the 2026-09-25 C=64 fault soak (an idle_open client on worker 2).
+for kind in idle queued; do
+mk "stall_$kind" "pass"
+python3 - "$TMP/stall_$kind" "$kind" <<'PY'
+import re, sys
+p, kind = sys.argv[1] + "/server-soak1.log", sys.argv[2]
+ring, ready = ("0.0", "0") if kind == "idle" else ("0.9", "1")
+out = []
+for l in open(p):
+    m = re.search(r"worker=0 seq=(\d+) slots", l)
+    if m and int(m.group(1)) >= 4:
+        l = re.sub(r"steps=\d+", "steps=4000", l)   # frozen from seq 4 on
+        out.append(l)
+        out.append(f"[DUMP] worker=0 seq={m.group(1)} slot id=3 state=1 out=1 stream=1 la=3 "
+                   f"ready={ready} steps=33 deltas=21 ring_s={ring} need_s=0.32 age_s=33.0 "
+                   f"since_rx_s=22.6 since_step_s=22.6 lag_max_ms=37\n")
+        continue
+    if re.search(r"worker=\d+ seq=\d+ slots", l):
+        w, q = re.search(r"worker=(\d+) seq=(\d+)", l).groups()
+        out.append(l)
+        out.append(f"[DUMP] worker={w} seq={q} slot id=0 state=1 out=1 stream=1 la=3 ready=1 "
+                   f"steps=9 deltas=5 ring_s=0.4 need_s=0.32 age_s=3.0 since_rx_s=0.1 "
+                   f"since_step_s=0.1 lag_max_ms=37\n")
+        continue
+    out.append(l)
+open(p, "w").writelines(out)
+PY
+done
+[ "$(state stall_idle 8)" = "PASS" ] \
+    && ok "frozen steps with only an idle client's slot (no queued audio) are not a stall" \
+    || bad "an idle client's slot failed bound 8: $(state stall_idle 8)"
+[ "$(state stall_queued 8)" = "FAIL" ] && [ "$(verdict stall_queued)" = "NOT QUALIFIED" ] \
+    && ok "frozen steps with a whole chunk queued are a stall" \
+    || bad "a stall with runnable work passed: $(state stall_queued 8)"
+
 # ... but a worker that goes idle because its streams ended is finished, not stalled.
 mk drained "pass"
 python3 - "$TMP/drained" <<'PY'

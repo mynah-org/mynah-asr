@@ -177,6 +177,12 @@ def parse_dumps(path):
         b = re.search(r"split model_busy_s=([\d.]+)", line)
         if b:
             rec["busy"] = float(b.group(1))
+        # Per-slot lines: does this slot hold RUNNABLE work (a whole chunk queued)?
+        sl = re.search(r" slot id=\d+ state=\d+ .* ready=(\d) .* ring_s=([\d.]+) need_s=([\d.]+)", line)
+        if sl:
+            rec["slot_lines"] = rec.get("slot_lines", 0) + 1
+            if sl.group(1) == "1" or float(sl.group(2)) >= float(sl.group(3)) > 0.0:
+                rec["runnable"] = rec.get("runnable", 0) + 1
         cb = re.search(r"seq=\d+ cancelled=(\d+)((?: [a-z_]+=\d+)*)\s*$", line)
         if cb:
             rec["cancel_by"] = {k: int(v) for k, v in
@@ -303,10 +309,19 @@ def fault_row(s, c, dumps, cm=None):
 
 
 def stall_check(dumps):
-    """Bound 8: no interval in which slots were active and nothing progressed."""
+    """Bound 8: no interval in which the server had WORK and nothing progressed.
+
+    "Work" is a slot holding a whole chunk (ready, or ring >= need) at either end of
+    the interval, read from the per-slot dump lines. An active slot with an EMPTY ring
+    is a client that is sending nothing -- an idle client waiting for --idle-ms, which
+    a fault-injection soak creates on purpose (`idle_open`) -- and a step counter that
+    does not move then is correct, not a stall. Found on the 2026-09-25 C=64 fault
+    soak: worker 2 held one idle_open slot (ring 0.0 s, 52.6 s since its last audio)
+    across a dump interval and the old rule failed the run. Dumps without per-slot
+    lines (older servers) keep the old rule: active at both ends and no progress."""
     if not dumps:
         return NOEV, "no [DUMP] line in the server log: SIGUSR1 produced nothing", []
-    viol, n_int = [], 0
+    viol, n_int, excused = [], 0, 0
     for w, seqs in sorted(dumps.items()):
         ordered = [seqs[s] for s in sorted(seqs)]
         for a, b in zip(ordered, ordered[1:]):
@@ -316,12 +331,20 @@ def stall_check(dumps):
             # Active at BOTH ends of the interval: a worker that went idle
             # because its streams ended is not stalled, it is finished.
             if a.get("active", 0) > 0 and b.get("active", 0) > 0 and b["steps"] == a["steps"]:
+                if "slot_lines" in a and "slot_lines" in b and \
+                        not a.get("runnable") and not b.get("runnable"):
+                    excused += 1
+                    continue
                 viol.append(f"worker {w}: steps stuck at {a['steps']} with "
-                            f"{a['active']}->{b.get('active')} slots active")
+                            f"{a['active']}->{b.get('active')} slots active"
+                            + (f", {a.get('runnable', 0)}->{b.get('runnable', 0)} with a chunk queued"
+                               if "slot_lines" in a else ""))
     if n_int == 0:
         return NOEV, "dumps carry no step counter to compare", []
     return (OK if not viol else BAD,
-            f"{n_int} interval(s) across {len(dumps)} worker(s), {len(viol)} with no progress",
+            f"{n_int} interval(s) across {len(dumps)} worker(s), {len(viol)} with no progress"
+            + (f"; {excused} with active slots but no queued audio (idle clients), not stalls"
+               if excused else ""),
             viol)
 
 
