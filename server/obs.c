@@ -308,6 +308,35 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "mynah_asr_offline_queued{worker=\"%s\"} %d\n",
         wl, st.offline_done, wl, st.offline_pending);
 
+    /* S12-18: the rest of the session books. Every session claimed is counted
+     * once when its slot is released: completed, cancelled (below, by reason),
+     * or aborted before it started; the ones still running are
+     * mynah_asr_sessions_active. `balanced` is that equation, evaluated in the
+     * same critical section as claim and release -- 0 is a counting bug. */
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_sessions_completed_total sessions that ended with done and a close.\n"
+        "# TYPE mynah_asr_sessions_completed_total counter\n"
+        "mynah_asr_sessions_completed_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_sessions_aborted_total sessions claimed and released before the\n"
+        "# scheduler ever saw them (the 101 or the output writer could not be set up).\n"
+        "# TYPE mynah_asr_sessions_aborted_total counter\n"
+        "mynah_asr_sessions_aborted_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_sessions_active stream slots not free right now.\n"
+        "# TYPE mynah_asr_sessions_active gauge\n"
+        "mynah_asr_sessions_active{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_sessions_balanced 1 when sessions = completed + cancelled +\n"
+        "# aborted + active in one snapshot. 0 is a counting bug, never load.\n"
+        "# TYPE mynah_asr_sessions_balanced gauge\n"
+        "mynah_asr_sessions_balanced{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_slots_abandoned_total slots whose ingest gave up waiting for the\n"
+        "# scheduler to end them; _recovered_total counts the ones the scheduler released.\n"
+        "# TYPE mynah_asr_slots_abandoned_total counter\n"
+        "mynah_asr_slots_abandoned_total{worker=\"%s\"} %lu\n"
+        "# TYPE mynah_asr_slots_abandoned_recovered_total counter\n"
+        "mynah_asr_slots_abandoned_recovered_total{worker=\"%s\"} %lu\n",
+        wl, st.completed, wl, st.aborted, wl, st.slots_active, wl, st.balanced,
+        wl, st.abandoned, wl, st.abandoned_recovered);
+
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_cancelled_total sessions ended by a cap, a dead peer or a\n"
         "# shutdown, bucketed by the code the client was given.\n"
@@ -680,6 +709,10 @@ void mynah_asr_obs_dump(void) {
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
+    OBS_ADD("[DUMP] worker=%d seq=%lu books sessions=%lu completed=%lu cancelled=%lu "
+            "aborted=%lu active=%d balanced=%d abandoned=%lu recovered=%lu\n",
+            widx, n, st.sessions, st.completed, st.cancelled, st.aborted,
+            st.slots_active, st.balanced, st.abandoned, st.abandoned_recovered);
     OBS_ADD("[DUMP] worker=%d seq=%lu cancelled=%lu", widx, n, st.cancelled);
     for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
         OBS_ADD(" %s=%lu", mynah_asr_sched_cancel_bucket_name(i), st.cancel_by[i]);

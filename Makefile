@@ -447,6 +447,20 @@ test-server-protocol: mynah-asr-server mynah-asr
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# S12-17..20: PROVOKED FAILURES. RST and FIN mid-utterance (speech and silence),
+# a reset during the finalize, the legal half-close, idle and stalled frames,
+# oversized / reserved-bit / bad control frames, garbage, the 503 at capacity, a
+# neighbour's transcript while three streams die around it, 40 mixed aborts with
+# RSS and books, and a prefork worker SIGKILLed under a live stream. Each case
+# checks the slot comes back, ONE outcome counter moves, the model stops working
+# for a client that is gone, and the session books balance. Any streaming model;
+# FAULT_LEAKS=1 adds `leaks` on the live server (macOS).
+FAULT_MODEL_DIR ?= $(MODEL_DIR)
+test-server-faults: mynah-asr-server mynah-asr
+	@sh tests/test_server_faults.sh $(FAULT_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-faults: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 # Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
 # test-server it asserts nothing about the transcript, so it runs with ANY
 # converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
@@ -594,4 +608,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-faults test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics

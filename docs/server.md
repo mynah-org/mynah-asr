@@ -294,6 +294,25 @@ not cost a session. A binary frame larger than `--max-frame-bytes` does end it.
 `finalize` followed by more audio is simply the next utterance on the same
 socket: the stream is reset for you and `seq` keeps counting.
 
+**How a session ends, and what the server owes for it** (S12-17..20, measured
+by `tests/test_server_faults.sh`):
+
+| the client... | the server | counted as |
+|---|---|---|
+| sends a close frame (or `finalize`, then more of nothing) | flushes the tail, `done`, closes | `completed` |
+| sends `finalize`, then half-closes (FIN) | the same: a FIN after `finalize` is legal | `completed` |
+| disconnects with no close frame (FIN or RST) mid-utterance | **cancels**: no tail, no `done`; the model stops at the next step | `peer_gone` |
+| sends a close frame, then resets the connection | cancels the tail it asked for | `peer_gone` |
+| stops sending, socket open | `error idle_timeout` after `--idle-ms` | `idle_timeout` |
+| stops in the middle of a frame | the same, through `SO_RCVTIMEO` | `idle_timeout` |
+| sends reserved bits, or a control frame over 125 bytes or fragmented (RFC 6455 5.2, 5.5) | `error protocol_error`, closes | `protocol_error` |
+
+Before 2026-09-25 a client that vanished without a close frame was FINALIZED:
+the rest of its ring (up to `--ring-seconds` of audio) ran through the model for
+nobody, and the session was counted nowhere. Speech hid it -- a delta written to
+a dead peer fails with `EPIPE` within a write or two -- but silence writes
+nothing: 27.4 s of audio were fed after a RST in `rst-mid-silent`, 0.00 s now.
+
 **The server pings** every `--ping-ms` (default 20000). A pong is not required —
 `--idle-ms` is the rule and the ping is only there to keep middleboxes from
 dropping an idle socket. Note the consequence, since it is measured rather than
@@ -333,8 +352,9 @@ message, an oversized frame) carries no `seq`: it is about the message the
 client just sent, not about the audio.
 
 **Error codes**: `idle_timeout` · `audio_limit` · `frame_too_large` ·
-`peer_gone` · `shutting_down` · `decode_failed` · `unknown_control` ·
-`language_not_served` · `unsupported_opcode` · `model_not_streaming`.
+`protocol_error` · `peer_gone` · `shutting_down` · `decode_failed` ·
+`unknown_control` · `language_not_served` · `unsupported_opcode` ·
+`model_not_streaming`.
 `audio_limit` is announced and then **finalised**: the audio already accepted is
 still owed a transcript, so the cap flushes the tail, emits `done` and closes.
 
@@ -372,6 +392,23 @@ router routes by and the same one a `model_not_found` quotes.
           "engine":"parakeet-tdt","streaming":false}]}
 ```
 
+**The session books.** Every session this worker claims ends in exactly ONE of
+`completed`, `cancelled` (by the code the client was sent, `cancelled_by`) or
+`aborted` (claimed, then released before the scheduler saw it: the 101 or the
+output writer could not be set up), and is counted once, when its slot goes back
+to FREE. Until then it is one of `slots.active`. `balanced` is
+
+    sessions == completed + cancelled + aborted + slots.active
+
+read in the same critical section as claim and release, so it holds in every
+snapshot, under load too: `false` is a counting bug, never load. A slot whose
+ingest gave up waiting for the scheduler (60 s + 5 s) is `abandoned.total`; the
+scheduler releases it when it finally ends the session (`abandoned.recovered`),
+so `total - recovered` is capacity lost right now. The prefork router keeps its
+own books per worker: `assigned = completed + lost + inflight`, where `lost` is
+the connections a worker held when it died (it is not respawned; the router
+logs `lost N connection(s)` and serves on with the rest).
+
 `/v1/health` reports **facts**: what this process actually did. The
 configuration it was given is on the `[SERVER-CONFIG]` banner line, printed once
 at start — a number that is configuration has no business in a counter, and a
@@ -380,7 +417,8 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 ```json
 {"status":"ok","inflight":2,"blas_budget":8,"threads":8,"worker":-1,
  "slots":{"active":2,"cap":4},"steps":312,"deltas":270,"eous":0,"sessions":9,
- "cancelled":1,
+ "completed":6,"aborted":0,"cancelled":1,"balanced":true,
+ "abandoned":{"total":0,"recovered":0},
  "cancelled_by":{"idle_timeout":1,"peer_gone":0,"frame_too_large":0,
                  "protocol_error":0,"shutting_down":0,"audio_limit":0,
                  "decode_failed":0,"other":0},

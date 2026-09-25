@@ -709,17 +709,35 @@ typedef struct {
     int f32;                     /* the session's binary format (format=f32le) */
     mynah_asr_slot *slot;
     mynah_asr_stream_out *out;
+    /* The client asked for the tail ({"type":"finalize"}) and has sent no audio
+     * since. Only then is an EOF a legal half-close waiting for `done`; any
+     * other EOF is a client that went away mid-utterance. */
+    int finalize_pending;
 } ws_ingest;
+
+/* How a read of the client socket ended. The three failures used to be one
+ * `-1`, and the ingest answered all three with a finalize: a client that
+ * vanished mid-utterance then had the rest of its ring -- up to --ring-seconds
+ * of audio -- run through the model for nobody, and was counted as nothing.
+ * Measured before the fix (tests/fault_probe.py, rst-mid-silent): 27.4 s of
+ * audio fed after a RST. */
+enum { WS_READ_OK = 0, WS_READ_EOF = -1, WS_READ_TIMEOUT = -2, WS_READ_ERROR = -3 };
 
 static int ws_read_exact(int fd, uint8_t *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
         const ssize_t r = recv(fd, buf + got, n - got, 0);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;   /* EOF, error, or the SO_RCVTIMEO backstop */
+        if (r == 0) return WS_READ_EOF;
+        if (r < 0) {
+            /* SO_RCVTIMEO, the backstop for a frame that starts and never
+             * finishes: an idle client, not a broken one. */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return WS_READ_TIMEOUT;
+            return WS_READ_ERROR;
+        }
         got += (size_t)r;
     }
-    return 0;
+    return WS_READ_OK;
 }
 
 static void ws_enqueue(ws_ingest *w, int opcode, const void *payload, size_t len) {
@@ -754,6 +772,7 @@ static void ws_control(ws_ingest *w, const uint8_t *payload, size_t len) {
     const char *type = (t != NULL && cJSON_IsString(t)) ? t->valuestring : NULL;
 
     if (type != NULL && strcmp(type, "finalize") == 0) {
+        w->finalize_pending = 1;
         mynah_asr_slot_request(w->slot, MYNAH_ASR_SLOT_REQ_FINALIZE, NULL,
                                MYNAH_ASR_SLOT_CANCEL_NONE);
     } else if (type != NULL && strcmp(type, "reset") == 0) {
@@ -810,6 +829,16 @@ static int ws_push_pcm(ws_ingest *w, const uint8_t *payload, size_t plen, double
         off += chunk;
     }
     return 1;
+}
+
+/* What a failed read means for the session. A timeout is an idle client. An
+ * EOF right after {"type":"finalize"} is the legal half-close of a client that
+ * is still reading (NONE: finalize as usual); any other EOF, and every socket
+ * error, is a client that is gone. */
+static mynah_asr_slot_cancel ws_read_loss(int rr, int finalize_pending) {
+    if (rr == WS_READ_TIMEOUT) return MYNAH_ASR_SLOT_CANCEL_IDLE;
+    if (rr == WS_READ_EOF && finalize_pending) return MYNAH_ASR_SLOT_CANCEL_NONE;
+    return MYNAH_ASR_SLOT_CANCEL_PEER;
 }
 
 /* Returns 1 when the descriptor is no longer the caller's -- handed to the
@@ -874,13 +903,15 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                             "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
                             accept);
+    /* Every exit before the writer is armed goes through sched_release, which
+     * counts the session as `aborted`: claimed, never started. */
     if (write_all(fd, resp, (size_t)rn) != 0) {
-        mynah_asr_slot_release(slot);
+        mynah_asr_sched_release(slot);
         return 0;
     }
 
     const int rfd = dup(fd);
-    if (rfd < 0) { mynah_asr_slot_release(slot); return 0; }
+    if (rfd < 0) { mynah_asr_sched_release(slot); return 0; }
     struct timeval tv = {.tv_sec = g_idle_ms / 1000,
                          .tv_usec = (g_idle_ms % 1000) * 1000};
     (void)setsockopt(rfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -888,7 +919,7 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     mynah_asr_stream_out *out = mynah_asr_stream_out_start(fd, 0, 0);
     if (out == NULL) {   /* the fd was never handed over: still the caller's */
         close(rfd);
-        mynah_asr_slot_release(slot);
+        mynah_asr_sched_release(slot);
         return 0;
     }
     ws_ingest w = {.fd = rfd, .f32 = params.f32, .slot = slot, .out = out};
@@ -896,6 +927,9 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     mynah_asr_thread_set_name("mynah-ingest");
 
     int cancelled = 0, closed = 0, shutting = 0;
+    /* Why the read loop ended, when it was not a close frame: the session is
+     * then cancelled under this reason instead of finalized. */
+    mynah_asr_slot_cancel lost = MYNAH_ASR_SLOT_CANCEL_NONE;
     size_t audio_samples = 0;
     const double t_start = mynah_asr_now();
     double last_activity = t_start, last_ping = t_start;
@@ -903,7 +937,7 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     while (!closed) {
         if (g_shutdown) { shutting = 1; break; }
         if (mynah_asr_slot_get_state(slot) == MYNAH_ASR_SLOT_DONE) break;
-        if (mynah_asr_stream_out_failed(out)) break;
+        if (mynah_asr_stream_out_failed(out)) { lost = MYNAH_ASR_SLOT_CANCEL_PEER; break; }
 
         /* The server's own liveness probe, on this thread's tick rather than on
          * a timer thread. It goes out through the writer like every other frame,
@@ -921,7 +955,11 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
          * frame that starts and never finishes. */
         struct pollfd pfd = {.fd = rfd, .events = POLLIN, .revents = 0};
         const int ready = poll(&pfd, 1, 200);
-        if (ready < 0) { if (errno == EINTR) continue; break; }
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            lost = MYNAH_ASR_SLOT_CANCEL_PEER;
+            break;
+        }
         if (ready == 0) {
             /* Idle is measured against ANY frame, not just audio: a client that
              * keeps the socket open and says nothing at all is the one holding
@@ -936,22 +974,47 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
         }
 
         uint8_t h[2];
-        if (ws_read_exact(rfd, h, 2) != 0) break;
+        int rr = ws_read_exact(rfd, h, 2);
+        if (rr != WS_READ_OK) { lost = ws_read_loss(rr, w.finalize_pending); break; }
         const int opcode = h[0] & 0x0F;
         const int masked = h[1] & 0x80;
         uint64_t plen = h[1] & 0x7F;
         if (plen == 126) {
             uint8_t e[2];
-            if (ws_read_exact(rfd, e, 2) != 0) break;
+            if ((rr = ws_read_exact(rfd, e, 2)) != WS_READ_OK) {
+                lost = ws_read_loss(rr, 0);
+                break;
+            }
             plen = ((uint64_t)e[0] << 8) | e[1];
         } else if (plen == 127) {
             uint8_t e[8];
-            if (ws_read_exact(rfd, e, 8) != 0) break;
+            if ((rr = ws_read_exact(rfd, e, 8)) != WS_READ_OK) {
+                lost = ws_read_loss(rr, 0);
+                break;
+            }
             plen = 0;
             for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
         }
         uint8_t mask[4] = {0};
-        if (masked && ws_read_exact(rfd, mask, 4) != 0) break;
+        if (masked && (rr = ws_read_exact(rfd, mask, 4)) != WS_READ_OK) {
+            lost = ws_read_loss(rr, 0);
+            break;
+        }
+        /* RFC 6455 5.2 and 5.5: reserved bits with no negotiated extension, a
+         * control frame over 125 bytes or fragmented -- the connection must be
+         * failed. Before this they were read as audio or ignored, and a client
+         * speaking another dialect got an idle timeout instead of a reason. */
+        if ((h[0] & 0x70) != 0 ||
+            ((opcode & 0x8) != 0 && (plen > 125 || (h[0] & 0x80) == 0))) {
+            ws_transport_error(&w, "protocol_error",
+                               (h[0] & 0x70) != 0
+                                   ? "reserved bits set: no extension was negotiated"
+                                   : "a control frame must be final and at most 125 bytes");
+            mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
+                                   MYNAH_ASR_SLOT_CANCEL_PROTOCOL);
+            cancelled = 1;
+            break;
+        }
         if (plen > (uint64_t)g_max_frame_bytes) {
             ws_transport_error(&w, "frame_too_large",
                                "the frame exceeds --max-frame-bytes");
@@ -962,7 +1025,11 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
         }
 
         payload = (uint8_t *)malloc((size_t)plen ? (size_t)plen : 1);
-        if (payload == NULL || ws_read_exact(rfd, payload, (size_t)plen) != 0) break;
+        if (payload == NULL) { lost = MYNAH_ASR_SLOT_CANCEL_PEER; break; }
+        if ((rr = ws_read_exact(rfd, payload, (size_t)plen)) != WS_READ_OK) {
+            lost = ws_read_loss(rr, 0);
+            break;
+        }
         if (masked)
             for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
         last_activity = mynah_asr_now();
@@ -987,6 +1054,7 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
             case 0x2: {
                 const size_t width = w.f32 ? 4u : 2u;
                 if (plen < width) break;
+                w.finalize_pending = 0;
                 if (!ws_push_pcm(&w, payload, (size_t)plen, last_activity)) {
                     closed = 1;
                     break;
@@ -1001,7 +1069,7 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                     /* Ended by the INGEST, so the scheduler never sees a
                      * cancel for it: counted here, in the same buckets, under
                      * the same code the client was just given. */
-                    mynah_asr_sched_note_cancel("audio_limit");
+                    mynah_asr_slot_set_outcome(slot, "audio_limit");
                     ws_transport_error(&w, "audio_limit",
                                        "the stream reached --max-audio-seconds");
                     mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
@@ -1026,6 +1094,13 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
      * SIGTERM is the exception -- the scheduler's drain owes that client an
      * `error shutting_down`, and a finalize racing it would answer `done`
      * instead, which tells the client the opposite of what happened. */
+    /* ...and a client that went away without a close frame is owed nothing:
+     * no tail, no `done`. It is cancelled here, so the model stops at the next
+     * step boundary instead of draining the ring for nobody. */
+    if (!cancelled && !shutting && !closed && lost != MYNAH_ASR_SLOT_CANCEL_NONE) {
+        mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL, lost);
+        cancelled = 1;
+    }
     if (!cancelled && !shutting)
         mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_FINALIZE |
                                      MYNAH_ASR_SLOT_REQ_CLOSE, NULL,
@@ -1040,14 +1115,16 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     }
     close(rfd);
     mynah_asr_thread_set_name("mynah-http");
-    if (done) {
-        mynah_asr_slot_release(slot);
+    if (done || !mynah_asr_sched_abandon(slot)) {
+        mynah_asr_sched_release(slot);
         mynah_asr_stream_out_release(out);
     } else {
         /* The scheduler still owns both. Letting go here would hand it a freed
-         * writer; the slot stays charged instead, which /v1/health shows. */
+         * writer, so the release becomes the scheduler's: it frees slot and
+         * writer when it finally ends the session (abandoned.recovered in
+         * /v1/health). Until then the slot is charged, and counted. */
         fprintf(stderr, "mynah-asr-server: slot %d did not finish; "
-                        "leaving it to the scheduler\n", slot->id);
+                        "left to the scheduler to release\n", slot->id);
     }
     return 1;
 }

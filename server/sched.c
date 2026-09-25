@@ -187,6 +187,13 @@ static struct {
      * /v1/health: relaxed atomics rather than a lock, so a health probe can
      * never queue behind a step. */
     _Atomic unsigned long steps, deltas, eous, cancelled, sessions, offline_jobs;
+    /* S12-18: the terminal outcomes. `acct_mu` is taken by claim, release and
+     * the snapshot -- a few times per SESSION, never per step -- so that
+     * sessions == completed + cancelled + aborted + active holds exactly in
+     * every snapshot instead of only when the server happens to be idle. */
+    pthread_mutex_t acct_mu;
+    int acct_ready;                /* acct_mu initialised (start ran)          */
+    _Atomic unsigned long completed, aborted, abandoned, abandoned_recovered;
     _Atomic unsigned long lag_hist[MYNAH_ASR_LAG_BUCKETS];
     _Atomic unsigned long lag_max_us;
     /* S3-3. Two more adds on paths that already do one, and one array indexed
@@ -284,7 +291,29 @@ static void count_cancel(const char *code) {
                               memory_order_relaxed);
 }
 
-void mynah_asr_sched_note_cancel(const char *code) { count_cancel(code); }
+/* The one place a session is counted. Called with acct_mu held, right before
+ * the slot goes back to FREE, whoever releases it. */
+static void count_outcome_locked(const char *outcome) {
+    if (outcome == NULL)
+        atomic_fetch_add_explicit(&g.aborted, 1, memory_order_relaxed);
+    else if (strcmp(outcome, "completed") == 0)
+        atomic_fetch_add_explicit(&g.completed, 1, memory_order_relaxed);
+    else
+        count_cancel(outcome);
+}
+
+void mynah_asr_sched_release(mynah_asr_slot *slot) {
+    pthread_mutex_lock(&g.acct_mu);
+    count_outcome_locked(mynah_asr_slot_outcome(slot));
+    mynah_asr_slot_release(slot);
+    pthread_mutex_unlock(&g.acct_mu);
+}
+
+int mynah_asr_sched_abandon(mynah_asr_slot *slot) {
+    if (!mynah_asr_slot_abandon(slot)) return 0;
+    atomic_fetch_add_explicit(&g.abandoned, 1, memory_order_relaxed);
+    return 1;
+}
 
 /* ----------------------------------------------------------- the invariant */
 
@@ -457,16 +486,27 @@ static int sched_ensure_stream(mynah_asr_slot *s) {
 /* Hands the session back: the writer drains what is queued, closes the socket
  * and goes; the ingest thread sees DONE and lets the slot go FREE. The stream
  * object stays with the slot -- that is what "pooled" means. */
-static void sched_close_session(mynah_asr_slot *s) {
+/* `outcome` is "completed" or the code the client was sent; it is recorded on
+ * the slot here and COUNTED once, at release (mynah_asr_sched_release). When
+ * the ingest has already abandoned the slot there is nobody left to release
+ * it, so the scheduler does: the output writer's producer reference is dropped
+ * here, after the finish above has handed the socket to the writer. */
+static void sched_close_session(mynah_asr_slot *s, const char *outcome) {
     sched_enqueue(s, 0x8, "", 0);
-    mynah_asr_stream_out_finish(s->out);
-    mynah_asr_slot_set_state(s, MYNAH_ASR_SLOT_DONE);
+    mynah_asr_stream_out *out = s->out;
+    mynah_asr_stream_out_finish(out);
+    if (mynah_asr_slot_finish(s, outcome)) {
+        atomic_fetch_add_explicit(&g.abandoned_recovered, 1, memory_order_relaxed);
+        mynah_asr_sched_release(s);
+        mynah_asr_stream_out_release(out);
+        fprintf(stderr, "mynah-asr-server: abandoned slot %d ended (%s) and released "
+                        "by the scheduler\n", s->id, outcome);
+    }
 }
 
 static void sched_cancel(mynah_asr_slot *s, const char *code, const char *msg) {
     sched_error_frame(s, code, msg);
-    count_cancel(code);
-    sched_close_session(s);
+    sched_close_session(s, code);
 }
 
 /* ---------------------------------------------------- R-2 first-partial trace
@@ -807,7 +847,7 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
     g.fin_calls++;
     sched_emit_done(s);
     if (close_after) {
-        sched_close_session(s);
+        sched_close_session(s, "completed");
     } else {
         /* The socket stays open for another utterance; the next audio starts
          * from a reset stream, so a client need not reconnect. */
@@ -954,15 +994,16 @@ static void *sched_main(void *arg) {
                 g.req_live[i] = 0;
                 did = 1;
             } else if (mynah_asr_stream_out_failed(g.req_out[i]) ||
-                       /* Skipped while the tail is being flushed: a client that
-                        * half-closes after asking to finalize is not gone, it is
-                        * waiting for `done`. */
-                       (!finalizing && mynah_asr_stream_out_peer_gone(g.req_out[i]))) {
+                       /* While the tail is being flushed only a HARD hangup
+                        * counts: a client that half-closes after asking to
+                        * finalize is not gone, it is waiting for `done` -- but
+                        * one that reset the connection will never read it, and
+                        * the tail it asked for is then work for nobody. */
+                       mynah_asr_stream_out_peer_gone_ex(g.req_out[i], finalizing)) {
                 /* No frame goes out on this one -- the socket is the thing that
                  * failed -- but the reason is still the one the client would
                  * have been told, so it is counted in that bucket. */
-                count_cancel(mynah_asr_slot_cancel_code(MYNAH_ASR_SLOT_CANCEL_PEER));
-                sched_close_session(s);
+                sched_close_session(s, mynah_asr_slot_cancel_code(MYNAH_ASR_SLOT_CANCEL_PEER));
                 g.req_live[i] = 0;
                 did = 1;
             }
@@ -1191,6 +1232,8 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     }
 
     if (pthread_mutex_init(&g.mu, NULL) != 0) return -1;
+    if (pthread_mutex_init(&g.acct_mu, NULL) != 0) return -1;
+    g.acct_ready = 1;
     if (pthread_cond_init(&g.wake, NULL) != 0) return -1;
     if (pthread_cond_init(&g.job_done, NULL) != 0) return -1;
 
@@ -1257,12 +1300,15 @@ int mynah_asr_sched_sample_rate(void) { return g.sample_rate > 0 ? g.sample_rate
 
 mynah_asr_slot *mynah_asr_sched_claim(const char *lang, int lookahead) {
     const double now = mynah_asr_now();
+    pthread_mutex_lock(&g.acct_mu);
     for (int i = 0; i < g.n_slots; i++) {
         if (mynah_asr_slot_claim(&g.slots[i], lang, lookahead, NULL, now) == 0) {
             atomic_fetch_add_explicit(&g.sessions, 1, memory_order_relaxed);
+            pthread_mutex_unlock(&g.acct_mu);
             return &g.slots[i];
         }
     }
+    pthread_mutex_unlock(&g.acct_mu);
     return NULL;
 }
 
@@ -1334,17 +1380,29 @@ int mynah_asr_sched_slots_view(mynah_asr_sched_slot_view *out, int max) {
 
 void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     memset(out, 0, sizeof(*out));
+    /* The session books, in one critical section with claim and release. A
+     * process that never started a scheduler (the prefork router) has no books
+     * and no lock to take. */
+    if (g.acct_ready) pthread_mutex_lock(&g.acct_mu);
     out->slots_active = mynah_asr_sched_active();
+    out->sessions = atomic_load_explicit(&g.sessions, memory_order_relaxed);
+    out->cancelled = atomic_load_explicit(&g.cancelled, memory_order_relaxed);
+    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
+        out->cancel_by[i] = atomic_load_explicit(&g.cancel_by[i], memory_order_relaxed);
+    out->completed = atomic_load_explicit(&g.completed, memory_order_relaxed);
+    out->aborted = atomic_load_explicit(&g.aborted, memory_order_relaxed);
+    if (g.acct_ready) pthread_mutex_unlock(&g.acct_mu);
+    out->abandoned = atomic_load_explicit(&g.abandoned, memory_order_relaxed);
+    out->abandoned_recovered =
+        atomic_load_explicit(&g.abandoned_recovered, memory_order_relaxed);
+    out->balanced = out->sessions ==
+        out->completed + out->cancelled + out->aborted + (unsigned long)out->slots_active;
     out->slots_cap = g.n_slots;
     out->streaming = g.streaming;
     out->steps    = atomic_load_explicit(&g.steps, memory_order_relaxed);
     out->deltas   = atomic_load_explicit(&g.deltas, memory_order_relaxed);
     out->eous     = atomic_load_explicit(&g.eous, memory_order_relaxed);
-    out->sessions = atomic_load_explicit(&g.sessions, memory_order_relaxed);
-    out->cancelled = atomic_load_explicit(&g.cancelled, memory_order_relaxed);
     out->offline_done = atomic_load_explicit(&g.offline_jobs, memory_order_relaxed);
-    for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
-        out->cancel_by[i] = atomic_load_explicit(&g.cancel_by[i], memory_order_relaxed);
     out->audio_seconds =
         (double)atomic_load_explicit(&g.audio_samples, memory_order_relaxed) /
         (double)g.sample_rate;
@@ -1472,7 +1530,15 @@ void mynah_asr_sched_health(cJSON *into) {
     cJSON_AddNumberToObject(into, "deltas", (double)st.deltas);
     cJSON_AddNumberToObject(into, "eous", (double)st.eous);
     cJSON_AddNumberToObject(into, "sessions", (double)st.sessions);
+    cJSON_AddNumberToObject(into, "completed", (double)st.completed);
+    cJSON_AddNumberToObject(into, "aborted", (double)st.aborted);
     cJSON_AddNumberToObject(into, "cancelled", (double)st.cancelled);
+    /* S12-18: sessions == completed + cancelled + aborted + slots.active, read
+     * in one critical section. False is a counting bug, never load. */
+    cJSON_AddBoolToObject(into, "balanced", st.balanced ? 1 : 0);
+    cJSON *ab = cJSON_AddObjectToObject(into, "abandoned");
+    cJSON_AddNumberToObject(ab, "total", (double)st.abandoned);
+    cJSON_AddNumberToObject(ab, "recovered", (double)st.abandoned_recovered);
     cJSON *cb = cJSON_AddObjectToObject(into, "cancelled_by");
     for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
         cJSON_AddNumberToObject(cb, mynah_asr_sched_cancel_bucket_name(i),
