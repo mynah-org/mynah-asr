@@ -1135,3 +1135,30 @@ the knob stays default off and research only. What would still move the first
 WORD is upstream of the decoder (cadence/lookahead, checkpoint), which S13-5
 already located on the checkpoint side. Evidence:
 `.work/evidence/report-bundle-20260924/raw/first-text-*` (untracked).
+
+# S13-10 — First word by lookahead preset (REGISTERED 2026-09-25, before the run)
+
+**Question.** The first complete word sits at ~1140 ms p50 / ~2330 ms p95 from
+speech onset (S13-5c, default preset). Serving and the decoder's commit policy
+are ruled out. Does a smaller-lookahead preset of the SAME checkpoint move it,
+and at what WER cost? (Presets in the pack: [56,0] [56,3] default, [56,6],
+[56,13]; chunk = (L+1) x 80 ms.)
+
+**Protocol.** Axion, build `2aee1be`, the 349 original recordings of the
+qualification bank (the S13-5c set), CLI `stream --deltas --quant int8
+--lookahead L`, 4 threads, 6 clips at a time on disjoint 5-cpu slices, no other
+flag. Same definitions as S13-5c: first text = audio consumed at the first
+delta, first complete word = audio consumed when the first word is closed,
+both from speech onset (the C=128 run's onsets). Audio consumed INCLUDES the
+lookahead the preset waits for, so it is the latency the preset imposes (not
+compute). WER/CER/WER-ff with streaming_metrics against the manifest.
+
+**Gate.** L=3 must reproduce the S13-5c delta-0 transcripts byte for byte
+(349/349) and WER mean 0.10398; otherwise the run is void.
+
+**Decision rule (registered now).** A preset is a product CANDIDATE if its
+first-word p95 is at least 200 ms below L=3 AND its WER mean is at most
++0.005 absolute over L=3 with no catastrophic clip (WER +0.2 or empty).
+Otherwise it is rejected as a first-word lever. Nothing is promoted from this
+run: a candidate goes to a serving qualification of its own (its cadence
+changes the capacity law).
