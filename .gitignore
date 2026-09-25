@@ -35,6 +35,7 @@ tools/.venv/
 # the streaming stress bank (~640 MB, regenerable with `make fetch-stress-bank`):
 # its manifest.json and README.md are tracked, its audio never is
 samples/stress-en/**/*.wav
+samples/stress-fr/**/*.wav
 # the EN/FR quality bank (FLEURS test split, fetched by tools/fetch_eval_bank.py):
 # audio and its manifest are evidence, not repository content (rule 6)
 samples/eval-bank/

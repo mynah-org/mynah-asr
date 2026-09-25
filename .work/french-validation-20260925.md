@@ -34,13 +34,24 @@ seed 42, class bounds 8/20 s; long clips are concatenations, as for English).
   English, M-6). Flagged clips are listed with the reason and excluded from the
   VALIDATED subset; the raw set's numbers are reported beside it.
 
-**Quality A/B (configuration, not model selection).** The validated original
-recordings, CLI `stream --deltas --quant int8`, L=3, `--lang fr` vs `--lang
-auto`, paired: WER/CER mean and corpus, first-word correctness against the
-reference, first-complete-word latency from the energy onset (and from the
-lexical onset when an aligner for French is available; if none, stated).
-Recommendation rule: explicit `fr` is recommended if its WER mean is not worse
-than auto's and first-word correctness is not worse.
+**Amendment (2026-09-25, still before any French measurement).** A French
+QUALITY baseline already exists and is reused rather than rebuilt:
+`samples/eval-bank/` (`tools/fetch_eval_bank.py`, FLEURS **test** split, 200 FR +
+200 EN, never tuned on), frozen in `cc28e08` (2026-09-22): stream int8 [56,3],
+FR WER 0.1316 [0.1148, 0.1496], CER 0.0651, first published word right 86.0 %,
+measured with the manifest's language, i.e. explicit `fr`. What S12-16 still
+lacks is (a) French under LOAD and (b) `fr` vs `auto`.
+
+**Quality A/B (configuration, not model selection).** `tools/eval/lang_gate.py`
+on the eval-bank FR 200, stream int8 L=3: explicit `fr` (must reproduce the
+frozen WER 0.1316 within its interval, else the run is void) vs `auto` (the
+language overridden to `auto`, same clips), paired: WER/CER, insertions,
+first-word correctness, first-text latency as lang_gate reports it.
+Recommendation rule: explicit `fr` is recommended if its WER is not worse than
+auto's and its first-word correctness is not worse.
+
+**The stress-fr bank** (built for load) gets the trust checks below, and the
+soak runs on its validated subset.
 
 **Serving.** `tools/bench/v2_qualify.sh` with the French corpus, the qualified
 flags and topology, `--soak-c 144 --soak-seconds 900 --soaks 1`, the clients
