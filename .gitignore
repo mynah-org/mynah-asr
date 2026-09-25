@@ -36,6 +36,7 @@ tools/.venv/
 # its manifest.json and README.md are tracked, its audio never is
 samples/stress-en/**/*.wav
 samples/stress-fr/**/*.wav
+samples/stress-fr/trust.json
 # the EN/FR quality bank (FLEURS test split, fetched by tools/fetch_eval_bank.py):
 # audio and its manifest are evidence, not repository content (rule 6)
 samples/eval-bank/
