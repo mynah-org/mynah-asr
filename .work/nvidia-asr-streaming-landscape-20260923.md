@@ -1342,3 +1342,60 @@ publication = t_pub - t_decode (expected 0, R-15); closing = t_close - t_pub.
 For the first-word errors: whether the reference's first word's tokens were
 ever the best non-blank before the wrong emission, and whether the error clips
 emit later than the correct ones.
+
+## S13-10 result — where Nemotron's ~600 ms go (2026-09-25)
+
+**Trace fact found on the way.** `MYNAH_ASR_TRACE_RNNT` prints ONE line per
+encoder frame (the frame's first decision); further symbols emitted in the same
+frame are not traced (e.g. "▁T" traced, "his" not, while the delta says "This").
+The analysis therefore takes the TEXT from the deltas and only frame TIMES from
+the trace. A first attempt that rebuilt words from traced tokens alone was wrong
+and is discarded.
+
+**RESULT — lifecycle of the first word, 318 clips whose first word matches the
+aligner (audio time, ms):**
+
+| stage | p50 | p90 | p95 | mean | owner |
+|---|---|---|---|---|---|
+| acoustic word end -> frame at which Nemotron completes the word | 400 | 640 | 720 | 451 | the checkpoint (RNNT emission alignment) |
+| that frame -> audio consumed when it is decided | 180 | 260 | 260 | 162 | preset geometry (lookahead + chunk wait) |
+| decided -> published in a delta | 0 | 0 | 0 | -10 | runtime: no gate (R-15 again) |
+| **= word end -> published (the model term)** | 620 | 840 | 940 | 602 | |
+| published -> closing separator | 300 | 400 | 600 | 206 | the next word's audio |
+
+The first PIECE of the word was already the best non-blank before its emission
+on 275/318 clips (p50 240 ms earlier), but with blank ahead by a p50 of **6.5
+nats** at that first frame -- not a near tie. S13-5c already showed that forcing
+earlier commits (up to 4 nats) produces word fragments, raises WER and does not
+move the first complete word.
+
+**CONCLUSION.** The ~600 ms are ~400 ms where Nemotron itself places the
+completing token after the acoustics (intrinsic to the checkpoint), ~180 ms of
+preset geometry (lookahead + chunk: the presets were measured, L=0 does not move
+the first word), and 0 ms of runtime. There is no runtime or decoder-policy
+stage holding a ready word. **Recorded as intrinsic; not pursued further as a
+CPU-serving optimisation.**
+
+**RESULT — first-word errors.** 36 clips' first word differs from the human
+reference (313/349 right), of which ~6 are reference formatting (digits:
+"250" vs "two", "2004" vs "two"; compounds: "citystates", "naturebased"). The
+reference word's first piece was ever the best non-blank before the wrong
+emission on 15/36; on the 8 error clips whose (wrong) word the aligner also
+heard, the alignment delay is p50 560 ms vs 400 overall (small n). No evidence
+that latency and accuracy share one mechanism beyond "hard clips are hard".
+
+**RESULT — Nemotron configuration note (candidate A, `--lang en` instead of the
+default `auto`, same checkpoint, not model selection).** Latency unchanged
+(model term p50 600 vs 620, raw p95 2310 vs 2330, paired median +0 ms). First
+word right 322/349 vs 313: **9 of the control's 36 errors recovered, 0 new
+errors introduced**; raw-p95 tail first words right 15/19 vs 12/19; final WER
+mean 0.10259 vs 0.10398, CER 0.06730 vs 0.06866. Several recovered errors were
+non-English first tokens under `auto` ("es", "det", "là"...).
+**DECISION PENDING (user/product):** when a client knows its language, sending
+`lang=en` is free and strictly better on this set; whether the product should
+default to an explicit language (or ask the client for it) is a product call.
+The server already accepts `?lang=`.
+
+Evidence: `.work/evidence/la-20260925/lifecycle.txt|json`, `candidates.txt`,
+scripts (untracked). Candidate B (EOU 120M) and C were not run (user: Nemotron
+is fixed).
