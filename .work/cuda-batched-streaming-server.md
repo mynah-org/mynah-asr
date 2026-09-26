@@ -514,6 +514,50 @@ one 120 s run passed (profile, 173 / 220 ms) and another failed (ladder,
 492 / 645 ms) -- near the knee the queue is bistable across runs, which is why
 only the 2x30-minute soaks decide.
 
+### 2026-09-26 evening: the V2 qualification of split-K at C=144 — FAILED
+
+`gpu_qualify.sh --gemm splitk`, commit `a3db12e`, binary `335843c3…`, same bank
+`04a7753aa1e80f9a`, same flags as the v1 run. Evidence (verdict, manifest,
+reference, health, run log):
+`.work/evidence/gpu-l4-20260926/qual-splitk-20260926T161458Z/`.
+
+| run | lag p95 | fin p95 | backlog max | drift worst | trend | parity | audio/wall | verdict |
+|---|---|---|---|---|---|---|---|---|
+| ladder C=128 (90 s) | 97 | 128 | 0.184 | 97 | n/a | PASS | 90.6x | pass (no trend over 90 s) |
+| ladder C=144 | 166 | 216 | 0.584 | 258 | n/a | PASS | 103.7x | pass (no trend over 90 s) |
+| ladder C=152 | **360** | 447 | **0.684** | **506** | -44 % | PASS | 90.6x | NOT QUALIFIED |
+| ladder C=160 | **607** | **781** | **0.984** | **773** | n/a | PASS | 110.7x | NOT QUALIFIED |
+| soak 1 C=144, 1800 s | **346** | 455 | **1.064** | **515** | +11.5 % | PASS | 138.1x | NOT QUALIFIED |
+| soak 2 C=144, 1800 s | **467** | **625** | **1.164** | **783** | +18.2 % | PASS | 138.2x | NOT QUALIFIED and **NOT PACED** (the generator could not hold 1x: DIAGNOSTIC) |
+
+Both soaks: 0 streams lost of 38 110 utterances, transcripts identical across
+streams and to the unloaded reference on 498/498 clips, books balanced in every
+dump, RSS 1.027x, one process.
+
+**RESULT, stated exactly:** CUDA split-K on the L4 does NOT qualify C=144: the
+90 s ladder passes it, the 30-minute soaks drift past the lag and backlog
+bounds (trend +11.5 %), so C=144 is at or past the knee under sustained load.
+C=128 is untested at 30 minutes on split-K; its 90 s rung has wide margins
+(97 / 128 ms, backlog 0.18 s, against v1's 165 / 224 ms, 0.34 s). The C=128
+soak pair was started and stopped by the owner at the end of the day, never
+measured.
+
+**FACT about the harness, to fix before the next soak:** soak 2 was not paced.
+The load generator runs in the same container as the server (one process per
+stream, 144 processes) on a host whose other tenants keep loadavg ~28; the
+container has a 24.5-CPU quota. The v1 soaks at C=128 were paced; at C=144 the
+generator lost the clock. The next GPU soak needs the generator on a second
+machine or pinned CPUs proven idle, or its result is DIAGNOSTIC.
+
+**Next, in order (tomorrow):**
+1. 2x30-minute soaks at **C=128 on split-K**, generator pacing proven (the
+   direct test of "does the first lever turn v1's C=128 FAIL into a PASS").
+2. If it qualifies: decide whether split-K becomes the default (`--gemm own`),
+   with the transcript identity of 498/498 as the quality evidence.
+3. Profile split-K at C=144 against C=128 (attention core is now the second
+   stage, 16-18 %) and choose the next lever: bf16 tensor cores on the FFN
+   first (the registered plan), each GEMM family behind its own WER gate.
+
 ## Explicit non-goals and rejected shortcuts
 
 - No per-op offload of the CPU step (the 2026-07 `cuda_gemm.cu` seam stays
