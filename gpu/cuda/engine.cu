@@ -84,6 +84,7 @@ struct cuda_engine {
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
     int use_cublas = 0;
+    int gemm_v1 = 0;   /* --gemm own-v1: the S14-2 kernel, the A/B arm */
     std::vector<slot_host> slots;
     std::vector<int> pending_resets;
     asr_engine_stats st = {};
@@ -190,7 +191,8 @@ static int gemm(cuda_engine *e, const float *A, int lda, const float *W, const f
                 float *C, int ldc, int M, int N, int K, int accumulate, int act) {
     if (M <= 0) return 0;
     if (!e->use_cublas) {
-        CK(e, "gemm", k_gemm_wt(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->stream));
+        if (e->gemm_v1) CK(e, "gemm", k_gemm_wt_v1(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->stream));
+        else CK(e, "gemm", k_gemm_wt(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->stream));
         return 0;
     }
     const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
@@ -396,9 +398,10 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         delete e; return nullptr;
     }
     e->use_cublas = cfg->gemm && strcmp(cfg->gemm, "cublas") == 0;
+    e->gemm_v1 = cfg->gemm && strcmp(cfg->gemm, "own-v1") == 0;
     e->prof = cfg->profile ? 1 : 0;
-    if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0) {
-        snprintf(err, errcap, "gemm '%s' is not one of own, cublas", cfg->gemm);
+    if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v1") != 0) {
+        snprintf(err, errcap, "gemm '%s' is not one of own, own-v1, cublas", cfg->gemm);
         delete e; return nullptr;
     }
     int ndev = 0;
@@ -502,7 +505,7 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
     f->name = "cuda";
     f->device = e->devname.c_str();
     f->precision = "f32";
-    f->gemm = e->use_cublas ? "cublas-pedantic (measured arm)" : "own-rowstable";
+    f->gemm = e->use_cublas ? "cublas-pedantic (measured NOT row-stable)" : e->gemm_v1 ? "own-rowstable-v1" : "own-rowstable-v2";
     f->model_name = e->pack.name;
     f->cap = e->cap; f->qmax = e->pack.qmax;
     f->n_lookaheads = e->pack.n_lookaheads;
@@ -523,7 +526,7 @@ static int cuda_dead(const cuda_engine *e) { return e->dead; }
 static const char *cuda_error(const cuda_engine *e) { return e->err; }
 
 static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
-    const char *g = e->use_cublas ? "cublas-sgemm-pedantic" : "own-rowstable-f32";
+    const char *g = e->use_cublas ? "cublas-sgemm-pedantic" : e->gemm_v1 ? "own-rowstable-v1" : "own-rowstable-v2";
     return (size_t)snprintf(buf, cap,
         "engine            cuda           %s\n"
         "gemm              %-14s row-stable-by-construction=%s\n"
@@ -535,7 +538,7 @@ static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
         "mel               host           src/features.c (double fft), phase 1\n"
         "precision         f32            weights f32 resident, no tf32\n"
         "graphs            off            phase 1\n",
-        e->devname.c_str(), g, e->use_cublas ? "no(measured)" : "yes", e->dm.conv_k, e->dm.pred_layers);
+        e->devname.c_str(), g, e->use_cublas ? "NO(measured)" : "yes", e->dm.conv_k, e->dm.pred_layers);
 }
 
 /* ----------------------------------------------------------------- slots */

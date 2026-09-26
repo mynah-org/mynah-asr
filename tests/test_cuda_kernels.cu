@@ -26,6 +26,7 @@
 #include <vector>
 
 static int g_fail = 0;
+static int g_cublas_unstable = 0;   /* shapes on which cuBLAS was measured row-UNstable */
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("FAIL "); printf(__VA_ARGS__); printf("\n"); } else { printf("OK   "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define CU(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("FAIL cuda: %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return 1; } } while (0)
 
@@ -124,9 +125,79 @@ static int test_cublas_rowstable(int N, int K, const char *what, cublasHandle_t 
         auto c = to_host(dC, (size_t)M * N);
         if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) { nbad++; if (bad_m < 0) bad_m = M; }
     }
-    CHECK(nbad == 0, "cublas row-stable %s [N=%d K=%d]: %d of %zu cohort sizes differ from M=257%s%d", what, N, K, nbad,
-          sizeof(Ms) / sizeof(Ms[0]), nbad ? ", first at M=" : "", nbad ? bad_m : 0);
+    /* REPORTED, not a failure of this test: it measures the comparison arm.
+     * Measured on the L4, 2026-09-26: NOT row-stable on any of the 12 shapes
+     * (from M=1), which is why cuBLAS is not the default (contract 4). */
+    printf("INFO cublas row-stable %s [N=%d K=%d]: %s (%d of %zu cohort sizes differ from M=257%s%d)\n", what, N, K,
+           nbad ? "NO" : "yes", nbad, sizeof(Ms) / sizeof(Ms[0]), nbad ? ", first at M=" : "", nbad ? bad_m : 0);
+    g_cublas_unstable += nbad ? 1 : 0;
     cudaFree(dA); cudaFree(dW); cudaFree(dRef); cudaFree(dC);
+    return 0;
+}
+
+
+/* ------------------------------------------------ v2 == v1, byte for byte (S14-8a)
+ * Every v2 configuration, pinned, and the dispatcher's own choice, at a sweep
+ * of cohort sizes, against the v1 kernel: the per-element fma chain is the
+ * same, so the bits must be. Then timing on the same shapes (INFO, not a gate). */
+static int test_gemm_v2(int N, int K, const char *what, int bench) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 5, 16, 24, 33, 64, 95, 128, 163, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N);
+    fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+    float *dA = dup_dev(A), *dW = dup_dev(W), *db = dup_dev(bias), *dR, *dC;
+    CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    int mism = 0;
+    for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+        const int M = Ms[mi];
+        for (int act = 0; act <= 2; act += 2) {
+            CU(cudaMemcpy(dR, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+            CU(k_gemm_wt_v1(dA, K, dW, db, dR, N, M, N, K, 1, act, 0));
+            CU(cudaDeviceSynchronize());
+            auto ref = to_host(dR, (size_t)M * N);
+            for (int cfg = -1; cfg < k_gemm_config_count(); cfg++) {
+                k_gemm_force_config(cfg);
+                CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                CU(k_gemm_wt(dA, K, dW, db, dC, N, M, N, K, 1, act, 0));
+                CU(cudaDeviceSynchronize());
+                auto c = to_host(dC, (size_t)M * N);
+                if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
+                    if (mism < 3) printf("     v2 %s cfg %s M=%d act=%d differs from v1\n", what, cfg < 0 ? "auto" : k_gemm_config_name(cfg), M, act);
+                    mism++;
+                }
+            }
+            k_gemm_force_config(-1);
+        }
+    }
+    CHECK(mism == 0, "gemm v2 == v1 byte for byte %s [N=%d K=%d]: every configuration, 10 cohort sizes, bias+accumulate, relu/silu (%d mismatches)", what, N, K, mism);
+    if (bench) {
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int Mb[] = {24, 64, 95, 128, 163, 256};
+        for (size_t mi = 0; mi < sizeof(Mb) / sizeof(Mb[0]); mi++) {
+            const int M = Mb[mi];
+            float t1 = 0, t2 = 0, tb = 0, ms;
+            for (int arm = 0; arm < 2; arm++) {
+                for (int r = 0; r < 3; r++) arm ? (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                cudaEventRecord(e0);
+                for (int r = 0; r < 20; r++) arm ? (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                (arm ? t2 : t1) = ms / 20.0f;
+            }
+            {
+                cublasHandle_t h; cublasCreate(&h); cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
+                const float al = 1.0f, be = 0.0f;
+                for (int r = 0; r < 3; r++) cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &al, dW, K, dA, K, &be, dC, N);
+                cudaEventRecord(e0);
+                for (int r = 0; r < 20; r++) cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &al, dW, K, dA, K, &be, dC, N);
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                tb = ms / 20.0f; cublasDestroy(h);
+            }
+            const double gf = 2.0 * M * N * K / 1e9;
+            printf("BENCH %-12s M=%3d  v1 %7.3f ms (%5.2f TF)  v2 %7.3f ms (%5.2f TF, %.2fx)  cublas %7.3f ms (%5.2f TF)\n",
+                   what, M, t1, gf / t1, t2, gf / t2, t1 / t2, tb, gf / tb);
+        }
+    }
+    cudaFree(dA); cudaFree(dW); cudaFree(db); cudaFree(dR); cudaFree(dC);
     return 0;
 }
 
@@ -486,7 +557,8 @@ static int test_decode(void) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const int bench = argc > 1 && strcmp(argv[1], "--bench") == 0;
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
         printf("SKIP test_cuda_kernels: compiled, no CUDA device\n");
@@ -531,12 +603,15 @@ int main(void) {
         }
         CHECK(nbad_total == 0, "own gemm row-stable over the cohort-size sweep, all shapes (%d mismatches)", nbad_total);
     }
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+        if (test_gemm_v2(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
     if (test_argmax() != 0) return 1;
     if (test_layernorm() != 0) return 1;
     if (test_attention() != 0) return 1;
     if (test_conv() != 0) return 1;
     if (test_subsampling() != 0) return 1;
     if (test_decode() != 0) return 1;
+    printf("INFO cuBLAS (pedantic f32) row-UNstable on %d of 12 shapes on this card\n", g_cublas_unstable);
     printf("%s: %d failure(s)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

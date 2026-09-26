@@ -77,6 +77,15 @@ struct gpu_arena {
 cudaError_t k_gemm_wt(const float *A, int lda, const float *W, const float *bias,
                       float *C, int ldc, int M, int N, int K, int accumulate, int act,
                       cudaStream_t s);
+/* v1, the S14-2 kernel: the bit reference every v2 configuration must equal,
+ * and the A/B arm (--gemm own-v1). */
+cudaError_t k_gemm_wt_v1(const float *A, int lda, const float *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         cudaStream_t s);
+/* tests: pin one v2 configuration (-1 = the dispatcher chooses) */
+void k_gemm_force_config(int cfg);
+int k_gemm_config_count(void);
+const char *k_gemm_config_name(int cfg);
 
 /* ------------------------------------------------------------- elementwise */
 /* out[r] = LN(x[r]) * w + b over d, eps 1e-5, mean/var in double as the CPU;
