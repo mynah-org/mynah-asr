@@ -485,6 +485,35 @@ numerical change (ENGINEERING.md §9): gate A (batch identity), gate B (CPU f32
 transcripts), a new unloaded reference, and a WER/CER check on the bank before
 any speed is quoted. That is a decision for the owner, recorded as S14-8b.
 
+## S14-8b split-K (decision 2026-09-26: split-K first, then bf16)
+
+Contract, stated before the numbers: same input row, same output row whatever
+the cohort; NOT bit-identical to v1 (the association of the sums changes).
+Split count S = f(N, K) only, each split the ascending chain over its k range,
+partials reduced in a fixed order, then the epilogue.
+
+**Kernel gates** (`tests/test_cuda_kernels`, L4): row-stable byte for byte on
+all 12 shapes over 12 cohort sizes; error against a double reference smaller
+than v1's on every shape (e.g. FFN2 1.25e-6 against 5.43e-6); 1.1-3.5x faster
+than v1 (FFN2 2-3x, the projections 1.5-3.5x), 1.3-1.7x behind cuBLAS in the
+serving range.
+
+**Transcript gates:** gate A (batch identity, slot independence) and gate B
+(CPU f32 == GPU) green on the 5 committed clips. **Bank quality gate**
+(`gpu/tools/transcript_ab.py`, registered bound: corpus WER not worse than v1
+by more than +0.002): the unloaded split-K reference over the 498 qualification
+clips is **byte-identical to v1's on 498 of 498 clips**; WER corpus 0.14483,
+mean 0.10515, CER mean 0.06737 for both. PASS.
+
+**Profile** (DIAGNOSTIC): device per pass 37.6 ms at C=128 (v1 54.5, -31 %),
+FFN1+FFN2 15.7 ms (v1 26.1, -40 %); attention core becomes the second largest
+stage (16-18 %). **WAVE ladder** (120 s, qualification bank): C=128 lag p95
+118 / fin 159 ms; **C=144 118->148 / 198 ms, backlog 0.384 s, clean** (v1 failed
+C=144); C=160 fails (492 / 645 ms); C=192 fails. FACT about the knee: at C=160
+one 120 s run passed (profile, 173 / 220 ms) and another failed (ladder,
+492 / 645 ms) -- near the knee the queue is bistable across runs, which is why
+only the 2x30-minute soaks decide.
+
 ## Explicit non-goals and rejected shortcuts
 
 - No per-op offload of the CPU step (the 2026-07 `cuda_gemm.cu` seam stays
