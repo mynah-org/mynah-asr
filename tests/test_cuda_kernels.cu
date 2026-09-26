@@ -158,7 +158,7 @@ static int test_gemm_v2(int N, int K, const char *what, int bench) {
             for (int cfg = -1; cfg < k_gemm_config_count(); cfg++) {
                 k_gemm_force_config(cfg);
                 CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
-                CU(k_gemm_wt(dA, K, dW, db, dC, N, M, N, K, 1, act, 0));
+                CU(k_gemm_wt_v2(dA, K, dW, db, dC, N, M, N, K, 1, act, 0));
                 CU(cudaDeviceSynchronize());
                 auto c = to_host(dC, (size_t)M * N);
                 if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
@@ -177,9 +177,9 @@ static int test_gemm_v2(int N, int K, const char *what, int bench) {
             const int M = Mb[mi];
             float t1 = 0, t2 = 0, tb = 0, ms;
             for (int arm = 0; arm < 2; arm++) {
-                for (int r = 0; r < 3; r++) arm ? (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                for (int r = 0; r < 3; r++) arm ? (void)k_gemm_wt_v2(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
                 cudaEventRecord(e0);
-                for (int r = 0; r < 20; r++) arm ? (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                for (int r = 0; r < 20; r++) arm ? (void)k_gemm_wt_v2(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0) : (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
                 cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
                 (arm ? t2 : t1) = ms / 20.0f;
             }

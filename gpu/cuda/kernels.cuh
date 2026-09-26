@@ -78,8 +78,12 @@ cudaError_t k_gemm_wt(const float *A, int lda, const float *W, const float *bias
                       float *C, int ldc, int M, int N, int K, int accumulate, int act,
                       cudaStream_t s);
 /* v1, the S14-2 kernel: the bit reference every v2 configuration must equal,
- * and the A/B arm (--gemm own-v1). */
+ * and the default (--gemm own). */
 cudaError_t k_gemm_wt_v1(const float *A, int lda, const float *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         cudaStream_t s);
+/* v2 (S14-8a): byte-identical to v1, not faster on the L4; the own-v2 arm */
+cudaError_t k_gemm_wt_v2(const float *A, int lda, const float *W, const float *bias,
                          float *C, int ldc, int M, int N, int K, int accumulate, int act,
                          cudaStream_t s);
 /* tests: pin one v2 configuration (-1 = the dispatcher chooses) */

@@ -436,6 +436,55 @@ Decision table, fixed now:
 | the GEMM stages dominate and scale with rows | tensor cores: bf16 weights with f32 accumulation, behind the CER gate |
 | many tiny stages of similar size, no dominant one | launch overhead: CUDA graphs keyed by cohort width, fusion of LN/residual |
 
+## S14-6b RESULT (2026-09-26, L4) and the first GEMM lever
+
+**Profile** (`--profile-stages`, DIAGNOSTIC; `.work/evidence/gpu-l4-20260926/`),
+frozen F32 v1, cohort 40 ms:
+
+| stage | C=128, 95 rows/pass | C=160, 163 rows/pass |
+|---|---|---|
+| FFN1 + FFN2 | 26.1 ms (48 %) | 34.9 ms (48 %) |
+| attention projections + O | 8.6 ms (16 %) | 11.0 ms (15 %) |
+| attention core | 6.7 ms (12 %) | 10.8 ms (15 %) |
+| conv (2 GEMMs + depthwise) | 6.0 ms (11 %) | 7.9 ms (11 %) |
+| decoder: joint + predictor + sync | 5.4 ms (10 %) | 6.1 ms (8 %) |
+| subsampling, post, transfers | 1.8 ms (3 %) | 2.3 ms (3 %) |
+| device total per pass | 54.5 ms | 73.0 ms |
+
+Step wall equals device time (55.0 against 54.5 ms), host mel is ~11 % of one
+thread, the label loop's host syncs are 0.4 %: by the registered table the
+serving, host-mel, label-loop and launch rows are ruled out, and the lever is
+the GEMM (~75 % of device time). FFN1 fitted over the two points: ~7 ms fixed
+per pass (2.7 ms of it f32 weight bandwidth) + 0.062 ms per row, i.e. ~6.5
+TFLOP/s effective, 27 % of the card's sustained FP32.
+
+**The cuBLAS arm** (same profile, `--gemm cublas`): device per pass 29-34 ms,
+FFN1 ~3.1 ms fixed + 0.036 ms per row; lag p95 82 ms and fin p95 112 ms at
+C=160 in a DIAGNOSTIC run. **But cuBLAS is MEASURED not row-stable on the L4**:
+on all 12 model shapes rows differ bitwise between cohort sizes from M=1
+(`tests/test_cuda_kernels`, now an INFO line). Gate A had passed with cuBLAS on
+5 clips only because the differing bits did not change those transcripts.
+**DECISION: cuBLAS cannot be the default (contract 4).**
+
+**S14-8a, GEMM v2 — REJECTED as the default.** Same per-element chain as v1
+(byte-identical, gated for 6 tile configurations x 10 cohort sizes x the
+epilogues), templated tiles, register-staged double buffering, float4 loads,
+a tile chosen per call. Measured: its best tile wins 10-15 % on a few shapes
+and loses on most; both v1 and v2 stay 2-4x behind cuBLAS. **FACT, and it
+bounds this whole family:** one sequential fma chain per output element leaves
+M x N independent chains, too few at small cohorts with a large K (FFN2:
+K = 4096, N = 1024), which is exactly where cuBLAS splits K. No tiling of the
+v1 chain reaches cuBLAS. v1 stays the default; v2 is the `--gemm own-v2` arm.
+
+**What the next GEMM lever must be, therefore:** a different accumulation
+ORDER — a split-K with a split fixed by K alone and a fixed-order reduction
+(row-stable by construction: nothing depends on M), or a pinned cuBLASLt
+algorithm (row stability then MEASURED with the same sweep), and later bf16
+tensor cores. Every one of these changes the bits relative to v1, so it is a
+numerical change (ENGINEERING.md §9): gate A (batch identity), gate B (CPU f32
+transcripts), a new unloaded reference, and a WER/CER check on the bank before
+any speed is quoted. That is a decision for the owner, recorded as S14-8b.
+
 ## Explicit non-goals and rejected shortcuts
 
 - No per-op offload of the CPU step (the 2026-07 `cuda_gemm.cu` seam stays

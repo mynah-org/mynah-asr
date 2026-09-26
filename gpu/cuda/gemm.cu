@@ -20,7 +20,7 @@
  * the reference and as an A/B arm. Profiled on the L4 (S14-6b): ~27 % of the
  * card's sustained FP32 and too few blocks at small M (16 blocks for a
  * 1024-wide output at M <= 64 on 58 SMs).
- * v2 (S14-8a): templated block tile and microtile, double-buffered shared
+* v2 (S14-8a, REJECTED as the default 2026-09-26, kept as the own-v2 arm): templated block tile and microtile, double-buffered shared
  * memory (one barrier per k-tile), interleaved thread->column mapping so the
  * shared loads are bank-conflict-free and the stores coalesced, and a tile
  * chosen per call to give the card at least two waves of blocks. */
@@ -300,9 +300,24 @@ const char *k_gemm_config_name(int cfg) {
     return cfg >= 0 && cfg < G2__N ? nm[cfg] : "?";
 }
 
+cudaError_t k_gemm_wt_v2(const float *A, int lda, const float *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         cudaStream_t s) {
+    if (M <= 0 || N <= 0) return cudaSuccess;
+    return launch_cfg(choose_cfg(M, N), A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+}
+
+/* The default. MEASURED on the L4 2026-09-26 (tests/test_cuda_kernels --bench):
+ * v2 is byte-identical to v1 but not faster -- its best tile wins 10-15 % on a
+ * few shapes and loses on most, and both stay 2-4x behind cuBLAS. The reason
+ * is structural, not tuning: one sequential fma chain per output element (the
+ * row-stability invariant) leaves too few independent chains at small cohorts
+ * with a large K, where cuBLAS splits K. So the default stays v1 and v2 is the
+ * --gemm own-v2 arm; the next GEMM lever changes the accumulation order and is
+ * therefore a numerical change with its own gate (see the S14 note). */
 cudaError_t k_gemm_wt(const float *A, int lda, const float *W, const float *bias,
                       float *C, int ldc, int M, int N, int K, int accumulate, int act,
                       cudaStream_t s) {
-    if (M <= 0 || N <= 0) return cudaSuccess;
-    return launch_cfg(choose_cfg(M, N), A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+    if (g_force_cfg >= 0) return k_gemm_wt_v2(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+    return k_gemm_wt_v1(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
 }
