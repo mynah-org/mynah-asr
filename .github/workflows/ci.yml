@@ -219,12 +219,12 @@ jobs:
         run: apt-get update && apt-get install -y build-essential git python3
       - name: Library
         run: make lib BLAS=none
-      - name: GPU server, kernels test, stream test (nvcc, compile and link)
+      - name: "GPU server, kernels test, stream test (nvcc, compile and link)"
         run: |
           make -C gpu CUDA_ARCH="sm_80 sm_86 sm_89 sm_90"
           make -C gpu test-kernels test-stream CUDA_ARCH="sm_80 sm_86 sm_89 sm_90"
           ls -la mynah-asr-server-cuda tests/test_cuda_kernels tests/test_cuda_stream
-      - name: No device: the kernel test skips, the server refuses visibly
+      - name: "No device: the kernel test skips, the server refuses visibly"
         run: |
           set +e
           tests/test_cuda_kernels; rc=$?
