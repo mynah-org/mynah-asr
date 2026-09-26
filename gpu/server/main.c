@@ -89,7 +89,7 @@ static struct {
     /* config */
     const char *model_dir, *host, *engine_name, *precision, *gemm;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
-    int threads, ring_seconds;
+    int threads, ring_seconds, profile;
     long max_frame_bytes;
     double max_audio_seconds;
     /* state */
@@ -921,6 +921,12 @@ static void health_json(cJSON *j) {
     cJSON_AddNumberToObject(ge, "d2h_bytes_total", es.d2h_bytes);
     cJSON_AddNumberToObject(ge, "device_errors_total", (double)es.errors);
     cJSON_AddNumberToObject(ge, "graphs", f.graphs);
+    cJSON_AddNumberToObject(ge, "host_mel_ms_total", es.host_mel_ms);
+    if (es.prof_passes > 0) {
+        cJSON *pr = cJSON_AddObjectToObject(ge, "profile_ms");
+        cJSON_AddNumberToObject(pr, "passes", (double)es.prof_passes);
+        for (int i = 0; i < ASR_PROF_STAGES; i++) cJSON_AddNumberToObject(pr, ASR_PROF_NAME[i], es.prof_ms[i]);
+    }
     cJSON *refused = cJSON_AddObjectToObject(j, "refused");
     cJSON_AddNumberToObject(refused, "server_at_capacity", (double)g.refused_cap);
     cJSON_AddNumberToObject(refused, "other", (double)g.refused_other);
@@ -979,6 +985,13 @@ static void dump_stderr(void) {
       n, g.cohorts, g.cohorts ? (double)g.cohort_lanes_sum / (double)g.cohorts : 0.0,
       g.cohorts ? g.cohort_wait_ms_sum / (double)g.cohorts : 0.0,
       es.steps ? es.step_wall_ms_sum / (double)es.steps : 0.0, es.decode_iters);
+    if (es.prof_passes > 0) {
+        double tot = 0.0;
+        for (int i = 0; i < ASR_PROF_STAGES; i++) tot += es.prof_ms[i];
+        D("[DUMP] worker=0 seq=%lu profile passes=%lu device_ms=%.1f host_mel_ms=%.1f", n, es.prof_passes, tot, es.host_mel_ms);
+        for (int i = 0; i < ASR_PROF_STAGES; i++) D(" %s=%.1f", ASR_PROF_NAME[i], es.prof_ms[i]);
+        D("\n");
+    }
     D("[DUMP] worker=0 seq=%lu books sessions=%lu completed=%lu cancelled=%lu aborted=%lu active=%d balanced=%d abandoned=0 recovered=0\n",
       n, g.sessions, g.completed, g.cancelled, g.aborted, g.active, balanced);
     D("[DUMP] worker=0 seq=%lu cancelled=%lu", n, g.cancelled);
@@ -1100,7 +1113,7 @@ static void usage(void) {
         "       [--device N] [--cap N] [--cohort-ms MS] [--http-threads N] [--idle-ms MS]\n"
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
         "       [--ring-seconds 30] [--gemm own|cublas] [--precision f32] [--engine-threads N (cpu engine pool)]\n"
-        "       [--dispatch-map] [--version]\n"
+        "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
 }
@@ -1125,6 +1138,7 @@ int main(int argc, char **argv) {
         else if (ARG("--http-threads") || ARG("--threads")) g.http_threads = atoi(v);
         else if (ARG("--engine-threads")) g.threads = atoi(v);
         else if (ARG("--ring-seconds")) g.ring_seconds = atoi(v);
+        else if (strcmp(a, "--profile-stages") == 0) g.profile = 1;
         else if (ARG("--idle-ms")) g.idle_ms = atoi(v);
         else if (ARG("--ping-ms")) g.ping_ms = atoi(v);
         else if (ARG("--max-frame-bytes")) g.max_frame_bytes = atol(v);
@@ -1147,7 +1161,8 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
-                          .precision = g.precision, .gemm = g.gemm, .threads = g.threads};
+                          .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
+                          .profile = g.profile};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
@@ -1195,10 +1210,11 @@ int main(int argc, char **argv) {
         char dm[4096];
         const size_t n = asr_engine_dispatch_map(g.eng, dm, sizeof(dm));
         fprintf(stderr, "[SERVER-CONFIG] mynah-asr-server-cuda %s: engine=%s device=\"%s\" precision=%s gemm=%s model=%s "
-                        "cap=%d cohort_ms=%d lookahead_default=%d presets=%d vram_weights_mb=%.0f vram_arena_mb=%.0f graphs=%d\n",
+                        "cap=%d cohort_ms=%d lookahead_default=%d presets=%d vram_weights_mb=%.0f vram_arena_mb=%.0f graphs=%d profile_stages=%s\n",
                 MYNAH_ASR_BUILD, g.facts.name, g.facts.device ? g.facts.device : "-", g.facts.precision, g.facts.gemm,
                 g.facts.model_name, g.cap, g.cohort_ms, g.facts.default_lookahead, g.facts.n_lookaheads,
-                (double)g.facts.vram_weights / 1048576.0, (double)g.facts.vram_arena / 1048576.0, g.facts.graphs);
+                (double)g.facts.vram_weights / 1048576.0, (double)g.facts.vram_arena / 1048576.0, g.facts.graphs,
+                g.profile ? "on (DIAGNOSTIC)" : "off");
         fwrite(dm, 1, n, stderr);
         fprintf(stderr, "mynah-asr-server-cuda: listening on %s:%d (%d http threads, %d stream slots, one engine thread)\n",
                 g.host, g.port, g.http_threads, g.cap);

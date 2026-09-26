@@ -395,6 +395,47 @@ qualified.
 - **S14-9** multi-GPU: one process per GPU behind the v2 router is the
   natural shape (SCM_RIGHTS handoff exists); not before S14-7.
 
+## S14-6b — profile C=128 against C=160 before any optimisation (registered 2026-09-26, before the data)
+
+DECISION: the qualified f32 build of 2026-09-26 (`075c8d2`) is frozen as the
+**CUDA F32 v1 baseline**. No lever of S14-8 is written until this profile says
+which one; afterwards every lever is one change, measured as an A/B against
+this baseline on the same bank, with transcript parity (gates A and B) before
+any timing is read. Precision (bf16/fp16/int8 on tensor cores) is a numerical
+change: it carries its own CER/WER gate on the bank and is never promoted on
+speed alone (ENGINEERING.md §9).
+
+Instrument: `mynah-asr-server-cuda --profile-stages` (DIAGNOSTIC, default off)
+records CUDA events at every stage boundary of a pass and charges each
+interval to the stage that opened it; the host mel front end is timed in the
+engine; both reach `/v1/health` (`engine.profile_ms`) and the `[DUMP] profile`
+line. Stages: h2d, subsample, ffn1, att_proj (LN + K/V/Q GEMMs), att_core
+(attention kernel + ring commit), att_out (O GEMM + residual), conv, ffn2,
+post (advance + prompt + projector), dec_joint (joint + head GEMM + argmax +
+decide), dec_pred (embedding + LSTM + projector), dec_sync (the per-iteration
+compaction, D2H of the active count and the host round trip), d2h, other.
+Nsight Systems is not installed on the box and hardware counters may be
+restricted in the container; `ncu` on single kernels is a follow-up only if
+the stage table points at one kernel.
+
+Runs: C=128 and C=160, 120 s each, fresh server, same bank rule as the
+qualification, `--cohort-ms 40`, profile ON (so the absolute latencies of
+these runs are not quoted: the events add a little work per pass). Recorded
+per run: the stage table per pass and per lane, passes per second, lanes and
+rows per pass, cohort wait, engine-thread busy fraction (step wall / wall),
+host mel ms per audio-second, GPU util and clocks from nvidia-smi.
+
+Decision table, fixed now:
+
+| if the profile shows | then the first lever is |
+|---|---|
+| step wall < ~50 % of wall at C=160 while lag fails | serving: the cohort policy, not the GPU (the engine thread waits) |
+| host mel or staging > ~25 % of the engine thread | move the mel to the device (cuFFT), S14-8 |
+| dec_sync + dec_joint + dec_pred > ~30 % of device time | the label loop: fewer host syncs (graph conditional nodes or a fixed iteration budget) |
+| the GEMM stages dominate and ms per pass is flat in rows | small-M GEMM efficiency (tile shape, split-K with a fixed order) before any precision change |
+| the GEMM stages dominate and scale with rows | tensor cores: bf16 weights with f32 accumulation, behind the CER gate |
+| many tiny stages of similar size, no dominant one | launch overhead: CUDA graphs keyed by cohort width, fusion of LN/residual |
+
 ## Explicit non-goals and rejected shortcuts
 
 - No per-op offload of the CPU step (the 2026-07 `cuda_gemm.cu` seam stays

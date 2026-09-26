@@ -47,6 +47,8 @@ typedef struct {
     const char *gemm;        /* cuda: "own" (default, row-stable by construction)
                                 or "cublas" (the comparison arm, measured) */
     int threads;             /* cpu: pool threads for the reference engine */
+    int profile;             /* cuda: 1 = per-stage CUDA-event timing (S14-6b);
+                                off by default, a DIAGNOSTIC arm, never a headline */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */
@@ -89,7 +91,19 @@ typedef struct {
     double step_wall_ms_sum;         /* wall inside asr_engine_step */
     double h2d_bytes, d2h_bytes;     /* traffic, total */
     unsigned long errors;            /* device errors (each one also logs) */
+    /* S14-6b stage profile (cuda --profile-stages): device milliseconds per
+     * stage between CUDA events, summed over passes; host milliseconds for the
+     * mel front end. prof_passes == 0 when the profile is off. */
+#define ASR_PROF_STAGES 14
+    double prof_ms[ASR_PROF_STAGES];
+    unsigned long prof_passes;
+    double host_mel_ms;              /* wall in slot_feed (streaming mel), total */
 } asr_engine_stats;
+
+/* names of the stage slots, in order */
+static const char *const ASR_PROF_NAME[ASR_PROF_STAGES] = {
+    "h2d", "subsample", "ffn1", "att_proj", "att_core", "att_out", "conv", "ffn2",
+    "post", "dec_joint", "dec_pred", "dec_sync", "d2h", "other"};
 
 typedef struct {
     void (*close)(asr_engine *e);

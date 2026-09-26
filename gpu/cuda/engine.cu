@@ -91,7 +91,34 @@ struct cuda_engine {
     char err[512] = {0};
     int dead = 0;
     std::string devname;
+    /* S14-6b: CUDA events at stage boundaries, one pass at a time */
+    int prof = 0;
+    static const int EV_MAX = 4096;
+    cudaEvent_t ev[4096];
+    int ev_tag[4096];
+    int nev = 0;
 };
+
+enum { PS_H2D = 0, PS_SS, PS_FFN1, PS_ATT_PROJ, PS_ATT_CORE, PS_ATT_OUT, PS_CONV, PS_FFN2,
+       PS_POST, PS_DEC_JOINT, PS_DEC_PRED, PS_DEC_SYNC, PS_D2H, PS_OTHER };
+
+/* mark: from here on the stream's time is charged to `tag` */
+static inline void prof_mark(cuda_engine *e, int tag) {
+    if (!e->prof || e->nev >= cuda_engine::EV_MAX) return;
+    cudaEventRecord(e->ev[e->nev], e->stream);
+    e->ev_tag[e->nev++] = tag;
+}
+/* after the pass's final sync: each interval charged to the tag that opened it */
+static void prof_collect(cuda_engine *e) {
+    if (!e->prof) return;
+    for (int i = 0; i + 1 < e->nev; i++) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, e->ev[i], e->ev[i + 1]) == cudaSuccess)
+            e->st.prof_ms[e->ev_tag[i]] += ms;
+    }
+    e->st.prof_passes++;
+    e->nev = 0;
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -369,6 +396,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         delete e; return nullptr;
     }
     e->use_cublas = cfg->gemm && strcmp(cfg->gemm, "cublas") == 0;
+    e->prof = cfg->profile ? 1 : 0;
     if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0) {
         snprintf(err, errcap, "gemm '%s' is not one of own, cublas", cfg->gemm);
         delete e; return nullptr;
@@ -390,6 +418,9 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, cfg->device) == cudaSuccess) e->devname = prop.name;
+    if (e->prof)
+        for (int i = 0; i < cuda_engine::EV_MAX; i++)
+            if (cudaEventCreate(&e->ev[i]) != cudaSuccess) { snprintf(err, errcap, "cudaEventCreate failed"); delete e; return nullptr; }
     if (e->use_cublas) {
         if (cublasCreate(&e->blas) != CUBLAS_STATUS_SUCCESS) {
             snprintf(err, errcap, "cublasCreate failed"); cuda_close(e); return nullptr;
@@ -553,7 +584,9 @@ static int cuda_slot_feed(cuda_engine *e, int slot, const float *pcm, size_t n) 
     if (e->dead || slot < 0 || slot >= e->cap) return -1;
     slot_host &s = e->slots[(size_t)slot];
     s.samples_fed += (unsigned long)n;
+    const double t0 = now_s();
     slot_pull_mel(e, s, pcm, n);
+    e->st.host_mel_ms += (now_s() - t0) * 1e3;
     return 0;
 }
 
@@ -603,11 +636,13 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
         memcpy(e->h_mel + (size_t)M * nm, e->slots[(size_t)l.slot].mel_buf, (size_t)l.n_mel * nm * sizeof(float));
         M += l.n_mel; R += l.q;
     }
+    prof_mark(e, PS_H2D);
     CK(e, "h2d rows", cudaMemcpyAsync(e->d_rows, e->h_rows, (size_t)B * sizeof(gpu_row), cudaMemcpyHostToDevice, e->stream));
     CK(e, "h2d mel", cudaMemcpyAsync(e->d_mel, e->h_mel, (size_t)M * nm * sizeof(float), cudaMemcpyHostToDevice, e->stream));
     e->st.h2d_bytes += (double)B * sizeof(gpu_row) + (double)M * nm * sizeof(float);
 
     /* subsampling */
+    prof_mark(e, PS_SS);
     CK(e, "ss0", k_ss_stage0(dm, e->ar, e->d_rows, B, e->d_mel, e->d_ss_in_w, e->d_ss_in_b, e->s0, e->stream));
     CK(e, "ss1 dw", k_ss_dw(dm, 1, e->ar, e->d_rows, B, e->s0, e->d_ss_dw_w[0], e->d_ss_dw_b[0], e->s1a, e->stream));
     if (gemm(e, e->s1a, dm.C, e->d_ss_pw_w[0], e->d_ss_pw_b[0], e->s1, dm.C, P[1], dm.C, dm.C, 0, 1) != 0) return -1;
@@ -621,20 +656,25 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
     const size_t nd = (size_t)R * dm.d;
     for (int li = 0; li < dm.n_layers; li++) {
         const gpu_layer_w &L = e->L[(size_t)li];
+        prof_mark(e, PS_FFN1);
         CK(e, "ln ff1", k_layernorm(e->xs, L.ln_ff1_w, L.ln_ff1_b, e->tmp, R, dm.d, 0, e->stream));
         if (gemm(e, e->tmp, dm.d, L.ff1_w1, nullptr, e->tmp2, dm.ffn, R, dm.ffn, dm.d, 0, 2) != 0) return -1;
         if (gemm(e, e->tmp2, dm.ffn, L.ff1_w2, nullptr, e->tmp, dm.d, R, dm.d, dm.ffn, 0, 0) != 0) return -1;
         CK(e, "res ff1", k_residual(e->xs, e->tmp, 0.5f, nd, e->stream));
 
+        prof_mark(e, PS_ATT_PROJ);
         CK(e, "ln att", k_layernorm(e->xs, L.ln_att_w, L.ln_att_b, e->xn, R, dm.d, 0, e->stream));
         if (gemm(e, e->xn, dm.d, L.k_w, nullptr, e->kn, dm.d, R, dm.d, dm.d, 0, 0) != 0) return -1;
         if (gemm(e, e->xn, dm.d, L.v_w, nullptr, e->vn, dm.d, R, dm.d, dm.d, 0, 0) != 0) return -1;
         if (gemm(e, e->xn, dm.d, L.q_w, nullptr, e->qs, dm.d, R, dm.d, dm.d, 0, 0) != 0) return -1;
+        prof_mark(e, PS_ATT_CORE);
         CK(e, "attention", k_attention(dm, L, li, e->d_relpos, e->ar, e->d_rows, B, e->qs, e->kn, e->vn, e->ctx, e->stream));
         CK(e, "kv commit", k_kv_commit(dm, li, e->ar, e->d_rows, B, e->kn, e->vn, e->stream));
+        prof_mark(e, PS_ATT_OUT);
         if (gemm(e, e->ctx, dm.d, L.o_w, nullptr, e->tmp, dm.d, R, dm.d, dm.d, 0, 0) != 0) return -1;
         CK(e, "res att", k_residual(e->xs, e->tmp, 1.0f, nd, e->stream));
 
+        prof_mark(e, PS_CONV);
         CK(e, "ln conv", k_layernorm(e->xs, L.ln_conv_w, L.ln_conv_b, e->xn, R, dm.d, 0, e->stream));
         if (gemm(e, e->xn, dm.d, L.pw1_w, nullptr, e->h2, 2 * dm.d, R, 2 * dm.d, dm.d, 0, 0) != 0) return -1;
         CK(e, "glu dwconv", k_glu_dwconv(dm, L, li, e->ar, e->d_rows, B, e->h2, e->cmid, e->stream));
@@ -642,12 +682,14 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
         if (gemm(e, e->tmp, dm.d, L.pw2_w, nullptr, e->xn, dm.d, R, dm.d, dm.d, 0, 0) != 0) return -1;
         CK(e, "res conv", k_residual(e->xs, e->xn, 1.0f, nd, e->stream));
 
+        prof_mark(e, PS_FFN2);
         CK(e, "ln ff2", k_layernorm(e->xs, L.ln_ff2_w, L.ln_ff2_b, e->tmp, R, dm.d, 0, e->stream));
         if (gemm(e, e->tmp, dm.d, L.ff2_w1, nullptr, e->tmp2, dm.ffn, R, dm.ffn, dm.d, 0, 2) != 0) return -1;
         if (gemm(e, e->tmp2, dm.ffn, L.ff2_w2, nullptr, e->tmp, dm.d, R, dm.d, dm.ffn, 0, 0) != 0) return -1;
         CK(e, "res ff2", k_residual(e->xs, e->tmp, 0.5f, nd, e->stream));
         CK(e, "ln out", k_layernorm(e->xs, L.ln_out_w, L.ln_out_b, e->xs, R, dm.d, 0, e->stream));
     }
+    prof_mark(e, PS_POST);
     CK(e, "kv advance", k_kv_advance(dm, e->ar, e->d_rows, B, e->stream));
 
     /* prompt + projector */
@@ -661,17 +703,20 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
     const int H = dm.Hdec;
     const int iter_cap = e->pack.qmax * (dm.max_symbols + 1) + 2;
     for (int it = 0; it < iter_cap; it++) {
+        prof_mark(e, PS_DEC_SYNC);
         CK(e, "dec compact", k_dec_compact(e->ar, e->d_rows, B, e->d_active, e->d_n_active, e->stream));
         CK(e, "d2h n_active", cudaMemcpyAsync(e->h_n_active, e->d_n_active, sizeof(int), cudaMemcpyDeviceToHost, e->stream));
         CK(e, "sync", cudaStreamSynchronize(e->stream));
         const int n = *e->h_n_active;
         if (n <= 0) break;
         e->st.decode_iters++;
+        prof_mark(e, PS_DEC_JOINT);
         CK(e, "dec joint", k_dec_joint(dm, e->ar, e->d_rows, e->d_active, n, e->enc, e->jin, e->stream));
         if (gemm(e, e->jin, H, e->d_head_w, e->d_head_b, e->logits, dm.V, n, dm.V, H, 0, 0) != 0) return -1;
         CK(e, "dec argmax", k_dec_argmax(e->logits, dm.V, n, e->d_am, e->stream));
         CK(e, "dec decide", k_dec_decide(dm, e->ar, e->d_rows, e->d_active, n, e->d_am, e->d_emit, e->stream));
         /* predictor step over the active lanes; only the emitting lanes commit */
+        prof_mark(e, PS_DEC_PRED);
         CK(e, "dec emb", k_dec_gather_emb(e->d_emb, H, e->d_am, n, e->xin, e->stream));
         float *x = e->xin, *xn2 = e->xnext;
         for (int l = 0; l < dm.pred_layers; l++) {
@@ -685,9 +730,12 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
         CK(e, "dec commit g", k_dec_commit_g(dm, e->ar, e->d_rows, e->d_active, e->d_emit, e->d_am, n, e->gtmp, e->stream));
     }
     /* results: tokens and metadata of every slot (small), once */
+    prof_mark(e, PS_D2H);
     CK(e, "d2h tok", cudaMemcpyAsync(e->h_tok, e->ar.tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     CK(e, "d2h meta", cudaMemcpyAsync(e->h_meta, e->ar.meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaMemcpyDeviceToHost, e->stream));
+    prof_mark(e, PS_OTHER);
     CK(e, "sync", cudaStreamSynchronize(e->stream));
+    prof_collect(e);
     e->st.d2h_bytes += (double)e->cap * e->ar.tok_cap * sizeof(int) + (double)e->cap * sizeof(gpu_slot_meta);
     e->st.rows += (unsigned long)R;
     e->st.lanes += (unsigned long)B;
