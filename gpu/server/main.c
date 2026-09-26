@@ -467,9 +467,14 @@ static void *engine_main(void *arg) {
                 pthread_mutex_unlock(&g.mu);
                 pthread_mutex_lock(&s->mu);
             }
+            /* the engine is told to finalize only once the ring is empty:
+             * a client that sends `finalize` right after blasting its audio
+             * still has seconds of it queued here, and a finalize handed over
+             * early would close the engine's mel stream in front of them */
+            const int fin_now = fin && s->ring_len == 0;
             const int ready = asr_engine_slot_ready(g.eng, s->id);
-            if (ready || fin) {
-                reqs[n].slot = s->id; reqs[n].finalize = fin;
+            if (ready || fin_now) {
+                reqs[n].slot = s->id; reqs[n].finalize = fin_now;
                 lane[n] = s; arrival[n] = s->ready_since > 0.0 ? s->ready_since : s->ring_arrival;
                 if (s->ready_since == 0.0) s->ready_since = now;
                 if (oldest == 0.0 || s->ready_since < oldest) oldest = s->ready_since;

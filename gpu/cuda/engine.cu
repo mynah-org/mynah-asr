@@ -44,6 +44,7 @@ struct slot_host {
     double emitted_t1 = 0.0;
     char lang[16] = {0};
     std::vector<int> tokens;
+    int reset_pending = 0;
 };
 
 struct cuda_engine {
@@ -519,7 +520,9 @@ static int cuda_slot_reset(cuda_engine *e, int slot, const char *lang, int looka
     mynah_asr_detok_reset(&s.detok);
     s.chars_emitted = 0; s.emitted_t1 = 0.0; s.lang[0] = '\0';
     s.tokens.clear();
-    e->pending_resets.push_back(slot);
+    /* once per slot until the next step applies it: repeated resets of an
+     * idle slot must not grow the list past the pinned buffer (cap entries) */
+    if (!s.reset_pending) { s.reset_pending = 1; e->pending_resets.push_back(slot); }
     return 0;
 }
 
@@ -734,7 +737,7 @@ static int cuda_step(cuda_engine *e, const asr_step_req *reqs, int n, asr_step_o
     /* pending resets first: a slot reset since the last step starts clean */
     if (!e->pending_resets.empty()) {
         const int nr = (int)e->pending_resets.size();
-        for (int i = 0; i < nr; i++) e->h_resets[i] = e->pending_resets[(size_t)i];
+        for (int i = 0; i < nr; i++) { e->h_resets[i] = e->pending_resets[(size_t)i]; e->slots[(size_t)e->h_resets[i]].reset_pending = 0; }
         CK(e, "h2d resets", cudaMemcpyAsync(e->d_resets, e->h_resets, (size_t)nr * sizeof(int), cudaMemcpyHostToDevice, e->stream));
         CK(e, "slots reset", k_slots_reset(e->dm, e->ar, e->d_resets, nr, e->d_sos_h, e->d_sos_c, e->d_sos_g, e->stream));
         e->pending_resets.clear();
