@@ -28,7 +28,9 @@ CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -D_DEFAULT_SOURCE
 CFLAGS  += -iquote $(TOP)/src -iquote $(TOP)/server -iquote $(TOP)/vendor -iquote . \
            -I$(TOP)/third_party/ingot/include -DMYNAH_ASR_BUILD='"$(shell git -C $(TOP) describe --always --dirty 2>/dev/null || echo dev)"'
 NVCCFLAGS ?= -O3 -std=c++14 -Xcompiler -fPIC $(GENCODE) --expt-relaxed-constexpr
-NVCCFLAGS += -I$(TOP)/src -I$(TOP)/server -I$(TOP)/vendor -I. -Icuda -I$(TOP)/third_party/ingot/include
+# no -I$(TOP)/src here: src/features.h would shadow glibc's <features.h> on the
+# system include path (nvcc has no -iquote); the .cu files include by relative path
+NVCCFLAGS += -I$(TOP)/vendor -I. -Icuda -I$(TOP)/third_party/ingot/include
 LDLIBS   := $(TOP)/libmynah_asr.a $(TOP)/third_party/ingot/libingot.a -lpthread -lm
 ifeq ($(UNAME_S),Darwin)
   LDLIBS += -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation

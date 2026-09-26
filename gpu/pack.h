@@ -10,12 +10,14 @@
 #ifndef MYNAH_ASR_GPU_PACK_H
 #define MYNAH_ASR_GPU_PACK_H
 
-#include "cJSON.h"
-#include "decoder.h"
-#include "encoder.h"
-#include "features.h"
-#include "tokenizer.h"
-#include "weights.h"
+/* relative paths on purpose: nvcc must not get -I../src, because src/features.h
+ * would shadow glibc's <features.h> for every system header (seen in CI) */
+#include "../vendor/cJSON.h"
+#include "../src/decoder.h"
+#include "../src/encoder.h"
+#include "../src/features.h"
+#include "../src/tokenizer.h"
+#include "../src/weights.h"
 
 typedef struct {
     cJSON *cfg;

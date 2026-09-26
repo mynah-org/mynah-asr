@@ -13,7 +13,9 @@
  *      printed with both texts and exits 3 -- a finding to look at, never a
  *      silent pass and never a silent fail.
  *
- * usage: tests/test_cuda_stream <model_dir> [clip.wav ...]   (default: tests/audio/test_*.wav)
+ * usage: tests/test_cuda_stream <model_dir> [--gemm own|cublas] [clip.wav ...]
+ *        (default clips: tests/audio/test_*.wav; the GEMM arm is an argument,
+ *        not an environment flag, so the flag registry stays the library's)
  * exit 0 = both gates pass; 1 = gate A failed or a device error; 3 = gate A
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -89,10 +91,13 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     const char *dflt[] = {"tests/audio/test_it.wav", "tests/audio/test_en.wav", "tests/audio/test_de.wav",
                           "tests/audio/test_fr.wav", "tests/audio/test_es.wav"};
-    const char *clips[MAXC];
+    const char *clips[MAXC], *gemm = "own";
     int n = 0;
-    if (argc > 2) for (int i = 2; i < argc && n < MAXC; i++) clips[n++] = argv[i];
-    else for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) gemm = argv[++i];
+        else if (n < MAXC) clips[n++] = argv[i];
+    }
+    if (n == 0) for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
     const char *langs[MAXC];
     for (int i = 0; i < n; i++) langs[i] = "auto";
 
@@ -104,7 +109,7 @@ int main(int argc, char **argv) {
     }
 
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = getenv("MYNAH_ASR_CUDA_GEMM") ? getenv("MYNAH_ASR_CUDA_GEMM") : "own"};
+    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = gemm};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) {
         if (strstr(err, "no CUDA device") || strstr(err, "not compiled")) { printf("SKIP test_cuda_stream: %s\n", err); return 77; }
