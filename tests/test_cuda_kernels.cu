@@ -211,6 +211,80 @@ static int test_gemm_v2(int N, int K, const char *what, int bench) {
     return 0;
 }
 
+
+/* ------------------------------------------------ split-K (S14-8b)
+ * Row stability across cohort sizes (the contract), accuracy against a double
+ * reference next to v1's (the numerical change, sized), and speed. */
+static int test_splitk(int N, int K, const char *what, int bench) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 2, 5, 16, 24, 33, 64, 95, 128, 163, 200, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N);
+    fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+    const size_t wsf = k_gemm_splitk_workspace_floats(Mmax, N, K);
+    float *dA = dup_dev(A), *dW = dup_dev(W), *db = dup_dev(bias), *dR, *dC, *ws = nullptr;
+    CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    if (wsf) CU(cudaMalloc(&ws, wsf * sizeof(float)));
+    int mism = 0;
+    for (int act = 0; act <= 2; act += 2) {
+        CU(cudaMemcpy(dR, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_wt_splitk(dA, K, dW, db, dR, N, Mmax, N, K, 1, act, ws, wsf, 0));
+        CU(cudaDeviceSynchronize());
+        auto ref = to_host(dR, (size_t)Mmax * N);
+        for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+            const int M = Ms[mi];
+            CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+            CU(k_gemm_wt_splitk(dA, K, dW, db, dC, N, M, N, K, 1, act, ws, wsf, 0));
+            CU(cudaDeviceSynchronize());
+            auto c = to_host(dC, (size_t)M * N);
+            if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) mism++;
+        }
+    }
+    CHECK(mism == 0, "splitk row-stable %s [N=%d K=%d, S=%d]: 12 cohort sizes vs M=257, byte for byte (%d mismatches)", what, N, K, k_gemm_splits(N, K), mism);
+    /* the numerical change, sized: max |err| vs double for split-K and for v1 */
+    {
+        const int M = 64;
+        CU(k_gemm_wt_splitk(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, ws, wsf, 0));
+        CU(k_gemm_wt_v1(dA, K, dW, nullptr, dR, N, M, N, K, 0, 0, 0));
+        CU(cudaDeviceSynchronize());
+        auto cs = to_host(dC, (size_t)M * N), c1 = to_host(dR, (size_t)M * N);
+        double es = 0, e1 = 0, ref_scale = 0;
+        for (int m = 0; m < M; m += 7)
+            for (int n = 0; n < N; n += 31) {
+                double r = 0;
+                for (int k = 0; k < K; k++) r += (double)A[(size_t)m * K + k] * (double)W[(size_t)n * K + k];
+                es = fmax(es, fabs(cs[(size_t)m * N + n] - r));
+                e1 = fmax(e1, fabs(c1[(size_t)m * N + n] - r));
+                ref_scale = fmax(ref_scale, fabs(r));
+            }
+        CHECK(es <= 2.0 * e1 + 1e-6, "splitk accuracy %s: max|err| vs double %.3g (v1 %.3g, |ref| up to %.3g)", what, es, e1, ref_scale);
+    }
+    if (bench) {
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int Mb[] = {24, 64, 95, 128, 163, 256};
+        cublasHandle_t h; cublasCreate(&h); cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
+        for (size_t mi = 0; mi < sizeof(Mb) / sizeof(Mb[0]); mi++) {
+            const int M = Mb[mi];
+            float t[3], ms;
+            for (int arm = 0; arm < 3; arm++) {
+                const float al = 1.0f, be = 0.0f;
+                for (int r = 0; r < 23; r++) {
+                    if (r == 3) cudaEventRecord(e0);
+                    if (arm == 0) (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                    else if (arm == 1) (void)k_gemm_wt_splitk(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, ws, wsf, 0);
+                    else cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &al, dW, K, dA, K, &be, dC, N);
+                }
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                t[arm] = ms / 20.0f;
+            }
+            printf("BENCHSK %-12s M=%3d S=%d  v1 %7.3f ms  splitk %7.3f ms (%.2fx v1)  cublas %7.3f ms (splitk/cublas %.2f)\n",
+                   what, M, k_gemm_splits(N, K), t[0], t[1], t[0] / t[1], t[2], t[1] / t[2]);
+        }
+        cublasDestroy(h);
+    }
+    cudaFree(dA); cudaFree(dW); cudaFree(db); cudaFree(dR); cudaFree(dC); if (ws) cudaFree(ws);
+    return 0;
+}
+
 /* -------------------------------------------------------------- argmax */
 static int test_argmax(void) {
     const int V = 13088, n = 3;
@@ -613,8 +687,11 @@ int main(int argc, char **argv) {
         }
         CHECK(nbad_total == 0, "own gemm row-stable over the cohort-size sweep, all shapes (%d mismatches)", nbad_total);
     }
+    const int bench_v2 = argc > 1 && strcmp(argv[1], "--bench-v2") == 0;
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
-        if (test_gemm_v2(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
+        if (test_gemm_v2(shapes[i][0], shapes[i][1], names[i], bench_v2) != 0) return 1;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+        if (test_splitk(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
     if (test_argmax() != 0) return 1;
     if (test_layernorm() != 0) return 1;
     if (test_attention() != 0) return 1;

@@ -86,6 +86,13 @@ cudaError_t k_gemm_wt_v1(const float *A, int lda, const float *W, const float *b
 cudaError_t k_gemm_wt_v2(const float *A, int lda, const float *W, const float *bias,
                          float *C, int ldc, int M, int N, int K, int accumulate, int act,
                          cudaStream_t s);
+/* split-K (S14-8b): S = f(N, K) only; row-stable by construction, NOT
+ * bit-identical to v1 (a numerical change). ws: >= S*M*N floats. */
+cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const float *bias,
+                             float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                             float *ws, size_t ws_floats, cudaStream_t s);
+int k_gemm_splits(int N, int K);
+size_t k_gemm_splitk_workspace_floats(int Mmax, int N, int K);
 /* tests: pin one v2 configuration (-1 = the dispatcher chooses) */
 void k_gemm_force_config(int cfg);
 int k_gemm_config_count(void);

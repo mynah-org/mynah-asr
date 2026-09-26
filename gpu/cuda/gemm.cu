@@ -321,3 +321,133 @@ cudaError_t k_gemm_wt(const float *A, int lda, const float *W, const float *bias
     if (g_force_cfg >= 0) return k_gemm_wt_v2(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
     return k_gemm_wt_v1(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
 }
+
+/* ------------------------------------------------------------ split-K (S14-8b)
+ * THE CONTRACT CHANGES HERE, deliberately (decision 2026-09-26): the result is
+ * no longer v1's single chain, so it is not bit-identical to v1. What it keeps
+ * is the property serving needs -- the same input row gives the same output row
+ * whatever else is in the cohort -- by construction:
+ *
+ *   S, the number of splits, is a function of the weight's shape (N, K) ONLY,
+ *   never of M. Split s is the ascending fma chain over its own k range
+ *   [s*KC, min((s+1)*KC, K)), KC a multiple of 16, starting from 0.0f, written
+ *   to its own partial buffer. The reduction adds the partials in the fixed
+ *   order ((P0 + P1) + P2) + ..., then bias, accumulate, activation.
+ *
+ * Nothing in either kernel reads M except to skip rows past the end, so a row's
+ * bits cannot depend on how many other rows share the call. Gated by the same
+ * cohort-size sweep as the other kernels; the change against v1 is a numerical
+ * change and carries the transcript and WER gates of the S14 note. */
+__global__ void __launch_bounds__(GEMM_THREADS)
+gemm_part_kernel(const float *__restrict__ A, int lda, const float *__restrict__ W,
+                 float *__restrict__ P, int M, int N, int K, int KC) {
+    __shared__ float As[GEMM_BK][GEMM_BM + 4];
+    __shared__ float Ws[GEMM_BK][GEMM_BN + 4];
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int m0 = blockIdx.y * GEMM_BM, n0 = blockIdx.x * GEMM_BN, sp = blockIdx.z;
+    const int kb = sp * KC, ke = min(K, kb + KC);
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+    const int lrow = tid >> 2, lk = (tid & 3) * 4;
+    for (int k0 = kb; k0 < ke; k0 += GEMM_BK) {
+        {
+            const int m = m0 + lrow;
+            const float *src = A + (size_t)m * (size_t)lda + k0 + lk;
+            const bool rin = m < M;
+#pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int k = k0 + lk + u;
+                As[lk + u][lrow] = (rin && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        {
+            const int n = n0 + lrow;
+            const float *src = W + (size_t)n * (size_t)K + k0 + lk;
+            const bool rin = n < N;
+#pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int k = k0 + lk + u;
+                Ws[lk + u][lrow] = (rin && k < ke) ? src[u] : 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < GEMM_BK; k++) {
+            float a[4], w[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) a[i] = As[k][ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; j++) w[j] = Ws[k][tx * 4 + j];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    float *Ps = P + (size_t)sp * (size_t)M * (size_t)N;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int n = n0 + tx * 4 + j;
+            if (n < N) Ps[(size_t)m * N + n] = acc[i][j];
+        }
+    }
+}
+
+__global__ void gemm_reduce_kernel(const float *__restrict__ P, int S, int M, int N,
+                                   const float *__restrict__ bias, float *__restrict__ C, int ldc,
+                                   int accumulate, int act) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (n >= N || m >= M) return;
+    const size_t mn = (size_t)M * (size_t)N, o = (size_t)m * N + n;
+    float v = P[o];
+    for (int sp = 1; sp < S; sp++) v += P[(size_t)sp * mn + o];      /* fixed order */
+    float *crow = C + (size_t)m * (size_t)ldc;
+    crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
+}
+
+/* S from the weight's shape only: enough (N-tile x split) blocks to give the
+ * card two waves when the cohort is one M-tile, each split at least 256 deep
+ * and a multiple of 16. The table is a pure function of (N, K, SM count); the
+ * SM count is fixed for the life of the process. */
+int k_gemm_splits(int N, int K) {
+    int sms = 0, dev = 0;
+    cudaGetDevice(&dev);
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0) sms = 40;
+    const int ntiles = (N + GEMM_BN - 1) / GEMM_BN;
+    int S = (2 * sms + ntiles - 1) / ntiles;
+    const int smax = K / 256;
+    if (S > smax) S = smax;
+    if (S < 1) S = 1;
+    return S;
+}
+
+size_t k_gemm_splitk_workspace_floats(int Mmax, int N, int K) {
+    const int S = k_gemm_splits(N, K);
+    return S > 1 ? (size_t)S * (size_t)Mmax * (size_t)N : 0;
+}
+
+cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const float *bias,
+                             float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                             float *ws, size_t ws_floats, cudaStream_t s) {
+    if (M <= 0 || N <= 0) return cudaSuccess;
+    const int S = k_gemm_splits(N, K);
+    if (S <= 1) return k_gemm_wt_v1(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+    if (!ws || ws_floats < (size_t)S * (size_t)M * (size_t)N) return cudaErrorInvalidValue;
+    int KC = (K + S - 1) / S;
+    KC = (KC + GEMM_BK - 1) / GEMM_BK * GEMM_BK;
+    dim3 grid((unsigned)((N + GEMM_BN - 1) / GEMM_BN), (unsigned)((M + GEMM_BM - 1) / GEMM_BM), (unsigned)S);
+    gemm_part_kernel<<<grid, GEMM_THREADS, 0, s>>>(A, lda, W, ws, M, N, K, KC);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+    gemm_reduce_kernel<<<g2, 256, 0, s>>>(ws, S, M, N, bias, C, ldc, accumulate, act);
+    return cudaGetLastError();
+}
