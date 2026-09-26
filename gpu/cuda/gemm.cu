@@ -132,15 +132,24 @@ cudaError_t k_gemm_wt_v1(const float *A, int lda, const float *W, const float *b
 /* ------------------------------------------------------------------ v2 */
 /* BM x BN block tile, TM x TN per thread; threads = (BM/TM) * (BN/TN).
  * Thread (ty, tx) owns rows ty + i*(BM/TM) and columns tx + j*(BN/TN):
- * interleaved, so a warp's shared reads hit consecutive words. */
-template <int BM, int BN, int TM, int TN>
+ * interleaved, so a warp's shared reads hit consecutive words.
+ *
+ * Software pipeline: the NEXT k-tile is fetched from global memory into
+ * registers (float4 along k when the operands are 16-byte aligned), the
+ * CURRENT tile is computed from shared memory while those loads are in flight,
+ * and only then are the registers written to the other shared buffer. Loading
+ * straight from global into shared (the first v2) makes every thread wait for
+ * its load before it can compute, and measured slower than v1. */
+template <int BM, int BN, int TM, int TN, bool VEC>
 __global__ void __launch_bounds__((BM / TM) * (BN / TN))
 gemm_wt_t(const float *__restrict__ A, int lda, const float *__restrict__ W,
           const float *__restrict__ bias, float *__restrict__ C, int ldc,
           int M, int N, int K, int accumulate, int act) {
     constexpr int NTX = BN / TN, NTY = BM / TM, NT = NTX * NTY;
-    __shared__ float As[2][GEMM_BK][BM + 1];
-    __shared__ float Ws[2][GEMM_BK][BN + 1];
+    constexpr int LA = (BM * 4 + NT - 1) / NT;      /* float4 loads per thread, A */
+    constexpr int LW = (BN * 4 + NT - 1) / NT;      /* float4 loads per thread, W */
+    __shared__ float As[2][GEMM_BK][BM + 4];
+    __shared__ float Ws[2][GEMM_BK][BN + 4];
     const int tid = threadIdx.x, tx = tid % NTX, ty = tid / NTX;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
 
@@ -150,26 +159,52 @@ gemm_wt_t(const float *__restrict__ A, int lda, const float *__restrict__ W,
 #pragma unroll
         for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
 
-    /* loads: consecutive threads walk k first (16 floats of one row), so a
-     * warp reads two 64-byte runs per row pair */
-    auto load = [&](int buf, int k0) {
-        for (int e = tid; e < BM * GEMM_BK; e += NT) {
-            const int r = e / GEMM_BK, kk = e % GEMM_BK, m = m0 + r, k = k0 + kk;
-            As[buf][kk][r] = (m < M && k < K) ? A[(size_t)m * (size_t)lda + k] : 0.0f;
+    float4 ra[LA], rw[LW];
+    /* quad q of a tile: row q / 4, k offset (q % 4) * 4 */
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int l = 0; l < LA; l++) {
+            const int q = tid + l * NT, r = q >> 2, kk = (q & 3) * 4, m = m0 + r, k = k0 + kk;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < BM * 4 && m < M) {
+                const float *p = A + (size_t)m * (size_t)lda + k;
+                if (VEC && k + 3 < K) v = *reinterpret_cast<const float4 *>(p);
+                else { if (k < K) v.x = p[0]; if (k + 1 < K) v.y = p[1]; if (k + 2 < K) v.z = p[2]; if (k + 3 < K) v.w = p[3]; }
+            }
+            ra[l] = v;
         }
-        for (int e = tid; e < BN * GEMM_BK; e += NT) {
-            const int r = e / GEMM_BK, kk = e % GEMM_BK, n = n0 + r, k = k0 + kk;
-            Ws[buf][kk][r] = (n < N && k < K) ? W[(size_t)n * (size_t)K + k] : 0.0f;
+#pragma unroll
+        for (int l = 0; l < LW; l++) {
+            const int q = tid + l * NT, r = q >> 2, kk = (q & 3) * 4, n = n0 + r, k = k0 + kk;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < BN * 4 && n < N) {
+                const float *p = W + (size_t)n * (size_t)K + k;
+                if (VEC && k + 3 < K) v = *reinterpret_cast<const float4 *>(p);
+                else { if (k < K) v.x = p[0]; if (k + 1 < K) v.y = p[1]; if (k + 2 < K) v.z = p[2]; if (k + 3 < K) v.w = p[3]; }
+            }
+            rw[l] = v;
+        }
+    };
+    auto stash = [&](int buf) {
+#pragma unroll
+        for (int l = 0; l < LA; l++) {
+            const int q = tid + l * NT, r = q >> 2, kk = (q & 3) * 4;
+            if (q < BM * 4) { As[buf][kk][r] = ra[l].x; As[buf][kk + 1][r] = ra[l].y; As[buf][kk + 2][r] = ra[l].z; As[buf][kk + 3][r] = ra[l].w; }
+        }
+#pragma unroll
+        for (int l = 0; l < LW; l++) {
+            const int q = tid + l * NT, r = q >> 2, kk = (q & 3) * 4;
+            if (q < BN * 4) { Ws[buf][kk][r] = rw[l].x; Ws[buf][kk + 1][r] = rw[l].y; Ws[buf][kk + 2][r] = rw[l].z; Ws[buf][kk + 3][r] = rw[l].w; }
         }
     };
 
     int buf = 0;
-    load(0, 0);
+    fetch(0);
+    stash(0);
     __syncthreads();
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
-        /* the other buffer was last read before the barrier that ended the
-         * previous iteration, so it can be refilled while this one is used */
-        if (k0 + GEMM_BK < K) load(buf ^ 1, k0 + GEMM_BK);
+        const bool more = k0 + GEMM_BK < K;
+        if (more) fetch(k0 + GEMM_BK);             /* in flight during the compute */
 #pragma unroll
         for (int k = 0; k < GEMM_BK; k++) {
             float a[TM], w[TN];
@@ -182,6 +217,8 @@ gemm_wt_t(const float *__restrict__ A, int lda, const float *__restrict__ W,
 #pragma unroll
                 for (int j = 0; j < TN; j++) acc[i][j] = fmaf(a[i], w[j], acc[i][j]);
         }
+        /* the other buffer was last read before the previous barrier */
+        if (more) stash(buf ^ 1);
         __syncthreads();
         buf ^= 1;
     }
@@ -204,15 +241,20 @@ template <int BM, int BN, int TM, int TN>
 static cudaError_t launch_t(const float *A, int lda, const float *W, const float *bias, float *C,
                             int ldc, int M, int N, int K, int accumulate, int act, cudaStream_t s) {
     dim3 grid((unsigned)((N + BN - 1) / BN), (unsigned)((M + BM - 1) / BM));
-    gemm_wt_t<BM, BN, TM, TN><<<grid, (BM / TM) * (BN / TN), 0, s>>>(A, lda, W, bias, C, ldc, M, N, K,
-                                                                     accumulate, act);
+    /* float4 loads need 16-byte rows: both base pointers aligned and both row
+     * strides multiples of 4 floats. Same arithmetic either way. */
+    const bool vec = ((((size_t)A) | ((size_t)W)) & 15u) == 0 && (lda & 3) == 0 && (K & 3) == 0;
+    if (vec)
+        gemm_wt_t<BM, BN, TM, TN, true><<<grid, (BM / TM) * (BN / TN), 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act);
+    else
+        gemm_wt_t<BM, BN, TM, TN, false><<<grid, (BM / TM) * (BN / TN), 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act);
     return cudaGetLastError();
 }
 
 /* the v2 configurations, largest reuse first */
-enum { G2_128x64 = 0, G2_64x128, G2_64x64, G2_32x64, G2_16x64, G2__N };
-static const int G2_BM[G2__N] = {128, 64, 64, 32, 16};
-static const int G2_BN[G2__N] = {64, 128, 64, 64, 64};
+enum { G2_128x64 = 0, G2_64x128, G2_64x64, G2_32x64, G2_16x64, G2_16x32, G2__N };
+static const int G2_BM[G2__N] = {128, 64, 64, 32, 16, 16};
+static const int G2_BN[G2__N] = {64, 128, 64, 64, 64, 32};
 
 static cudaError_t launch_cfg(int cfg, const float *A, int lda, const float *W, const float *bias,
                               float *C, int ldc, int M, int N, int K, int accumulate, int act,
@@ -222,7 +264,8 @@ static cudaError_t launch_cfg(int cfg, const float *A, int lda, const float *W, 
         case G2_64x128: return launch_t<64, 128, 4, 8>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
         case G2_64x64: return launch_t<64, 64, 4, 4>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
         case G2_32x64: return launch_t<32, 64, 2, 4>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
-        default: return launch_t<16, 64, 1, 4>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+        case G2_16x64: return launch_t<16, 64, 1, 4>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
+        default: return launch_t<16, 32, 1, 2>(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, s);
     }
 }
 
@@ -253,7 +296,7 @@ static int choose_cfg(int M, int N) {
 void k_gemm_force_config(int cfg) { g_force_cfg = cfg; }
 int k_gemm_config_count(void) { return G2__N; }
 const char *k_gemm_config_name(int cfg) {
-    static const char *const nm[G2__N] = {"128x64/8x4", "64x128/4x8", "64x64/4x4", "32x64/2x4", "16x64/1x4"};
+    static const char *const nm[G2__N] = {"128x64/8x4", "64x128/4x8", "64x64/4x4", "32x64/2x4", "16x64/1x4", "16x32/1x2"};
     return cfg >= 0 && cfg < G2__N ? nm[cfg] : "?";
 }
 

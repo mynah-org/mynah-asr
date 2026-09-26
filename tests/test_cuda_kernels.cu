@@ -192,9 +192,19 @@ static int test_gemm_v2(int N, int K, const char *what, int bench) {
                 cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
                 tb = ms / 20.0f; cublasDestroy(h);
             }
+            char cfgs[256] = ""; size_t cw = 0;
+            for (int cfg = 0; cfg < k_gemm_config_count(); cfg++) {
+                k_gemm_force_config(cfg);
+                for (int r = 0; r < 3; r++) (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                cudaEventRecord(e0);
+                for (int r = 0; r < 20; r++) (void)k_gemm_wt(dA, K, dW, nullptr, dC, N, M, N, K, 0, 0, 0);
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                cw += (size_t)snprintf(cfgs + cw, sizeof(cfgs) - cw, " %s=%.3f", k_gemm_config_name(cfg), ms / 20.0f);
+            }
+            k_gemm_force_config(-1);
             const double gf = 2.0 * M * N * K / 1e9;
-            printf("BENCH %-12s M=%3d  v1 %7.3f ms (%5.2f TF)  v2 %7.3f ms (%5.2f TF, %.2fx)  cublas %7.3f ms (%5.2f TF)\n",
-                   what, M, t1, gf / t1, t2, gf / t2, t1 / t2, tb, gf / tb);
+            printf("BENCH %-12s M=%3d  v1 %7.3f ms (%5.2f TF)  v2 %7.3f ms (%5.2f TF, %.2fx)  cublas %7.3f ms (%5.2f TF)  |%s\n",
+                   what, M, t1, gf / t1, t2, gf / t2, t1 / t2, tb, gf / tb, cfgs);
         }
     }
     cudaFree(dA); cudaFree(dW); cudaFree(db); cudaFree(dR); cudaFree(dC);
