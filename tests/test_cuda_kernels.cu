@@ -15,6 +15,7 @@
  * device (SKIP, the CI compile-only job's expected outcome). No model. */
 #include "../gpu/cuda/kernels.cuh"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <math.h>
@@ -91,6 +92,41 @@ static int test_gemm_shape(int N, int K, const char *what) {
     }
     CHECK(ok, "gemm epilogue %s: accumulate + relu", what);
     cudaFree(dA); cudaFree(dW); cudaFree(db); cudaFree(dC1); cudaFree(dC2);
+    return 0;
+}
+
+
+/* ------------------------------------------------ cuBLAS row stability (S14-6b)
+ * cuBLAS is not row-stable by contract: its heuristics pick the kernel (tile,
+ * split-K) per shape. Like a vendor BLAS on the CPU (S1-4), the property is
+ * therefore MEASURED on the card in use: every row of C at M in a sweep of
+ * cohort sizes is compared byte for byte with the same row inside M = 257,
+ * with the exact call the engine makes (pedantic f32, row-major via op T/N). */
+static int test_cublas_rowstable(int N, int K, const char *what, cublasHandle_t h) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17, 24, 31, 32, 33, 48, 63, 64, 65, 95, 96, 100, 127, 128, 129, 160, 163, 192, 200, 255, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K);
+    fill(A, 1.0f); fill(W, 0.05f);
+    float *dA = dup_dev(A), *dW = dup_dev(W), *dRef, *dC;
+    CU(cudaMalloc(&dRef, (size_t)Mmax * N * sizeof(float)));
+    CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    const float alpha = 1.0f, beta = 0.0f;
+    if (cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, Mmax, K, &alpha, dW, K, dA, K, &beta, dRef, N) != CUBLAS_STATUS_SUCCESS) {
+        printf("FAIL cublas call\n"); return 1;
+    }
+    CU(cudaDeviceSynchronize());
+    auto ref = to_host(dRef, (size_t)Mmax * N);
+    int bad_m = -1, nbad = 0;
+    for (size_t i = 0; i < sizeof(Ms) / sizeof(Ms[0]); i++) {
+        const int M = Ms[i];
+        if (cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, dW, K, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS) { printf("FAIL cublas call\n"); return 1; }
+        CU(cudaDeviceSynchronize());
+        auto c = to_host(dC, (size_t)M * N);
+        if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) { nbad++; if (bad_m < 0) bad_m = M; }
+    }
+    CHECK(nbad == 0, "cublas row-stable %s [N=%d K=%d]: %d of %zu cohort sizes differ from M=257%s%d", what, N, K, nbad,
+          sizeof(Ms) / sizeof(Ms[0]), nbad ? ", first at M=" : "", nbad ? bad_m : 0);
+    cudaFree(dA); cudaFree(dW); cudaFree(dRef); cudaFree(dC);
     return 0;
 }
 
@@ -464,6 +500,37 @@ int main(void) {
     const char *names[] = {"ffn1", "ffn2", "qkvo/pw2", "pw1", "ss-linear", "prompt-l1", "prompt-l2", "encproj", "head", "lstm", "proj", "ss-pointwise"};
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         if (test_gemm_shape(shapes[i][0], shapes[i][1], names[i]) != 0) return 1;
+    {
+        cublasHandle_t h;
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { printf("FAIL cublasCreate\n"); return 1; }
+        cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH);
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+            if (test_cublas_rowstable(shapes[i][0], shapes[i][1], names[i], h) != 0) return 1;
+        cublasDestroy(h);
+    }
+    /* our own GEMM, the same sweep (the M=1-inside-257 check above is one point) */
+    {
+        int nbad_total = 0;
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+            const int N = shapes[i][0], K = shapes[i][1], Mmax = 257;
+            const int Ms[] = {1, 3, 7, 16, 17, 33, 64, 65, 100, 128, 163, 200, 256};
+            std::vector<float> A((size_t)Mmax * K), W((size_t)N * K);
+            fill(A, 1.0f); fill(W, 0.05f);
+            float *dA = dup_dev(A), *dW = dup_dev(W), *dRef, *dC;
+            CU(cudaMalloc(&dRef, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+            CU(k_gemm_wt(dA, K, dW, nullptr, dRef, N, Mmax, N, K, 0, 0, 0));
+            CU(cudaDeviceSynchronize());
+            auto ref = to_host(dRef, (size_t)Mmax * N);
+            for (size_t j = 0; j < sizeof(Ms) / sizeof(Ms[0]); j++) {
+                CU(k_gemm_wt(dA, K, dW, nullptr, dC, N, Ms[j], N, K, 0, 0, 0));
+                CU(cudaDeviceSynchronize());
+                auto c = to_host(dC, (size_t)Ms[j] * N);
+                if (memcmp(c.data(), ref.data(), (size_t)Ms[j] * N * sizeof(float)) != 0) nbad_total++;
+            }
+            cudaFree(dA); cudaFree(dW); cudaFree(dRef); cudaFree(dC);
+        }
+        CHECK(nbad_total == 0, "own gemm row-stable over the cohort-size sweep, all shapes (%d mismatches)", nbad_total);
+    }
     if (test_argmax() != 0) return 1;
     if (test_layernorm() != 0) return 1;
     if (test_attention() != 0) return 1;
