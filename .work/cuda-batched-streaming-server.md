@@ -548,6 +548,42 @@ once per iteration; a small-M tile and fewer syncs are the first levers, and
 the GPU utilisation figure (68-82 %) is the nvidia-smi "a kernel was running"
 fraction, not SM occupancy.
 
+### 2026-09-26, the V2 qualification of the frozen CUDA F32 v1 baseline (L4)
+
+`gpu/tools/gpu_qualify.sh`, commit `075c8d2`, binary `23c9efd5…`, bank
+`04a7753aa1e80f9a` (498 clips, the SAME bank as the CPU C=128/144/152 runs),
+`lang=auto`, lookahead 3, `--cohort-ms 40`, cap 192; unloaded reference at C=4
+from the GPU server itself; verdict by the unmodified `tools/bench/v2_verdict.py`.
+Evidence: `.work/evidence/gpu-l4-20260926/qual-20260926T134405Z/`.
+
+**RESULT, stated exactly:** CUDA F32 v1: C128 short-run passed all latency
+gates; formal 2x30m qualification failed because soak #1 exceeded backlog_max
+by 44 ms (0.684 vs 0.640 s). All other reported gates passed. Optimization and
+profile campaign continues from the frozen baseline. C=128 is therefore NOT
+"qualified" and NOT "safe" on this GPU build.
+
+| run | lost | lag p95 | fin p95 | backlog max | drift worst | parity | TTFP paired p95 | audio/wall | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| ladder C=96 (90 s) | 0 | 114 | 158 | 0.184 | 116 | PASS | +60 | 62.5x | pass (no trend over 90 s) |
+| ladder C=128 | 0 | 165 | 224 | 0.344 | 178 | PASS | +94 | 89.2x | pass (no trend over 90 s) |
+| ladder C=144 | 0 | 286 | 369 | **0.784** | **352** | PASS | +184 | 103.5x | NOT QUALIFIED |
+| ladder C=160 | 0 | **611** | **814** | **0.884** | **675** | PASS | +422 | 110.3x | NOT QUALIFIED |
+| soak 1 C=128, 1800 s, seed 42 | 0 / 17016 | 177 | 237 | **0.684** | 213 | PASS | +104 | 123.3x | NOT QUALIFIED (backlog only) |
+| soak 2 C=128, 1800 s, seed 43 | 0 / 17023 | 164 | 223 | 0.584 | 180 | PASS | +91 | 123.8x | QUALIFIED |
+
+Both soaks: books balanced in all 63 dumps, RSS 1.021x, one process throughout,
+fairness 1.04x / 1.02x, 0 deltas over 1280 ms. For orientation only (not a
+claim; different hardware class and different cost): the 30-core Axion CPU
+fleet qualified C=128 at lag p95 129 / fin 221 ms and ~124 audio-s/s on the
+same bank.
+
+**FACT from the server's own counters** (cohorts, lanes per cohort, step wall,
+cohort wait): the single engine thread spends 86 % of wall inside `step` at
+C=128 (33 lanes, 68-71 ms per step) and the cohort wait averages ~80 ms against
+the 40 ms setting, i.e. a cohort waits for the previous step to finish. The
+serial step chain, not the GPU, is saturating; what inside the step costs the
+time is S14-6b's question.
+
 Per GPU phase, this section will record the box, the commit, the binary hash,
 `nvidia-smi` identity, the `--dispatch-map` output and the artefact path
 (untracked under `.work/evidence/`).
