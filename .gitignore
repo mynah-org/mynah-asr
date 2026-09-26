@@ -89,3 +89,8 @@ models_local/
 # belong in docs/serving-findings.md and configs/perf/, never as raw output in
 # the tree (repo rule 6).
 tier-evidence/
+# S14: the GPU server tree binaries
+mynah-asr-server-cuda
+mynah-asr-server-cuda-cpuonly
+tests/test_cuda_kernels
+tests/test_cuda_stream
