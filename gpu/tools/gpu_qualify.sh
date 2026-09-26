@@ -18,7 +18,7 @@
 #       --corpus samples/stress-en/manifest.json --corpus-sample 498 \
 #       [--phase all|reference|ladder|soak] [--ladder "96 128 144 160"] [--ladder-seconds 90]
 #       [--soak-c 128] [--soak-seconds 1800] [--soaks 2] [--seed 42]
-#       [--cohort-ms 40] [--cap 192] [--lang auto] [--lookahead 3] [--ref-c 4]
+#       [--cohort-ms 40] [--cap 192] [--lang auto] [--lookahead 3] [--ref-c 4] [--gemm own|splitk]
 #       [--reference-file <run>/reference.json] [--out ~/asr-evidence/gpu]
 #
 # Refuses: a dirty tree, a GPU another process is using, a dispatch map with an
@@ -29,7 +29,7 @@ cd "$(dirname "$0")/../.." || exit 2
 MODEL=""; PHASE=all; LADDER="96 128 144 160"; LADDER_S=90; SOAK_C=128; SOAK_S=1800; SOAKS=2
 SEED=42; COHORT=40; CAP=192; LANG_Q=auto; LOOKAHEAD=3; REF_C=4; REF_IN=""
 CORPUS=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; MIN_PEAK_DBFS=-30
-WARMUP=30; WINDOW=60; DUMP_EVERY=30; OUT="$HOME/asr-evidence/gpu"; PORT=8291; BIN=./mynah-asr-server-cuda
+WARMUP=30; WINDOW=60; DUMP_EVERY=30; OUT="$HOME/asr-evidence/gpu"; PORT=8291; BIN=./mynah-asr-server-cuda; GEMM=own
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MODEL="$2"; shift 2 ;;
@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do
         --window) WINDOW="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
+        --gemm) GEMM="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "gpu_qualify: unknown option: $1" >&2; exit 2 ;;
     esac
@@ -111,13 +112,13 @@ for c in $BANK; do printf '%s %s\n' "$(sha256sum "$c" | cut -d' ' -f1)" "$c"; do
 REV=$(git rev-parse --short HEAD); DIRTY=$(git status --porcelain | grep -v '^??' | wc -l | tr -d ' ')
 BIN_SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
 [ "$DIRTY" = "0" ] || die "dirty tree ($DIRTY tracked files): a qualification measures a commit (ENGINEERING.md §12)"
-say "gpu_qualify commit=$REV binary=$BIN_SHA model=$MODEL cohort_ms=$COHORT cap=$CAP lang=$LANG_Q lookahead=$LOOKAHEAD"
+say "gpu_qualify commit=$REV binary=$BIN_SHA model=$MODEL gemm=$GEMM cohort_ms=$COHORT cap=$CAP lang=$LANG_Q lookahead=$LOOKAHEAD"
 say "            corpus $NCLIP clips from $CORPUS, bank-sha256 $BANK_SHA   evidence -> $RUN"
 
 # ------------------------------------------------------------ 1. freeze
 { uname -a; echo; nproc; cat /sys/fs/cgroup/cpu.max 2>/dev/null; echo; free -g; cat /proc/loadavg; } > "$RUN/host.txt" 2>&1
 nvidia-smi -q > "$RUN/nvidia-smi.txt" 2>&1
-"$BIN" -m "$MODEL" --dispatch-map > "$RUN/dispatch.txt" 2>&1 || die "the server could not print its dispatch map (see dispatch.txt)"
+"$BIN" -m "$MODEL" --gemm "$GEMM" --dispatch-map > "$RUN/dispatch.txt" 2>&1 || die "the server could not print its dispatch map (see dispatch.txt)"
 UNKNOWN=$(sed -n 's/^\([0-9][0-9]*\) row(s) UNKNOWN.*/\1/p' "$RUN/dispatch.txt" | tail -1)
 [ "${UNKNOWN:-1}" = "0" ] || die "dispatch map has UNKNOWN rows or none at all"
 OTHERS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -c .)
@@ -138,7 +139,7 @@ fi
 # ------------------------------------------------------------ server lifecycle
 SRV=""; DUMPER=""; SMI=""
 start_server() {   # start_server <tag>
-    "$BIN" -m "$MODEL" -p "$PORT" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" \
+    "$BIN" -m "$MODEL" -p "$PORT" --gemm "$GEMM" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" \
         --metrics-port $(( PORT + 1000 )) > "$RUN/server-$1.log" 2>&1 &
     SRV=$!
     for i in $(seq 1 300); do curl -sf -m 2 "http://localhost:$PORT/v1/health" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -252,7 +253,7 @@ GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 cat > "$RUN/manifest.json" <<JSON
 { "utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "commit": "$REV", "dirty_files": $DIRTY,
   "binary_sha256": "$BIN_SHA", "binary": "mynah-asr-server-cuda", "engine": "cuda", "gpu": "$GPU_NAME",
-  "model": "$MODEL", "quant": "f32", "lookahead": $LOOKAHEAD, "cohort_ms": $COHORT,
+  "model": "$MODEL", "quant": "f32", "gemm": "$GEMM", "lookahead": $LOOKAHEAD, "cohort_ms": $COHORT,
   "workers": 1, "threads_per_worker": 1, "cap": $CAP, "http_threads_per_worker": $(( CAP + 32 )),
   "connection_ceiling": $(( CAP + 32 )), "server_cpus": "container", "gen_cpus": "container",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA", "corpus": "$CORPUS", "corpus_sample": $CORPUS_SAMPLE,
