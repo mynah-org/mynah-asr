@@ -447,6 +447,66 @@ reported SKIP 77 with no device, the server refused with "no CUDA device"), `tes
 `tests/test_cuda_stream` have never executed. This is the state S14-6 starts
 from.
 
+### 2026-09-26, first GPU: NVIDIA L4 on a rented container (S14-6)
+
+Box: one L4 (sm_89, 22.5 GiB with ECC, driver 595.84, CUDA 12.8), an
+unprivileged container with a 24.5-CPU cgroup quota on a shared 128-core host
+(the loadavg the container sees, ~28, is the HOST's). Build `CUDA_ARCH=sm_89`
+from a clean clone of the branch; raw evidence in
+`.work/evidence/gpu-l4-20260926/` (untracked).
+
+**Is the GPU what it claims** (`gpu/tools/gpu_doctor.sh`, idle box):
+
+| check | measured | reading |
+|---|---|---|
+| P-state | P8 idle, P0 under load, memory at 6251 MHz | full clocks |
+| power limit | 72 W = default = max | not lowered by the provider |
+| MIG / other processes | none / none | the whole GPU |
+| VRAM allocatable | 22272 of 22565 MiB (98.7 %) | no cap |
+| device bandwidth (copy r+w) | 210 GB/s, 70 % of 300 | normal for GDDR6 |
+| FP32 FMA sustained | 23.8 TFLOP/s, 78 % of 30.3 | `sw_power_cap` at 72 W holds the SM at ~1570 of 2040 MHz: the L4's own TDP, the same on any L4 |
+| PCIe pinned | 25.4 / 22.1 GB/s | Gen4 x16 |
+
+**Gates, first run on a device, all green:** `tests/test_cuda_kernels` 51/51,
+including the GEMM row-stability BYTE gate on all 12 model shapes and lane
+identity of the attention; `tests/test_cuda_stream` gate A (batch identity and
+slot independence, 5 clips, 5 languages) and **gate B: the GPU f32 transcripts
+are byte-identical to the library's CPU f32 stream path on all 5 clips**, both
+with the own GEMM and with the cuBLAS arm.
+
+**Two defects the protocol probes found on the device** (the engine-level test
+could not): the server handed `finalize` to the engine with audio still queued
+(empty transcripts), and repeated resets of an idle slot overflowed the pinned
+reset list (device error, engine dead, exit 70). Both fixed in `aea98e9`; then
+7/7 protocol probes and the 16-case fault suite green on the GPU (0 failed
+invariants, books balanced, 0.00 s fed after a peer left, RSS flat over 40
+aborts).
+
+**WAVE ladder** (screening, never promotes; 120 s per rung, fresh server,
+`lang=en`, lookahead 3, `--cohort-ms 40`, stress-en all 1587 clips, generator
+on the same box; stream_load's own TTFP line is the provisional envelope, which
+v2_verdict reports and does not gate):
+
+| C | lag p95 (client) | fin p95 | backlog max | lost | cohorts | lanes/cohort | step ms | GPU util |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 86 | 128 | 0.084 s | 0 | 2585 | 5.0 | 42.5 | 68 % |
+| 64 | 103 | 140 | 0.184 s | 0 | 2535 | 10.2 | 47.4 | 82 % |
+| 96 | 137 | 191 | 0.184 s | 0 | 2078 | 18.8 | 58.9 | 81 % |
+| 128 | 178 | 237 | 0.384 s | 0 | 1800 | 28.7 | 66.3 | 78 % |
+| 160 | **625** | **800** | 0.864 s | 0 | 1128 | 56.1 | 100.9 | 78 % |
+
+Reading, labelled: **RESULT (WAVE)** C=128 is inside the latency bounds
+(320 / 500 / 0.640) and C=160 is out, the same knee region as the 30-core Axion
+fleet (C=144 qualified, 152 fails). **FACT** the fixed cost of a step is large:
+42 ms at 5 lanes, and only +59 ms from 5 to 56 lanes, so a lane costs ~1.2 ms
+while the pass costs ~36 ms before any lane — the byte count predicted 8 ms of
+f32 weight traffic, so the fixed term is kernel inefficiency, not bandwidth.
+**HYPOTHESIS** (S14-8): the own GEMM launches N/64 × M/64 blocks, i.e. 16 blocks
+for a 1024-wide output at small M on 58 SMs, and the label loop synchronises
+once per iteration; a small-M tile and fewer syncs are the first levers, and
+the GPU utilisation figure (68-82 %) is the nvidia-smi "a kernel was running"
+fraction, not SM occupancy.
+
 Per GPU phase, this section will record the box, the commit, the binary hash,
 `nvidia-smi` identity, the `--dispatch-map` output and the artefact path
 (untracked under `.work/evidence/`).
