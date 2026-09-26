@@ -441,7 +441,9 @@ exactly what the cpu reference engine exists to expose on a machine without a
 GPU.
 
 Not run: anything on a GPU. The cuda engine (`gpu/cuda/*.cu`) is
-compile-verified by the CI job only, `tests/test_cuda_kernels` and
+compile-verified by the CI job only (run 36240377764 green: nvcc 12.6 built
+and linked the server and both tests for sm_80/86/89/90, the kernel test
+reported SKIP 77 with no device, the server refused with "no CUDA device"), `tests/test_cuda_kernels` and
 `tests/test_cuda_stream` have never executed. This is the state S14-6 starts
 from.
 
