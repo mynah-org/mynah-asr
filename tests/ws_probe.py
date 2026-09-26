@@ -252,6 +252,14 @@ def load_reference(path: str) -> dict:
     return json.load(open(path, encoding="utf-8"))
 
 
+def stream_path(a) -> str:
+    """The stream URL; an empty --lang or --lookahead leaves that key out, for a
+    model with no language prompt or a single preset (the English-only EOU
+    model refuses any `lang`)."""
+    q = [f"{k}={v}" for k, v in (("lang", a.lang), ("lookahead", a.lookahead)) if v != ""]
+    return "/v1/audio/stream" + ("?" + "&".join(q) if q else "")
+
+
 def verdict(ok: bool, what: str) -> int:
     print(("OK   " if ok else "FAIL ") + what)
     return 0 if ok else 1
@@ -261,7 +269,7 @@ def verdict(ok: bool, what: str) -> int:
 
 def cmd_utterances(a) -> int:
     ref = load_reference(a.reference)
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path)
     bad, all_seqs = [], []
     try:
@@ -293,7 +301,7 @@ def cmd_utterances(a) -> int:
 
 def cmd_control(a) -> int:
     ref = load_reference(a.reference)
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path)
     bad = []
     try:
@@ -319,7 +327,7 @@ def cmd_control(a) -> int:
 
 def cmd_bad_lang(a) -> int:
     ref = load_reference(a.reference)
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path)
     bad = []
     try:
@@ -363,7 +371,7 @@ def cmd_http(a) -> int:
 def cmd_hold(a) -> int:
     """Takes a slot and keeps it. With --clip it streams one first, which is what
     the SIGTERM check needs: a live stream when the signal arrives."""
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path)
     codes = []
     try:
@@ -402,7 +410,7 @@ def cmd_hold(a) -> int:
 
 def cmd_idle(a) -> int:
     """Says nothing at all after the handshake."""
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path, pong=False)
     codes = []
     try:
@@ -424,7 +432,7 @@ def cmd_idle(a) -> int:
 
 def cmd_ping(a) -> int:
     """Reads for a while without saying anything else and counts server pings."""
-    path = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    path = stream_path(a)
     sess = Session(a.host, a.port, path)
     try:
         time.sleep(a.wait)

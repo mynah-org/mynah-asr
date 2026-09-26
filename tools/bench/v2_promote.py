@@ -63,7 +63,9 @@ def collect(run):
             "seed": v.get("seed"), "bank": v.get("bank_sha256"),
             "utterances": s["counts"]["ok"],
             "audio_s": round(s["counts"]["audio_s"], 1),
-            "lost": s["counts"]["errors"], "rejected": s["counts"]["rejected"],
+            # whole run, warm-up included (S12-17); older runs only have `errors`
+            "lost": s["counts"].get("errors_total", s["counts"]["errors"]),
+            "rejected": s["counts"]["rejected"],
             "emission_lag_p50_ms": V.g(m, "emission_lag_ms", "p50"),
             "emission_lag_p95_ms": V.g(m, "emission_lag_ms", "p95"),
             "emission_lag_p99_ms": V.g(m, "emission_lag_ms", "p99"),

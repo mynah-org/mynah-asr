@@ -94,6 +94,16 @@ typedef struct mynah_asr_slot {
     size_t samples_consumed;       /* absolute: taken by the scheduler */
     int req;                       /* MYNAH_ASR_SLOT_REQ_* */
     mynah_asr_slot_cancel cancel_reason;
+    /* S12-18. How this session ENDED, recorded once, first writer wins: NULL
+     * while it runs, "completed" for a `done` + close, otherwise the code the
+     * client was sent (a cancel bucket name). It is COUNTED once, when the slot
+     * goes back to FREE, by whoever releases it -- so every session claimed is
+     * counted exactly once, and the books can be checked:
+     *     sessions == completed + cancelled + aborted + active. */
+    const char *outcome;
+    /* The ingest gave up waiting for the scheduler (mynah_asr_slot_abandon):
+     * the scheduler, when it finally ends the session, releases it itself. */
+    int abandoned;
     char req_lang[MYNAH_ASR_SLOT_LANG_CAP];
 
     /* ------------------------------------ the scheduler's alone once ACTIVE */
@@ -112,6 +122,7 @@ typedef struct mynah_asr_slot {
      * close the path from audio-in to bytes-out. Diagnostic: nothing in the
      * serving path reads them. */
     double t_first_audio, t_first_queued;
+    int first_text_counted;        /* S12-21: this session's first text is in the fleet histogram */
     double last_arrival;           /* of the newest sample the scheduler took */
     /* When the model last served this slot. `steps` says how many times; this
      * says how long ago, which is the only one of the two that can distinguish
@@ -226,6 +237,24 @@ int mynah_asr_slot_take_requests(mynah_asr_slot *s, char *lang,
 /* Moves the slot to a state the ingest can observe. The scheduler uses DONE to
  * say "I am finished with this session"; FINISHING is bookkeeping for /health. */
 void mynah_asr_slot_set_state(mynah_asr_slot *s, mynah_asr_slot_state st);
+
+/* Records how the session ended, unless something already did (first wins: an
+ * ingest that hit --max-audio-seconds says `audio_limit` before the scheduler's
+ * close says `completed`). `code` must be a string literal. */
+void mynah_asr_slot_set_outcome(mynah_asr_slot *s, const char *code);
+
+/* The scheduler's end of a session: records `code` (first wins) and moves the
+ * slot to DONE under one lock. Returns 1 when the ingest had ABANDONED the slot,
+ * in which case nobody else will ever release it and the caller must. */
+int mynah_asr_slot_finish(mynah_asr_slot *s, const char *code);
+
+/* The ingest giving up on a slot the scheduler has not finished. Returns 0 when
+ * the slot turned out to be DONE after all (the caller releases it as usual),
+ * 1 when it is now the scheduler's to release. */
+int mynah_asr_slot_abandon(mynah_asr_slot *s);
+
+/* The outcome recorded so far (NULL: none). */
+const char *mynah_asr_slot_outcome(mynah_asr_slot *s);
 
 /* Blocks until the scheduler has moved the slot to DONE, or the timeout runs
  * out. Returns 1 when DONE. The ingest thread uses it instead of polling, so a

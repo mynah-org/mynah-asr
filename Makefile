@@ -145,7 +145,7 @@ mynah-asr: $(OBJ) build/cli/main.o
 
 mynah-asr-server: $(OBJ) build/server/main.o build/server/http_util.o build/server/prefork.o \
                   build/server/stream_out.o build/server/slot.o build/server/sched.o \
-                  build/server/metrics.o build/server/obs.o
+                  build/server/metrics.o build/server/obs.o build/server/fleet.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lpthread
 
 # objects in build/ (never next to the sources: the variant builds — ubsan, cuda
@@ -158,7 +158,7 @@ build/src/metal_mps.o: src/metal_mps.m $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
-TESTS := tests/test_qmat tests/test_sgemm tests/test_threads tests/test_flags tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch
+TESTS := tests/test_qmat tests/test_sgemm tests/test_threads tests/test_flags tests/test_align tests/test_vadseg tests/test_tokenize tests/test_stream_out tests/test_features tests/test_subsampling tests/test_encoder tests/test_streaming tests/test_batch tests/test_stream_batch tests/test_kv_layout
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib
@@ -193,7 +193,7 @@ SCRIPTED_TESTS := tests/test_vad
 test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@for t in $(TESTS); do \
 	  if [ $$t = tests/test_qmat ] || [ $$t = tests/test_sgemm ] || [ $$t = tests/test_threads ] || [ $$t = tests/test_flags ] || [ $$t = tests/test_align ] || [ $$t = tests/test_vadseg ] || [ $$t = tests/test_tokenize ] || [ $$t = tests/test_stream_out ]; then $$t; rc=$$?; \
-	  elif [ $$t = tests/test_stream_batch ]; then $$t $(MODEL_DIR); rc=$$?; \
+	  elif [ $$t = tests/test_stream_batch ] || [ $$t = tests/test_kv_layout ]; then $$t $(MODEL_DIR); rc=$$?; \
 	  else $$t $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; fi; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
@@ -447,6 +447,20 @@ test-server-protocol: mynah-asr-server mynah-asr
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-protocol: model, binaries or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
+# S12-17..20: PROVOKED FAILURES. RST and FIN mid-utterance (speech and silence),
+# a reset during the finalize, the legal half-close, idle and stalled frames,
+# oversized / reserved-bit / bad control frames, garbage, the 503 at capacity, a
+# neighbour's transcript while three streams die around it, 40 mixed aborts with
+# RSS and books, and a prefork worker SIGKILLed under a live stream. Each case
+# checks the slot comes back, ONE outcome counter moves, the model stops working
+# for a client that is gone, and the session books balance. Any streaming model;
+# FAULT_LEAKS=1 adds `leaks` on the live server (macOS).
+FAULT_MODEL_DIR ?= $(MODEL_DIR)
+test-server-faults: mynah-asr-server mynah-asr
+	@sh tests/test_server_faults.sh $(FAULT_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-faults: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 # Model-agnostic server check (concurrency + adaptive-BLAS accounting): unlike
 # test-server it asserts nothing about the transcript, so it runs with ANY
 # converted model. CI uses it with the 110m (CONC_MODEL_DIR=...), which is how
@@ -542,6 +556,7 @@ leaks: mynah-asr tests/test_streaming tests/test_vad tests/test_align tests/test
 check:
 	@sh tests/test_check_plan.sh
 	@out=$$(python3 tools/bench/streaming_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
+	@out=$$(python3 tools/bench/stream_load.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_partial_quality.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_verdict.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_promote.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
@@ -593,4 +608,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-faults test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics

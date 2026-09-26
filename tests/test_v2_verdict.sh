@@ -34,7 +34,16 @@ d = {
  "summary": {
    "counts": {"utterances": 600, "ok": 600, "errors": 0, "rejected": 0,
               "warmup_excluded": 20, "deltas": 9000, "eous": 600,
-              "audio_s": 5220.0, "span_s": 1800.0},
+              "audio_s": 5220.0, "span_s": 1800.0,
+              # the whole-run accounting stream_load writes since 2026-09-25
+              "errors_warmup": 0, "errors_total": 0, "error_kinds": {},
+              "rejected_warmup": 0, "rejected_total": 0, "cut_at_deadline": 0,
+              "started": 620, "stream_deaths": 0},
+   "accounting": {"started": 620, "ok": 620, "rejected": 0, "cut_at_deadline": 0,
+                  "errors": 0, "error_kinds": {}, "errors_warmup": 0,
+                  "conservation": True, "conservation_detail": None},
+   "streams": {"expected": 16, "dead": [], "exited_early": [],
+               "terminated_at_deadline": []},
    "pacing": {"paced": True, "verdict": "PACED"},
    "metrics": {
      "emission_lag_ms": {"p50": 40.0, "p95": 95.0, "max": 400.0, "n": 9000},
@@ -68,6 +77,10 @@ with open(dir + "/server-soak1.log", "w") as f:
             f.write(f"[DUMP] worker={w} seq={seq} slots active=6 cap=96 sessions=10 "
                     f"steps={seq*1000} deltas=50 eous=5 audio_s=100.0\n")
             f.write(f"[DUMP] worker={w} seq={seq} split model_busy_s={seq*20.0:.2f} (0.800) x\n")
+            f.write(f"[DUMP] worker={w} seq={seq} books sessions={10 + seq} completed={seq} "
+                    f"cancelled=2 aborted=0 active=8 balanced=1 abandoned=0 recovered=0\n")
+            f.write(f"[DUMP] worker={w} seq={seq} cancelled=2 idle_timeout=1 peer_gone=1 "
+                    f"frame_too_large=0 protocol_error=0 other=0\n")
 with open(dir + "/procsample-soak1.txt", "w") as f:
     for seq in range(6):
         f.write("t=10:00:0%d pids=101,102,103,\n" % seq)
@@ -161,8 +174,158 @@ mk ready_ok "WITH_BASELINE = True; RPEN = 300.0"
 [ "$(verdict ready_ok)" = "QUALIFIED" ] && ok "and 300 ms, inside the cadence, does not" \
     || bad "300 ms failed a 320 ms bound"
 
-mk lost "d['summary']['counts']['errors'] = 3"
+mk lost "d['summary']['counts'].update(errors=3, errors_total=3, error_kinds={'timeout': 3})"
 [ "$(verdict lost)" = "NOT QUALIFIED" ] && ok "three lost streams disqualify" || bad "lost streams did not disqualify"
+
+# --- harness accounting (S12-17, AUDIT 2026-09-24). Each case is a run the OLD
+# verdict read as QUALIFIED: it read `counts.errors`, which excludes the warm-up,
+# and nothing else about the accounting.
+mk warmerr "d['summary']['counts'].update(errors_warmup=2, errors_total=2, error_kinds={'server_disconnect': 2})"
+[ "$(verdict warmerr)" = "NOT QUALIFIED" ] && [ "$(state warmerr 1)" = "FAIL" ] \
+    && ok "two errors inside the warm-up fail bound 1 (the post-warm-up count is still 0)" \
+    || bad "warm-up errors were dropped again: $(verdict warmerr) / bound 1 $(state warmerr 1)"
+
+mk conserv "d['summary']['accounting'].update(conservation=False, conservation_detail='started 620 != 619')"
+[ "$(verdict conserv)" = "NOT QUALIFIED" ] && [ "$(state conserv A)" = "FAIL" ] \
+    && ok "an utterance missing from the accounting fails the run" \
+    || bad "a broken conservation invariant passed: $(verdict conserv)"
+
+mk deaths "d['summary']['counts']['stream_deaths'] = 1; d['summary']['streams']['dead'] = [7]"
+[ "$(verdict deaths)" = "NOT QUALIFIED" ] && [ "$(state deaths A)" = "FAIL" ] \
+    && ok "a client stream that died before the deadline fails the run" \
+    || bad "a dead client stream passed: $(verdict deaths)"
+
+mk nomarks "d['summary']['accounting'].update(conservation=None, conservation_detail='no start marks')"
+[ "$(verdict nomarks)" = "INCONCLUSIVE (missing evidence)" ] \
+    && ok "a new-format run whose conservation was not checked is inconclusive, not qualified" \
+    || bad "an unchecked conservation passed: $(verdict nomarks)"
+
+mk cut "d['summary']['counts']['cut_at_deadline'] = 3; d['summary']['accounting'].update(cut_at_deadline=3, started=623)"
+[ "$(verdict cut)" = "QUALIFIED" ] \
+    && ok "utterances cut at the soak deadline are counted and are not losses" \
+    || bad "cut_at_deadline was treated as a loss: $(verdict cut)"
+
+# An old run keeps its verdict and says what it cannot know.
+mk legacy "[d['summary']['counts'].pop(k) for k in ('errors_warmup', 'errors_total', 'error_kinds', 'rejected_warmup', 'rejected_total', 'cut_at_deadline', 'started', 'stream_deaths')]; d['summary'].pop('accounting'); d['summary'].pop('streams')"
+[ "$(verdict legacy)" = "QUALIFIED" ] && ok "a run recorded before the accounting fields keeps its verdict" \
+    || bad "an old run changed verdict or crashed: '$(verdict legacy)'"
+python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/legacy" 2>/dev/null | grep -q "warning: run predates errors_total" \
+    && [ "$(state legacy A)" = "NOT REGISTERED" ] \
+    && ok "and warns that warm-up errors and stream deaths are unknown" \
+    || bad "an old run was judged without saying what it could not know"
+mk legacylost "[d['summary']['counts'].pop(k) for k in ('errors_total', 'errors_warmup')]; d['summary']['counts']['errors'] = 3"
+[ "$(verdict legacylost)" = "NOT QUALIFIED" ] && ok "an old run with post-warm-up losses still fails" \
+    || bad "the fallback to counts.errors is broken"
+
+# --- the server's session books (S12-18), from the worker dumps
+[ "$(state healthy B)" = "PASS" ] && ok "balanced server books pass row B" \
+    || bad "balanced books did not pass row B: $(state healthy B)"
+mk unbal "pass"
+sed -i.bak 's/worker=1 seq=4 books sessions=14 completed=4 cancelled=2 aborted=0 active=8 balanced=1/worker=1 seq=4 books sessions=14 completed=4 cancelled=1 aborted=0 active=8 balanced=0/' \
+    "$TMP/unbal/server-soak1.log"
+[ "$(verdict unbal)" = "NOT QUALIFIED" ] && [ "$(state unbal B)" = "FAIL" ] \
+    && ok "one unbalanced books line in one worker's dumps fails the run" \
+    || bad "a server that lost a session qualified: $(verdict unbal) / B $(state unbal B)"
+mk abandon "pass"
+sed -i.bak 's/worker=2 seq=6 books \(.*\) abandoned=0 recovered=0/worker=2 seq=6 books \1 abandoned=1 recovered=0/' \
+    "$TMP/abandon/server-soak1.log"
+[ "$(verdict abandon)" = "NOT QUALIFIED" ] && [ "$(state abandon B)" = "FAIL" ] \
+    && ok "an abandoned slot never recovered by the end fails the run" \
+    || bad "a leaked slot qualified: $(verdict abandon) / B $(state abandon B)"
+mk oldserver "pass"
+sed -i.bak '/ books sessions=/d' "$TMP/oldserver/server-soak1.log"
+[ "$(verdict oldserver)" = "QUALIFIED" ] && [ "$(state oldserver B)" = "NOT REGISTERED" ] \
+    && ok "a server that predates the books keeps its verdict, row B not registered" \
+    || bad "an old server log changed verdict: $(verdict oldserver) / B $(state oldserver B)"
+
+# --- fault injection (P0-d): 70 of 690 utterances aborted on purpose, 10 per point.
+# They are not losses, and the healthy streams are judged alone; row F accounts them.
+FAULTS="d['summary']['counts']['aborted_by_client'] = 70
+d['summary']['accounting'].update(aborted_by_client=70, started=690)
+pts = ['before_first_partial', 'before_first_partial_silence', 'mid_utterance',
+       'mid_utterance_silence', 'partial_frame', 'during_finalization', 'idle_open']
+d['summary']['faults'] = {'planned': {p: 10 for p in pts}, 'aborted': {p: 10 for p in pts},
+    'preempted': {p: {} for p in pts}, 'methods': {p: {} for p in pts},
+    'server_end': {p: ({'idle_timeout': 10} if p == 'idle_open' else {}) for p in pts},
+    'planned_total': 70, 'aborted_total': 70, 'early_delta': 0, 'violations': [],
+    'client': {'sessions': 690, 'sessions_unknown': 0, 'audio_sent_s': 5500.0,
+               'audio_ok_s': 5220.0, 'audio_aborted_s': 280.0, 'audio_unknown_s': 0.0}}"
+SRV_OK="d['summary']['faults']['server'] = {'checked': True, 'match': True, 'mismatches': 0,
+    'rows': [{'bucket': 'peer_gone', 'server': 25, 'lo': 20, 'hi': 30, 'ok': True}],
+    'residual': {'server_audio_s': 5499.0, 'client_sent_s': 5500.0, 'unknown_s': 0.0,
+                 'residual_s': -1.0, 'bound_s': 22.4, 'aborts': 70, 'chunk_ms': 320.0,
+                 'ok': True, 'aborted_consumed_s': 279.0, 'aborted_sent_s': 280.0},
+    'detail': 'every bucket inside its interval'}"
+[ -z "$(state healthy F)" ] && ok "a run without a fault plan has no row F" \
+    || bad "row F appeared on a run with no plan: $(state healthy F)"
+mk faults "$FAULTS
+$SRV_OK"
+[ "$(verdict faults)" = "QUALIFIED" ] && [ "$(state faults F)" = "PASS" ] \
+    && [ "$(state faults 1)" = "PASS" ] && [ "$(state faults A)" = "PASS" ] \
+    && ok "70 planned aborts are not losses; the healthy streams qualify and row F passes" \
+    || bad "planned aborts were judged as losses: $(verdict faults) / 1 $(state faults 1) / F $(state faults F)"
+FOUT=$(python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/faults" 2>/dev/null)
+echo "$FOUT" | grep -q "mid_utterance_silence 10/10.*partial_frame 10/10.*server /v1/health delta: peer_gone 25 in \[20,30\]" \
+    && ok "row F shows planned vs executed per point, silent and partial-frame included, and the server's count" \
+    || bad "row F does not show the per-point accounting"
+echo "$FOUT" | grep -q "residual model work -1.00 s.*bound 70 x 320 ms = 22.40 s" \
+    && ok "row F shows the residual-model-work bound" \
+    || bad "row F does not show the residual-model-work bound"
+mk faults_srvbad "$FAULTS
+$SRV_OK
+d['summary']['faults']['server'].update(match=False, mismatches=1, detail='server peer_gone 12 outside [20, 30]')"
+[ "$(verdict faults_srvbad)" = "NOT QUALIFIED" ] && [ "$(state faults_srvbad F)" = "FAIL" ] \
+    && ok "a server that did not count the client's RSTs fails row F" \
+    || bad "a server/client abort mismatch passed: $(verdict faults_srvbad)"
+mk faults_viol "$FAULTS
+$SRV_OK
+d['summary']['faults']['violations'] = ['stream 3 rep 7: aborted_by_client without an executed plan']"
+[ "$(state faults_viol F)" = "FAIL" ] && [ "$(verdict faults_viol)" = "NOT QUALIFIED" ] \
+    && ok "an abort the harness cannot account for fails row F" \
+    || bad "a fault accounting violation passed: $(state faults_viol F)"
+mk faults_pre "$FAULTS
+$SRV_OK
+d['summary']['faults']['preempted']['mid_utterance'] = {'server_disconnect': 1}
+d['summary']['counts'].update(errors_total=1, error_kinds={'server_disconnect': 1})"
+[ "$(state faults_pre 1)" = "FAIL" ] && [ "$(verdict faults_pre)" = "NOT QUALIFIED" ] \
+    && ok "an error BEFORE the abort point is a real loss for bound 1" \
+    || bad "a failure before the abort point was excused by the plan: $(state faults_pre 1)"
+# prefork: no /v1/health cross-check; the workers' dumps are the server's evidence
+mk faults_dump "$FAULTS"
+[ "$(verdict faults_dump)" = "QUALIFIED" ] && [ "$(state faults_dump F)" = "PASS" ] \
+    && ok "prefork: the [DUMP] lines cross-check the aborts, sessions and audio (upper bounds)" \
+    || bad "the dump cross-check failed a consistent run: $(verdict faults_dump) / F $(state faults_dump F)"
+mk faults_dumpbad "$FAULTS"
+sed -i.bak 's/worker=1 seq=6 cancelled=2 idle_timeout=1 peer_gone=1/worker=1 seq=6 cancelled=101 idle_timeout=1 peer_gone=100/' \
+    "$TMP/faults_dumpbad/server-soak1.log"
+[ "$(state faults_dumpbad F)" = "FAIL" ] && [ "$(verdict faults_dumpbad)" = "NOT QUALIFIED" ] \
+    && ok "more peer_gone in the dumps than the client could have caused fails row F" \
+    || bad "a server over-count passed: $(state faults_dumpbad F)"
+mk faults_proto "$FAULTS"
+sed -i.bak 's/worker=1 seq=6 cancelled=2 idle_timeout=1 peer_gone=1 frame_too_large=0 protocol_error=0/worker=1 seq=6 cancelled=3 idle_timeout=1 peer_gone=1 frame_too_large=0 protocol_error=1/' \
+    "$TMP/faults_proto/server-soak1.log"
+[ "$(state faults_proto F)" = "FAIL" ] \
+    && ok "a protocol_error no planned abort can cause fails row F" \
+    || bad "an unplanned protocol_error in the dumps passed: $(state faults_proto F)"
+mk faults_sess "$FAULTS
+d['summary']['faults']['client']['sessions'] = 40"
+[ "$(state faults_sess F)" = "FAIL" ] \
+    && ok "more server sessions than the client opened (a session missing client-side) fails row F" \
+    || bad "a session count the client cannot explain passed: $(state faults_sess F)"
+# the dumps say 100 + 100 + 5400 = 5600 s fed; the clients sent 5500 s, + 70 x 320 ms
+mk faults_resid "$FAULTS"
+sed -i.bak 's/\(worker=2 seq=6 slots .*\) audio_s=100.0/\1 audio_s=5400.0/' \
+    "$TMP/faults_resid/server-soak1.log"
+[ "$(state faults_resid F)" = "FAIL" ] \
+    && python3 "$ROOT/tools/bench/v2_verdict.py" "$TMP/faults_resid" 2>/dev/null | grep -q "EXCEEDED" \
+    && ok "model work beyond the audio the clients sent (+ one step per abort) fails row F" \
+    || bad "residual model work over the bound passed: $(state faults_resid F)"
+mk faults_nosrv "$FAULTS"
+sed -i.bak '/ seq=[0-9]* cancelled=/d' "$TMP/faults_nosrv/server-soak1.log"
+[ "$(state faults_nosrv F)" = "NO EVIDENCE" ] \
+    && [ "$(verdict faults_nosrv)" = "INCONCLUSIVE (missing evidence)" ] \
+    && ok "a fault run with no server evidence is inconclusive, never qualified" \
+    || bad "an unchecked fault run qualified: $(verdict faults_nosrv) / F $(state faults_nosrv F)"
 
 mk lag "d['summary']['metrics']['emission_lag_ms']['p95'] = 321.0"
 [ "$(verdict lag)" = "NOT QUALIFIED" ] && ok "emission lag p95 one ms over the chunk period disqualifies" \
@@ -240,6 +403,43 @@ open(p, "w").writelines(out)
 PY
 [ "$(verdict stalled)" = "NOT QUALIFIED" ] && ok "a worker whose step counter freezes while slots are active disqualifies" \
     || bad "a frozen worker passed"
+
+# With per-slot lines: frozen steps are a stall only if a slot held a whole chunk.
+# An idle client (ring 0, nothing ready) holding its slot until --idle-ms is not.
+# Found on the 2026-09-25 C=64 fault soak (an idle_open client on worker 2).
+for kind in idle queued; do
+mk "stall_$kind" "pass"
+python3 - "$TMP/stall_$kind" "$kind" <<'PY'
+import re, sys
+p, kind = sys.argv[1] + "/server-soak1.log", sys.argv[2]
+ring, ready = ("0.0", "0") if kind == "idle" else ("0.9", "1")
+out = []
+for l in open(p):
+    m = re.search(r"worker=0 seq=(\d+) slots", l)
+    if m and int(m.group(1)) >= 4:
+        l = re.sub(r"steps=\d+", "steps=4000", l)   # frozen from seq 4 on
+        out.append(l)
+        out.append(f"[DUMP] worker=0 seq={m.group(1)} slot id=3 state=1 out=1 stream=1 la=3 "
+                   f"ready={ready} steps=33 deltas=21 ring_s={ring} need_s=0.32 age_s=33.0 "
+                   f"since_rx_s=22.6 since_step_s=22.6 lag_max_ms=37\n")
+        continue
+    if re.search(r"worker=\d+ seq=\d+ slots", l):
+        w, q = re.search(r"worker=(\d+) seq=(\d+)", l).groups()
+        out.append(l)
+        out.append(f"[DUMP] worker={w} seq={q} slot id=0 state=1 out=1 stream=1 la=3 ready=1 "
+                   f"steps=9 deltas=5 ring_s=0.4 need_s=0.32 age_s=3.0 since_rx_s=0.1 "
+                   f"since_step_s=0.1 lag_max_ms=37\n")
+        continue
+    out.append(l)
+open(p, "w").writelines(out)
+PY
+done
+[ "$(state stall_idle 8)" = "PASS" ] \
+    && ok "frozen steps with only an idle client's slot (no queued audio) are not a stall" \
+    || bad "an idle client's slot failed bound 8: $(state stall_idle 8)"
+[ "$(state stall_queued 8)" = "FAIL" ] && [ "$(verdict stall_queued)" = "NOT QUALIFIED" ] \
+    && ok "frozen steps with a whole chunk queued are a stall" \
+    || bad "a stall with runnable work passed: $(state stall_queued 8)"
 
 # ... but a worker that goes idle because its streams ended is finished, not stalled.
 mk drained "pass"

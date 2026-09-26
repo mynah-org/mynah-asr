@@ -33,6 +33,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "fleet.h"
 #include "prefork.h"
 
 #include "metrics.h"
@@ -1659,6 +1660,12 @@ typedef struct {
     double *disp;
     int disp_cap, disp_head, disp_n;
     long long over_cap;  /* outstanding connections seen past the service cap */
+    /* S12-18. Connections this worker held when its channel closed: the worker
+     * died with them, so they are neither completed nor in flight. Before this
+     * they were zeroed out of `active` and appeared nowhere. The router's books:
+     *   assigned == completed + lost + active, per worker, always. */
+    long long lost;
+    int died;            /* the channel closed: this worker is gone for good */
 } worker_state;
 
 static void disp_push(worker_state *w, double t) {
@@ -1976,6 +1983,16 @@ static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
                                lbl, v->w[i].completed);
     }
     mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_worker_lost_total connections this worker held when it died:\n"
+        "# neither completed nor in flight. assigned = completed + lost + inflight.\n"
+        "# TYPE mynah_asr_worker_lost_total counter\n");
+    for (int i = 0; i < v->workers; ++i) {
+        char lbl[96];
+        pf_worker_labels(v, i, lbl, sizeof(lbl));
+        mynah_asr_metrics_addf(b, "mynah_asr_worker_lost_total{%s} %lld\n",
+                               lbl, v->w[i].lost);
+    }
+    mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_worker_over_service_cap_total outstanding connections this\n"
         "# worker was seen holding past --service-cap.\n"
         "# TYPE mynah_asr_worker_over_service_cap_total counter\n");
@@ -1987,6 +2004,23 @@ static void pf_render_metrics(mynah_asr_metrics_buf *b, void *ud) {
             lbl, v->w[i].over_cap);
     }
 
+    {
+        /* The service-wide series: every worker's shared snapshot summed. */
+        int dead[256] = {0};
+        mynah_asr_fleet_router fr;
+        memset(&fr, 0, sizeof(fr));
+        fr.prefork = 1;
+        fr.workers = v->workers;
+        for (int i = 0; i < v->workers; ++i) {
+            if (i < 256) dead[i] = v->w[i].died;
+            if (v->w[i].died) fr.worker_deaths++;
+            else if (v->w[i].pid > 0) fr.workers_up++;
+            fr.router_lost += v->w[i].lost;
+        }
+        mynah_asr_fleet_stats fs;
+        mynah_asr_fleet_sum(&fs, dead, &fr);
+        mynah_asr_fleet_render(b, &fs, &fr);
+    }
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_connections_dispatched_total connections routed to a worker.\n"
         "# TYPE mynah_asr_connections_dispatched_total counter\n"
@@ -2236,6 +2270,12 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
                     ? local.metrics_bind : "127.0.0.1", local.metrics_port);
         fflush(stderr);
     }
+
+    /* S12-21: one shared page per worker, mapped before the fork so every
+     * child inherits it, for the service-wide /metrics (server/fleet.h). */
+    if (mynah_asr_fleet_map(workers) != 0)
+        fprintf(stderr, "prefork: WARNING no shared fleet pages: /metrics will carry "
+                        "the router's view only\n");
 
     worker_state *w = (worker_state *)calloc((size_t)workers, sizeof(*w));
     if (w == NULL) return MYNAH_ASR_PREFORK_ERROR;
@@ -2638,6 +2678,12 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
                 close(w[i].chan);
                 w[i].chan = -1;
                 w[i].pid = -1;
+                /* Its connections died with it: charged to `lost`, not dropped. */
+                w[i].lost += w[i].active;
+                w[i].died = 1;
+                fprintf(stderr, "prefork: worker %d lost %d connection(s) in flight; "
+                                "it is not respawned, the fleet now has %d worker(s)\n",
+                        i, w[i].active, live - 1);
                 w[i].active = 0;
                 w[i].disp_n = 0;
                 --live;
@@ -2884,12 +2930,13 @@ mynah_asr_prefork_role mynah_asr_prefork_run(const mynah_asr_prefork_config *cfg
      * leaked slot. */
     for (int i = 0; i < workers; ++i) {
         fprintf(stderr, "  worker %d%s%s: assigned=%lld completed=%lld"
-                        " still-in-flight=%d over-service-cap=%lld\n",
+                        " still-in-flight=%d lost=%lld%s over-service-cap=%lld\n",
                 i,
                 groups > 1 ? " " : "",
                 groups > 1 && local.models[w[i].grp] != NULL
                     ? local.models[w[i].grp] : "",
-                w[i].assigned, w[i].completed, w[i].active, w[i].over_cap);
+                w[i].assigned, w[i].completed, w[i].active, w[i].lost,
+                w[i].died ? " (died)" : "", w[i].over_cap);
         free(w[i].disp);
     }
     close(local.listen_fd);
