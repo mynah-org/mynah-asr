@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fleet.h"
 #include "../src/dispatch.h"
 #include "../src/flags.h"
 #include "../src/mynah_asr.h"
@@ -308,6 +309,35 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "mynah_asr_offline_queued{worker=\"%s\"} %d\n",
         wl, st.offline_done, wl, st.offline_pending);
 
+    /* S12-18: the rest of the session books. Every session claimed is counted
+     * once when its slot is released: completed, cancelled (below, by reason),
+     * or aborted before it started; the ones still running are
+     * mynah_asr_sessions_active. `balanced` is that equation, evaluated in the
+     * same critical section as claim and release -- 0 is a counting bug. */
+    mynah_asr_metrics_addf(b,
+        "# HELP mynah_asr_sessions_completed_total sessions that ended with done and a close.\n"
+        "# TYPE mynah_asr_sessions_completed_total counter\n"
+        "mynah_asr_sessions_completed_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_sessions_aborted_total sessions claimed and released before the\n"
+        "# scheduler ever saw them (the 101 or the output writer could not be set up).\n"
+        "# TYPE mynah_asr_sessions_aborted_total counter\n"
+        "mynah_asr_sessions_aborted_total{worker=\"%s\"} %lu\n"
+        "# HELP mynah_asr_sessions_active stream slots not free right now.\n"
+        "# TYPE mynah_asr_sessions_active gauge\n"
+        "mynah_asr_sessions_active{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_sessions_balanced 1 when sessions = completed + cancelled +\n"
+        "# aborted + active in one snapshot. 0 is a counting bug, never load.\n"
+        "# TYPE mynah_asr_sessions_balanced gauge\n"
+        "mynah_asr_sessions_balanced{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_slots_abandoned_total slots whose ingest gave up waiting for the\n"
+        "# scheduler to end them; _recovered_total counts the ones the scheduler released.\n"
+        "# TYPE mynah_asr_slots_abandoned_total counter\n"
+        "mynah_asr_slots_abandoned_total{worker=\"%s\"} %lu\n"
+        "# TYPE mynah_asr_slots_abandoned_recovered_total counter\n"
+        "mynah_asr_slots_abandoned_recovered_total{worker=\"%s\"} %lu\n",
+        wl, st.completed, wl, st.aborted, wl, st.slots_active, wl, st.balanced,
+        wl, st.abandoned, wl, st.abandoned_recovered);
+
     mynah_asr_metrics_addf(b,
         "# HELP mynah_asr_cancelled_total sessions ended by a cap, a dead peer or a\n"
         "# shutdown, bucketed by the code the client was given.\n"
@@ -462,6 +492,15 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "# TYPE mynah_asr_slots_cap gauge\n"
         "mynah_asr_slots_cap{worker=\"%s\"} %d\n",
         wl, st.slots_active, wl, st.slots_cap);
+
+    /* The service-wide series, as a fleet of one: the same names a prefork
+     * router exports, so a dashboard never has to know the topology. */
+    mynah_asr_fleet_stats fs;
+    mynah_asr_fleet_collect(&fs);
+    mynah_asr_fleet_router fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.workers = fr.workers_up = 1;
+    mynah_asr_fleet_render(b, &fs, &fr);
 }
 
 /* ------------------------------------------------------------------- SIGUSR1 */
@@ -572,6 +611,9 @@ void mynah_asr_obs_dump(void) {
                     "ns_per_row=%8.0f rows=%llu frames=%llu steps=%llu\n",
                     widx, n, tot, (double)tot / (double)st.comp_rows,
                     st.comp_rows, st.comp_frames, st.comp_steps);
+            OBS_ADD("[DUMP] worker=%d seq=%lu kv_copy layout=%s bytes=%llu "
+                    "bytes_per_row=%.0f\n", widx, n, st.kv_layout, st.kv_bytes,
+                    (double)st.kv_bytes / (double)st.comp_rows);
             OBS_ADD("[DUMP] worker=%d seq=%lu relpos_calls private=%llu shared=%llu "
                     "group=%llu\n", widx, n, st.relpos_priv, st.relpos_shared,
                     st.relpos_group);
@@ -641,6 +683,16 @@ void mynah_asr_obs_dump(void) {
                 ww ? 100.0 * (double)ps.worker_spin / (double)ww : 0.0,
                 cc ? 100.0 * (double)ps.caller_spin / (double)cc : 0.0);
     }
+    {   /* where int8 activation quantisation ran: on the scheduler thread inside
+         * mul_rows (and how long it took there), or inside the producing
+         * parallel regions (STREAM_PAR >= 4) */
+        mynah_asr_actq_stats aq;
+        mynah_asr_qmat_actq_stats(&aq);
+        OBS_ADD("[DUMP] worker=%d seq=%lu actq caller_calls=%llu caller_rows=%llu "
+                "caller_ms=%.1f producer_rows=%llu prequant_gemms=%llu\n",
+                widx, n, aq.caller_calls, aq.caller_rows, (double)aq.caller_ns / 1e6,
+                aq.producer_rows, aq.prequant_gemms);
+    }
     {   /* Per-slot, because a stall is a property of PARTICULAR streams. The
          * aggregate says the fleet is behind; this says which ones, how much
          * audio is waiting in each ring, and whether the scheduler can even see
@@ -667,6 +719,10 @@ void mynah_asr_obs_dump(void) {
     }
     OBS_ADD("[DUMP] worker=%d seq=%lu offline queued=%d done=%lu max_pending=%d\n",
             widx, n, st.offline_pending, st.offline_done, st.offline_max_pending);
+    OBS_ADD("[DUMP] worker=%d seq=%lu books sessions=%lu completed=%lu cancelled=%lu "
+            "aborted=%lu active=%d balanced=%d abandoned=%lu recovered=%lu\n",
+            widx, n, st.sessions, st.completed, st.cancelled, st.aborted,
+            st.slots_active, st.balanced, st.abandoned, st.abandoned_recovered);
     OBS_ADD("[DUMP] worker=%d seq=%lu cancelled=%lu", widx, n, st.cancelled);
     for (int i = 0; i < MYNAH_ASR_SCHED_CANCEL__COUNT; i++)
         OBS_ADD(" %s=%lu", mynah_asr_sched_cancel_bucket_name(i), st.cancel_by[i]);

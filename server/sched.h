@@ -160,6 +160,24 @@ const char *mynah_asr_sched_cancel_bucket_name(int bucket);
 typedef struct {
     int  slots_active, slots_cap, streaming;
     unsigned long steps, deltas, eous, sessions, cancelled;
+    /* S12-18. Every session claimed ends in exactly one of: `completed` (done +
+     * close), `cancelled` (by bucket, above), `aborted` (released before the
+     * scheduler ever saw it: the 101 or the writer could not be set up), or it
+     * is still one of `slots_active`. Read under the same lock that claims and
+     * releases, so `balanced` is exact in every snapshot, not only at rest. */
+    unsigned long completed, aborted;
+    /* The ingest gave up waiting for the scheduler to end a session (60 s + 5 s):
+     * the slot is charged to the scheduler, which releases it when it finally
+     * ends it (`abandoned_recovered`). abandoned - recovered is capacity that
+     * is lost right now. */
+    unsigned long abandoned, abandoned_recovered;
+    int balanced;
+    /* S12-21, for the service-wide metrics (server/fleet.h): the most slots this
+     * worker ever held at once, and three per-session latencies as counts per
+     * fleet edge (mynah_asr_fleet_ms_edges / _s_edges, last = past the edge). */
+    int active_peak;
+    unsigned long first_text_hist[14], finalize_hist[14], session_hist[13];
+    double first_text_sum_ms, finalize_sum_ms, session_sum_s;
     unsigned long offline_done;
     int  offline_pending, offline_max_pending;
     unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];
@@ -222,6 +240,8 @@ typedef struct {
     unsigned long pos_bsum[41];
     /* rows that took the shared rel-pos projection, against all rows stacked */
     unsigned long long share_rows, share_total;
+    const char *kv_layout;              /* CACHE-RING-1: which layout ran ... */
+    unsigned long long kv_bytes;        /* ... and what it copied */
     /* the batched step split by component, ns, with its rows and steps */
     unsigned long long comp_ns[11], comp_rows, comp_frames, comp_steps;
     unsigned long long relpos_priv, relpos_shared, relpos_group;
@@ -298,9 +318,17 @@ double mynah_asr_sched_lag_quantile(const unsigned long *hist, double q);
  * named in a label. */
 unsigned long mynah_asr_sched_lag_over(const unsigned long *hist, int ms);
 
-/* Counts a session ended by the INGEST side under a code the scheduler never
- * sees (today: `audio_limit`). Same buckets, same total, one funnel. */
-void mynah_asr_sched_note_cancel(const char *code);
+/* The ingest's end of a session, and the ONLY place a session is counted:
+ * reads the outcome the scheduler (or the ingest) recorded, counts it once --
+ * completed, cancelled by bucket, or aborted when nothing ever ended it -- and
+ * returns the slot to FREE. Replaces mynah_asr_slot_release for every slot
+ * that came out of mynah_asr_sched_claim. */
+void mynah_asr_sched_release(mynah_asr_slot *slot);
+
+/* The ingest giving up on a slot the scheduler has not finished: counted, and
+ * the release becomes the scheduler's. Returns 1 when abandoned, 0 when the
+ * slot was DONE after all and the caller must release it as usual. */
+int mynah_asr_sched_abandon(mynah_asr_slot *slot);
 
 /* Slots not FREE right now -- what /v1/health reports as `inflight`. */
 int mynah_asr_sched_active(void);

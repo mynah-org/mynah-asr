@@ -395,6 +395,10 @@ int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o) {
 }
 
 int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
+    return mynah_asr_stream_out_peer_gone_ex(o, 0);
+}
+
+int mynah_asr_stream_out_peer_gone_ex(mynah_asr_stream_out *o, int hard_only) {
     if (o == NULL) return 1;
 
     so_lock(o, "mynah_asr_stream_out_peer_gone");
@@ -420,12 +424,31 @@ int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
 #endif
     pfd.revents = 0;
 
+    /* hard_only: a half-close (FIN, POLLRDHUP, a zero-length peek) is a client
+     * that may still be reading and is NOT gone; only a reset or an error is.
+     * POLLRDHUP is dropped for that; POLLIN stays, because macOS reports a RST
+     * as READABLE (the error comes out of the read), not as POLLHUP/POLLERR --
+     * measured, tests/fault_probe.py close-then-rst-silent. */
+    if (hard_only) pfd.events = POLLIN;
     int gone = 0;
     const int ready = poll(&pfd, 1, 0);   /* zero timeout: never blocks on mu */
     if (ready < 0) {
         /* EINTR and EAGAIN are "ask again"; anything else means this descriptor
          * can no longer be polled, which is a dead stream. */
         gone = (errno != EINTR && errno != EAGAIN);
+    } else if (ready > 0 && hard_only) {
+        /* POLLHUP is NOT a hard hangup here: macOS raises it for a plain FIN
+         * once POLLIN is asked for, and a FIN after `finalize` is the legal
+         * half-close (measured: fault_probe half-close-ok). A reset is POLLERR
+         * on Linux and a read error on macOS; the peek tells a FIN (0) and
+         * unread data (> 0) from it, and never blocks (MSG_DONTWAIT). */
+        if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
+            gone = 1;
+        } else if ((pfd.revents & (POLLIN | POLLHUP)) != 0) {
+            char probe;
+            const ssize_t n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            gone = n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+        }
     } else if (ready > 0) {
         if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
             gone = 1;

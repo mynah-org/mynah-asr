@@ -24,7 +24,7 @@ import argparse, concurrent.futures as cf, json, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "tools", "bench"))
-from streaming_metrics import pct
+from streaming_metrics import cer, cer_format_free, normalise, pct, wer, wer_format_free
 
 FRAME = re.compile(r"\[RNNT\] frame=(-?\d+) audio_s=([\d.]+).*?chose=(-?\d+)"
                    r"(?:.*?margin_lex=(-?[\d.]+))?(?:.*?margin_nb=(-?[\d.]+))?")
@@ -78,7 +78,7 @@ def one(binary, model, clip, quant, lookahead):
             first_decoded = float(m.group(2))
             break
 
-    deltas = []
+    deltas, final_text = [], None
     for line in r.stdout.splitlines():
         try:
             o = json.loads(line)
@@ -86,6 +86,8 @@ def one(binary, model, clip, quant, lookahead):
             continue
         if o.get("type") == "delta" and (o.get("text") or "").strip():
             deltas.append(o)
+        elif o.get("type") == "final":
+            final_text = o.get("text")
     first_delta = deltas[0] if deltas else None
 
     return {"clip": clip, "blank_id": blank_id,
@@ -95,6 +97,7 @@ def one(binary, model, clip, quant, lookahead):
             "first_decoded_audio_s": first_decoded,
             "first_delta_t1": first_delta and first_delta.get("t1"),
             "first_delta_text": first_delta and first_delta.get("text"),
+            "final_text": final_text,
             "n_deltas": len(deltas)}
 
 
@@ -126,6 +129,21 @@ def main():
             r["onset_s"] = o
             r["class"] = m.get("class")
             r["duration_s"] = m.get("duration_sec")
+            r["composed"] = bool(m.get("composed"))
+            ref = m.get("text")
+            hyp = r.get("final_text")
+            if ref and hyp is not None:
+                # The SAME scorers the qualification used. A timing number and a
+                # quality number for one clip must come from one run, or the
+                # paired question "was the earliness paid for" cannot be asked.
+                r["ref"] = ref
+                r["wer"] = wer(hyp, ref)
+                r["cer"] = cer(hyp, ref)
+                r["wer_ff"] = wer_format_free(hyp, ref, "en")
+                r["cer_ff"] = cer_format_free(hyp, ref, "en")
+                r["ref_words"] = len(normalise(ref).split())
+                r["ref_chars"] = len(normalise(ref))
+                r["empty"] = not normalise(hyp)
             if o is not None and not r.get("error"):
                 fn = r.get("first_nonblank")
                 if fn:
@@ -149,6 +167,13 @@ def main():
            "speech_to_first_published_ms": P("speech_to_first_published_ms"),
            "publication_gate_ms": P("publication_gate_ms"),
            "blank_decisions_before_first": P("blank_decisions_before"),
+           "wer": P("wer"), "cer": P("cer"),
+           "wer_ff": P("wer_ff"), "cer_ff": P("cer_ff"),
+           "empty": sum(1 for r in rows if r.get("empty")),
+           "wer_corpus": (sum(r["wer"] * r["ref_words"] for r in rows if r.get("wer") is not None)
+                          / max(1, sum(r["ref_words"] for r in rows if r.get("wer") is not None))),
+           "cer_corpus": (sum(r["cer"] * r["ref_chars"] for r in rows if r.get("cer") is not None)
+                          / max(1, sum(r["ref_chars"] for r in rows if r.get("cer") is not None))),
            "rows": rows}
     json.dump(out, open(a.out, "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k != "rows"}, indent=1))

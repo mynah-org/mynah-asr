@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,7 +326,33 @@ static void actq_row(void *ctx, int t) {
                                  c->x + (size_t)t * (size_t)c->k, c->k);
 }
 
+static _Atomic unsigned long long g_aq_caller_rows, g_aq_caller_ns, g_aq_caller_calls,
+                                  g_aq_producer_rows, g_aq_prequant_gemms;
+
+static unsigned long long aq_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+void mynah_asr_qmat_actq_stats(mynah_asr_actq_stats *o) {
+    o->caller_rows = atomic_load_explicit(&g_aq_caller_rows, memory_order_relaxed);
+    o->caller_ns = atomic_load_explicit(&g_aq_caller_ns, memory_order_relaxed);
+    o->caller_calls = atomic_load_explicit(&g_aq_caller_calls, memory_order_relaxed);
+    o->producer_rows = atomic_load_explicit(&g_aq_producer_rows, memory_order_relaxed);
+    o->prequant_gemms = atomic_load_explicit(&g_aq_prequant_gemms, memory_order_relaxed);
+}
+
+static void quantize_act_rows_(int8_t *qx, float *sx, const float *x, int T, int k);
 static void quantize_act_rows(int8_t *qx, float *sx, const float *x, int T, int k) {
+    const unsigned long long t0 = aq_now_ns();
+    quantize_act_rows_(qx, sx, x, T, k);
+    atomic_fetch_add_explicit(&g_aq_caller_ns, aq_now_ns() - t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_aq_caller_rows, (unsigned long long)T, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_aq_caller_calls, 1ull, memory_order_relaxed);
+}
+
+static void quantize_act_rows_(int8_t *qx, float *sx, const float *x, int T, int k) {
     if ((long long)T * (long long)k >= QMAT_ACT_PAR_ELEMS && T > 1 &&
         mynah_asr_num_threads() > 1) {
         actq_ctx c = {.x = x, .qx = qx, .sx = sx, .k = k};
@@ -1519,6 +1546,42 @@ int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out,
         mynah_asr_qmat_mul(m, x + (size_t)t * (size_t)m->k,
                            out + (size_t)t * (size_t)m->n, 1);
     return MYNAH_ASR_QC_GENERIC;
+}
+
+int mynah_asr_qmat_prequant_ok(const mynah_asr_qmat *m) {
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    if (m->qtype != MYNAH_ASR_Q_INT8 || m->k > QMAT_K_MAX) return 0;
+    if (q8_leaf() == MYNAH_ASR_QK_SCALAR) return 0;
+#ifdef MYNAH_ASR_HAVE_X86
+    return x86_caps() >= MYNAH_ASR_CAPS_AVX2;
+#else
+    return arm_caps() >= MYNAH_ASR_ARM_SDOT;
+#endif
+#else
+    (void)m;
+    return 0;
+#endif
+}
+
+float mynah_asr_qmat_quant_row(int8_t *qx, const float *x, int k) {
+    atomic_fetch_add_explicit(&g_aq_producer_rows, 1ull, memory_order_relaxed);
+    return quantize_act_int8(qx, x, k);
+}
+
+int mynah_asr_qmat_mul_rows_q(const mynah_asr_qmat *m, const int8_t *qx, const float *sx,
+                              float *out, int T) {
+    if (T <= 0) return MYNAH_ASR_QC_DOT_ROWS;
+#if defined(MYNAH_ASR_HAVE_SDOT) || defined(MYNAH_ASR_HAVE_X86)
+    qc(MYNAH_ASR_QC_DOT_ROWS);
+    atomic_fetch_add_explicit(&g_aq_prequant_gemms, 1ull, memory_order_relaxed);
+    qgemm_ctx c = {.m = m, .qx = (int8_t *)qx, .sx = (float *)sx, .out = out, .T = T,
+                   .leaf = q8_leaf()};
+    mynah_asr_parallel_for((m->n + QGEMM_ROWS - 1) / QGEMM_ROWS, qgemm_block, &c);
+    return MYNAH_ASR_QC_DOT_ROWS;
+#else
+    (void)m; (void)qx; (void)sx; (void)out;
+    return -1;
+#endif
 }
 
 /* ---------------------------------------------------------- fused helpers */

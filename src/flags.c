@@ -116,6 +116,44 @@ static const mynah_asr_flag g_flags[] = {
      " probe window does not match a direct projection byte for byte",
      NULL, NULL},
 
+    {"MYNAH_ASR_KV_LAYOUT", MYNAH_ASR_FLAG_KERNEL, "shift (the pre-CACHE-RING-1 layout)",
+     "shift|ring|slide: the physical layout of the streaming attention K/V cache (src/kvcache.h)."
+     " shift memmoves the kept rows down every chunk and gathers the window every layer; ring"
+     " advances a head and writes only the fresh rows, still gathering; slide keeps left+slack rows"
+     " so the window is the arena itself, compacting once every ~slack/Q chunks. Same logical"
+     " contents, same floats: tests/test_kv_layout gates it with memcmp. RESEARCH A/B (S13-1d)",
+     NULL, NULL},
+
+    {"MYNAH_ASR_STREAM_PAR", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
+     "0/1/2: 1 runs the per-stream stages of the batched encoder step (attention core + K/V commit,"
+     " conv mid) over streams on the pool instead of serially on the scheduler thread; 2 also runs"
+     " SiLU per stream and each residual add + layer norm fused per row block; 3 also runs the"
+     " per-stream VAD/mel front end and the greedy decode over streams, publishing deltas on the"
+     " caller in stream order (serial whenever a decoder trace or injection is set); 4 also moves every"
+     " int8 activation quantisation into the parallel region that produced its rows (no new dispatch)."
+     " Each stream/row"
+     " touches only its own state, so the floats are the same: tests/test_stream_batch and"
+     " tests/test_kv_layout gate it. RESEARCH A/B (S10-3)",
+     NULL, NULL},
+
+    {"MYNAH_ASR_STREAM_PAR_DECODE", MYNAH_ASR_FLAG_KERNEL, "1 (level 3 on whenever STREAM_PAR >= 3)",
+     "0 turns off only STREAM_PAR level 3 (front end + decode over streams) while the encoder"
+     " levels stay on, so level 4 can be measured on top of level 2 without level 3. RESEARCH A/B",
+     NULL, NULL},
+
+    {"MYNAH_ASR_FIN_STACK", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
+     "1: a chunk flushed one stream at a time (a finalizing stream's last pieces and padded"
+     " tail, and every chunk of a plain feed) takes the stacked encoder path at B=1 instead of"
+     " the single step, whose small-T products run serially on the calling thread. Same floats"
+     " by the S1-4 contract. RESEARCH A/B (plateau campaign: finalization)",
+     NULL, NULL},
+
+    {"MYNAH_ASR_BLANK_BIAS", MYNAH_ASR_FLAG_DEBUG, "unset (off)",
+     "<delta> > 0: until a stream's first natural emission, a decision whose blank beats the best"
+     " non-blank by less than delta commits the non-blank. RESEARCH ONLY (S13-5b first-text"
+     " experiment); changes transcripts, never a default. RNNT greedy only",
+     NULL, NULL},
+
     {"MYNAH_ASR_STACK_SOLO", MYNAH_ASR_FLAG_KERNEL, "1 (on)",
      "1/0: whether a ready set of ONE goes through the stacked encoder path."
      " The group is per lookahead preset, so this is not only B==1: eight streams on eight"

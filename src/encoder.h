@@ -5,6 +5,7 @@
 #ifndef MYNAH_ASR_ENCODER_H
 #define MYNAH_ASR_ENCODER_H
 
+#include "kvcache.h"
 #include "qmat.h"
 #include "subsampling.h"
 #include "weights.h"
@@ -104,13 +105,13 @@ int mynah_asr_encoder_forward_batch(const mynah_asr_encoder *enc, const float *c
 typedef struct {
     const mynah_asr_encoder *enc;
     mynah_asr_ss_stream ss;
-    float *k_cache, *v_cache;   /* [n_layers, left, d_model] */
+    mynah_asr_kv kv;            /* attention K/V cache; kv.valid = frames held
+                                   (0..left). Layout: src/kvcache.h */
     float *conv_cache;          /* [n_layers, conv_k-1, d_model] */
     int left, right, q;         /* q = right+1 encoder frames per chunk */
-    int cache_valid;            /* valid frames in the K/V cache (0..left) */
     long t_abs;                 /* absolute encoder frames produced so far: the
                                    R-13 probe needs a frame index, and deriving
-                                   one outside from cache_valid stops working
+                                   one outside from kv.valid stops working
                                    the moment the cache saturates */
     /* hot-path scratch, ONE malloc at init (zero mallocs per chunk):
      * pointers carved out of scr. Sized for Qmax = q+2, Kmax = left+Qmax. */
@@ -126,6 +127,12 @@ typedef struct {
 
 int mynah_asr_enc_stream_init(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
                           int left_ctx, int right_ctx, int n_mels);
+/* MYNAH_ASR_STREAM_PAR as resolved (0 off, 1..3 research levels, S10-3). */
+int mynah_asr_enc_stream_par_level(void);
+/* The same with an explicit K/V layout (MYNAH_ASR_KV_*), so a test can hold
+ * every layout in one process; the plain init uses mynah_asr_kv_layout_default(). */
+int mynah_asr_enc_stream_init_layout(mynah_asr_enc_stream *es, const mynah_asr_encoder *enc,
+                                     int left_ctx, int right_ctx, int n_mels, int kv_layout);
 void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es);
 /* Back to the first-chunk state (empty caches), keeping every allocation. */
 void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es);
@@ -175,6 +182,15 @@ int mynah_asr_enc_stream_step_batch(mynah_asr_enc_batch *bb,
                                 mynah_asr_enc_stream *const *ess, int B,
                                 const float *const *mel, const int *n_mel, int n_mels,
                                 const int *prompt_id, float *const *out, int *q_out);
+/* The same with a per-stream is_last (NULL = none), so a stream's LAST, short
+ * chunk -- the causal right pad the single step applies -- can take the stacked
+ * path too (MYNAH_ASR_FIN_STACK). The subsampling step is the one that reads it;
+ * everything after it is shape-agnostic in Q. */
+int mynah_asr_enc_stream_step_batch_last(mynah_asr_enc_batch *bb,
+                                         mynah_asr_enc_stream *const *ess, int B,
+                                         const float *const *mel, const int *n_mel, int n_mels,
+                                         const int *prompt_id, const int *is_last,
+                                         float *const *out, int *q_out);
 
 /* f32 only: whether the batched path is allowed to stack the rows. A vendor
  * cblas_sgemm is not contractually row-stable in M, so for those the answer is
@@ -203,10 +219,10 @@ void mynah_asr_enc_relpos_all(unsigned long long *priv, unsigned long long *shar
                           unsigned long long *group);
 
 /* ------------------------------------------- rel-pos projection sharing (S1-7)
- * `rk = pe @ relk_wR` depends only on (layer, K) with K = cache_valid + q, so
+ * `rk = pe @ relk_wR` depends only on (layer, K) with K = kv.valid + q, so
  * every stream of a batched pass that is at the same K computes the SAME matrix.
  * The batched step computes it once per (layer, K-group) and lets the group read
- * it; a stream at a different K (a slot on its first chunks, cache_valid < left)
+ * it; a stream at a different K (a slot on its first chunks, kv.valid < left)
  * keeps its own. Bit-exact by construction: identical inputs, identical call.
  *
  * Which of the two actually happened is a counter, not a claim

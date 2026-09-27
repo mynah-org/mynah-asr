@@ -201,3 +201,39 @@ jobs:
           make EXTRA_CFLAGS="-DMYNAH_ASR_CUDA" OBJ_EXTRA="build/src/cuda_gemm.o" \
                EXTRA_LDFLAGS="-lcublas -lcudart" tests/test_qmat
           tests/test_qmat
+
+  # S14: the CUDA batched streaming server, a separate tree (gpu/). Compile-only
+  # in the toolkit container with an explicit architecture list -- no GPU on the
+  # runner, so the kernel test must SKIP (77) and the server must say "not
+  # compiled"/"no CUDA device" rather than fall back. The cpu-only build of the
+  # same server is exercised too: it is the reference engine behind the same seam.
+  build-gpu-server:
+    name: Build GPU server (compile-only, sm_80/86/89/90)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y build-essential git python3
+      - name: Library
+        run: make lib BLAS=none
+      - name: "GPU server, kernels test, stream test (nvcc, compile and link)"
+        run: |
+          make -C gpu CUDA_ARCH="sm_80 sm_86 sm_89 sm_90"
+          make -C gpu test-kernels test-stream CUDA_ARCH="sm_80 sm_86 sm_89 sm_90"
+          ls -la mynah-asr-server-cuda tests/test_cuda_kernels tests/test_cuda_stream
+      - name: "No device: the kernel test skips, the server refuses visibly"
+        run: |
+          set +e
+          tests/test_cuda_kernels; rc=$?
+          echo "test_cuda_kernels exit $rc"; [ "$rc" -eq 77 ] || exit 1
+          ./mynah-asr-server-cuda --version
+          ./mynah-asr-server-cuda -m /nonexistent --engine cuda 2>&1 | tee srv.txt
+          grep -q "no CUDA device" srv.txt || exit 1
+      - name: cpu-only build of the same server (the reference engine)
+        run: |
+          make -C gpu cpu
+          ./mynah-asr-server-cuda-cpuonly -m /nonexistent --engine cuda 2>&1 | tee stub.txt; true
+          grep -q "not compiled" stub.txt
