@@ -22,6 +22,10 @@ Cases (run by `suite`, in this order; each can also be run alone):
   close-then-rst   close frame (finalize) then an immediate RST
   close-then-rst-silent  the same with silence: only a hard-hangup check made
                    WHILE the tail is flushed can stop it
+  close-then-fin-silent  close frame, then close() (FIN) and silence: no hard
+                   hangup and nothing written -- only the server's ping while it
+                   waits for `done` draws the reset that stops the tail
+  finalize-then-fin-silent  the same with a `finalize` text frame
   rst-unacked      RST with data still unsent: the server's kernel refuses it and
                    the connection is half-open (a vanished network); bound = --idle-ms
   half-close-ok    finalize, then shutdown(SHUT_WR): LEGAL, must still get `done`
@@ -37,6 +41,12 @@ Cases (run by `suite`, in this order; each can also be run alone):
   abort-loop       N mixed aborts, then RSS growth and the balance
   fleet-metrics    (prefork only, not in `suite`) a deterministic mixed workload;
                    the router's summed mynah_asr_fleet_* series must equal it
+  rest-gone-queued (REST, not in `suite`) a request whose client closes while it
+                   waits behind another one: dropped before inference
+                   (offline.peer_gone +1, offline.done counts only the other)
+  rest-stalled-body (REST, not in `suite`) headers and part of the body, then
+                   silence: the server answers 400 and frees the thread within
+                   --idle-ms
   worker-kill      (prefork only, not in `suite`) SIGKILL one worker under a live
                    stream: the router charges it to `lost`, its books balance,
                    the other worker's stream is untouched and new streams are served
@@ -215,6 +225,26 @@ def blast(sock: socket.socket, pcm: bytes) -> None:
         sock.sendall(ws_frame(0x2, pcm[off:off + step]))
 
 
+def wav_bytes(pcm: bytes) -> bytes:
+    """16 kHz mono PCM16 in a RIFF header: what the REST endpoint reads."""
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16) +
+            b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+def rest_request(pcm: bytes) -> bytes:
+    """A complete POST /v1/audio/transcriptions, multipart, as raw bytes."""
+    b = "----mynahfault%08x" % random.getrandbits(32)
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n"
+            f"json\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; "
+            f"filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n").encode() + \
+        wav_bytes(pcm) + f"\r\n--{b}--\r\n".encode()
+    head = (f"POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\n"
+            f"Content-Type: multipart/form-data; boundary={b}\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    return head + body
+
+
 def rss_kb(pid: int) -> int:
     try:
         out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True,
@@ -304,6 +334,91 @@ class Suite:
                                     f"still queued at the RST, need >= 5)")
         self.settle("close-then-rst-silent", before, {"cancel:peer_gone": 1}, fed_at,
                     self.a.zombie_s)
+
+    def close_then_fin_silent(self, name: str, how: bytes):
+        # The client asked for the tail (close frame or finalize) and then
+        # closed its socket: a FIN, which the server must treat as a possibly
+        # legal half-close, and silence, so no delta is written that could
+        # bounce. Without the server's ping while it waits for `done`, the
+        # whole queued ring is flushed for nobody.
+        before = health(self.a.port)
+        sock = raw_upgrade(self.a.port)
+        blast(sock, bytes(int(28.0 * RATE) * 2))
+        sock.sendall(how)
+        fed_at = health(self.a.port).get("audio_seconds", 0.0)
+        queued = 28.0 - (fed_at - before.get("audio_seconds", 0.0))
+        sock.close()
+        self.c.check(queued >= 5.0, f"{name}: discriminating ({queued:.1f} s still "
+                                    f"queued at the close, need >= 5)")
+        self.settle(name, before, {"cancel:peer_gone": 1}, fed_at, self.a.zombie_s)
+
+    def case_close_then_fin_silent(self):
+        self.close_then_fin_silent("close-then-fin-silent", ws_frame(0x8, b""))
+
+    def case_finalize_then_fin_silent(self):
+        self.close_then_fin_silent("finalize-then-fin-silent",
+                                   ws_frame(0x1, b'{"type":"finalize"}'))
+
+    # -- REST ---------------------------------------------------------------
+    def case_rest_gone_queued(self):
+        # One request occupies the scheduler (--batch 1); a second one is sent
+        # whole and its client closes at once, while it waits in the queue. The
+        # model must never run it: nobody is left to read the answer, and the
+        # run would stall every stream on the worker.
+        secs = self.a.rest_seconds
+        pcm = long_pcm(self.a.clip, secs)
+        h0 = health(self.a.port)
+        off0 = h0.get("offline") or {}
+        done0, gone0 = off0.get("done", 0), off0.get("peer_gone")
+        self.c.check(gone0 is not None, "rest-gone-queued: offline.peer_gone is exported")
+        if gone0 is None:
+            return
+        first = socket.create_connection(("localhost", self.a.port), timeout=300)
+        first.sendall(rest_request(pcm))
+        time.sleep(0.5)                        # the first is now inside the model
+        second = socket.create_connection(("localhost", self.a.port), timeout=30)
+        second.sendall(rest_request(pcm))
+        busy = ((health(self.a.port).get("offline") or {}).get("done", 0) == done0)
+        second.close()                         # FIN: the client left
+        resp = drain(first, 300.0)
+        first.close()
+        self.c.check(busy, "rest-gone-queued: discriminating (the first request was "
+                           "still running when the second client left)")
+        self.c.check(resp.startswith(b"HTTP/1.1 200"),
+                     f"rest-gone-queued: the first request is answered ({resp[:40]!r})")
+        t0 = time.monotonic()
+        h = health(self.a.port)
+        while time.monotonic() - t0 < self.a.settle:
+            off = h.get("offline") or {}
+            if off.get("peer_gone", 0) > gone0 and off.get("queued", 0) == 0:
+                break
+            time.sleep(0.2)
+            h = health(self.a.port)
+        off = h.get("offline") or {}
+        self.c.check(off.get("peer_gone", 0) - gone0 == 1,
+                     f"rest-gone-queued: the gone request was dropped "
+                     f"(peer_gone +{off.get('peer_gone', 0) - gone0}, expected +1)")
+        self.c.check(off.get("done", 0) - done0 == 1,
+                     f"rest-gone-queued: only the first one ran "
+                     f"(done +{off.get('done', 0) - done0}, expected +1)")
+        fed = h.get("audio_seconds", 0.0) - h0.get("audio_seconds", 0.0)
+        self.c.check(fed <= secs + 0.5,
+                     f"rest-gone-queued: audio fed {fed:.1f} s (one request = {secs:.0f} s)")
+
+    def case_rest_stalled_body(self):
+        req = rest_request(self.pcm[: RATE * 2])
+        cut = req.index(b"\r\n\r\n") + 4 + 64
+        sock = socket.create_connection(("localhost", self.a.port), timeout=30)
+        t0 = time.monotonic()
+        sock.sendall(req[:cut])                # headers and 64 bytes of the body
+        got = drain(sock, self.a.idle_ms / 1000.0 + 10.0)
+        took = time.monotonic() - t0
+        sock.close()
+        self.c.check(b"incomplete_body" in got and took <= self.a.idle_ms / 1000.0 + 3.0,
+                     f"rest-stalled-body: 400 incomplete_body within --idle-ms + 3 s "
+                     f"({took:.1f} s, {got[:40]!r})")
+        h = health(self.a.port)
+        self.c.check(h.get("status") == "ok", "rest-stalled-body: the server still answers")
 
     def case_rst_unacked(self):
         # A RST sent while the client still has unsent data carries a sequence
@@ -700,7 +815,8 @@ class Suite:
         self.c.check(not errors and (self.ref is None or text == self.ref),
                      f"worker-kill: a new stream after the death is served correctly ({errors})")
 
-    CASES = ["rst-mid", "fin-mid", "rst-mid-silent", "fin-mid-silent", "close-then-rst", "close-then-rst-silent", "rst-unacked", "half-close-ok", "idle-open",
+    CASES = ["rst-mid", "fin-mid", "rst-mid-silent", "fin-mid-silent", "close-then-rst", "close-then-rst-silent",
+             "close-then-fin-silent", "finalize-then-fin-silent", "rst-unacked", "half-close-ok", "idle-open",
              "stall-mid-frame", "oversize", "rsv-bits", "bad-control", "garbage",
              "capacity", "neighbours", "abort-loop"]
 
@@ -730,7 +846,11 @@ def main() -> int:
     ap.add_argument("--loops", type=int, default=40)
     ap.add_argument("--metrics-port", type=int, default=0, help="the prefork router's /metrics")
     ap.add_argument("--rss-mb", type=float, default=24.0)
-    ap.add_argument("cases", nargs="+", help="'suite' or case names: " + " ".join(Suite.CASES))
+    ap.add_argument("--rest-seconds", type=float, default=120.0,
+                    help="audio per request in rest-gone-queued: long enough that the "
+                         "first request is still running when the second client leaves")
+    ap.add_argument("cases", nargs="+", help="'suite' or case names: " + " ".join(Suite.CASES)
+                    + " (REST, not in suite: rest-gone-queued rest-stalled-body)")
     a = ap.parse_args()
     global STREAM_PATH
     if a.lang:

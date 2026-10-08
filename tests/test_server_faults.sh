@@ -8,6 +8,11 @@
 # them; this script only builds the reference, starts the server and reports.
 #
 # Usage: test_server_faults.sh [model_dir] [port]
+#        FAULT_SERVER=gpu-cpu test_server_faults.sh [model_dir] [port]
+# FAULT_SERVER=gpu-cpu runs the same WebSocket suite against the GPU server's
+# cpu-only build (`make -C gpu cpu`, the reference engine behind the same seam
+# as the CUDA one): same protocol, same books, its own cancellation code. The
+# prefork cases do not apply to it (one process) and are skipped.
 # Exit: 0 ok, 1 fail, 77 skip (model missing).
 MODEL_DIR="${1:-models/nemotron-3.5-asr-streaming-0.6b}"
 # Any cache-aware streaming model will do: nothing below asserts a model-specific
@@ -17,6 +22,10 @@ CLIP=tests/audio/test_en.wav
 [ -f "$MODEL_DIR/mynah.json" ] || exit 77
 [ -f "$CLIP" ] || exit 77
 [ -x ./mynah-asr-server ] && [ -x ./mynah-asr ] || exit 77
+FAULT_SERVER="${FAULT_SERVER:-cpu}"
+if [ "$FAULT_SERVER" = gpu-cpu ]; then
+    [ -x ./mynah-asr-server-cuda-cpuonly ] || exit 77
+fi
 
 TMP=$(mktemp -d /tmp/mynah_asr_faults.XXXXXX) || exit 1
 SRV_PID=""
@@ -29,8 +38,13 @@ trap cleanup EXIT
 CAP=4; IDLE=2000; MAXF=65536
 # --threads is the HTTP thread count: kept above --cap, or the stream past the
 # cap waits in accept() for a thread instead of reading its 503.
-./mynah-asr-server -m "$MODEL_DIR" -p "$PORT" --threads 8 --batch 4 --quant int8 \
-    --cap $CAP --idle-ms $IDLE --ping-ms 0 --max-frame-bytes $MAXF > "$TMP/srv.log" 2>&1 &
+if [ "$FAULT_SERVER" = gpu-cpu ]; then
+    ./mynah-asr-server-cuda-cpuonly -m "$MODEL_DIR" -p "$PORT" --engine cpu --http-threads 8 \
+        --cap $CAP --idle-ms $IDLE --ping-ms 0 --max-frame-bytes $MAXF > "$TMP/srv.log" 2>&1 &
+else
+    ./mynah-asr-server -m "$MODEL_DIR" -p "$PORT" --threads 8 --batch 4 --quant int8 \
+        --cap $CAP --idle-ms $IDLE --ping-ms 0 --max-frame-bytes $MAXF > "$TMP/srv.log" 2>&1 &
+fi
 SRV_PID=$!
 ready=0
 for i in $(seq 1 150); do
@@ -90,7 +104,7 @@ if grep -q "did not finish" "$TMP/srv.log"; then
 fi
 
 # ---- a worker process dies under a live stream (prefork) --------------------
-if [ -z "$FAULT_CASES" ] || [ "$FAULT_CASES" = "worker-kill" ] || [ "$FAULT_CASES" = "fleet-metrics" ]; then
+if [ "$FAULT_SERVER" != gpu-cpu ] && { [ -z "$FAULT_CASES" ] || [ "$FAULT_CASES" = "worker-kill" ] || [ "$FAULT_CASES" = "fleet-metrics" ]; }; then
 PORT2=$((PORT + 1)); MPORT=$((PORT + 2))
 ./mynah-asr-server -m "$MODEL_DIR" -p "$PORT2" --prefork 2 --prefork-threads 2 --threads 4 \
     --cap 2 --idle-ms $IDLE --ping-ms 0 --metrics-port "$MPORT" > "$TMP/pf.log" 2>&1 &

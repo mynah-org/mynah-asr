@@ -237,3 +237,49 @@ jobs:
           make -C gpu cpu
           ./mynah-asr-server-cuda-cpuonly -m /nonexistent --engine cuda 2>&1 | tee stub.txt; true
           grep -q "not compiled" stub.txt
+
+  # Zombies and cancellation on BOTH streaming servers, with a real streaming
+  # model: the WebSocket fault suite (RST/FIN mid-utterance, close or finalize
+  # then FIN in silence, idle, stalls, garbage, capacity, aborts, prefork worker
+  # kill) against mynah-asr-server, and the same suite against the GPU server's
+  # cpu-only build. The CI's 110m is offline-only, so this job uses the smallest
+  # cache-aware model NVIDIA publishes (Parakeet Realtime EOU 120M, English, 150
+  # MB int8); converted once, then served from the cache.
+  server-faults-streaming:
+    name: Server faults (streaming model, CPU and GPU servers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EOU_MODEL: parakeet_realtime_eou_120m-v1
+      EOU_URL: https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1/resolve/main/parakeet_realtime_eou_120m-v1.nemo
+      # one model thread: a 120M model on a CI runner eats the 28 s a case
+      # queues almost at once, and the zombie bound is audio seconds per
+      # detection delay -- a slower model keeps both checks discriminating
+      MYNAH_ASR_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache the converted streaming model
+        id: eou-cache
+        uses: actions/cache@v6
+        with:
+          path: models/parakeet_realtime_eou_120m-v1
+          key: parakeet_realtime_eou_120m-v1-v1-${{ hashFiles('tools/convert_nemo.py') }}
+      - name: Setup uv
+        if: steps.eou-cache.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v9.0.0
+      - name: Download and convert (.nemo -> mynah-asr)
+        if: steps.eou-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models/$EOU_MODEL
+          curl -fL --retry 3 -o models/$EOU_MODEL/$EOU_MODEL.nemo "$EOU_URL"
+          cd tools && uv sync --extra oracle
+          uv run python convert_nemo.py ../models/$EOU_MODEL
+          cd .. && rm models/$EOU_MODEL/$EOU_MODEL.nemo
+      - name: Build
+        run: make BLAS=none && make lib BLAS=none
+      - name: Int8 pack (the servers serve int8)
+        run: ./mynah-asr quantize -m models/$EOU_MODEL --quant int8
+      - name: Fault suite, CPU server (incl. prefork worker kill)
+        run: make BLAS=none test-server-faults FAULT_MODEL_DIR=models/$EOU_MODEL
+      - name: Fault suite, GPU server (cpu-only build, same seam as CUDA)
+        run: make BLAS=none test-gpu-server-faults FAULT_MODEL_DIR=models/$EOU_MODEL

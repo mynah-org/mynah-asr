@@ -247,6 +247,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_server_rest_faults.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-rest-faults: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_server_models.sh $(MODEL_DIR) $(MULTI_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-models: needs BOTH $(MODEL_DIR) and $(MULTI_MODEL_DIR)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
@@ -484,6 +487,21 @@ CONC_MODEL_DIR ?= $(PARAKEET110_DIR)
 # S3-3/S3-4: the banner, /v1/health as facts, /metrics on its own port (the
 # token bucket, the double bind, the router's fleet view) and the SIGUSR1 dump.
 # Model-agnostic and REST-only, so it runs wherever test-server-concurrency does.
+# The same WebSocket fault suite against the GPU server's cpu-only build (the
+# reference engine behind the CUDA seam): its cancellation code is its own.
+test-gpu-server-faults: mynah-asr-server mynah-asr lib
+	@$(MAKE) --no-print-directory -C gpu cpu
+	@FAULT_SERVER=gpu-cpu sh tests/test_server_faults.sh $(FAULT_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP gpu-server-faults: model, binaries or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
+# REST clients that go away: a queued request is dropped before inference, a
+# stalled body frees its thread within --idle-ms. Model-agnostic, REST-only.
+test-server-rest-faults: mynah-asr-server
+	@sh tests/test_server_rest_faults.sh $(CONC_MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP server-rest-faults: model, binaries, curl or python3 missing"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+
 test-server-metrics: mynah-asr-server
 	@sh tests/test_server_metrics.sh $(CONC_MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-metrics: model, binaries, curl or python3 missing"; \
@@ -623,4 +641,4 @@ dist: mynah-asr mynah-asr-server libmynah_asr.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-faults test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
+.PHONY: all clean check bench-gemm bench-throughput box-doctor box-advise install dist test golden-dump lib shared example debug ubsan asan bench leaks test-vad test-vad-spans fetch-vad test-nemo-langs fetch-lang-samples fetch-stress-bank test-server test-server-stream test-server-protocol test-server-faults test-gpu-server-faults test-server-rest-faults test-server-concurrency test-samples test-stream-allocs bench-stream-wave bench-stream-soak cuda update-ingot test-stream-batch-allocs test-server-metrics
