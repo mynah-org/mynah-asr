@@ -1120,7 +1120,20 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                                MYNAH_ASR_SLOT_CANCEL_NONE);
     mynah_asr_sched_wake();
 
-    int done = mynah_asr_slot_wait_done(slot, 60000);
+    /* Waiting for `done` after a close frame or a finalize: a client that
+     * then vanished (close(), FIN) and sends nothing more is invisible to the
+     * hard-hangup probe, and with silence on the line nothing is written that
+     * could bounce -- the scheduler would flush the whole ring and the tail for
+     * nobody. A ping every 500 ms gives a closed peer something to answer
+     * with a reset, which fails the writer and cancels the tail at the next
+     * step; a client that legally half-closed and still reads just gets the
+     * ping. Same 60 s ceiling as before. */
+    int done = 0;
+    for (int waited = 0; waited < 60000 && !done; waited += 250) {
+        done = mynah_asr_slot_wait_done(slot, 250);
+        if (!done && !cancelled && !shutting && waited % 500 == 250)
+            ws_enqueue(&w, 0x9, "", 0);
+    }
     if (!done) {
         mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,
                                MYNAH_ASR_SLOT_CANCEL_PEER);
