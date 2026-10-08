@@ -606,6 +606,7 @@ worker label; the only labels are `reason` and `le`.
 | `mynah_asr_fleet_audio_seconds_total` | counter | audio fed to the model: the throughput unit |
 | `mynah_asr_fleet_model_busy_seconds_total` | counter | `rate()` ÷ workers = model duty |
 | `mynah_asr_fleet_steps_total` · `_deltas_total` | counter | |
+| `mynah_asr_fleet_offline_jobs_total` · `_offline_peer_gone_total` | counter | REST jobs run through the model / dropped before inference because the client had left |
 | `mynah_asr_fleet_backlog_seconds` · `_backlog_max_seconds` | gauge | audio queued in the rings, total and the worst stream |
 | `mynah_asr_fleet_emission_lag_seconds` | histogram | EXACT: every edge is a multiple of the 8 ms bucket |
 | `mynah_asr_fleet_first_text_seconds` | histogram | per session, first audio in to first text out, measured in the scheduler. It INCLUDES the audio before the first word and the client's own pacing: what a user waits, not a model latency, and not a first-WORD latency |
@@ -623,7 +624,9 @@ two workers and requires the summed series to equal it exactly, and
 `worker-kill` requires monotonic totals, `worker_deaths_total` 1 and the held
 session in `sessions_lost_total`.
 
-**A first view (Grafana), one panel per operational question:**
+**A first view (Grafana), one panel per operational question** -- shipped,
+with Prometheus scrape config, alerts and an OpenTelemetry collector example, in
+[`configs/observability/`](../configs/observability/README.md):
 
 | question | panel |
 |---|---|
