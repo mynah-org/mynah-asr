@@ -285,6 +285,120 @@ static int test_splitk(int N, int K, const char *what, int bench) {
     return 0;
 }
 
+/* ------------------------------------------------ own-tc (bf16 tensor cores)
+ * The contract of --gemm own-tc, gated byte for byte: every row of every
+ * cohort size equals the same row inside M = 257, for every block tile the
+ * dispatcher may pick, with bias + accumulate and relu/silu epilogues, and a
+ * second identical call returns the same bytes. S comes from (N, K) only.
+ * Accuracy is sized against a double reference over the bf16-ROUNDED operands
+ * (what the kernel is asked to compute) and against the f32 operands (the
+ * numerical change vs the f32 arms, reported). */
+static float bf16_round_host(float x) {
+    unsigned u; memcpy(&u, &x, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);    /* round to nearest even; no NaN in these tests */
+    u &= 0xFFFF0000u;
+    float r; memcpy(&r, &u, 4);
+    return r;
+}
+
+static int test_gemm_tc(int N, int K, const char *what, int bench) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 2, 5, 16, 24, 33, 64, 95, 128, 163, 200, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N);
+    fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+    const size_t wsf = k_gemm_tc_workspace_floats(Mmax, N, K);
+    float *dA = dup_dev(A), *dW = dup_dev(W), *db = dup_dev(bias), *dR, *dC, *ws = nullptr;
+    unsigned short *dW16 = nullptr;
+    CU(cudaMalloc(&dW16, (size_t)N * K * sizeof(unsigned short)));
+    CU(k_f32_to_bf16(dW, dW16, (size_t)N * K, 0));
+    CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    if (wsf) CU(cudaMalloc(&ws, wsf * sizeof(float)));
+    int mism = 0, rep_mism = 0;
+    for (int act = 0; act <= 2; act += 2) {
+        CU(cudaMemcpy(dR, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_wt_tc(dA, K, dW16, db, dR, N, Mmax, N, K, 1, act, ws, wsf, 0));
+        CU(cudaDeviceSynchronize());
+        auto ref = to_host(dR, (size_t)Mmax * N);
+        /* the same call again: deterministic */
+        CU(cudaMemcpy(dC, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, Mmax, N, K, 1, act, ws, wsf, 0));
+        CU(cudaDeviceSynchronize());
+        if (memcmp(to_host(dC, (size_t)Mmax * N).data(), ref.data(), (size_t)Mmax * N * sizeof(float)) != 0) rep_mism++;
+        for (int cfg = -1; cfg < k_gemm_tc_config_count(); cfg++) {
+            k_gemm_tc_force_config(cfg);
+            for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+                const int M = Ms[mi];
+                CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, M, N, K, 1, act, ws, wsf, 0));
+                CU(cudaDeviceSynchronize());
+                auto c = to_host(dC, (size_t)M * N);
+                if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
+                    if (mism < 3) printf("     own-tc %s cfg %s M=%d act=%d differs from M=257\n", what, cfg < 0 ? "auto" : k_gemm_tc_config_name(cfg), M, act);
+                    mism++;
+                }
+            }
+        }
+        k_gemm_tc_force_config(-1);
+    }
+    CHECK(mism == 0 && rep_mism == 0, "own-tc row-stable %s [N=%d K=%d, S=%d]: 12 cohort sizes x %d tiles x relu/silu vs M=257, and a repeat, byte for byte (%d + %d mismatches)",
+          what, N, K, k_gemm_tc_splits(N, K), k_gemm_tc_config_count() + 1, mism, rep_mism);
+    /* accuracy: vs double over the bf16-rounded operands (the kernel's job) and
+     * vs double over the f32 operands (the numerical change, next to v1's) */
+    {
+        const int M = 64;
+        CU(k_gemm_wt_tc(dA, K, dW16, nullptr, dC, N, M, N, K, 0, 0, ws, wsf, 0));
+        CU(k_gemm_wt_v1(dA, K, dW, nullptr, dR, N, M, N, K, 0, 0, 0));
+        CU(cudaDeviceSynchronize());
+        auto ct = to_host(dC, (size_t)M * N), c1 = to_host(dR, (size_t)M * N);
+        double e16 = 0, e32 = 0, e1 = 0, scale = 0;
+        for (int m = 0; m < M; m += 7)
+            for (int n = 0; n < N; n += 31) {
+                double r16 = 0, r32 = 0;
+                for (int k = 0; k < K; k++) {
+                    const float a = A[(size_t)m * K + k], w = W[(size_t)n * K + k];
+                    r16 += (double)bf16_round_host(a) * (double)bf16_round_host(w);
+                    r32 += (double)a * (double)w;
+                }
+                e16 = fmax(e16, fabs(ct[(size_t)m * N + n] - r16));
+                e32 = fmax(e32, fabs(ct[(size_t)m * N + n] - r32));
+                e1 = fmax(e1, fabs(c1[(size_t)m * N + n] - r32));
+                scale = fmax(scale, fabs(r32));
+            }
+        CHECK(e16 <= 4.0 * e1 + 1e-5, "own-tc exact on bf16 operands %s: max|err| vs double(bf16 inputs) %.3g (f32 v1 vs double %.3g)", what, e16, e1);
+        printf("INFO own-tc numerical change %s: max|err| vs double(f32 inputs) %.3g, v1 %.3g, |ref| up to %.3g\n", what, e32, e1, scale);
+    }
+    if (bench) {
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int Mb[] = {24, 64, 95, 128, 163, 256, 512};
+        const size_t wsk = k_gemm_splitk_workspace_floats(512, N, K), wst = k_gemm_tc_workspace_floats(512, N, K);
+        float *wk = nullptr, *wt = nullptr, *dAb = nullptr, *dCb = nullptr;
+        std::vector<float> Ab((size_t)512 * K); fill(Ab, 1.0f);
+        dAb = dup_dev(Ab);
+        CU(cudaMalloc(&dCb, (size_t)512 * N * sizeof(float)));
+        if (wsk) CU(cudaMalloc(&wk, wsk * sizeof(float)));
+        if (wst) CU(cudaMalloc(&wt, wst * sizeof(float)));
+        for (size_t mi = 0; mi < sizeof(Mb) / sizeof(Mb[0]); mi++) {
+            const int M = Mb[mi];
+            float t[3], ms;
+            for (int arm = 0; arm < 3; arm++) {
+                for (int r = 0; r < 23; r++) {
+                    if (r == 3) cudaEventRecord(e0);
+                    if (arm == 0) (void)k_gemm_wt_v1(dAb, K, dW, nullptr, dCb, N, M, N, K, 0, 0, 0);
+                    else if (arm == 1) (void)k_gemm_wt_splitk(dAb, K, dW, nullptr, dCb, N, M, N, K, 0, 0, wk, wsk, 0);
+                    else (void)k_gemm_wt_tc(dAb, K, dW16, nullptr, dCb, N, M, N, K, 0, 0, wt, wst, 0);
+                }
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                t[arm] = ms / 20.0f;
+            }
+            printf("BENCHTC %-12s M=%3d S=%d  v1 %7.3f ms  splitk %7.3f ms  own-tc %7.3f ms (%.2fx splitk, %.1f TFLOP/s)\n",
+                   what, M, k_gemm_tc_splits(N, K), t[0], t[1], t[2], t[1] / t[2], 2.0 * M * N * (double)K / (t[2] * 1e9));
+        }
+        cudaFree(wk); cudaFree(wt); cudaFree(dAb); cudaFree(dCb);
+    }
+    cudaFree(dA); cudaFree(dW); cudaFree(dW16); cudaFree(db); cudaFree(dR); cudaFree(dC); if (ws) cudaFree(ws);
+    return 0;
+}
+
 /* -------------------------------------------------------------- argmax */
 static int test_argmax(void) {
     const int V = 13088, n = 3;
@@ -692,6 +806,17 @@ int main(int argc, char **argv) {
         if (test_gemm_v2(shapes[i][0], shapes[i][1], names[i], bench_v2) != 0) return 1;
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         if (test_splitk(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
+    {
+        const int bench_tc = argc > 1 && strcmp(argv[1], "--bench-tc") == 0;
+        if (p.major >= 8) {
+            for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+                if (test_gemm_tc(shapes[i][0], shapes[i][1], names[i], bench_tc) != 0) return 1;
+            /* off-model shape: K not a multiple of 8 (the scalar staging path), ragged N */
+            if (test_gemm_tc(100, 300, "ragged", 0) != 0) return 1;
+        } else {
+            printf("SKIP own-tc: %s is sm_%d%d, the arm needs sm_80+\n", p.name, p.major, p.minor);
+        }
+    }
     if (test_argmax() != 0) return 1;
     if (test_layernorm() != 0) return 1;
     if (test_attention() != 0) return 1;

@@ -28,6 +28,9 @@
 
 #include <math.h>
 
+#include <cuda_bf16.h>
+#include <mma.h>
+
 #define GEMM_BK 16
 
 __device__ __forceinline__ float gemm_sigmoid(float x) {
@@ -413,14 +416,15 @@ __global__ void gemm_reduce_kernel(const float *__restrict__ P, int S, int M, in
     crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
 }
 
-/* S from the weight's shape only: enough (N-tile x split) blocks to give the
- * card two waves when the cohort is one M-tile, each split at least 256 deep
- * and a multiple of 16. The table is a pure function of (N, K, SM count); the
- * SM count is fixed for the life of the process. */
+/* S from the weight's shape only: enough (N-tile x split) blocks to give an
+ * L4 (58 SMs) two waves when the cohort is one M-tile, each split at least 256
+ * deep and a multiple of 16. S14-11: S used to read the SM count of the card
+ * it ran on, so a transcript could differ between GPU classes; the count is
+ * now the constant the split was tuned and qualified with, which gives the
+ * same S -- the same bits -- on the L4 as before and on every other card. */
+#define SPLITK_REF_SMS 58
 int k_gemm_splits(int N, int K) {
-    int sms = 0, dev = 0;
-    cudaGetDevice(&dev);
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0) sms = 40;
+    const int sms = SPLITK_REF_SMS;
     const int ntiles = (N + GEMM_BN - 1) / GEMM_BN;
     int S = (2 * sms + ntiles - 1) / ntiles;
     const int smax = K / 256;
@@ -447,6 +451,244 @@ cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const floa
     gemm_part_kernel<<<grid, GEMM_THREADS, 0, s>>>(A, lda, W, ws, M, N, K, KC);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
+    dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
+    gemm_reduce_kernel<<<g2, 256, 0, s>>>(ws, S, M, N, bias, C, ldc, accumulate, act);
+    return cudaGetLastError();
+}
+
+/* ------------------------------------------------- bf16 tensor cores (own-tc)
+ * --precision bf16 --gemm own-tc. Ported from mynah-tts's fixed-order prefill
+ * tile (MYNAH_CUDA_PREFILL_BF16TC). A NUMERICAL CHANGE against every f32 arm:
+ * the weights are a resident bf16 copy (round to nearest even, once at open),
+ * the activations are rounded to bf16 as they are staged into shared memory,
+ * the products accumulate in fp32 on the tensor cores (WMMA 16x16x16).
+ *
+ * What it keeps, by construction, is contract 4 -- a row's bits do not depend
+ * on how many rows share the call -- and, new against split-K, they do not
+ * depend on the card either:
+ *
+ *   S, the number of K splits, is tc_splits(N, K): a pure function of the
+ *   weight's shape and two constants of this file. Never M, never the SM
+ *   count, never the tile. Split s covers [s*KC, min((s+1)*KC, K)), KC a
+ *   multiple of TC_BK. Inside a split, element (m, n) is the WMMA
+ *   accumulator chain over the 32-wide K slabs in ascending order and, inside
+ *   a slab, the two 16-deep MMA steps in ascending order, from 0.0f. A tensor
+ *   core MMA computes each output element from its own row of A and column of
+ *   B only, so the rows sharing a fragment cannot change it. Partials are
+ *   added in split order ((P0 + P1) + P2) + ..., then bias, + C, activation
+ *   -- the same reduce kernel as split-K.
+ *
+ * The block tile (which warp computes an element, how many blocks there are)
+ * changes no bit, so it is chosen per call from M and N for speed; the test
+ * pins every configuration and compares bytes. Needs sm_80+ (bf16 WMMA); the
+ * engine refuses the arm on an older card instead of falling back. */
+#define TC_BK 32
+#define TC_LD (TC_BK + 8)         /* bf16 elements per shared row: 80 bytes, 16-byte multiple */
+#define TC_SLD 20                 /* per-warp 16x16 fp32 staging row, padded */
+#define TC_SPLIT_TARGET 128       /* (64-wide N tiles x splits) aimed at for one M tile */
+#define TC_SPLIT_MIN_DEPTH 256    /* no split shallower than this */
+
+__device__ __forceinline__ unsigned short tc_bf16_bits(float x) {
+    __nv_bfloat16 h = __float2bfloat16_rn(x);
+    return *reinterpret_cast<unsigned short *>(&h);
+}
+
+__global__ void k_f32_to_bf16_kernel(const float *__restrict__ src, unsigned short *__restrict__ dst, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = tc_bf16_bits(src[i]);
+}
+
+cudaError_t k_f32_to_bf16(const float *src, unsigned short *dst, size_t n, cudaStream_t s) {
+    if (n == 0) return cudaSuccess;
+    k_f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(src, dst, n);
+    return cudaGetLastError();
+}
+
+/* WM x WN warps, each 32 x 32 outputs (2 x 2 fragments). */
+template <int WM, int WN, bool VEC>
+__global__ void __launch_bounds__(WM * WN * 32)
+gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__restrict__ W,
+               const float *__restrict__ bias, float *__restrict__ C, int ldc,
+               int M, int N, int K, int KC, float *__restrict__ P, int accumulate, int act) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    constexpr int BM = WM * 32, BN = WN * 32, NT = WM * WN * 32;
+    constexpr int LA = BM * (TC_BK / 4) / NT;   /* float4 of A per thread per slab */
+    constexpr int LW = BN * (TC_BK / 8) / NT;   /* 8 x bf16 of W per thread per slab */
+    static_assert(LA * NT == BM * (TC_BK / 4) && LW * NT == BN * (TC_BK / 8), "tile/threads");
+    __shared__ __align__(32) unsigned short As[BM * TC_LD];
+    __shared__ __align__(32) unsigned short Ws[BN * TC_LD];
+    __shared__ __align__(32) float St[WM * WN * 16 * TC_SLD];
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wm = warp / WN, wn = warp % WN;
+    const int kbeg = blockIdx.z * KC, kend = min(K, kbeg + KC);
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    float4 ra[LA];
+    uint4 rw[LW];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int l = 0; l < LA; l++) {
+            const int q = tid + l * NT, r = q / (TC_BK / 4), kk = (q % (TC_BK / 4)) * 4;
+            const int m = m0 + r, k = k0 + kk;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (m < M) {
+                const float *p = A + (size_t)m * (size_t)lda + k;
+                if (VEC) { if (k < kend) v = *reinterpret_cast<const float4 *>(p); }
+                else { if (k < kend) v.x = p[0]; if (k + 1 < kend) v.y = p[1]; if (k + 2 < kend) v.z = p[2]; if (k + 3 < kend) v.w = p[3]; }
+            }
+            ra[l] = v;
+        }
+#pragma unroll
+        for (int l = 0; l < LW; l++) {
+            const int q = tid + l * NT, r = q / (TC_BK / 8), kk = (q % (TC_BK / 8)) * 8;
+            const int n = n0 + r, k = k0 + kk;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (n < N) {
+                const unsigned short *p = W + (size_t)n * (size_t)K + k;
+                if (VEC) { if (k < kend) v = *reinterpret_cast<const uint4 *>(p); }
+                else {
+                    unsigned short h[8];
+#pragma unroll
+                    for (int u = 0; u < 8; u++) h[u] = k + u < kend ? p[u] : (unsigned short)0;
+                    v.x = (unsigned)h[0] | ((unsigned)h[1] << 16); v.y = (unsigned)h[2] | ((unsigned)h[3] << 16);
+                    v.z = (unsigned)h[4] | ((unsigned)h[5] << 16); v.w = (unsigned)h[6] | ((unsigned)h[7] << 16);
+                }
+            }
+            rw[l] = v;
+        }
+    };
+    auto stash = [&]() {
+#pragma unroll
+        for (int l = 0; l < LA; l++) {
+            const int q = tid + l * NT, r = q / (TC_BK / 4), kk = (q % (TC_BK / 4)) * 4;
+            uint2 pk;
+            pk.x = (unsigned)tc_bf16_bits(ra[l].x) | ((unsigned)tc_bf16_bits(ra[l].y) << 16);
+            pk.y = (unsigned)tc_bf16_bits(ra[l].z) | ((unsigned)tc_bf16_bits(ra[l].w) << 16);
+            *reinterpret_cast<uint2 *>(As + r * TC_LD + kk) = pk;
+        }
+#pragma unroll
+        for (int l = 0; l < LW; l++) {
+            const int q = tid + l * NT, r = q / (TC_BK / 8), kk = (q % (TC_BK / 8)) * 8;
+            *reinterpret_cast<uint4 *>(Ws + r * TC_LD + kk) = rw[l];
+        }
+    };
+
+    if (kbeg < kend) fetch(kbeg);
+    for (int k0 = kbeg; k0 < kend; k0 += TC_BK) {
+        stash();
+        __syncthreads();
+        if (k0 + TC_BK < kend) fetch(k0 + TC_BK);    /* in flight during the MMAs */
+#pragma unroll
+        for (int kk = 0; kk < TC_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+                wmma::load_matrix_sync(a[i], reinterpret_cast<const __nv_bfloat16 *>(As + (wm * 32 + i * 16) * TC_LD + kk), TC_LD);
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+                wmma::load_matrix_sync(b[j], reinterpret_cast<const __nv_bfloat16 *>(Ws + (wn * 32 + j * 16) * TC_LD + kk), TC_LD);
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    float *st = St + warp * 16 * TC_SLD;
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            wmma::store_matrix_sync(st, acc[i][j], TC_SLD, wmma::mem_row_major);
+            __syncwarp();
+            const int rb = m0 + wm * 32 + i * 16, cb = n0 + wn * 32 + j * 16;
+            for (int e = lane; e < 256; e += 32) {
+                const int r = e >> 4, c = e & 15, m = rb + r, n = cb + c;
+                if (m >= M || n >= N) continue;
+                const float v = st[r * TC_SLD + c];
+                if (P) P[(size_t)blockIdx.z * (size_t)M * (size_t)N + (size_t)m * N + n] = v;
+                else {
+                    float *crow = C + (size_t)m * (size_t)ldc;
+                    crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
+                }
+            }
+            __syncwarp();
+        }
+#endif
+}
+
+/* the block tiles, largest first; pure performance (see above) */
+enum { TC_64x128 = 0, TC_64x64, TC_32x64, TC__N };
+static int g_tc_force = -1;
+
+static int tc_choose(int M, int N, int S) {
+    if (g_tc_force >= 0) return g_tc_force;
+    if (M <= 32) return TC_32x64;
+    const long blocks = (long)((N + 127) / 128) * (long)((M + 63) / 64) * S;
+    return blocks >= 2L * TC_SPLIT_TARGET ? TC_64x128 : TC_64x64;
+}
+
+template <int WM, int WN>
+static void tc_launch(bool vec, const float *A, int lda, const unsigned short *W, const float *bias,
+                      float *C, int ldc, int M, int N, int K, int KC, int S, float *P,
+                      int accumulate, int act, cudaStream_t s) {
+    dim3 grid((unsigned)((N + WN * 32 - 1) / (WN * 32)), (unsigned)((M + WM * 32 - 1) / (WM * 32)), (unsigned)S);
+    if (vec) gemm_tc_kernel<WM, WN, true><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, P, accumulate, act);
+    else gemm_tc_kernel<WM, WN, false><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, P, accumulate, act);
+}
+
+/* S from the weight's shape and this file's two constants ONLY: enough
+ * (64-wide N tile x split) blocks to reach TC_SPLIT_TARGET for a one-tile
+ * cohort, no split shallower than TC_SPLIT_MIN_DEPTH. The same S on an L4, an
+ * A100 or a MIG slice: S14-11 does not apply to this arm. */
+int k_gemm_tc_splits(int N, int K) {
+    const int ntiles = (N + 63) / 64;
+    int S = (TC_SPLIT_TARGET + ntiles - 1) / ntiles;
+    const int smax = K / TC_SPLIT_MIN_DEPTH;
+    if (S > smax) S = smax;
+    if (S < 1) S = 1;
+    return S;
+}
+
+size_t k_gemm_tc_workspace_floats(int Mmax, int N, int K) {
+    const int S = k_gemm_tc_splits(N, K);
+    return S > 1 ? (size_t)S * (size_t)Mmax * (size_t)N : 0;
+}
+
+void k_gemm_tc_force_config(int cfg) { g_tc_force = cfg; }
+int k_gemm_tc_config_count(void) { return TC__N; }
+const char *k_gemm_tc_config_name(int cfg) {
+    static const char *const nm[TC__N] = {"tc64x128", "tc64x64", "tc32x64"};
+    return cfg >= 0 && cfg < TC__N ? nm[cfg] : "?";
+}
+
+cudaError_t k_gemm_wt_tc(const float *A, int lda, const unsigned short *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         float *ws, size_t ws_floats, cudaStream_t s) {
+    if (M <= 0 || N <= 0) return cudaSuccess;
+    const int S = k_gemm_tc_splits(N, K);
+    if (S > 1 && (!ws || ws_floats < (size_t)S * (size_t)M * (size_t)N)) return cudaErrorInvalidValue;
+    int KC = (K + S - 1) / S;
+    KC = (KC + TC_BK - 1) / TC_BK * TC_BK;
+    /* 16-byte loads need 16-byte rows in both operands; same arithmetic either way */
+    const bool vec = (((size_t)A & 15u) == 0) && (((size_t)W & 15u) == 0) && (lda & 3) == 0 && (K & 7) == 0;
+    float *P = S > 1 ? ws : nullptr;
+    switch (tc_choose(M, N, S)) {
+        case TC_64x128: tc_launch<2, 4>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
+        case TC_64x64: tc_launch<2, 2>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
+        default: tc_launch<1, 2>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess || S == 1) return e;
     dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
     gemm_reduce_kernel<<<g2, 256, 0, s>>>(ws, S, M, N, bias, C, ldc, accumulate, act);
     return cudaGetLastError();
