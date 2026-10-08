@@ -49,6 +49,26 @@ counters; `SIGUSR1` prints the `[DUMP]` lines `tools/bench/v2_verdict.py` reads.
 `tools/bench/v2_qualify.sh`, `tests/ws_probe.py` and `tests/fault_probe.py`
 run against it unchanged.
 
+## Quantised arms (default off)
+
+Two independent switches, both numerical changes (not bit-identical to f32),
+both batch-invariant by construction (a lane's bytes never depend on its
+cohort or slot; gate A of `tests/test_cuda_stream` holds byte for byte):
+
+| flag | what is stored | how it is read |
+|---|---|---|
+| `--kv-dtype f32` (default) | the K/V ring f32, 10.5 MiB per slot | reference |
+| `--kv-dtype bf16` | ring bf16 (round to nearest even), 5.25 MiB per slot | widened in the attention kernel |
+| `--kv-dtype int8` | ring int8 + one f32 scale per (position, head), `scale = max\|x\|/127`, 2.71 MiB per slot | `code * scale` in the attention kernel |
+| `--weights int8` | the 24 layers' FFN, q/k/v/o, pointwise-conv linears and the joint head as the CPU's per-row int8 codes (`mynah_asr_quantize_int8`) | `gpu/cuda/gemm_w8.cu`: the v1 fixed-order fma chain over the codes, times the row scale |
+
+The fresh rows of a chunk are attended in f32 and quantised once on commit, so
+a row reads the same values on every later chunk, alone or batched. The
+subsampling, prompt projector, LSTM and depthwise weights stay f32. The
+dispatch map's `precision` and `kv ring` lines and the banner's `precision=`
+(`f32`, `f32+kv-int8`, `w8a32`, `w8a32+kv-int8`, ...) say what resolved.
+Evidence: [`.work/cuda-quant.md`](../.work/cuda-quant.md).
+
 ## Status
 
 See the board (`PLAN.md` S14) and the note's Evidence section. Until S14-6 runs
