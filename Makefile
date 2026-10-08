@@ -198,6 +198,21 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model or golden dumps missing (make golden-dump)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
+	@# rule 4 for the research flags (default off): the stream-parallel levels
+	@# and the stacked flush must leave every batched and single-stream byte
+	@# where the default path puts it. The flags are read once per process, so
+	@# each level is its own run; 4 pool threads so the per-stream regions
+	@# really run on the pool.
+	@for lvl in 1 2 3 4; do \
+	  for t in tests/test_stream_batch tests/test_kv_layout; do \
+	    MYNAH_ASR_THREADS=4 MYNAH_ASR_STREAM_PAR=$$lvl $$t $(MODEL_DIR); rc=$$?; \
+	    if [ $$rc -eq 77 ]; then echo "SKIP $$t (MYNAH_ASR_STREAM_PAR=$$lvl): model missing"; \
+	    elif [ $$rc -ne 0 ]; then echo "FAIL $$t under MYNAH_ASR_STREAM_PAR=$$lvl"; exit $$rc; fi; \
+	  done; \
+	done
+	@MYNAH_ASR_FIN_STACK=1 tests/test_streaming $(MODEL_DIR) tests/audio/test_it.wav tests/golden/test_it; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP tests/test_streaming (MYNAH_ASR_FIN_STACK=1): model or golden dumps missing"; \
+	  elif [ $$rc -ne 0 ]; then echo "FAIL tests/test_streaming under MYNAH_ASR_FIN_STACK=1"; exit $$rc; fi
 	@for spec in "$(PARAKEET_DIR) tests/audio/test_it.wav tests/golden/parakeet_it" \
 	             "$(PARAKEET110_DIR) tests/audio/test_en.wav tests/golden/parakeet110_en"; do \
 	  for t in $(PARITY_BOTH); do \
