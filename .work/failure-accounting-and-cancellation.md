@@ -5,7 +5,7 @@ Nemotron (fault suite + fault-injection soaks C=64 and C=80, both QUALIFIED).
 Open: qwen-tts (S12-23), worker respawn (S12-22, a decision), and the full
 Nemotron protocol/stream tests on the Mac (the box ran the fault suite).
 
-Task: S12-17, S12-18, S12-19, S12-20
+Task: S12-17, S12-18, S12-19, S12-20, S12-27, S12-28
 
 ## Question
 
@@ -354,6 +354,50 @@ idle_open client holding its slot with an empty ring (52.6 s since its last
 audio) while that worker had nothing else to do. A stall now needs a slot with
 a whole chunk queued; re-judged, both runs QUALIFIED. The verdicts from the
 old rule are kept in the evidence (`verdict-c64.txt`, `verdict-c80.txt`).
+
+## Zombie audit of 2026-10-08 (S12-27), both servers
+
+Question asked by the owner: when a client disconnects, does CPU or GPU work
+stop, or is a request finished for nobody? Traced from socket event to slot
+release in `server/` and `gpu/server/`, scenario by scenario.
+
+FACT (OK before this audit): RST/FIN mid-utterance, RST during the tail, slow
+or non-reading clients, a queued WebSocket that leaves: at most one batched
+step after the hangup, slot and K/V reset on the next claim, books exact.
+
+FACT (zombies found, fixed):
+- REST, CPU server: `mynah_asr_sched_submit` waited with no peer check and
+  `sched_run_jobs` ran the job inline on the scheduler thread -- a request whose
+  client left while queued got a full transcription (bounded only by the 200 MB
+  body: ~6,250 s of audio), stalling every stream on the worker. Now each job
+  carries its connection and is probed after dequeue
+  (`mynah_asr_fd_peer_gone`: reset, error or FIN; never blocks); a gone job is
+  dropped with rc -3 and counted (`offline.peer_gone`).
+- REST, CPU server: no `SO_RCVTIMEO`/`SO_SNDTIMEO` on REST sockets, so a body
+  that stopped arriving held an HTTP thread for ever. Now `--idle-ms`.
+- WebSocket, both servers: close frame or `finalize`, then close() and silence.
+  The FIN is a legal half-close for a finalizing stream and silence writes
+  nothing, so nothing ever bounced: the whole ring (<= 30 s) and the tail ran for
+  nobody. Now the ingest pings at once and every 500 ms while it waits for
+  `done`; a closed peer answers with a reset and the hard-hangup probe cancels.
+- GPU server: after the 60 s + 5 s wait the ingest released the slot and its
+  writer while the engine thread could still use them. Now the slot is marked
+  abandoned under its mutex and `end_session` releases it (as the CPU server's
+  `sched_abandon` does).
+
+Gates (CI): `tests/test_server_rest_faults.sh` (rest-gone-queued,
+rest-stalled-body) inside `make test` on the 110m, all three OSes; a CI job that
+converts Parakeet Realtime EOU 120M once (cached) and runs the full WebSocket
+fault suite -- now with close-then-fin-silent and finalize-then-fin-silent --
+against `mynah-asr-server` (prefork worker kill included) and against the GPU
+server's cpu-only build (`make test-gpu-server-faults`). Until then no
+streaming fault case ran in CI. The CUDA engine itself still has no CI fault
+run (no device on the runners); its cancellation code is the server's, shared
+with the cpu-only build.
+
+UNKNOWN / open (S12-28): a REST job already inside the batched call still
+finishes (no abort point in `mynah_asr_transcribe_batch_ts`); the prefork router
+sees a FIN-only queued client at dispatch rather than while queued.
 
 ## Conclusion (so far)
 

@@ -303,6 +303,7 @@ by `tests/test_server_faults.sh`):
 | sends `finalize`, then half-closes (FIN) | the same: a FIN after `finalize` is legal | `completed` |
 | disconnects with no close frame (FIN or RST) mid-utterance | **cancels**: no tail, no `done`; the model stops at the next step | `peer_gone` |
 | sends a close frame, then resets the connection | cancels the tail it asked for | `peer_gone` |
+| sends a close frame or `finalize`, then closes its socket (FIN) and is gone | cancels the tail once the server's ping draws the reset (one round trip) | `peer_gone` |
 | stops sending, socket open | `error idle_timeout` after `--idle-ms` | `idle_timeout` |
 | stops in the middle of a frame | the same, through `SO_RCVTIMEO` | `idle_timeout` |
 | sends reserved bits, or a control frame over 125 bytes or fragmented (RFC 6455 5.2, 5.5) | `error protocol_error`, closes | `protocol_error` |
@@ -312,6 +313,24 @@ the rest of its ring (up to `--ring-seconds` of audio) ran through the model for
 nobody, and the session was counted nowhere. Speech hid it -- a delta written to
 a dead peer fails with `EPIPE` within a write or two -- but silence writes
 nothing: 27.4 s of audio were fed after a RST in `rst-mid-silent`, 0.00 s now.
+
+While the ingest waits for `done` it **pings the client** at once and every
+500 ms, whatever `--ping-ms` says. A FIN after a close frame or a `finalize` is a
+legal half-close, so on its own it cannot end the session; but a client that
+closed its whole socket answers the ping with a reset, the writer fails, and
+the tail stops at the next step (`close-then-fin-silent`,
+`finalize-then-fin-silent`). A client that half-closed and still reads just
+receives the ping. The GPU server does the same.
+
+**REST clients that go away** (`tests/test_server_rest_faults.sh`): a request
+waits in the worker's offline queue and then runs inline on the scheduler
+thread. Before it runs, its connection is probed; a client that left (reset,
+error or FIN) is dropped with no inference and counted in
+`offline.peer_gone` / `mynah_asr_offline_peer_gone_total`. A request already
+inside the model still runs to its end (the batched call has no abort point).
+REST sockets carry `SO_RCVTIMEO`/`SO_SNDTIMEO` of `--idle-ms` (inactivity, not
+total time), so a body that stops arriving gets `400 incomplete_body` and a
+client that stops reading its response frees the thread.
 
 **The server pings** every `--ping-ms` (default 20000). A pong is not required —
 `--idle-ms` is the rule and the ping is only there to keep middleboxes from
@@ -422,7 +441,7 @@ health endpoint that reports both is one that will be quoted for the wrong one.
  "cancelled_by":{"idle_timeout":1,"peer_gone":0,"frame_too_large":0,
                  "protocol_error":0,"shutting_down":0,"audio_limit":0,
                  "decode_failed":0,"other":0},
- "offline":{"queued":0,"done":4,"max_pending":8},
+ "offline":{"queued":0,"done":4,"peer_gone":0,"max_pending":8},
  "audio_seconds":5.229,
  "lag_ms":{"p50":144,"p95":312,"max":358.6,"count":270,"bucket_ms":8},
  "streaming":true,
@@ -449,7 +468,7 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 | `steps`, `deltas`, `eous` | scheduler steps that fed a chunk, frames emitted |
 | `sessions` | slots claimed since start |
 | `cancelled`, `cancelled_by` | sessions ended early, bucketed **by the `code` the client was sent** — the counter and the error frame can never name two different things |
-| `offline` | REST jobs `queued` now, `done` since start, and `--max-pending` |
+| `offline` | REST jobs `queued` now, `done` since start, `peer_gone` (dropped before inference: the client had left), and `--max-pending` |
 | `audio_seconds` | seconds of audio fed to the model, streams and REST alike |
 | `lag_ms` | emission lag since start, from the 8 ms histogram (`bucket_ms`); `p50`/`p95` are therefore quantised to 8 ms, which is a measurement — a percentile computed from a mean is not |
 | `batch` | what the batched stream step did (S2-2b). `batched_steps_total` counts the calls, one per step that had a ready set; `rows_stacked_total` is the library's own count of encoder rows that went through the STACKED path, so **0 next to a non-zero `batched_steps_total` means every step degraded to per-stream steps** rather than a silent fallback; `ready_mean` is `ready_sum / batched_steps_total`; `step_wall_ms` is time spent inside the call (model only: building the set and the frames are outside it); `by_b` is the same sum/count split by ready-set size, which is what the cadence law `T_step(B) = a + b·B` is fitted from |

@@ -3,7 +3,7 @@
 Status: IN PROGRESS (opened 2026-09-26; design accepted for implementation the
 same day; nothing measured on a GPU yet)
 
-Task: S14-1 … S14-9 (board section S14)
+Task: S14-1 … S14-12 (board section S14)
 Question: can ONE process on ONE GPU serve at least the C=128 real-time
 Nemotron streams the qualified CPU fleet serves on 30 Axion cores, on a cloud
 GPU instance that has FEW vCPUs (4–8) and a 24 GB class card, with the same
@@ -718,7 +718,25 @@ one is available. The claim on the table — C=128 on a small-vCPU GPU
 instance — is a hypothesis with a byte-count argument behind it, not a
 result.
 
+## Review before merging to main (2026-10-08, S14-10)
+
+Code review of the tree, no device (compile-checked by the CI's nvcc job and
+the cpu-only build). Fixed:
+- `alloc_scratch` sized the per-lane mel/subsampling budget from the FIRST
+  chunk (1 + sub*L) while a steady chunk is sub*(L+1): one lane alone could
+  overflow `h_mel`/`d_mel`/stage-0 when Bmax was small (`--cap` < ~8). The
+  budget now takes the larger.
+- `cudaSetDevice` ran only on the opening thread: with `--device N != 0` the
+  engine thread launched on device 0. Step, facts and close now bind it.
+- SIGUSR1/SIGTERM took `g.mu`/`g_q.mu` inside the handler (self-deadlock under
+  the harness's SIGUSR1); the handler now sets flags only.
+- the CPU reference engine kept a slot's staged PCM across a reset;
+- the ingest freed a slot the engine still held after its 65 s wait.
+Open, boarded: S14-11 (split-K depends on the SM count), S14-12 (gate gaps,
+shared memory > 48 KB, `_exit` before the writers flush).
+
 ## Next action
 
-Implement S14-2 and S14-3 (`gpu/cuda/`), S14-4, then S14-5 (`gpu/server/`);
-extend CI; then bring-up on a GPU box (S14-6).
+S14-8b: 2x30-minute split-K soaks at C=128 with the generator off the server's
+CPUs (see "Next, in order" above); S14-11 before split-K becomes the default;
+then S14-7 on the target instance class.
