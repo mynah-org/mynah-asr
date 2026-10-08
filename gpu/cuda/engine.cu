@@ -102,6 +102,8 @@ struct cuda_engine {
     cudaEvent_t ev[4096];
     int ev_tag[4096];
     int nev = 0;
+    /* --profile-host: host wall per phase of a step (asr_engine_stats.hprof_*) */
+    int hprof = 0;
 };
 
 enum { PS_H2D = 0, PS_SS, PS_FFN1, PS_ATT_PROJ, PS_ATT_CORE, PS_ATT_OUT, PS_CONV, PS_FFN2,
@@ -131,6 +133,16 @@ static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* --profile-host: charge the time since `t` to phase `ph` and return now.
+ * With the profile off neither reads a clock: one predictable branch. */
+static inline double hp_now(const cuda_engine *e) { return e->hprof ? now_s() : 0.0; }
+static inline double hp_lap(cuda_engine *e, int ph, double t) {
+    if (!e->hprof) return 0.0;
+    const double n = now_s();
+    e->st.hprof_us[ph] += (n - t) * 1e6;
+    return n;
 }
 
 static void set_err(cuda_engine *e, const char *what, cudaError_t c) {
@@ -424,6 +436,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     e->gemm_v2 = cfg->gemm && strcmp(cfg->gemm, "own-v2") == 0;
     e->gemm_splitk = cfg->gemm && strcmp(cfg->gemm, "splitk") == 0;
     e->prof = cfg->profile ? 1 : 0;
+    e->hprof = cfg->profile_host ? 1 : 0;
     if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v2") != 0 && strcmp(cfg->gemm, "splitk") != 0) {
         snprintf(err, errcap, "gemm '%s' is not one of own, own-v2, splitk, cublas", cfg->gemm);
         delete e; return nullptr;
@@ -651,6 +664,7 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
     const int B = (int)lanes.size();
     if (B == 0) return 0;
     const int nm = dm.n_mels;
+    double hp = hp_now(e);
     /* descriptors and the packed mel */
     int R = 0, M = 0, P[GPU_SS_STAGES] = {0, 0, 0};
     for (int a = 0; a < B; a++) {
@@ -665,6 +679,7 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
         memcpy(e->h_mel + (size_t)M * nm, e->slots[(size_t)l.slot].mel_buf, (size_t)l.n_mel * nm * sizeof(float));
         M += l.n_mel; R += l.q;
     }
+    hp = hp_lap(e, ASR_HP_PASS_BUILD, hp);
     prof_mark(e, PS_H2D);
     CK(e, "h2d rows", cudaMemcpyAsync(e->d_rows, e->h_rows, (size_t)B * sizeof(gpu_row), cudaMemcpyHostToDevice, e->stream));
     CK(e, "h2d mel", cudaMemcpyAsync(e->d_mel, e->h_mel, (size_t)M * nm * sizeof(float), cudaMemcpyHostToDevice, e->stream));
@@ -726,6 +741,7 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
     if (gemm(e, e->cat, dm.d + dm.np, e->d_pl1_w, e->d_pl1_b, e->mid, dm.inter, R, dm.inter, dm.d + dm.np, 0, 1) != 0) return -1;
     if (gemm(e, e->mid, dm.inter, e->d_pl2_w, e->d_pl2_b, e->fused, dm.d, R, dm.d, dm.inter, 0, 0) != 0) return -1;
     if (gemm(e, e->fused, dm.d, e->d_ep_w, e->d_ep_b, e->enc, dm.dout, R, dm.dout, dm.d, 0, 0) != 0) return -1;
+    hp = hp_lap(e, ASR_HP_ENQUEUE, hp);
 
     /* the label loop */
     CK(e, "dec begin", k_dec_begin(e->ar, e->d_rows, B, e->stream));
@@ -735,7 +751,10 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
         prof_mark(e, PS_DEC_SYNC);
         CK(e, "dec compact", k_dec_compact(e->ar, e->d_rows, B, e->d_active, e->d_n_active, e->stream));
         CK(e, "d2h n_active", cudaMemcpyAsync(e->h_n_active, e->d_n_active, sizeof(int), cudaMemcpyDeviceToHost, e->stream));
+        hp = hp_lap(e, ASR_HP_DEC_LAUNCH, hp);
         CK(e, "sync", cudaStreamSynchronize(e->stream));
+        hp = hp_lap(e, it == 0 ? ASR_HP_ENC_WAIT : ASR_HP_DEC_WAIT, hp);
+        if (e->hprof) e->st.hprof_syncs++;
         const int n = *e->h_n_active;
         if (n <= 0) break;
         e->st.decode_iters++;
@@ -763,7 +782,10 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
     CK(e, "d2h tok", cudaMemcpyAsync(e->h_tok, e->ar.tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     CK(e, "d2h meta", cudaMemcpyAsync(e->h_meta, e->ar.meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaMemcpyDeviceToHost, e->stream));
     prof_mark(e, PS_OTHER);
+    hp = hp_lap(e, ASR_HP_DEC_LAUNCH, hp);
     CK(e, "sync", cudaStreamSynchronize(e->stream));
+    hp = hp_lap(e, ASR_HP_FINAL_WAIT, hp);
+    if (e->hprof) { e->st.hprof_syncs++; e->st.hprof_passes++; }
     prof_collect(e);
     e->st.d2h_bytes += (double)e->cap * e->ar.tok_cap * sizeof(int) + (double)e->cap * sizeof(gpu_slot_meta);
     e->st.rows += (unsigned long)R;
@@ -801,12 +823,15 @@ static int run_pass(cuda_engine *e, const std::vector<pass_lane> &lanes, const a
             o.finished = 1;
         }
     }
+    (void)hp_lap(e, ASR_HP_DETOK, hp);
     return 0;
 }
 
 static int cuda_step(cuda_engine *e, const asr_step_req *reqs, int n, asr_step_out *outs) {
     if (e->dead) return -1;
     const double t0 = now_s();
+    double hp_in = 0.0;   /* the phases run_pass charged before this step */
+    if (e->hprof) for (int k = 0; k < ASR_HPROF_PHASES; k++) hp_in += e->st.hprof_us[k];
     for (int i = 0; i < n; i++) {
         outs[i].text = ""; outs[i].t0 = outs[i].t1 = 0.0;
         outs[i].n_tokens = 0; outs[i].finished = 0; outs[i].stepped = 0;
@@ -819,6 +844,7 @@ static int cuda_step(cuda_engine *e, const asr_step_req *reqs, int n, asr_step_o
         CK(e, "slots reset", k_slots_reset(e->dm, e->ar, e->d_resets, nr, e->d_sos_h, e->d_sos_c, e->d_sos_g, e->stream));
         e->pending_resets.clear();
     }
+    (void)hp_lap(e, ASR_HP_RESET, t0);
     /* decide, per request, what this step consumes */
     std::vector<pass_lane> lanes;
     lanes.reserve((size_t)n);
@@ -869,8 +895,17 @@ static int cuda_step(cuda_engine *e, const asr_step_req *reqs, int n, asr_step_o
         for (int st = 0; st < GPU_SS_STAGES; st++) P[st] += to[st] * e->dm.Fo[st];
     }
     if (run_pass(e, lanes, reqs, outs) != 0) return -1;
+    const double t_end = now_s();
+    if (e->hprof) {
+        /* whatever the step spent outside the timed phases (lane selection,
+         * the mel tail on finalize, pass splitting) is pass building: the
+         * eight phases then sum to the step wall exactly */
+        double hp_out = 0.0;
+        for (int k = 0; k < ASR_HPROF_PHASES; k++) hp_out += e->st.hprof_us[k];
+        e->st.hprof_us[ASR_HP_PASS_BUILD] += (t_end - t0) * 1e6 - (hp_out - hp_in);
+    }
     e->st.steps++;
-    e->st.step_wall_ms_sum += (now_s() - t0) * 1e3;
+    e->st.step_wall_ms_sum += (t_end - t0) * 1e3;
     return 0;
 }
 
