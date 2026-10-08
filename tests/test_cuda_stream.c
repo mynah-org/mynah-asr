@@ -13,9 +13,11 @@
  *      printed with both texts and exits 3 -- a finding to look at, never a
  *      silent pass and never a silent fail.
  *
- * usage: tests/test_cuda_stream <model_dir> [--gemm own|cublas] [clip.wav ...]
+ * usage: tests/test_cuda_stream <model_dir> [--gemm own|splitk|own-tc|cublas]
+ *            [--precision f32|bf16] [clip.wav ...]
  *        (default clips: tests/audio/test_*.wav; the GEMM arm is an argument,
- *        not an environment flag, so the flag registry stays the library's)
+ *        not an environment flag, so the flag registry stays the library's;
+ *        bf16 goes with own-tc, and gate B then measures a numerical change)
  * exit 0 = both gates pass; 1 = gate A failed or a device error; 3 = gate A
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -91,10 +93,11 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     const char *dflt[] = {"tests/audio/test_it.wav", "tests/audio/test_en.wav", "tests/audio/test_de.wav",
                           "tests/audio/test_fr.wav", "tests/audio/test_es.wav"};
-    const char *clips[MAXC], *gemm = "own";
+    const char *clips[MAXC], *gemm = "own", *precision = "f32";
     int n = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) gemm = argv[++i];
+        else if (strcmp(argv[i], "--precision") == 0 && i + 1 < argc) precision = argv[++i];
         else if (n < MAXC) clips[n++] = argv[i];
     }
     if (n == 0) for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
@@ -109,14 +112,14 @@ int main(int argc, char **argv) {
     }
 
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = gemm};
+    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = precision, .gemm = gemm};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) {
         if (strstr(err, "no CUDA device") || strstr(err, "not compiled")) { printf("SKIP test_cuda_stream: %s\n", err); return 77; }
         printf("FAIL open: %s\n", err); return 1;
     }
     asr_engine_facts f; asr_engine_get_facts(e, &f);
-    printf("test_cuda_stream on %s, gemm=%s, %d clip(s)\n", f.device, f.gemm, n);
+    printf("test_cuda_stream on %s, precision=%s gemm=%s, %d clip(s)\n", f.device, f.precision, f.gemm, n);
 
     /* ---- gate A: each clip alone, then all together (mixed lanes) */
     utt alone[MAXC] = {{0}}, together[MAXC] = {{0}};
@@ -132,6 +135,18 @@ int main(int argc, char **argv) {
         if (!same) fail = 1;
         printf("%s A batch-identity %-28s %s\n", same ? "OK  " : "FAIL", clips[i], same ? "identical" : "DIFFERS");
         if (!same) printf("       alone   : %s\n       cohort  : %s\n", a, b);
+    }
+    /* the same cohort again: a run is deterministic */
+    {
+        utt again[MAXC] = {{0}};
+        if (run_cohort(e, pcm, ns, n, langs, again) != 0) return 1;
+        for (int i = 0; i < n; i++) {
+            const char *a = together[i].text ? together[i].text : "", *b = again[i].text ? again[i].text : "";
+            const int same = strcmp(a, b) == 0;
+            if (!same) fail = 1;
+            printf("%s A repeat %-36s %s\n", same ? "OK  " : "FAIL", clips[i], same ? "identical on a second run" : "DIFFERS");
+            free(again[i].text);
+        }
     }
     /* poisoned idle lanes: the same cohort with the clips shifted by one slot */
     {

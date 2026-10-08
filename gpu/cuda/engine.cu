@@ -27,6 +27,7 @@ extern "C" {
 #include <time.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 /* ------------------------------------------------------------------ types */
@@ -88,6 +89,12 @@ struct cuda_engine {
     int gemm_splitk = 0; /* --gemm splitk: S14-8b, row-stable by construction, NOT bit-identical to v1 */
     float *sk_ws = nullptr;
     size_t sk_ws_floats = 0;
+    /* --precision bf16 --gemm own-tc: a resident bf16 copy of every GEMM weight,
+     * keyed by its f32 device pointer (the call sites stay as they are) */
+    int gemm_tc = 0;
+    std::unordered_map<const float *, const unsigned short *> w16;
+    float *tc_ws = nullptr;
+    size_t tc_ws_floats = 0;
     std::vector<slot_host> slots;
     std::vector<int> pending_resets;
     asr_engine_stats st = {};
@@ -194,6 +201,16 @@ __global__ void bias_act_kernel(float *__restrict__ C, int ldc, const float *__r
 static int gemm(cuda_engine *e, const float *A, int lda, const float *W, const float *bias,
                 float *C, int ldc, int M, int N, int K, int accumulate, int act) {
     if (M <= 0) return 0;
+    if (e->gemm_tc) {
+        auto it = e->w16.find(W);
+        if (it == e->w16.end()) {
+            snprintf(e->err, sizeof(e->err), "own-tc: a GEMM weight has no bf16 copy (N=%d K=%d)", N, K);
+            e->dead = 1; e->st.errors++;
+            return -1;
+        }
+        CK(e, "gemm tc", k_gemm_wt_tc(A, lda, it->second, bias, C, ldc, M, N, K, accumulate, act, e->tc_ws, e->tc_ws_floats, e->stream));
+        return 0;
+    }
     if (!e->use_cublas) {
         if (e->gemm_splitk) CK(e, "gemm", k_gemm_wt_splitk(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->sk_ws, e->sk_ws_floats, e->stream));
         else if (e->gemm_v2) CK(e, "gemm", k_gemm_wt_v2(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->stream));
@@ -279,7 +296,7 @@ static int alloc_scratch(cuda_engine *e) {
     DM(e->xin, B * H, "xin"); DM(e->xnext, B * H, "xnext"); DM(e->hrows, B * H, "hrows");
     DM(e->gtmp, B * H, "gtmp");
 #undef DM
-    if (e->gemm_splitk) {
+    if (e->gemm_splitk || e->gemm_tc) {
         /* every (M bound, N, K) the pass issues; the largest S*M*N wins */
         const int R_ = e->Rmax, B_ = e->Bmax, P1 = e->Pmax[1], P2 = e->Pmax[2];
         const int CF_ = dm.C * dm.Fo[GPU_SS_STAGES - 1];
@@ -287,10 +304,16 @@ static int alloc_scratch(cuda_engine *e) {
                               {R_, dm.d, dm.d}, {R_, 2 * dm.d, dm.d}, {R_, dm.inter, dm.d + dm.np}, {R_, dm.d, dm.inter},
                               {R_, dm.dout, dm.d}, {B_, dm.V, dm.Hdec}, {B_, 4 * dm.Hdec, dm.Hdec}, {B_, dm.Hdec, dm.Hdec}};
         for (size_t i = 0; i < sizeof(shp) / sizeof(shp[0]); i++) {
-            const size_t f = k_gemm_splitk_workspace_floats(shp[i][0], shp[i][1], shp[i][2]);
-            if (f > e->sk_ws_floats) e->sk_ws_floats = f;
+            if (e->gemm_tc) {
+                const size_t f = k_gemm_tc_workspace_floats(shp[i][0], shp[i][1], shp[i][2]);
+                if (f > e->tc_ws_floats) e->tc_ws_floats = f;
+            } else {
+                const size_t f = k_gemm_splitk_workspace_floats(shp[i][0], shp[i][1], shp[i][2]);
+                if (f > e->sk_ws_floats) e->sk_ws_floats = f;
+            }
         }
         if (e->sk_ws_floats && dmalloc(e, (void **)&e->sk_ws, e->sk_ws_floats * sizeof(float), acct, "split-K workspace") != 0) return -1;
+        if (e->tc_ws_floats && dmalloc(e, (void **)&e->tc_ws, e->tc_ws_floats * sizeof(float), acct, "own-tc split workspace") != 0) return -1;
     }
     if (dmalloc(e, (void **)&e->d_rows, B * sizeof(gpu_row), acct, "rows") != 0) return -1;
     if (dmalloc(e, (void **)&e->d_active, B * sizeof(int), acct, "active") != 0) return -1;
@@ -408,6 +431,40 @@ static int upload_weights(cuda_engine *e) {
     return 0;
 }
 
+/* own-tc: the bf16 copy of one GEMM weight [N, K], converted on the device
+ * (round to nearest even) from the f32 upload; the f32 copy stays resident */
+static int tc_weight(cuda_engine *e, const float *W, size_t n) {
+    if (!W || e->w16.count(W)) return 0;
+    void *d = nullptr;
+    if (dmalloc(e, &d, n * sizeof(unsigned short), &e->vram_weights, "bf16 weight") != 0) return -1;
+    CK(e, "bf16 weight", k_f32_to_bf16(W, (unsigned short *)d, n, e->stream));
+    e->w16[W] = (const unsigned short *)d;
+    return 0;
+}
+
+static int tc_weights(cuda_engine *e) {
+    const gpu_model_dims &dm = e->dm;
+    const size_t d = (size_t)dm.d, ffn = (size_t)dm.ffn, C = (size_t)dm.C, H = (size_t)dm.Hdec;
+    for (const gpu_layer_w &L : e->L) {
+        if (tc_weight(e, L.ff1_w1, ffn * d) || tc_weight(e, L.ff1_w2, d * ffn) ||
+            tc_weight(e, L.q_w, d * d) || tc_weight(e, L.k_w, d * d) || tc_weight(e, L.v_w, d * d) ||
+            tc_weight(e, L.o_w, d * d) || tc_weight(e, L.pw1_w, 2 * d * d) || tc_weight(e, L.pw2_w, d * d) ||
+            tc_weight(e, L.ff2_w1, ffn * d) || tc_weight(e, L.ff2_w2, d * ffn))
+            return -1;
+    }
+    for (int i = 0; i < 2; i++)
+        if (tc_weight(e, e->d_ss_pw_w[i], C * C)) return -1;
+    if (tc_weight(e, e->d_ss_lin_w, d * C * (size_t)dm.Fo[GPU_SS_STAGES - 1]) ||
+        tc_weight(e, e->d_pl1_w, (size_t)dm.inter * (size_t)(dm.d + dm.np)) ||
+        tc_weight(e, e->d_pl2_w, d * (size_t)dm.inter) || tc_weight(e, e->d_ep_w, (size_t)dm.dout * d) ||
+        tc_weight(e, e->d_proj_w, H * H) || tc_weight(e, e->d_head_w, (size_t)dm.V * H))
+        return -1;
+    for (int l = 0; l < dm.pred_layers; l++)
+        if (tc_weight(e, e->d_wih[l], 4 * H * H) || tc_weight(e, e->d_whh[l], 4 * H * H)) return -1;
+    CK(e, "bf16 weights", cudaStreamSynchronize(e->stream));
+    return 0;
+}
+
 static const asr_engine_ops *cuda_ops(void);
 static void cuda_close(cuda_engine *e);
 
@@ -416,16 +473,25 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     e->base.ops = cuda_ops();
     e->cfg = *cfg;
     e->cap = cfg->cap > 0 ? cfg->cap : 1;
-    if (cfg->precision && strcmp(cfg->precision, "f32") != 0) {
-        snprintf(err, errcap, "precision '%s' is not implemented yet (S14-8); f32 only", cfg->precision);
+    /* bf16 exists only as the own-tc arm, and own-tc only in bf16: one flag
+     * never silently changes what the other means */
+    const int want_bf16 = cfg->precision && strcmp(cfg->precision, "bf16") == 0;
+    e->gemm_tc = cfg->gemm && strcmp(cfg->gemm, "own-tc") == 0;
+    if (cfg->precision && strcmp(cfg->precision, "f32") != 0 && !want_bf16) {
+        snprintf(err, errcap, "precision '%s' is not one of f32, bf16", cfg->precision);
+        delete e; return nullptr;
+    }
+    if (want_bf16 != e->gemm_tc) {
+        snprintf(err, errcap, "--precision bf16 goes with --gemm own-tc and only with it (got precision=%s gemm=%s)",
+                 cfg->precision ? cfg->precision : "f32", cfg->gemm ? cfg->gemm : "own");
         delete e; return nullptr;
     }
     e->use_cublas = cfg->gemm && strcmp(cfg->gemm, "cublas") == 0;
     e->gemm_v2 = cfg->gemm && strcmp(cfg->gemm, "own-v2") == 0;
     e->gemm_splitk = cfg->gemm && strcmp(cfg->gemm, "splitk") == 0;
     e->prof = cfg->profile ? 1 : 0;
-    if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v2") != 0 && strcmp(cfg->gemm, "splitk") != 0) {
-        snprintf(err, errcap, "gemm '%s' is not one of own, own-v2, splitk, cublas", cfg->gemm);
+    if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v2") != 0 && strcmp(cfg->gemm, "splitk") != 0 && !e->gemm_tc) {
+        snprintf(err, errcap, "gemm '%s' is not one of own, own-v2, splitk, own-tc, cublas", cfg->gemm);
         delete e; return nullptr;
     }
     int ndev = 0;
@@ -444,8 +510,12 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         delete e; return nullptr;
     }
     e->device = cfg->device;
-    cudaDeviceProp prop;
+    cudaDeviceProp prop = {};
     if (cudaGetDeviceProperties(&prop, cfg->device) == cudaSuccess) e->devname = prop.name;
+    if (e->gemm_tc && prop.major < 8) {
+        snprintf(err, errcap, "--gemm own-tc needs bf16 tensor cores (sm_80+); %s is sm_%d%d", prop.name, prop.major, prop.minor);
+        cuda_close(e); return nullptr;
+    }
     if (e->prof)
         for (int i = 0; i < cuda_engine::EV_MAX; i++)
             if (cudaEventCreate(&e->ev[i]) != cudaSuccess) { snprintf(err, errcap, "cudaEventCreate failed"); delete e; return nullptr; }
@@ -487,7 +557,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     size_t freeb = 0, totb = 0;
     cudaMemGetInfo(&freeb, &totb);
     e->vram_total = totb;
-    if (upload_weights(e) != 0 || alloc_arena(e) != 0 || alloc_scratch(e) != 0) {
+    if (upload_weights(e) != 0 || (e->gemm_tc && tc_weights(e) != 0) || alloc_arena(e) != 0 || alloc_scratch(e) != 0) {
         snprintf(err, errcap, "%s", e->err[0] ? e->err : "device allocation failed");
         cuda_close(e); return nullptr;
     }
@@ -529,8 +599,8 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
     memset(f, 0, sizeof(*f));
     f->name = "cuda";
     f->device = e->devname.c_str();
-    f->precision = "f32";
-    f->gemm = e->use_cublas ? "cublas-pedantic (measured NOT row-stable)" : e->gemm_splitk ? "own-splitk-rowstable" : e->gemm_v2 ? "own-rowstable-v2" : "own-rowstable-v1";
+    f->precision = e->gemm_tc ? "bf16" : "f32";
+    f->gemm = e->use_cublas ? "cublas-pedantic (measured NOT row-stable)" : e->gemm_tc ? "own-tc-bf16-rowstable" : e->gemm_splitk ? "own-splitk-rowstable" : e->gemm_v2 ? "own-rowstable-v2" : "own-rowstable-v1";
     f->model_name = e->pack.name;
     f->cap = e->cap; f->qmax = e->pack.qmax;
     f->n_lookaheads = e->pack.n_lookaheads;
@@ -551,7 +621,7 @@ static int cuda_dead(const cuda_engine *e) { return e->dead; }
 static const char *cuda_error(const cuda_engine *e) { return e->err; }
 
 static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
-    const char *g = e->use_cublas ? "cublas-sgemm-pedantic" : e->gemm_splitk ? "own-splitk-rowstable" : e->gemm_v2 ? "own-rowstable-v2" : "own-rowstable-v1";
+    const char *g = e->use_cublas ? "cublas-sgemm-pedantic" : e->gemm_tc ? "own-tc-bf16" : e->gemm_splitk ? "own-splitk-rowstable" : e->gemm_v2 ? "own-rowstable-v2" : "own-rowstable-v1";
     return (size_t)snprintf(buf, cap,
         "engine            cuda           %s\n"
         "gemm              %-14s row-stable-by-construction=%s%s\n"
@@ -561,10 +631,14 @@ static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
         "conv              own            glu + causal depthwise k=%d, cached\n"
         "decoder           own            label loop, first-index argmax, lstm x%d\n"
         "mel               host           src/features.c (double fft), phase 1\n"
-        "precision         f32            weights f32 resident, no tf32\n"
+        "precision         %-14s %s\n"
         "graphs            off            phase 1\n",
         e->devname.c_str(), g, e->use_cublas ? "NO(measured)" : "yes",
-        e->gemm_splitk ? " splits=f(N,K) fixed-order reduction, NOT bit-identical to v1" : "", e->dm.conv_k, e->dm.pred_layers);
+        e->gemm_tc ? " splits=f(N,K) only (not the SM count), fixed-order reduction, wmma bf16 x bf16 -> f32"
+                   : e->gemm_splitk ? " splits=f(N,K) fixed-order reduction, NOT bit-identical to v1" : "",
+        e->dm.conv_k, e->dm.pred_layers, e->gemm_tc ? "bf16" : "f32",
+        e->gemm_tc ? "gemm weights bf16 resident (+ f32 copy), activations rounded to bf16, f32 accumulate; rest f32"
+                   : "weights f32 resident, no tf32");
 }
 
 /* ----------------------------------------------------------------- slots */

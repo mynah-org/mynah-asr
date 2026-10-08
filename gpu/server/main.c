@@ -1157,7 +1157,7 @@ static void usage(void) {
         "usage: mynah-asr-server-cuda -m <model_dir> [-p PORT] [--host H] [--engine cuda|cpu]\n"
         "       [--device N] [--cap N] [--cohort-ms MS] [--http-threads N] [--idle-ms MS]\n"
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
-        "       [--ring-seconds 30] [--gemm own|cublas] [--precision f32] [--engine-threads N (cpu engine pool)]\n"
+        "       [--ring-seconds 30] [--gemm own|own-v2|splitk|own-tc|cublas] [--precision f32|bf16 (bf16 = own-tc only)] [--engine-threads N (cpu engine pool)]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
