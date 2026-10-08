@@ -49,6 +49,12 @@ typedef struct {
     int threads;             /* cpu: pool threads for the reference engine */
     int profile;             /* cuda: 1 = per-stage CUDA-event timing (S14-6b);
                                 off by default, a DIAGNOSTIC arm, never a headline */
+    int profile_host;        /* cuda: 1 = host wall per phase inside a step
+                                (--profile-host); off = no clock read at all */
+    int pass_lanes;          /* cuda: lanes per encoder pass (the scratch
+                                budget); 0 = the default min(cap, 128). A
+                                cohort above it runs as several passes; a row's
+                                result never depends on it (contract 4) */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */
@@ -80,6 +86,8 @@ typedef struct {
     double frame_sec;        /* one encoder frame, seconds */
     size_t vram_total, vram_used, vram_arena, vram_weights;  /* bytes; 0 on cpu */
     int graphs;              /* CUDA graphs in use (S14-8), 0 in phase 1 */
+    int pass_lanes;          /* lanes per encoder pass as resolved; 0 on cpu */
+    const char *pci_bus_id;  /* the GPU's PCI bus id ("0000:01:00.0"); NULL on cpu */
 } asr_engine_facts;
 
 /* Per-step counters the engine keeps, for the SIGUSR1 dump and /metrics. */
@@ -98,7 +106,28 @@ typedef struct {
     double prof_ms[ASR_PROF_STAGES];
     unsigned long prof_passes;
     double host_mel_ms;              /* wall in slot_feed (streaming mel), total */
+    /* --profile-host: host wall inside asr_engine_step per phase, microseconds,
+     * summed (ASR_HPROF_NAME). The *_wait phases are the engine thread blocked
+     * on the device (cudaStreamSynchronize); the others are host work. All
+     * zero when the profile is off, and always on the cpu engine. */
+#define ASR_HPROF_PHASES 8
+    double hprof_us[ASR_HPROF_PHASES];
+    unsigned long hprof_passes;      /* encoder passes timed */
+    unsigned long hprof_syncs;       /* device syncs waited on, total */
 } asr_engine_stats;
+
+/* reset: pending slot resets enqueued; pass_build: lane selection,
+ * descriptors and the packed mel into pinned memory (everything in the step
+ * outside the other phases, so the phases sum to the step wall); enqueue: H2D
+ * + subsampling + 24 layers + projector launched (host time to queue them, not
+ * device time); enc_wait: the label loop's first sync, i.e. the engine thread
+ * blocked until the encoder pass is done; dec_launch: the label loop's
+ * launches; dec_wait: its later per-iteration syncs; final_wait: the last sync
+ * of a pass (D2H of tokens/meta); detok: detokenise + consume the chunk. */
+static const char *const ASR_HPROF_NAME[ASR_HPROF_PHASES] = {
+    "reset", "pass_build", "enqueue", "enc_wait", "dec_launch", "dec_wait", "final_wait", "detok"};
+enum { ASR_HP_RESET = 0, ASR_HP_PASS_BUILD, ASR_HP_ENQUEUE, ASR_HP_ENC_WAIT, ASR_HP_DEC_LAUNCH,
+       ASR_HP_DEC_WAIT, ASR_HP_FINAL_WAIT, ASR_HP_DETOK };
 
 /* names of the stage slots, in order */
 static const char *const ASR_PROF_NAME[ASR_PROF_STAGES] = {

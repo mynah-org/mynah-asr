@@ -49,6 +49,56 @@ counters; `SIGUSR1` prints the `[DUMP]` lines `tools/bench/v2_verdict.py` reads.
 `tools/bench/v2_qualify.sh`, `tests/ws_probe.py` and `tests/fault_probe.py`
 run against it unchanged.
 
+At start the server raises its open-file soft limit to the hard one and says
+what it got (each stream holds two descriptors); when `accept()` still runs
+out of descriptors or kernel memory it logs once a second, counts
+`accept_backoffs` (`/v1/health`, `/metrics`, `[DUMP] ... vram`) and backs off
+20 ms instead of spinning. The banner also carries `pass_lanes` (the lanes
+one encoder pass holds, `--pass-lanes N|cap`, default min(cap, 128), at most
+1024; a larger cohort runs as several passes, which never changes a row's
+result: `tests/test_cuda_stream <pack> --pass-lanes 2` gates the split path), `vram_used_at_ready_mb` (device-wide) and a
+`[TOPOLOGY]` line (CPU model, usable CPUs, affinity, cgroup quota, NUMA nodes,
+the GPU's PCI id and NUMA node, the open-file limit).
+
+### Where the engine thread's time goes: `--profile-host` (DIAGNOSTIC)
+
+```
+./mynah-asr-server-cuda -m ... --profile-host      # then SIGUSR1, or stop it
+```
+
+Every segment of the engine loop is charged to one phase, so the phases sum
+to the thread's wall: `scan`, `stage_copy`, `mel`, `idle`, `cohort_wait`,
+`step`, `publish`; and inside the step the engine's own phases `reset`,
+`pass_build`, `enqueue` (host time to queue H2D + encoder + projector),
+`enc_wait` (blocked until the encoder pass is done), `dec_launch`, `dec_wait`,
+`final_wait`, `detok`. Each `[DUMP]` (SIGUSR1, shutdown) is followed by
+cumulative `[HOSTP] seq=N` lines: the host / device-wait / cohort-wait / idle
+split, per phase total, us per cycle, us per lane and share of wall, the tail
+of the cycle and host-busy times, and the engine thread's rusage. `/v1/health`
+(`engine.host_profile_us`) and `/metrics` (`mynah_asr_gpu_hostp_us_total`)
+carry the same totals. Off (the default) the loop reads no extra clock. A run
+with the profile on is DIAGNOSTIC, never a latency headline.
+
+`gpu/tools/hostp_level.py server.log --from 1 --to 2` turns two dumps into one
+level's profile.
+
+### Bench hygiene
+
+- `gpu/tools/topology.sh [--server-cpus L] [--gen-cpus L]`: the `[TOPOLOGY]`
+  line of a run (GPU, driver, the GPU's NUMA node, CPU, usable CPUs incl. the
+  cgroup quota, governor, loadavg, the NUMA nodes of the pinned sets) and a
+  WARNING when server and generator share CPUs or the server is off the GPU's
+  node.
+- `gpu/tools/gpu_sample.py run|summary`: nvidia-smi samples during a level
+  (SM %, power, temperature, SM clock, throttle reasons, VRAM) and one `[GPU]`
+  summary line per level.
+- `gpu/tools/gpu_knee.sh`: a WAVE-class screen over a few levels, fresh server
+  per level, with `PIN`/`CLIPIN` (taskset for server / load generator),
+  `SRV_ARGS` (e.g. `--profile-host`), and per level the client latency line,
+  the `[GPU]` line, the server's VRAM and the `[HOSTP-LEVEL]` profile of the
+  measured window. `gpu_qualify.sh` records the same topology and `[GPU]`
+  lines and takes `--server-cpus` / `--gen-cpus`.
+
 ## Status
 
 See the board (`PLAN.md` S14) and the note's Evidence section. Until S14-6 runs
