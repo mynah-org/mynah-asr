@@ -416,14 +416,15 @@ __global__ void gemm_reduce_kernel(const float *__restrict__ P, int S, int M, in
     crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
 }
 
-/* S from the weight's shape only: enough (N-tile x split) blocks to give the
- * card two waves when the cohort is one M-tile, each split at least 256 deep
- * and a multiple of 16. The table is a pure function of (N, K, SM count); the
- * SM count is fixed for the life of the process. */
+/* S from the weight's shape only: enough (N-tile x split) blocks to give an
+ * L4 (58 SMs) two waves when the cohort is one M-tile, each split at least 256
+ * deep and a multiple of 16. S14-11: S used to read the SM count of the card
+ * it ran on, so a transcript could differ between GPU classes; the count is
+ * now the constant the split was tuned and qualified with, which gives the
+ * same S -- the same bits -- on the L4 as before and on every other card. */
+#define SPLITK_REF_SMS 58
 int k_gemm_splits(int N, int K) {
-    int sms = 0, dev = 0;
-    cudaGetDevice(&dev);
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0) sms = 40;
+    const int sms = SPLITK_REF_SMS;
     const int ntiles = (N + GEMM_BN - 1) / GEMM_BN;
     int S = (2 * sms + ntiles - 1) / ntiles;
     const int smax = K / 256;
