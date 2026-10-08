@@ -1,0 +1,943 @@
+{
+ "title": "mynah-asr",
+ "uid": "mynah-asr",
+ "schemaVersion": 39,
+ "version": 1,
+ "editable": true,
+ "tags": [
+  "mynah",
+  "asr"
+ ],
+ "time": {
+  "from": "now-1h",
+  "to": "now"
+ },
+ "refresh": "10s",
+ "timezone": "",
+ "panels": [
+  {
+   "type": "row",
+   "title": "Are requests being served?",
+   "id": 1,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Audio served (s of audio per s)",
+   "description": "rate(audio_seconds_total): concurrent real-time streams sustained. The throughput unit.",
+   "id": 2,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_fleet_audio_seconds_total[1m])",
+     "legendFormat": "cpu fleet",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_audio_seconds_total{worker=\"gpu\"}[1m])",
+     "legendFormat": "gpu",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Sessions completed / s",
+   "description": "",
+   "id": 3,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 1
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_fleet_sessions_completed_total[1m])",
+     "legendFormat": "cpu fleet",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_sessions_completed_total{worker=\"gpu\"}[1m])",
+     "legendFormat": "gpu",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "REST jobs / s",
+   "description": "Offline requests run, and dropped because the client had left before they ran.",
+   "id": 4,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 1
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_fleet_offline_jobs_total[1m])",
+     "legendFormat": "run",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_fleet_offline_peer_gone_total[1m])",
+     "legendFormat": "dropped: client gone",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "row",
+   "title": "Is the service near saturation?",
+   "id": 5,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 9
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Slots in use",
+   "description": "active / slots. At 1.0 the next stream is refused (503).",
+   "id": 6,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_sessions_active / mynah_asr_fleet_slots",
+     "legendFormat": "cpu fleet",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_sessions_active{worker=\"gpu\"}",
+     "legendFormat": "gpu (active)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Model duty per worker",
+   "description": "rate(model_busy) / workers_up: the fraction of time the model runs.",
+   "id": 7,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_fleet_model_busy_seconds_total[1m]) / mynah_asr_fleet_workers_up",
+     "legendFormat": "cpu",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Refusals by code",
+   "description": "",
+   "id": 8,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "sum by (code) (rate(mynah_asr_refused_total[5m]))",
+     "legendFormat": "{{code}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "row",
+   "title": "Is latency or backlog deteriorating?",
+   "id": 9,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 18
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Emission lag p50 / p95",
+   "description": "Quantiles for the eye; the alerts count deltas over 320 ms exactly.",
+   "id": 10,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 19
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(mynah_asr_fleet_emission_lag_seconds_bucket[5m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(mynah_asr_fleet_emission_lag_seconds_bucket[5m])))",
+     "legendFormat": "p95",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_emission_lag_ms_sum{worker=\"gpu\"}[5m]) / rate(mynah_asr_emission_lag_ms_count{worker=\"gpu\"}[5m]) / 1000",
+     "legendFormat": "gpu mean",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Deltas 320 ms late or worse (exact)",
+   "description": "1 - bucket{le=0.32}/count: counted, not interpolated.",
+   "id": 11,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 19
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "1 - rate(mynah_asr_fleet_emission_lag_seconds_bucket{le=\"0.32\"}[5m]) / rate(mynah_asr_fleet_emission_lag_seconds_count[5m])",
+     "legendFormat": "fraction",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Finalization and first text p95",
+   "description": "finalization: last sample in to done. first text: first audio in to first text out (includes the silence before the first word).",
+   "id": 12,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 19
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(mynah_asr_fleet_finalization_seconds_bucket[5m])))",
+     "legendFormat": "finalization p95",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(mynah_asr_fleet_first_text_seconds_bucket[5m])))",
+     "legendFormat": "first text p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Backlog",
+   "description": "Audio received and not yet encoded: total, and the worst single stream (qualification bound 0.64 s).",
+   "id": 13,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 27
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_backlog_seconds",
+     "legendFormat": "total",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_backlog_max_seconds",
+     "legendFormat": "worst stream",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Session duration p50 / p95",
+   "description": "",
+   "id": 14,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 27
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(mynah_asr_fleet_session_seconds_bucket[5m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(mynah_asr_fleet_session_seconds_bucket[5m])))",
+     "legendFormat": "p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "row",
+   "title": "Are clients leaving, and does the server stop for them?",
+   "id": 15,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 35
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Sessions cancelled by reason",
+   "description": "peer_gone = the client disconnected; the model stops at the next step.",
+   "id": 16,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 36
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "sum by (reason) (rate(mynah_asr_fleet_sessions_cancelled_total[5m]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "sum by (reason) (rate(mynah_asr_cancelled_total{worker=\"gpu\"}[5m]))",
+     "legendFormat": "gpu {{reason}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "stat",
+   "title": "Abandoned slots not yet recovered",
+   "description": "Must return to 0: anything else is capacity leaking.",
+   "id": 17,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 36
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_slots_abandoned_total - mynah_asr_fleet_slots_abandoned_recovered_total",
+     "legendFormat": "outstanding",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "row",
+   "title": "Integrity",
+   "id": 18,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 44
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Books balanced",
+   "description": "sessions = completed + cancelled + aborted + active, in every snapshot.",
+   "id": 19,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 45
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_books_balanced",
+     "legendFormat": "cpu",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_sessions_balanced{worker=\"gpu\"}",
+     "legendFormat": "gpu",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "stat",
+   "title": "Workers up / configured",
+   "description": "",
+   "id": 20,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 45
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_workers_up",
+     "legendFormat": "up",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_workers",
+     "legendFormat": "configured",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "stat",
+   "title": "Sessions lost with a worker (1 h)",
+   "description": "",
+   "id": 21,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 45
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "increase(mynah_asr_fleet_sessions_lost_total[1h])",
+     "legendFormat": "lost",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "stat",
+   "title": "Snapshot age",
+   "description": "How stale the summed fleet series are (publish period 250 ms).",
+   "id": 22,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 45
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "mynah_asr_fleet_snapshot_age_seconds",
+     "legendFormat": "age",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "row",
+   "title": "GPU server",
+   "id": 23,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 53
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Mean cohort width",
+   "description": "lanes per batched pass",
+   "id": 24,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 54
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_gpu_cohort_lanes_sum[1m]) / rate(mynah_asr_gpu_cohorts_total[1m])",
+     "legendFormat": "lanes",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "timeseries",
+   "title": "Step wall time per cohort",
+   "description": "",
+   "id": 25,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 54
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "rate(mynah_asr_gpu_step_wall_ms_sum[1m]) / rate(mynah_asr_gpu_cohorts_total[1m]) / 1000",
+     "legendFormat": "s",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "type": "stat",
+   "title": "Device errors",
+   "description": "Any is fatal: the engine marks itself dead and the server exits 70.",
+   "id": 26,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "mynah-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 54
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "mynah-prometheus"
+     },
+     "expr": "increase(mynah_asr_gpu_device_errors_total[5m])",
+     "legendFormat": "errors",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  }
+ ],
+ "templating": {
+  "list": []
+ },
+ "annotations": {
+  "list": []
+ }
+}

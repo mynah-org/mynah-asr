@@ -145,6 +145,8 @@ void mynah_asr_fleet_collect(mynah_asr_fleet_stats *o) {
     o->steps = st.steps;
     o->deltas = st.deltas;
     o->audio_seconds = st.audio_seconds;
+    o->offline_done = st.offline_done;
+    o->offline_peer_gone = st.offline_peer_gone;
     o->model_busy_s = st.w_model + st.w_model_solo;
     o->uptime_s = st.uptime_s > 0.0 ? st.uptime_s : 0.0;
     /* The 8 ms lag histogram folded onto the fleet edges. Bucket i holds lags
@@ -226,6 +228,8 @@ void mynah_asr_fleet_add(mynah_asr_fleet_stats *a, const mynah_asr_fleet_stats *
     a->steps += b->steps;
     a->deltas += b->deltas;
     a->audio_seconds += b->audio_seconds;
+    a->offline_done += b->offline_done;
+    a->offline_peer_gone += b->offline_peer_gone;
     a->model_busy_s += b->model_busy_s;
     for (int i = 0; i <= MYNAH_ASR_FLEET_MS_EDGES; i++) {
         a->lag[i] += b->lag[i];
@@ -380,6 +384,12 @@ void mynah_asr_fleet_render(mynah_asr_metrics_buf *b, const mynah_asr_fleet_stat
         "# TYPE mynah_asr_fleet_steps_total counter\nmynah_asr_fleet_steps_total %lu\n"
         "# HELP mynah_asr_fleet_deltas_total transcript deltas sent.\n"
         "# TYPE mynah_asr_fleet_deltas_total counter\nmynah_asr_fleet_deltas_total %lu\n"
+        "# HELP mynah_asr_fleet_offline_jobs_total REST jobs run through the model.\n"
+        "# TYPE mynah_asr_fleet_offline_jobs_total counter\nmynah_asr_fleet_offline_jobs_total %lu\n"
+        "# HELP mynah_asr_fleet_offline_peer_gone_total REST jobs dropped before inference:\n"
+        "# the client had left while the request waited.\n"
+        "# TYPE mynah_asr_fleet_offline_peer_gone_total counter\n"
+        "mynah_asr_fleet_offline_peer_gone_total %lu\n"
         "# HELP mynah_asr_fleet_backlog_seconds audio queued in the rings, not yet fed.\n"
         "# TYPE mynah_asr_fleet_backlog_seconds gauge\n"
         "mynah_asr_fleet_backlog_seconds %.3f\n"
@@ -387,6 +397,7 @@ void mynah_asr_fleet_render(mynah_asr_metrics_buf *b, const mynah_asr_fleet_stat
         "# TYPE mynah_asr_fleet_backlog_max_seconds gauge\n"
         "mynah_asr_fleet_backlog_max_seconds %.3f\n",
         s->audio_seconds, s->model_busy_s, s->steps, s->deltas,
+        s->offline_done, s->offline_peer_gone,
         s->backlog_s_sum, s->backlog_s_max);
     render_hist(b, "mynah_asr_fleet_emission_lag_seconds",
                 "delta emission lag: arrival of the last sample it covers to the frame.",

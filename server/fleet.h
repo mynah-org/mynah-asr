@@ -62,6 +62,7 @@ typedef struct {
     unsigned long unbalanced_snapshots;   /* books read unbalanced: a bug if > 0 */
     int active, cap, active_peak, balanced;
     unsigned long steps, deltas;
+    unsigned long offline_done, offline_peer_gone;   /* REST jobs run / dropped: client gone */
     double audio_seconds;
     double model_busy_s;                  /* the model running, batched or solo */
     double uptime_s;
