@@ -378,8 +378,11 @@ FACT (zombies found, fixed):
 - WebSocket, both servers: close frame or `finalize`, then close() and silence.
   The FIN is a legal half-close for a finalizing stream and silence writes
   nothing, so nothing ever bounced: the whole ring (<= 30 s) and the tail ran for
-  nobody. Now the ingest pings at once and every 500 ms while it waits for
-  `done`; a closed peer answers with a reset and the hard-hangup probe cancels.
+  nobody. Now the ingest sends an unsolicited pong (RFC 6455 5.5.3, no reply
+  expected) at once and every 500 ms while it waits for `done`; a closed peer
+  answers with a reset and the hard-hangup probe cancels. A first version sent
+  a PING: CI's half-close-ok caught it -- a client that legally half-closed
+  tries to pong back and fails on its own closed write side.
 - GPU server: after the 60 s + 5 s wait the ingest released the slot and its
   writer while the engine thread could still use them. Now the slot is marked
   abandoned under its mutex and `end_session` releases it (as the CPU server's

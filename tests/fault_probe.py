@@ -23,7 +23,7 @@ Cases (run by `suite`, in this order; each can also be run alone):
   close-then-rst-silent  the same with silence: only a hard-hangup check made
                    WHILE the tail is flushed can stop it
   close-then-fin-silent  close frame, then close() (FIN) and silence: no hard
-                   hangup and nothing written -- only the server's ping while it
+                   hangup and nothing written -- only the server's pong while it
                    waits for `done` draws the reset that stops the tail
   finalize-then-fin-silent  the same with a `finalize` text frame
   rst-unacked      RST with data still unsent: the server's kernel refuses it and

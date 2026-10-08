@@ -303,7 +303,7 @@ by `tests/test_server_faults.sh`):
 | sends `finalize`, then half-closes (FIN) | the same: a FIN after `finalize` is legal | `completed` |
 | disconnects with no close frame (FIN or RST) mid-utterance | **cancels**: no tail, no `done`; the model stops at the next step | `peer_gone` |
 | sends a close frame, then resets the connection | cancels the tail it asked for | `peer_gone` |
-| sends a close frame or `finalize`, then closes its socket (FIN) and is gone | cancels the tail once the server's ping draws the reset (one round trip) | `peer_gone` |
+| sends a close frame or `finalize`, then closes its socket (FIN) and is gone | cancels the tail once the server's unsolicited pong draws the reset (one round trip) | `peer_gone` |
 | stops sending, socket open | `error idle_timeout` after `--idle-ms` | `idle_timeout` |
 | stops in the middle of a frame | the same, through `SO_RCVTIMEO` | `idle_timeout` |
 | sends reserved bits, or a control frame over 125 bytes or fragmented (RFC 6455 5.2, 5.5) | `error protocol_error`, closes | `protocol_error` |
@@ -314,13 +314,15 @@ nobody, and the session was counted nowhere. Speech hid it -- a delta written to
 a dead peer fails with `EPIPE` within a write or two -- but silence writes
 nothing: 27.4 s of audio were fed after a RST in `rst-mid-silent`, 0.00 s now.
 
-While the ingest waits for `done` it **pings the client** at once and every
-500 ms, whatever `--ping-ms` says. A FIN after a close frame or a `finalize` is a
-legal half-close, so on its own it cannot end the session; but a client that
-closed its whole socket answers the ping with a reset, the writer fails, and
-the tail stops at the next step (`close-then-fin-silent`,
-`finalize-then-fin-silent`). A client that half-closed and still reads just
-receives the ping. The GPU server does the same.
+While the ingest waits for `done` it sends the client an **unsolicited pong**
+at once and every 500 ms, whatever `--ping-ms` says. A FIN after a close frame or
+a `finalize` is a legal half-close, so on its own it cannot end the session; but
+a client that closed its whole socket answers that write with a reset, the
+writer fails, and the tail stops at the next step (`close-then-fin-silent`,
+`finalize-then-fin-silent`). A pong and not a ping because RFC 6455 5.5.3 makes
+an unsolicited pong a one-way heartbeat that expects no answer: a client that
+half-closed cannot write a pong back, and a ping makes its library try
+(`half-close-ok` caught exactly that). The GPU server does the same.
 
 **REST clients that go away** (`tests/test_server_rest_faults.sh`): a request
 waits in the worker's offline queue and then runs inline on the scheduler

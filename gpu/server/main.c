@@ -865,12 +865,14 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     free(payload);
     if (!cancelled && !shutting && !closed && lost >= 0) { slot_request(slot, REQ_CANCEL, lost, NULL); cancelled = 1; }
     if (!cancelled && !shutting && !closed) slot_request(slot, REQ_FINALIZE | REQ_CLOSE, 0, NULL);
-    /* As in the CPU server: a ping every 500 ms while waiting for `done`
-     * gives a peer that vanished after its close frame or finalize something
-     * to answer with a reset, so the tail is not flushed for nobody. */
+    /* As in the CPU server: an unsolicited pong (no reply expected, so a
+     * legally half-closed client is never asked to write) every 500 ms while
+     * waiting for `done` gives a peer that vanished after its close frame or
+     * finalize something to answer with a reset, so the tail is not flushed
+     * for nobody. */
     int done = 0;
     for (int waited = 0; waited < 60000 && !done; waited += 250) {
-        if (!cancelled && !shutting && waited % 500 == 0) ws_enqueue(&w, 0x9, "", 0);
+        if (!cancelled && !shutting && waited % 500 == 0) ws_enqueue(&w, 0xA, "", 0);
         done = slot_wait_done(slot, 250);
     }
     if (!done) { slot_request(slot, REQ_CANCEL, CB_PEER, NULL); done = slot_wait_done(slot, 5000); }
