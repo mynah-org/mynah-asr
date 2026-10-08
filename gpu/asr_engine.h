@@ -51,6 +51,10 @@ typedef struct {
                                 off by default, a DIAGNOSTIC arm, never a headline */
     int profile_host;        /* cuda: 1 = host wall per phase inside a step
                                 (--profile-host); off = no clock read at all */
+    int pass_lanes;          /* cuda: lanes per encoder pass (the scratch
+                                budget); 0 = the default min(cap, 128). A
+                                cohort above it runs as several passes; a row's
+                                result never depends on it (contract 4) */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */
@@ -82,6 +86,7 @@ typedef struct {
     double frame_sec;        /* one encoder frame, seconds */
     size_t vram_total, vram_used, vram_arena, vram_weights;  /* bytes; 0 on cpu */
     int graphs;              /* CUDA graphs in use (S14-8), 0 in phase 1 */
+    int pass_lanes;          /* lanes per encoder pass as resolved; 0 on cpu */
     const char *pci_bus_id;  /* the GPU's PCI bus id ("0000:01:00.0"); NULL on cpu */
 } asr_engine_facts;
 

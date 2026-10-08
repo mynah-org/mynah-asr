@@ -261,7 +261,8 @@ static int alloc_scratch(cuda_engine *e) {
     const int qmax = e->pack.qmax;
     /* budget: a pass of up to Bmax lanes at the LARGEST preset; a cohort that
      * needs more is split into passes */
-    e->Bmax = e->cap < 128 ? e->cap : 128;
+    const int lanes = e->cfg.pass_lanes > 0 ? e->cfg.pass_lanes : 128;
+    e->Bmax = e->cap < lanes ? e->cap : lanes;
     e->Rmax = e->Bmax * qmax;
     /* the per-lane bound is the larger of the first chunk (1 + sub*L) and a
      * steady one (sub*(L+1), the larger), with the widest padding, so that a
@@ -438,6 +439,11 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     e->gemm_splitk = cfg->gemm && strcmp(cfg->gemm, "splitk") == 0;
     e->prof = cfg->profile ? 1 : 0;
     e->hprof = cfg->profile_host ? 1 : 0;
+    /* the label loop's lane compaction is one block over at most 1024 lanes */
+    if (cfg->pass_lanes < 0 || cfg->pass_lanes > 1024) {
+        snprintf(err, errcap, "pass lanes %d outside 1..1024 (0 = the default min(cap, 128))", cfg->pass_lanes);
+        delete e; return nullptr;
+    }
     if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v2") != 0 && strcmp(cfg->gemm, "splitk") != 0) {
         snprintf(err, errcap, "gemm '%s' is not one of own, own-v2, splitk, cublas", cfg->gemm);
         delete e; return nullptr;
@@ -557,6 +563,7 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
     if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) { f->vram_total = totb; f->vram_used = totb - freeb; }
     f->vram_arena = e->vram_arena; f->vram_weights = e->vram_weights;
     f->graphs = 0;
+    f->pass_lanes = e->Bmax;
     f->pci_bus_id = e->pci_bus_id;
 }
 

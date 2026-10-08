@@ -13,9 +13,12 @@
  *      printed with both texts and exits 3 -- a finding to look at, never a
  *      silent pass and never a silent fail.
  *
- * usage: tests/test_cuda_stream <model_dir> [--gemm own|cublas] [clip.wav ...]
+ * usage: tests/test_cuda_stream <model_dir> [--gemm own|cublas] [--pass-lanes N] [clip.wav ...]
  *        (default clips: tests/audio/test_*.wav; the GEMM arm is an argument,
- *        not an environment flag, so the flag registry stays the library's)
+ *        not an environment flag, so the flag registry stays the library's).
+ *        --pass-lanes N below the clip count makes the mixed cohort of gate A
+ *        run as several encoder passes in one step (S14-12: the split path),
+ *        which must not change a byte either.
  * exit 0 = both gates pass; 1 = gate A failed or a device error; 3 = gate A
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -92,9 +95,10 @@ int main(int argc, char **argv) {
     const char *dflt[] = {"tests/audio/test_it.wav", "tests/audio/test_en.wav", "tests/audio/test_de.wav",
                           "tests/audio/test_fr.wav", "tests/audio/test_es.wav"};
     const char *clips[MAXC], *gemm = "own";
-    int n = 0;
+    int n = 0, pass_lanes = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) gemm = argv[++i];
+        else if (strcmp(argv[i], "--pass-lanes") == 0 && i + 1 < argc) pass_lanes = atoi(argv[++i]);
         else if (n < MAXC) clips[n++] = argv[i];
     }
     if (n == 0) for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
@@ -109,14 +113,15 @@ int main(int argc, char **argv) {
     }
 
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = gemm};
+    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = gemm,
+                          .pass_lanes = pass_lanes};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) {
         if (strstr(err, "no CUDA device") || strstr(err, "not compiled")) { printf("SKIP test_cuda_stream: %s\n", err); return 77; }
         printf("FAIL open: %s\n", err); return 1;
     }
     asr_engine_facts f; asr_engine_get_facts(e, &f);
-    printf("test_cuda_stream on %s, gemm=%s, %d clip(s)\n", f.device, f.gemm, n);
+    printf("test_cuda_stream on %s, gemm=%s, pass_lanes=%d, %d clip(s)\n", f.device, f.gemm, f.pass_lanes, n);
 
     /* ---- gate A: each clip alone, then all together (mixed lanes) */
     utt alone[MAXC] = {{0}}, together[MAXC] = {{0}};

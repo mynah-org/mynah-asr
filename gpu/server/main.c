@@ -93,7 +93,7 @@ static struct {
     /* config */
     const char *model_dir, *host, *engine_name, *precision, *gemm;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
-    int threads, ring_seconds, profile, profile_host;
+    int threads, ring_seconds, profile, profile_host, pass_lanes;
     long max_frame_bytes;
     double max_audio_seconds;
     /* state */
@@ -1002,6 +1002,7 @@ static void health_json(cJSON *j) {
     cJSON_AddNumberToObject(ge, "vram_ready_mb", g.vram_ready_mb);
     if ((double)f.vram_used / 1048576.0 > g.vram_peak_mb) g.vram_peak_mb = (double)f.vram_used / 1048576.0;
     cJSON_AddNumberToObject(ge, "vram_peak_seen_mb", g.vram_peak_mb);
+    cJSON_AddNumberToObject(ge, "pass_lanes", f.pass_lanes);
     cJSON_AddNumberToObject(ge, "decode_iters_total", (double)es.decode_iters);
     cJSON_AddNumberToObject(ge, "h2d_bytes_total", es.h2d_bytes);
     cJSON_AddNumberToObject(ge, "d2h_bytes_total", es.d2h_bytes);
@@ -1272,6 +1273,7 @@ static void usage(void) {
         "       [--ring-seconds 30] [--gemm own|cublas] [--precision f32] [--engine-threads N (cpu engine pool)]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "       [--profile-host (DIAGNOSTIC: the engine thread's wall per phase, [HOSTP] lines)]\n"
+        "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
 }
@@ -1298,6 +1300,7 @@ int main(int argc, char **argv) {
         else if (ARG("--ring-seconds")) g.ring_seconds = atoi(v);
         else if (strcmp(a, "--profile-stages") == 0) g.profile = 1;
         else if (strcmp(a, "--profile-host") == 0) g.profile_host = 1;
+        else if (ARG("--pass-lanes")) g.pass_lanes = strcmp(v, "cap") == 0 ? -1 : atoi(v);
         else if (ARG("--idle-ms")) g.idle_ms = atoi(v);
         else if (ARG("--ping-ms")) g.ping_ms = atoi(v);
         else if (ARG("--max-frame-bytes")) g.max_frame_bytes = atol(v);
@@ -1316,13 +1319,14 @@ int main(int argc, char **argv) {
     if (g.cohort_ms < 0) g.cohort_ms = 0;
     if (g.ring_seconds < 1) g.ring_seconds = 1;
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
+    if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
 
     signal(SIGPIPE, SIG_IGN);
     raise_nofile_limit();
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
-                          .profile = g.profile, .profile_host = g.profile_host};
+                          .profile = g.profile, .profile_host = g.profile_host, .pass_lanes = g.pass_lanes};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
@@ -1373,12 +1377,12 @@ int main(int argc, char **argv) {
         g.vram_ready_mb = g.vram_peak_mb = (double)g.facts.vram_used / 1048576.0;
         fprintf(stderr, "[SERVER-CONFIG] mynah-asr-server-cuda %s: engine=%s device=\"%s\" precision=%s gemm=%s model=%s "
                         "cap=%d cohort_ms=%d lookahead_default=%d presets=%d vram_weights_mb=%.0f vram_arena_mb=%.0f graphs=%d profile_stages=%s "
-                        "profile_host=%s vram_used_at_ready_mb=%.0f vram_total_mb=%.0f\n",
+                        "profile_host=%s pass_lanes=%d vram_used_at_ready_mb=%.0f vram_total_mb=%.0f\n",
                 MYNAH_ASR_BUILD, g.facts.name, g.facts.device ? g.facts.device : "-", g.facts.precision, g.facts.gemm,
                 g.facts.model_name, g.cap, g.cohort_ms, g.facts.default_lookahead, g.facts.n_lookaheads,
                 (double)g.facts.vram_weights / 1048576.0, (double)g.facts.vram_arena / 1048576.0, g.facts.graphs,
                 g.profile ? "on (DIAGNOSTIC)" : "off", g.profile_host ? "on (DIAGNOSTIC)" : "off",
-                g.vram_ready_mb, (double)g.facts.vram_total / 1048576.0);
+                g.facts.pass_lanes, g.vram_ready_mb, (double)g.facts.vram_total / 1048576.0);
         fwrite(dm, 1, n, stderr);
         char topo[1024];
         const size_t tn = host_topology_line(g.facts.pci_bus_id, topo, sizeof(topo));
