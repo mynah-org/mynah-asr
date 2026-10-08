@@ -20,6 +20,12 @@
 #       [--soak-c 128] [--soak-seconds 1800] [--soaks 2] [--seed 42]
 #       [--cohort-ms 40] [--cap 192] [--lang auto] [--lookahead 3] [--ref-c 4] [--gemm own|splitk]
 #       [--reference-file <run>/reference.json] [--out ~/asr-evidence/gpu]
+#       [--server-cpus 0-31] [--gen-cpus 64-95]   (taskset; the GPU's NUMA node for the server)
+#
+# Every run records a [TOPOLOGY] line (gpu/tools/topology.sh: GPU, driver, the
+# GPU's NUMA node, CPU, usable CPUs incl. the cgroup quota, the pinning) and,
+# per rung, a [GPU] summary of the nvidia-smi samples (gpu/tools/gpu_sample.py:
+# SM %, power, temperature, SM clock, throttle reasons, VRAM).
 #
 # Refuses: a dirty tree, a GPU another process is using, a dispatch map with an
 # UNKNOWN row, a container already busy on CPU (its own cgroup, not loadavg).
@@ -30,6 +36,7 @@ MODEL=""; PHASE=all; LADDER="96 128 144 160"; LADDER_S=90; SOAK_C=128; SOAK_S=18
 SEED=42; COHORT=40; CAP=192; LANG_Q=auto; LOOKAHEAD=3; REF_C=4; REF_IN=""
 CORPUS=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; MIN_PEAK_DBFS=-30
 WARMUP=30; WINDOW=60; DUMP_EVERY=30; OUT="$HOME/asr-evidence/gpu"; PORT=8291; BIN=./mynah-asr-server-cuda; GEMM=own
+SRV_CPUS=""; GEN_CPUS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MODEL="$2"; shift 2 ;;
@@ -55,6 +62,8 @@ while [ $# -gt 0 ]; do
         --out) OUT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --gemm) GEMM="$2"; shift 2 ;;
+        --server-cpus) SRV_CPUS="$2"; shift 2 ;;
+        --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "gpu_qualify: unknown option: $1" >&2; exit 2 ;;
     esac
@@ -117,6 +126,10 @@ say "            corpus $NCLIP clips from $CORPUS, bank-sha256 $BANK_SHA   evide
 
 # ------------------------------------------------------------ 1. freeze
 { uname -a; echo; nproc; cat /sys/fs/cgroup/cpu.max 2>/dev/null; echo; free -g; cat /proc/loadavg; } > "$RUN/host.txt" 2>&1
+SP=""; [ -n "$SRV_CPUS" ] && SP="taskset -c $SRV_CPUS"
+GP=""; [ -n "$GEN_CPUS" ] && GP="taskset -c $GEN_CPUS"
+gpu/tools/topology.sh ${SRV_CPUS:+--server-cpus "$SRV_CPUS"} ${GEN_CPUS:+--gen-cpus "$GEN_CPUS"} > "$RUN/topology.txt" 2>&1
+cat "$RUN/topology.txt" | tee -a "$RUN/run.log"
 nvidia-smi -q > "$RUN/nvidia-smi.txt" 2>&1
 "$BIN" -m "$MODEL" --gemm "$GEMM" --dispatch-map > "$RUN/dispatch.txt" 2>&1 || die "the server could not print its dispatch map (see dispatch.txt)"
 UNKNOWN=$(sed -n 's/^\([0-9][0-9]*\) row(s) UNKNOWN.*/\1/p' "$RUN/dispatch.txt" | tail -1)
@@ -139,14 +152,13 @@ fi
 # ------------------------------------------------------------ server lifecycle
 SRV=""; DUMPER=""; SMI=""
 start_server() {   # start_server <tag>
-    "$BIN" -m "$MODEL" -p "$PORT" --gemm "$GEMM" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" \
+    $SP "$BIN" -m "$MODEL" -p "$PORT" --gemm "$GEMM" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" \
         --metrics-port $(( PORT + 1000 )) > "$RUN/server-$1.log" 2>&1 &
     SRV=$!
     for i in $(seq 1 300); do curl -sf -m 2 "http://localhost:$PORT/v1/health" >/dev/null 2>&1 && break; sleep 0.5; done
     curl -sf -m 2 "http://localhost:$PORT/v1/health" >/dev/null 2>&1 || { cat "$RUN/server-$1.log"; die "$1: the server never became ready"; }
     grep -q "engine=cuda" "$RUN/server-$1.log" || die "$1: the banner does not say engine=cuda"
-    nvidia-smi --query-gpu=timestamp,pstate,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,memory.used,clocks_event_reasons.active \
-        --format=csv,noheader -l 2 > "$RUN/gpu-$1.csv" 2>&1 & SMI=$!
+    python3 gpu/tools/gpu_sample.py run --out "$RUN/gpu-$1.csv" --interval-ms 1000 & SMI=$!
     # bounds 11/12 read RSS and the roster from here; the "worker" is the one process
     ( while kill -0 $SRV 2>/dev/null; do
           sleep "$DUMP_EVERY"; kill -USR1 $SRV 2>/dev/null
@@ -160,6 +172,8 @@ stop_server() {   # stop_server <tag>
     kill -USR1 $SRV 2>/dev/null; sleep 1
     kill $DUMPER $SMI 2>/dev/null; wait $DUMPER $SMI 2>/dev/null
     kill -TERM $SRV 2>/dev/null; wait $SRV 2>/dev/null; SRV=""; sleep 1
+    python3 gpu/tools/gpu_sample.py summary "$RUN/gpu-$1.csv" --label "$1" --json "$RUN/gpu-$1.json" | tee -a "$RUN/run.log"
+    grep "seq=.* vram used_mb" "$RUN/server-$1.log" | tail -1 | sed "s/.*vram /[VRAM] $1 /" | tee -a "$RUN/run.log"
 }
 trap '[ -n "$SRV" ] && kill -TERM $SRV 2>/dev/null; kill $DUMPER $SMI 2>/dev/null; exit 130' INT TERM
 
@@ -177,7 +191,7 @@ for c in sys.argv[1:]:
 print(",".join(k for k in ("short", "medium", "long") if k in have))
 CLSPY
 )
-load() { python3 tools/bench/stream_load.py --port "$PORT" --lookahead "$LOOKAHEAD" --lang "$LANG_Q" \
+load() { $GP python3 tools/bench/stream_load.py --port "$PORT" --lookahead "$LOOKAHEAD" --lang "$LANG_Q" \
              --bank "$CLASSES" --class-bounds 8,20 ${ONSETS:+--onsets "$ONSETS"} "$@"; }
 
 # ------------------------------------------------------------ 2. reference
@@ -255,7 +269,7 @@ cat > "$RUN/manifest.json" <<JSON
   "binary_sha256": "$BIN_SHA", "binary": "mynah-asr-server-cuda", "engine": "cuda", "gpu": "$GPU_NAME",
   "model": "$MODEL", "quant": "f32", "gemm": "$GEMM", "lookahead": $LOOKAHEAD, "cohort_ms": $COHORT,
   "workers": 1, "threads_per_worker": 1, "cap": $CAP, "http_threads_per_worker": $(( CAP + 32 )),
-  "connection_ceiling": $(( CAP + 32 )), "server_cpus": "container", "gen_cpus": "container",
+  "connection_ceiling": $(( CAP + 32 )), "server_cpus": "${SRV_CPUS:-container}", "gen_cpus": "${GEN_CPUS:-container}",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA", "corpus": "$CORPUS", "corpus_sample": $CORPUS_SAMPLE,
   "corpus_seed": $CORPUS_SEED, "min_peak_dbfs": $MIN_PEAK_DBFS, "reference_concurrency": $REF_C,
   "lang": "$LANG_Q", "configuration": "gpu-s14",
