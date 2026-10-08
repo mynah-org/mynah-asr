@@ -93,6 +93,21 @@ cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const floa
                              float *ws, size_t ws_floats, cudaStream_t s);
 int k_gemm_splits(int N, int K);
 size_t k_gemm_splitk_workspace_floats(int Mmax, int N, int K);
+/* own-tc (--precision bf16 --gemm own-tc): bf16 weights resident, activations
+ * rounded to bf16 when staged, fp32 accumulation on the tensor cores (sm_80+).
+ * S = k_gemm_tc_splits(N, K): the weight's shape only -- never M, never the
+ * SM count -- so a row's bits depend neither on its cohort nor on the card.
+ * A numerical change against every f32 arm. ws: >= S*M*N floats when S > 1. */
+cudaError_t k_gemm_wt_tc(const float *A, int lda, const unsigned short *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         float *ws, size_t ws_floats, cudaStream_t s);
+int k_gemm_tc_splits(int N, int K);
+size_t k_gemm_tc_workspace_floats(int Mmax, int N, int K);
+cudaError_t k_f32_to_bf16(const float *src, unsigned short *dst, size_t n, cudaStream_t s);
+/* tests: pin one own-tc block tile (-1 = the dispatcher chooses); bit-neutral */
+void k_gemm_tc_force_config(int cfg);
+int k_gemm_tc_config_count(void);
+const char *k_gemm_tc_config_name(int cfg);
 /* tests: pin one v2 configuration (-1 = the dispatcher chooses) */
 void k_gemm_force_config(int cfg);
 int k_gemm_config_count(void);
