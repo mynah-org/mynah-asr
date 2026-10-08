@@ -11,7 +11,9 @@
  *
  * usage: tests/cuda_bank_transcribe <model_dir> --list clips.txt --json out.json
  *            [--cohort 64] [--gemm own|splitk|own-tc] [--precision f32|bf16]
- *            [--lookahead 3] [--lang auto]
+ *            [--lookahead 3] [--lang auto] [--profile 1]
+ * --profile 1: the engine's per-stage CUDA-event profile (DIAGNOSTIC: it
+ * adds events to the stream), printed per pass at the end with rows per pass.
  * exit 0 = every clip transcribed; 1 = an engine error; 2 = usage/input. */
 #include "../gpu/asr_engine.h"
 
@@ -83,7 +85,7 @@ static void json_str(FILE *f, const char *s) {
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <model_dir> --list clips.txt --json out.json [...]\n", argv[0]); return 2; }
     const char *model = argv[1], *list = NULL, *json = NULL, *gemm = "own", *precision = "f32", *lang = "auto";
-    int cohort = 64, la = 3;
+    int cohort = 64, la = 3, prof = 0;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--list")) list = argv[i + 1];
         else if (!strcmp(argv[i], "--json")) json = argv[i + 1];
@@ -92,6 +94,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cohort")) cohort = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--lookahead")) la = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--lang")) lang = argv[i + 1];
+        else if (!strcmp(argv[i], "--profile")) prof = atoi(argv[i + 1]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!list || !json || cohort < 1 || cohort > MAXC) { fprintf(stderr, "--list and --json are required; 1 <= --cohort <= %d\n", MAXC); return 2; }
@@ -107,7 +110,7 @@ int main(int argc, char **argv) {
     fclose(lf);
 
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = cohort, .device = 0, .precision = precision, .gemm = gemm};
+    asr_engine_cfg cfg = {.model_dir = model, .cap = cohort, .device = 0, .precision = precision, .gemm = gemm, .profile = prof};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) { fprintf(stderr, "open: %s\n", err); return 1; }
     asr_engine_facts f; asr_engine_get_facts(e, &f);
@@ -146,6 +149,18 @@ int main(int argc, char **argv) {
     asr_engine_stats st; asr_engine_get_stats(e, &st);
     fprintf(stderr, "done: %d clips, %.0f s of audio in %.1f s wall (%.1fx), %lu steps, step wall mean %.2f ms\n",
             nclip, audio_s, wall, audio_s / wall, st.steps, st.steps ? st.step_wall_ms_sum / (double)st.steps : 0.0);
+    if (st.prof_passes > 0) {
+        const double np = (double)st.prof_passes;
+        double tot = 0.0, dec = 0.0;
+        for (int i = 0; i < ASR_PROF_STAGES; i++) {
+            tot += st.prof_ms[i];
+            if (!strncmp(ASR_PROF_NAME[i], "dec", 3) || !strcmp(ASR_PROF_NAME[i], "d2h")) dec += st.prof_ms[i];
+        }
+        fprintf(stderr, "profile: %lu passes, %.1f rows/pass, %.1f lanes/pass, device %.2f ms/pass (encoder+projector %.2f, decoder+d2h %.2f)\n  ",
+                st.prof_passes, (double)st.rows / np, (double)st.lanes / np, tot / np, (tot - dec) / np, dec / np);
+        for (int i = 0; i < ASR_PROF_STAGES; i++) fprintf(stderr, " %s=%.2f", ASR_PROF_NAME[i], st.prof_ms[i] / np);
+        fprintf(stderr, "\n");
+    }
     asr_engine_close(e);
     return 0;
 }
