@@ -71,6 +71,8 @@ cost?
 
 - Gate C: 5 clips x 5 languages, all five arms OK (85 passes each; the graph arms
   85/85 from graphs, buckets 1,2,4,6 so padded lanes and padded rows both occur).
+  The same with `--gemm splitk` (graphs capture the split-K partial + reduce
+  launches and their workspace): all five arms OK, gates A and B green too.
 - Server identity, C=64 WAVE, 64 clips of `samples/stress-en` (every 7th):
   stage-ahead, stage-ahead + team of 4, graphs + warm-up, all together: 64/64
   clips identical in every delta's text and audio_s; 0 errors.
@@ -83,6 +85,14 @@ cost?
   2.5 -> 0.1 ms per step); at this load few chunks arrive inside the window
   (stage-ahead staged 174 chunks in 159 windows), so no latency effect is
   expected or seen. The A/B that can credit or reject these is at the knee.
+
+- TSAN: not run. The box's kernel uses 32 random mmap bits and the container may
+  not change its personality (`setarch -R` refused), so gcc 13's TSAN aborts at
+  start-up. Race-freedom rests on the design: each slot's host state is touched
+  by exactly one team thread per batch (atomic claim, distinct slots), the job
+  is published and the results collected under the team mutex, the helpers make
+  no CUDA call, and the engine thread is the only caller of every other op.
+  Owed: TSAN on a host that allows it (clang >= 18 or ASLR off).
 
 ## Unknowns
 
