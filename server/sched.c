@@ -837,7 +837,10 @@ static void sched_step_batch(int B) {
 /* The last piece of a finalizing stream, shorter than a chunk. It does NOT go
  * through the batched call: that call takes whole chunks only, and what follows
  * this piece is the tail, which needs the causal right pad only
- * mynah_asr_stream_finish applies. Returns 1 when it fed something. */
+ * mynah_asr_stream_finish applies. Returns 1 when it fed something, -1 when
+ * the feed failed and the session was cancelled: the slot may then already be
+ * released (an abandoned one is freed by sched_close_session), so the caller
+ * must not touch its requests again. */
 static int sched_feed_tail(mynah_asr_slot *s, size_t avail) {
     mynah_asr_sched_assert_thread("mynah_asr_stream_feed");
     if (avail == 0) return 0;
@@ -852,8 +855,9 @@ static int sched_feed_tail(mynah_asr_slot *s, size_t avail) {
     atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
                               memory_order_relaxed);
     if (mynah_asr_stream_feed(s->stream, s->take, got, sched_on_result, &ctx) != 0) {
+        g.req_live[s->id] = 0;
         sched_cancel(s, "decode_failed", "the stream step failed");
-        return 1;
+        return -1;
     }
     return 1;
 }
@@ -1184,7 +1188,11 @@ static void *sched_main(void *arg) {
             if (avail > 0) {
                 /* The piece goes now and the finalize stays pending: the tail
                  * runs on a later pass, when the ring is empty. */
-                if (sched_feed_tail(s, avail)) did = 1;
+                const int fed = sched_feed_tail(s, avail);
+                if (fed) did = 1;
+                /* cancelled: the slot may already belong to a new session,
+                 * which must not inherit this one's finalize/close */
+                if (fed < 0) continue;
                 mynah_asr_slot_request(s, g.req[i] &
                     (MYNAH_ASR_SLOT_REQ_FINALIZE | MYNAH_ASR_SLOT_REQ_CLOSE),
                     NULL, MYNAH_ASR_SLOT_CANCEL_NONE);
