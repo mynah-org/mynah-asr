@@ -95,6 +95,7 @@ struct cuda_engine {
     char err[512] = {0};
     int dead = 0;
     std::string devname;
+    int device = 0;   /* cudaSetDevice is per host thread: every op re-binds it */
     /* S14-6b: CUDA events at stage boundaries, one pass at a time */
     int prof = 0;
     static const int EV_MAX = 4096;
@@ -249,7 +250,12 @@ static int alloc_scratch(cuda_engine *e) {
      * needs more is split into passes */
     e->Bmax = e->cap < 128 ? e->cap : 128;
     e->Rmax = e->Bmax * qmax;
-    const int melmax = asr_pack_chunk_mel(&e->pack, qmax - 1, 1);
+    /* the per-lane bound is the larger of the first chunk (1 + sub*L) and a
+     * steady one (sub*(L+1), the larger), with the widest padding, so that a
+     * lane alone always fits an empty pass whatever Bmax is */
+    const int mel_first = asr_pack_chunk_mel(&e->pack, qmax - 1, 1);
+    const int mel_steady = asr_pack_chunk_mel(&e->pack, qmax - 1, 0);
+    const int melmax = mel_first > mel_steady ? mel_first : mel_steady;
     e->Mmax = e->Bmax * melmax;
     int to[GPU_SS_STAGES];
     ss_geometry(melmax, 1, 1, to);
@@ -437,6 +443,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         snprintf(err, errcap, "cudaSetDevice/StreamCreate: %s", cudaGetErrorString(c));
         delete e; return nullptr;
     }
+    e->device = cfg->device;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, cfg->device) == cudaSuccess) e->devname = prop.name;
     if (e->prof)
@@ -870,8 +877,13 @@ static int cuda_step(cuda_engine *e, const asr_step_req *reqs, int n, asr_step_o
 /* ------------------------------------------------------------- the ops table */
 #define CE(e) ((cuda_engine *)(e))
 #define CCE(e) ((const cuda_engine *)(e))
-static void ops_close(asr_engine *e) { cuda_close(CE(e)); }
-static void ops_facts(const asr_engine *e, asr_engine_facts *f) { cuda_facts(CCE(e), f); }
+/* The engine is opened on the main thread but stepped on the engine thread
+ * and queried from the HTTP threads; the current device is per host thread,
+ * so every op that touches the runtime binds the engine's device first
+ * (otherwise --device N != 0 launches on device 0). */
+static void bind_device(const cuda_engine *e) { cudaSetDevice(e->device); }
+static void ops_close(asr_engine *e) { bind_device(CE(e)); cuda_close(CE(e)); }
+static void ops_facts(const asr_engine *e, asr_engine_facts *f) { bind_device(CCE(e)); cuda_facts(CCE(e), f); }
 static void ops_stats(const asr_engine *e, asr_engine_stats *s) { cuda_stats(CCE(e), s); }
 static int ops_lang_id(const asr_engine *e, const char *l) { return cuda_lang_id(CCE(e), l); }
 static int ops_lookahead_ok(const asr_engine *e, int la) { return cuda_lookahead_ok(CCE(e), la); }
@@ -882,7 +894,7 @@ static int ops_slot_ready(const asr_engine *e, int s) { return cuda_slot_ready(C
 static double ops_slot_audio(const asr_engine *e, int s) { return cuda_slot_audio_s(CCE(e), s); }
 static const char *ops_slot_text(const asr_engine *e, int s) { return cuda_slot_text(CCE(e), s); }
 static const char *ops_slot_lang(const asr_engine *e, int s) { return cuda_slot_lang(CCE(e), s); }
-static int ops_step(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { return cuda_step(CE(e), r, n, o); }
+static int ops_step(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { bind_device(CE(e)); return cuda_step(CE(e), r, n, o); }
 static int ops_dead(const asr_engine *e) { return cuda_dead(CCE(e)); }
 static const char *ops_error(const asr_engine *e) { return cuda_error(CCE(e)); }
 static size_t ops_dispatch(const asr_engine *e, char *b, size_t c) { return cuda_dispatch_map(CCE(e), b, c); }
