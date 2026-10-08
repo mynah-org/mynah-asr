@@ -27,6 +27,7 @@ extern "C" {
 #include <time.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 /* ------------------------------------------------------------------ types */
@@ -86,12 +87,19 @@ struct cuda_engine {
     int use_cublas = 0;
     int gemm_v2 = 0;   /* --gemm own-v2: S14-8a, byte-identical, not faster (kept as an arm) */
     int gemm_splitk = 0; /* --gemm splitk: S14-8b, row-stable by construction, NOT bit-identical to v1 */
+    /* --weights int8: the quantised matrices. The f32 pointer slots of those
+     * weights (gpu_layer_w, d_head_w) hold the int8 device pointer instead, and
+     * gemm() routes any W found here to k_gemm_w8; nothing dereferences those
+     * slots as f32. */
+    struct w8_mat { const int8_t *q; const float *s; };
+    int weights_int8 = 0;
+    std::unordered_map<const void *, w8_mat> w8;
     float *sk_ws = nullptr;
     size_t sk_ws_floats = 0;
     std::vector<slot_host> slots;
     std::vector<int> pending_resets;
     asr_engine_stats st = {};
-    size_t vram_weights = 0, vram_arena = 0, vram_total = 0;
+    size_t vram_weights = 0, vram_arena = 0, vram_total = 0, vram_kv = 0;
     char err[512] = {0};
     int dead = 0;
     std::string devname;
@@ -162,6 +170,41 @@ static const float *qf32(const mynah_asr_qmat *m) {
     return m->qtype == MYNAH_ASR_Q_F32 ? m->f32 : nullptr;
 }
 
+/* --weights int8: per-row symmetric codes and scales on the device, the same
+ * codes the CPU int8 path holds (a pre-quantised pack's own, else quantised
+ * here with the library's quantiser). Returns the int8 pointer, typed as the
+ * f32 slot it replaces; gemm() finds it in e->w8. */
+static const float *upload_w8_raw(cuda_engine *e, const float *w32, const int8_t *q8, const float *sc,
+                                  int n, int k, const char *what) {
+    std::vector<int8_t> q;
+    std::vector<float> s;
+    if (!q8) {
+        if (!w32) { snprintf(e->err, sizeof(e->err), "%s: missing tensor", what); return nullptr; }
+        q.resize((size_t)n * (size_t)k);
+        s.resize((size_t)n);
+        mynah_asr_quantize_int8(w32, n, k, q.data(), s.data());
+        q8 = q.data(); sc = s.data();
+    }
+    void *dq = nullptr, *ds = nullptr;
+    if (dmalloc(e, &dq, (size_t)n * (size_t)k, &e->vram_weights, what) != 0) return nullptr;
+    if (dmalloc(e, &ds, (size_t)n * sizeof(float), &e->vram_weights, what) != 0) return nullptr;
+    cudaError_t c = cudaMemcpy(dq, q8, (size_t)n * (size_t)k, cudaMemcpyHostToDevice);
+    if (c == cudaSuccess) c = cudaMemcpy(ds, sc, (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+    if (c != cudaSuccess) { set_err(e, what, c); return nullptr; }
+    e->w8[dq] = cuda_engine::w8_mat{(const int8_t *)dq, (const float *)ds};
+    return (const float *)dq;
+}
+
+/* a qmat-backed linear: int8 when --weights int8, else the f32 upload */
+static const float *upload_lin(cuda_engine *e, const mynah_asr_qmat *m, int n, int k, const char *what) {
+    if (e->weights_int8) {
+        if (m->qtype == MYNAH_ASR_Q_INT8 && m->n == n && m->k == k)
+            return upload_w8_raw(e, nullptr, m->q8, m->scales, n, k, what);
+        return upload_w8_raw(e, qf32(m), nullptr, nullptr, n, k, what);
+    }
+    return upload(e, qf32(m), (size_t)n * (size_t)k, what);
+}
+
 /* the three stride-2 stages on the time axis, as src/subsampling.c computes them */
 static void ss_geometry(int n_mel, int first, int last, int to[GPU_SS_STAGES]) {
     int T = n_mel;
@@ -194,6 +237,13 @@ __global__ void bias_act_kernel(float *__restrict__ C, int ldc, const float *__r
 static int gemm(cuda_engine *e, const float *A, int lda, const float *W, const float *bias,
                 float *C, int ldc, int M, int N, int K, int accumulate, int act) {
     if (M <= 0) return 0;
+    if (e->weights_int8) {
+        auto it = e->w8.find((const void *)W);
+        if (it != e->w8.end()) {
+            CK(e, "gemm w8", k_gemm_w8(A, lda, it->second.q, it->second.s, bias, C, ldc, M, N, K, accumulate, act, e->stream));
+            return 0;
+        }
+    }
     if (!e->use_cublas) {
         if (e->gemm_splitk) CK(e, "gemm", k_gemm_wt_splitk(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->sk_ws, e->sk_ws_floats, e->stream));
         else if (e->gemm_v2) CK(e, "gemm", k_gemm_wt_v2(A, lda, W, bias, C, ldc, M, N, K, accumulate, act, e->stream));
@@ -311,7 +361,20 @@ static int alloc_arena(cuda_engine *e) {
     const gpu_model_dims &dm = e->dm;
     const size_t cap = (size_t)e->cap;
     size_t *acct = &e->vram_arena;
-    if (dmalloc(e, (void **)&e->ar.kv, cap * dm.n_layers * 2 * dm.left * dm.d * sizeof(float), acct, "kv arena") != 0) return -1;
+    const size_t kv_n = cap * dm.n_layers * 2 * dm.left * dm.d;
+    const size_t kv_esz = e->ar.kv_dtype == GPU_KV_INT8 ? 1 : e->ar.kv_dtype == GPU_KV_BF16 ? 2 : sizeof(float);
+    void *kvp = nullptr;
+    if (dmalloc(e, &kvp, kv_n * kv_esz, acct, "kv arena") != 0) return -1;
+    CK(e, "arena memset", cudaMemset(kvp, 0, kv_n * kv_esz));
+    e->vram_kv = kv_n * kv_esz;
+    if (e->ar.kv_dtype == GPU_KV_F32) e->ar.kv = (float *)kvp;
+    else e->ar.kvq = kvp;
+    if (e->ar.kv_dtype == GPU_KV_INT8) {
+        const size_t ns = cap * dm.n_layers * 2 * dm.left * dm.H;
+        if (dmalloc(e, (void **)&e->ar.kv_scale, ns * sizeof(float), acct, "kv scales") != 0) return -1;
+        CK(e, "arena memset", cudaMemset(e->ar.kv_scale, 0, ns * sizeof(float)));
+        e->vram_kv += ns * sizeof(float);
+    }
     if (dmalloc(e, (void **)&e->ar.conv_cache, cap * dm.n_layers * (dm.conv_k - 1) * dm.d * sizeof(float), acct, "conv cache") != 0) return -1;
     for (int s = 0; s < GPU_SS_STAGES; s++) {
         const size_t n = (size_t)(s == 0 ? 1 : dm.C) * dm.F[s];
@@ -324,7 +387,6 @@ static int alloc_arena(cuda_engine *e) {
     e->ar.tok_cap = e->pack.qmax * dm.max_symbols;
     if (dmalloc(e, (void **)&e->ar.tok, cap * e->ar.tok_cap * sizeof(int), acct, "tok") != 0) return -1;
     if (dmalloc(e, (void **)&e->ar.tok_frame, cap * e->ar.tok_cap * sizeof(int), acct, "tok frame") != 0) return -1;
-    CK(e, "arena memset", cudaMemset(e->ar.kv, 0, cap * dm.n_layers * 2 * dm.left * dm.d * sizeof(float)));
     CK(e, "arena memset", cudaMemset(e->ar.meta, 0, cap * sizeof(gpu_slot_meta)));
     return 0;
 }
@@ -339,21 +401,22 @@ static int upload_weights(cuda_engine *e) {
         const mynah_asr_enc_layer &s = enc.layers[li];
         gpu_layer_w &L = e->L[(size_t)li];
 #define UP(dst, src, n, what) do { (dst) = upload(e, (src), (n), what); if (!(dst)) return -1; } while (0)
+#define UL(dst, qm, n, k, what) do { (dst) = upload_lin(e, (qm), (n), (k), what); if (!(dst)) return -1; } while (0)
         UP(L.ln_ff1_w, s.ln_ff1_w, d, "ln_ff1_w"); UP(L.ln_ff1_b, s.ln_ff1_b, d, "ln_ff1_b");
-        UP(L.ff1_w1, qf32(&s.ff1_w1), (size_t)dm.ffn * d, "ff1_w1");
-        UP(L.ff1_w2, qf32(&s.ff1_w2), d * (size_t)dm.ffn, "ff1_w2");
+        UL(L.ff1_w1, &s.ff1_w1, dm.ffn, dm.d, "ff1_w1");
+        UL(L.ff1_w2, &s.ff1_w2, dm.d, dm.ffn, "ff1_w2");
         UP(L.ln_att_w, s.ln_att_w, d, "ln_att_w"); UP(L.ln_att_b, s.ln_att_b, d, "ln_att_b");
-        UP(L.q_w, qf32(&s.q_w), d * d, "q_w"); UP(L.k_w, qf32(&s.k_w), d * d, "k_w");
-        UP(L.v_w, qf32(&s.v_w), d * d, "v_w"); UP(L.o_w, qf32(&s.o_w), d * d, "o_w");
+        UL(L.q_w, &s.q_w, dm.d, dm.d, "q_w"); UL(L.k_w, &s.k_w, dm.d, dm.d, "k_w");
+        UL(L.v_w, &s.v_w, dm.d, dm.d, "v_w"); UL(L.o_w, &s.o_w, dm.d, dm.d, "o_w");
         UP(L.bias_u, s.bias_u, d, "bias_u"); UP(L.bias_v, s.bias_v, d, "bias_v");
         UP(L.ln_conv_w, s.ln_conv_w, d, "ln_conv_w"); UP(L.ln_conv_b, s.ln_conv_b, d, "ln_conv_b");
-        UP(L.pw1_w, qf32(&s.pw1_w), 2 * d * d, "pw1_w");
+        UL(L.pw1_w, &s.pw1_w, 2 * dm.d, dm.d, "pw1_w");
         UP(L.dw_w, s.dw_w, d * (size_t)dm.conv_k, "dw_w");
         UP(L.cnorm_w, s.cnorm_w, d, "cnorm_w"); UP(L.cnorm_b, s.cnorm_b, d, "cnorm_b");
-        UP(L.pw2_w, qf32(&s.pw2_w), d * d, "pw2_w");
+        UL(L.pw2_w, &s.pw2_w, dm.d, dm.d, "pw2_w");
         UP(L.ln_ff2_w, s.ln_ff2_w, d, "ln_ff2_w"); UP(L.ln_ff2_b, s.ln_ff2_b, d, "ln_ff2_b");
-        UP(L.ff2_w1, qf32(&s.ff2_w1), (size_t)dm.ffn * d, "ff2_w1");
-        UP(L.ff2_w2, qf32(&s.ff2_w2), d * (size_t)dm.ffn, "ff2_w2");
+        UL(L.ff2_w1, &s.ff2_w1, dm.ffn, dm.d, "ff2_w1");
+        UL(L.ff2_w2, &s.ff2_w2, dm.d, dm.ffn, "ff2_w2");
         UP(L.ln_out_w, s.ln_out_w, d, "ln_out_w"); UP(L.ln_out_b, s.ln_out_b, d, "ln_out_b");
     }
     UP(e->d_relpos, enc.relpos_tab, (size_t)dm.n_layers * (size_t)(2 * dm.kmax - 1) * d, "relpos table");
@@ -385,7 +448,7 @@ static int upload_weights(cuda_engine *e) {
         UP(e->d_bsum[l], bsum.data(), 4 * H, "b_ih + b_hh");
     }
     UP(e->d_proj_w, dec.proj_w, H * H, "proj_w"); UP(e->d_proj_b, dec.proj_b, H, "proj_b");
-    UP(e->d_head_w, qf32(&dec.head), (size_t)dm.V * H, "head");
+    { const float *hw_ = upload_lin(e, &dec.head, dm.V, dm.Hdec, "head"); if (!hw_) return -1; e->d_head_w = (float *)hw_; }
     UP(e->d_head_b, dec.head_b, (size_t)dm.V, "head_b");
     /* the SOS predictor state: one pred_step(blank) from zeros, computed by the
      * library's own decoder on the host (T = 0 runs exactly that and nothing else) */
@@ -405,6 +468,7 @@ static int upload_weights(cuda_engine *e) {
         free(st);
     }
 #undef UP
+#undef UL
     return 0;
 }
 
@@ -424,6 +488,19 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     e->gemm_v2 = cfg->gemm && strcmp(cfg->gemm, "own-v2") == 0;
     e->gemm_splitk = cfg->gemm && strcmp(cfg->gemm, "splitk") == 0;
     e->prof = cfg->profile ? 1 : 0;
+    if (!cfg->weights || strcmp(cfg->weights, "f32") == 0) e->weights_int8 = 0;
+    else if (strcmp(cfg->weights, "int8") == 0) e->weights_int8 = 1;
+    else {
+        snprintf(err, errcap, "weights '%s' is not one of f32, int8", cfg->weights);
+        delete e; return nullptr;
+    }
+    if (!cfg->kv_dtype || strcmp(cfg->kv_dtype, "f32") == 0) e->ar.kv_dtype = GPU_KV_F32;
+    else if (strcmp(cfg->kv_dtype, "bf16") == 0) e->ar.kv_dtype = GPU_KV_BF16;
+    else if (strcmp(cfg->kv_dtype, "int8") == 0) e->ar.kv_dtype = GPU_KV_INT8;
+    else {
+        snprintf(err, errcap, "kv dtype '%s' is not one of f32, bf16, int8", cfg->kv_dtype);
+        delete e; return nullptr;
+    }
     if (cfg->gemm && !e->use_cublas && strcmp(cfg->gemm, "own") != 0 && strcmp(cfg->gemm, "own-v2") != 0 && strcmp(cfg->gemm, "splitk") != 0) {
         snprintf(err, errcap, "gemm '%s' is not one of own, own-v2, splitk, cublas", cfg->gemm);
         delete e; return nullptr;
@@ -529,7 +606,9 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
     memset(f, 0, sizeof(*f));
     f->name = "cuda";
     f->device = e->devname.c_str();
-    f->precision = "f32";
+    static const char *const PREC[2][3] = {{"f32", "f32+kv-bf16", "f32+kv-int8"},
+                                           {"w8a32", "w8a32+kv-bf16", "w8a32+kv-int8"}};
+    f->precision = PREC[e->weights_int8][e->ar.kv_dtype];
     f->gemm = e->use_cublas ? "cublas-pedantic (measured NOT row-stable)" : e->gemm_splitk ? "own-splitk-rowstable" : e->gemm_v2 ? "own-rowstable-v2" : "own-rowstable-v1";
     f->model_name = e->pack.name;
     f->cap = e->cap; f->qmax = e->pack.qmax;
@@ -561,10 +640,18 @@ static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
         "conv              own            glu + causal depthwise k=%d, cached\n"
         "decoder           own            label loop, first-index argmax, lstm x%d\n"
         "mel               host           src/features.c (double fft), phase 1\n"
-        "precision         f32            weights f32 resident, no tf32\n"
+        "precision         %-14s %s\n"
+        "kv ring           %-14s %s, %.2f MiB per slot\n"
         "graphs            off            phase 1\n",
         e->devname.c_str(), g, e->use_cublas ? "NO(measured)" : "yes",
-        e->gemm_splitk ? " splits=f(N,K) fixed-order reduction, NOT bit-identical to v1" : "", e->dm.conv_k, e->dm.pred_layers);
+        e->gemm_splitk ? " splits=f(N,K) fixed-order reduction, NOT bit-identical to v1" : "", e->dm.conv_k, e->dm.pred_layers,
+        e->weights_int8 ? "w8a32" : "f32",
+        e->weights_int8 ? "encoder linears + joint head int8 per-row (own w8 gemm, row-stable), rest f32; NOT bit-identical to f32"
+                        : "weights f32 resident, no tf32",
+        e->ar.kv_dtype == GPU_KV_INT8 ? "int8" : e->ar.kv_dtype == GPU_KV_BF16 ? "bf16" : "f32",
+        e->ar.kv_dtype == GPU_KV_INT8 ? "per (position, head) scale max|x|/127, NOT bit-identical to f32"
+        : e->ar.kv_dtype == GPU_KV_BF16 ? "round-to-nearest-even, NOT bit-identical to f32" : "reference",
+        (double)e->vram_kv / (double)(e->cap > 0 ? e->cap : 1) / 1048576.0);
 }
 
 /* ----------------------------------------------------------------- slots */

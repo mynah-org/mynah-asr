@@ -88,7 +88,7 @@ typedef struct {
 /* ---------------------------------------------------------------- global */
 static struct {
     /* config */
-    const char *model_dir, *host, *engine_name, *precision, *gemm;
+    const char *model_dir, *host, *engine_name, *precision, *gemm, *kv_dtype, *weights;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
     int threads, ring_seconds, profile;
     long max_frame_bytes;
@@ -1158,6 +1158,7 @@ static void usage(void) {
         "       [--device N] [--cap N] [--cohort-ms MS] [--http-threads N] [--idle-ms MS]\n"
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
         "       [--ring-seconds 30] [--gemm own|cublas] [--precision f32] [--engine-threads N (cpu engine pool)]\n"
+        "       [--kv-dtype f32|bf16|int8 (K/V ring storage; default f32)] [--weights f32|int8]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
@@ -1191,6 +1192,8 @@ int main(int argc, char **argv) {
         else if (ARG("--metrics-port")) g.metrics_port = atoi(v);
         else if (ARG("--gemm")) g.gemm = v;
         else if (ARG("--precision")) g.precision = v;
+        else if (ARG("--kv-dtype")) g.kv_dtype = v;
+        else if (ARG("--weights")) g.weights = v;
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
         else if (strcmp(a, "--version") == 0) { printf("mynah-asr-server-cuda %s\n", MYNAH_ASR_BUILD); return 0; }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
@@ -1207,7 +1210,7 @@ int main(int argc, char **argv) {
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
-                          .profile = g.profile};
+                          .profile = g.profile, .kv_dtype = g.kv_dtype, .weights = g.weights};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
