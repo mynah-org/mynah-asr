@@ -31,6 +31,17 @@
  *        run as several encoder passes in one step (S14-12: the split path),
  *        which must not change a byte either. Gate C runs every serving-loop
  *        option on top of the chosen precision / GEMM / pass-lanes arm.
+ *        [--kv-dtype f32|bf16|int8] [--weights f32|int8]
+ *        [--list clips.txt] [--alone N] [--no-cpu] [--json out.json --key-root DIR]
+ *        [--bench C --steps S]
+ *   --list      one clip path per line (up to MAXC), added to the clips
+ *   --alone N   gate A compares only the first N clips alone vs in the cohort
+ *               (every clip is still checked on a shifted slot)
+ *   --json      writes {clip path relative to --key-root: cohort text}, the
+ *               reference.json form gpu/tools/transcript_ab.py reads
+ *   --bench C   no gates: C lanes (the clips cycled) stepped together with the
+ *               stage profile on; prints device ms per full pass (passes where
+ *               all C lanes stepped, after 2 warm steps) and the VRAM facts
  * exit 0 = the gates pass; 1 = gate A or C failed or a device error; 3 = A and C
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -42,7 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAXC 16
+#define MAXC 256
 
 typedef struct { char *text; char *log; } utt;
 
@@ -133,22 +144,106 @@ static void on_res(const mynah_asr_result *r, void *ud) {
     cat_text(((cb_ctx *)ud)->u, r->text);
 }
 
+static int bench(const char *model, const char *gemm, const char *kv_dtype, const char *weights, float **pcm, size_t *ns,
+                 int n, int C, int steps) {
+    char err[512] = "";
+    asr_engine_cfg cfg = {.model_dir = model, .cap = C, .device = 0, .precision = "f32", .gemm = gemm,
+                          .profile = 1, .kv_dtype = kv_dtype, .weights = weights};
+    asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
+    if (!e) { printf("FAIL open: %s\n", err); return 1; }
+    asr_engine_facts f; asr_engine_get_facts(e, &f);
+    char dm[4096];
+    const size_t dn = asr_engine_dispatch_map(e, dm, sizeof(dm));
+    fwrite(dm, 1, dn, stdout);
+    printf("BENCH ready C=%d precision=%s gemm=%s vram_weights_mib=%.1f vram_arena_mib=%.1f vram_used_mib=%.1f\n",
+           C, f.precision, f.gemm, f.vram_weights / 1048576.0, f.vram_arena / 1048576.0, f.vram_used / 1048576.0);
+    asr_step_req *reqs = calloc((size_t)C, sizeof(*reqs));
+    asr_step_out *outs = calloc((size_t)C, sizeof(*outs));
+    size_t *off = calloc((size_t)C, sizeof(size_t));
+    if (!reqs || !outs || !off) return 1;
+    for (int i = 0; i < C; i++)
+        if (asr_engine_slot_reset(e, i, "auto", 3) != 0) { printf("FAIL slot reset\n"); return 1; }
+    double prof[ASR_PROF_STAGES] = {0}, wall = 0.0;
+    unsigned long passes = 0, full = 0;
+    for (int st = 0; st < steps; st++) {
+        int nreq = 0;
+        for (int i = 0; i < C; i++) {
+            const int c = i % n;
+            const size_t need = asr_engine_slot_need_samples(e, i);
+            if (need > 0 && off[i] + need <= ns[c]) {
+                if (asr_engine_slot_feed(e, i, pcm[c] + off[i], need) != 0) return 1;
+                off[i] += need;
+            }
+            if (asr_engine_slot_ready(e, i)) { reqs[nreq].slot = i; reqs[nreq].finalize = 0; nreq++; }
+        }
+        if (nreq == 0) break;
+        asr_engine_stats a, b;
+        asr_engine_get_stats(e, &a);
+        if (asr_engine_step(e, reqs, nreq, outs) != 0) { printf("FAIL step: %s\n", asr_engine_error(e)); return 1; }
+        asr_engine_get_stats(e, &b);
+        if (st >= 2 && nreq == C) {
+            for (int k = 0; k < ASR_PROF_STAGES; k++) prof[k] += b.prof_ms[k] - a.prof_ms[k];
+            passes += b.prof_passes - a.prof_passes;
+            wall += b.step_wall_ms_sum - a.step_wall_ms_sum;
+            full++;
+        }
+    }
+    double tot = 0.0;
+    for (int k = 0; k < ASR_PROF_STAGES; k++) tot += prof[k];
+    printf("BENCH C=%d full_steps=%lu passes=%lu device_ms_per_pass=%.3f step_wall_ms=%.3f\n", C, full, passes,
+           passes ? tot / (double)passes : 0.0, full ? wall / (double)full : 0.0);
+    for (int k = 0; k < ASR_PROF_STAGES; k++)
+        printf("BENCH   %-10s %8.3f ms/pass\n", ASR_PROF_NAME[k], passes ? prof[k] / (double)passes : 0.0);
+    asr_engine_close(e);
+    return 0;
+}
+
+static void json_str(FILE *fp, const char *s) {
+    fputc('"', fp);
+    for (; s && *s; s++) {
+        const unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') fprintf(fp, "\\%c", c);
+        else if (c < 0x20) fprintf(fp, "\\u%04x", c);
+        else fputc(c, fp);
+    }
+    fputc('"', fp);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <model_dir> [clips...]\n", argv[0]); return 2; }
     const char *model = argv[1];
     const char *dflt[] = {"tests/audio/test_it.wav", "tests/audio/test_en.wav", "tests/audio/test_de.wav",
                           "tests/audio/test_fr.wav", "tests/audio/test_es.wav"};
-    const char *clips[MAXC], *gemm = "own", *precision = "f32", *buckets = "1,2,4";
-    int n = 0, pass_lanes = 0, skip_c = 0;
+    const char *clips[MAXC], *gemm = "own", *precision = "f32", *buckets = "1,2,4", *kv_dtype = NULL, *json = NULL, *key_root = NULL, *weights = NULL;
+    int n = 0, pass_lanes = 0, skip_c = 0, n_alone = -1, no_cpu = 0, bench_c = 0, bench_steps = 40;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) gemm = argv[++i];
         else if (strcmp(argv[i], "--precision") == 0 && i + 1 < argc) precision = argv[++i];
         else if (strcmp(argv[i], "--pass-lanes") == 0 && i + 1 < argc) pass_lanes = atoi(argv[++i]);
         else if (strcmp(argv[i], "--graph-buckets") == 0 && i + 1 < argc) buckets = argv[++i];
         else if (strcmp(argv[i], "--no-gate-c") == 0) skip_c = 1;
+        else if (strcmp(argv[i], "--kv-dtype") == 0 && i + 1 < argc) kv_dtype = argv[++i];
+        else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) weights = argv[++i];
+        else if (strcmp(argv[i], "--json") == 0 && i + 1 < argc) json = argv[++i];
+        else if (strcmp(argv[i], "--key-root") == 0 && i + 1 < argc) key_root = argv[++i];
+        else if (strcmp(argv[i], "--alone") == 0 && i + 1 < argc) n_alone = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) bench_c = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) bench_steps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
+        else if (strcmp(argv[i], "--list") == 0 && i + 1 < argc) {
+            FILE *lf = fopen(argv[++i], "r");
+            if (!lf) { fprintf(stderr, "cannot open %s\n", argv[i]); return 2; }
+            char line[1024];
+            while (n < MAXC && fgets(line, sizeof(line), lf)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (line[0]) clips[n++] = strdup(line);
+            }
+            fclose(lf);
+        }
         else if (n < MAXC) clips[n++] = argv[i];
     }
     if (n == 0) for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
+    if (n_alone < 0 || n_alone > n) n_alone = n;
     const char *langs[MAXC];
     for (int i = 0; i < n; i++) langs[i] = "auto";
 
@@ -158,10 +253,11 @@ int main(int argc, char **argv) {
         pcm[i] = mynah_asr_wav_load(clips[i], &ns[i], &sr);
         if (!pcm[i] || sr != 16000) { fprintf(stderr, "cannot load %s (16 kHz mono)\n", clips[i]); return 2; }
     }
+    if (bench_c > 0) return bench(model, gemm, kv_dtype, weights, pcm, ns, n, bench_c, bench_steps);
 
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = precision, .gemm = gemm,
-                          .pass_lanes = pass_lanes};
+                          .pass_lanes = pass_lanes, .kv_dtype = kv_dtype, .weights = weights};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) {
         if (strstr(err, "no CUDA device") || strstr(err, "not compiled")) { printf("SKIP test_cuda_stream: %s\n", err); return 77; }
@@ -173,12 +269,31 @@ int main(int argc, char **argv) {
     /* ---- gate A: each clip alone, then all together (mixed lanes) */
     utt alone[MAXC] = {{0}}, together[MAXC] = {{0}};
     int fail = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n_alone; i++) {
         float *p1[1] = {pcm[i]}; size_t n1[1] = {ns[i]}; const char *l1[1] = {langs[i]};
         if (run_cohort(e, p1, n1, 1, l1, &alone[i]) != 0) return 1;
     }
     if (run_cohort(e, pcm, ns, n, langs, together) != 0) return 1;
-    for (int i = 0; i < n; i++) {
+    /* clips not run alone are checked against their own cohort text on a shifted slot */
+    for (int i = n_alone; i < n; i++) alone[i].text = together[i].text ? strdup(together[i].text) : NULL;
+    if (json) {
+        FILE *jf = fopen(json, "w");
+        if (!jf) { printf("FAIL: cannot write %s\n", json); return 1; }
+        const size_t kr = key_root ? strlen(key_root) : 0;
+        fprintf(jf, "{\n");
+        for (int i = 0; i < n; i++) {
+            const char *k = clips[i];
+            if (kr && strncmp(k, key_root, kr) == 0) { k += kr; while (*k == '/') k++; }
+            fprintf(jf, "  ");
+            json_str(jf, k);
+            fprintf(jf, ": ");
+            json_str(jf, together[i].text ? together[i].text : "");
+            fprintf(jf, "%s\n", i + 1 < n ? "," : "");
+        }
+        fprintf(jf, "}\n");
+        fclose(jf);
+    }
+    for (int i = 0; i < n_alone; i++) {
         const char *a = alone[i].text ? alone[i].text : "", *b = together[i].text ? together[i].text : "";
         const int same = strcmp(a, b) == 0;
         if (!same) fail = 1;
@@ -211,6 +326,9 @@ int main(int argc, char **argv) {
         }
     }
     if (fail) { printf("FAIL gate A: a stream's text depends on its cohort or its slot\n"); return 1; }
+
+    printf("OK   A: %d clip(s) alone == cohort, %d clip(s) slot-independent\n", n_alone, n);
+    if (no_cpu) { asr_engine_close(e); printf("PASS: gate A (gate B skipped, --no-cpu)\n"); return 0; }
 
     /* ---- gate B: the library's f32 CPU stream API */
     mynah_asr_model *m = mynah_asr_load_quant(model, MYNAH_ASR_QUANT_F32);

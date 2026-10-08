@@ -65,6 +65,13 @@ typedef struct {
                                 reset every slot; 0 (default) = none */
     int host_threads;        /* cuda: threads (caller included) that run the
                                 host mel of a slot_feed_batch; <= 1 = inline */
+    const char *kv_dtype;    /* cuda: storage of the per-slot K/V ring: "f32"
+                                (default, NULL), "bf16" or "int8" (per position
+                                and head scale). A numerical change: the ring is
+                                read back quantised; batch-invariant by construction */
+    const char *weights;     /* cuda: "f32" (default, NULL) or "int8": the large
+                                encoder linears and the joint head stored as the
+                                CPU's per-row int8 codes, own int8-weight GEMM */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */

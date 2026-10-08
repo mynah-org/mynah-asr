@@ -97,7 +97,7 @@ typedef struct {
 /* ---------------------------------------------------------------- global */
 static struct {
     /* config */
-    const char *model_dir, *host, *engine_name, *precision, *gemm;
+    const char *model_dir, *host, *engine_name, *precision, *gemm, *kv_dtype, *weights;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
     int threads, ring_seconds, profile, profile_host, pass_lanes;
     int stage_ahead, host_threads, graphs, warmup;
@@ -1416,6 +1416,7 @@ static void usage(void) {
         "       [--device N] [--cap N] [--cohort-ms MS] [--http-threads N] [--idle-ms MS]\n"
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
         "       [--ring-seconds 30] [--gemm own|own-v2|splitk|own-tc|cublas] [--precision f32|bf16 (bf16 = own-tc only)] [--engine-threads N (cpu engine pool)]\n"
+        "       [--kv-dtype f32|bf16|int8 (K/V ring storage; default f32)] [--weights f32|int8]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "       [--profile-host (DIAGNOSTIC: the engine thread's wall per phase, [HOSTP] lines)]\n"
         "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
@@ -1472,6 +1473,8 @@ int main(int argc, char **argv) {
         }
         else if (ARG("--graph-buckets")) g.graph_buckets = v;
         else if (ARG("--warmup")) g.warmup = atoi(v);
+        else if (ARG("--kv-dtype")) g.kv_dtype = v;
+        else if (ARG("--weights")) g.weights = v;
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
         else if (strcmp(a, "--version") == 0) { printf("mynah-asr-server-cuda %s\n", MYNAH_ASR_BUILD); return 0; }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
@@ -1498,7 +1501,8 @@ int main(int argc, char **argv) {
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
                           .profile = g.profile, .profile_host = g.profile_host, .pass_lanes = g.pass_lanes,
                           .graphs = g.graphs, .graph_buckets = g.graph_buckets,
-                          .warmup = g.warmup, .host_threads = g.host_threads};
+                          .warmup = g.warmup, .host_threads = g.host_threads,
+                          .kv_dtype = g.kv_dtype, .weights = g.weights};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }

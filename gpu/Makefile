@@ -41,7 +41,7 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 B := $(TOP)/build/gpu
 
 C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
-CU_OBJ   := $(B)/gemm.o $(B)/kernels.o $(B)/engine.o
+CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
 
 .PHONY: all cpu clean test-kernels test-stream bank-transcribe lib
 all: $(TOP)/mynah-asr-server-cuda
@@ -92,7 +92,7 @@ $(B)/test_cuda_kernels.o: $(TOP)/tests/test_cuda_kernels.cu cuda/kernels.cuh
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 test-kernels: $(TOP)/tests/test_cuda_kernels
-$(TOP)/tests/test_cuda_kernels: $(B)/test_cuda_kernels.o $(B)/gemm.o $(B)/kernels.o
+$(TOP)/tests/test_cuda_kernels: $(B)/test_cuda_kernels.o $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o
 	$(NVCC) $(GENCODE) -o $@ $^ $(CUDA_LIBS)
 
 $(B)/test_cuda_stream.o: $(TOP)/tests/test_cuda_stream.c asr_engine.h
