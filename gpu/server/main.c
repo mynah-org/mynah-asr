@@ -82,6 +82,7 @@ typedef struct {
     const char *outcome;          /* the code the session ended with, or NULL = completed */
     int done;                     /* the engine thread ended the session */
     int engine_open;              /* the engine slot holds this utterance */
+    int abandoned;                /* the ingest gave up waiting: end_session releases */
 } gslot;
 
 /* ---------------------------------------------------------------- global */
@@ -103,6 +104,7 @@ static struct {
     pthread_t engine_thread;
     /* books, under mu */
     unsigned long sessions, completed, cancelled, aborted;
+    unsigned long abandoned, abandoned_recovered;
     unsigned long cancel_by[CB__N];
     int active;
     unsigned long steps, deltas, cohorts;
@@ -233,7 +235,7 @@ static void slot_release_locked(gslot *s) {
     g.active--;
     s->state = SLOT_FREE;
     s->out = NULL;
-    s->req = 0; s->done = 0; s->outcome = NULL; s->engine_open = 0;
+    s->req = 0; s->done = 0; s->outcome = NULL; s->engine_open = 0; s->abandoned = 0;
     s->ring_len = s->ring_head = 0; s->ready_since = 0.0;
 }
 
@@ -375,15 +377,30 @@ static void frame_done(gslot *s) {
 
 /* -------------------------------------------------------- engine thread */
 static void end_session(gslot *s, const char *outcome) {
-    /* engine-thread only: records the outcome, closes the writer, wakes the ingest */
+    /* engine-thread only: records the outcome, closes the writer, wakes the
+     * ingest -- or, when the ingest already gave up on this slot, releases the
+     * slot and the writer itself (the ingest cannot: the engine was still
+     * using both). Exactly one side releases, decided under s->mu. */
     pthread_mutex_lock(&s->mu);
     if (s->outcome == NULL && outcome) s->outcome = outcome;
     s->state = SLOT_DONE;
     s->done = 1;
-    if (s->out) mynah_asr_stream_out_finish(s->out);
+    mynah_asr_stream_out *out = s->out;
+    if (out) mynah_asr_stream_out_finish(out);
+    const int abandoned = s->abandoned;
+    const char *ended = s->outcome ? s->outcome : "completed";
     pthread_cond_broadcast(&s->done_cv);
     pthread_cond_broadcast(&s->space);
     pthread_mutex_unlock(&s->mu);
+    if (abandoned) {
+        pthread_mutex_lock(&g.mu);
+        slot_release_locked(s);
+        g.abandoned_recovered++;
+        pthread_mutex_unlock(&g.mu);
+        if (out) mynah_asr_stream_out_release(out);
+        fprintf(stderr, "mynah-asr-server-cuda: abandoned slot %d ended (%s) and released by the engine thread\n",
+                s->id, ended);
+    }
 }
 
 static void engine_dead_exit(void) {
@@ -848,10 +865,31 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     free(payload);
     if (!cancelled && !shutting && !closed && lost >= 0) { slot_request(slot, REQ_CANCEL, lost, NULL); cancelled = 1; }
     if (!cancelled && !shutting && !closed) slot_request(slot, REQ_FINALIZE | REQ_CLOSE, 0, NULL);
-    int done = slot_wait_done(slot, 60000);
+    /* As in the CPU server: a ping every 500 ms while waiting for `done`
+     * gives a peer that vanished after its close frame or finalize something
+     * to answer with a reset, so the tail is not flushed for nobody. */
+    int done = 0;
+    for (int waited = 0; waited < 60000 && !done; waited += 250) {
+        done = slot_wait_done(slot, 250);
+        if (!done && !cancelled && !shutting && waited % 500 == 250) ws_enqueue(&w, 0x9, "", 0);
+    }
     if (!done) { slot_request(slot, REQ_CANCEL, CB_PEER, NULL); done = slot_wait_done(slot, 5000); }
     close(rfd);
     mynah_asr_thread_set_name("mynah-http");
+    if (!done) {
+        /* the engine still holds the slot and may still write through `out`:
+         * releasing here would hand it freed memory. Hand the release over,
+         * unless the session ended between the wait and this lock. */
+        pthread_mutex_lock(&slot->mu);
+        if (!slot->done) slot->abandoned = 1;
+        const int handed = slot->abandoned;
+        pthread_mutex_unlock(&slot->mu);
+        if (handed) {
+            pthread_mutex_lock(&g.mu); g.abandoned++; pthread_mutex_unlock(&g.mu);
+            fprintf(stderr, "mynah-asr-server-cuda: slot %d did not finish; left to the engine thread to release\n", slot->id);
+            return 1;
+        }
+    }
     pthread_mutex_lock(&g.mu);
     slot_release_locked(slot);
     pthread_mutex_unlock(&g.mu);
@@ -882,7 +920,8 @@ static void health_json(cJSON *j) {
     const int balanced = g.sessions == g.completed + g.cancelled + g.aborted + (unsigned long)g.active;
     cJSON_AddBoolToObject(j, "balanced", balanced);
     cJSON *ab = cJSON_AddObjectToObject(j, "abandoned");
-    cJSON_AddNumberToObject(ab, "total", 0); cJSON_AddNumberToObject(ab, "recovered", 0);
+    cJSON_AddNumberToObject(ab, "total", (double)g.abandoned);
+    cJSON_AddNumberToObject(ab, "recovered", (double)g.abandoned_recovered);
     cJSON *cb = cJSON_AddObjectToObject(j, "cancelled_by");
     for (int i = 0; i < CB__N; i++) cJSON_AddNumberToObject(cb, CANCEL_NAME[i], (double)g.cancel_by[i]);
     cJSON_AddNumberToObject(j, "audio_seconds", g.audio_seconds);
@@ -992,8 +1031,8 @@ static void dump_stderr(void) {
         for (int i = 0; i < ASR_PROF_STAGES; i++) D(" %s=%.1f", ASR_PROF_NAME[i], es.prof_ms[i]);
         D("\n");
     }
-    D("[DUMP] worker=0 seq=%lu books sessions=%lu completed=%lu cancelled=%lu aborted=%lu active=%d balanced=%d abandoned=0 recovered=0\n",
-      n, g.sessions, g.completed, g.cancelled, g.aborted, g.active, balanced);
+    D("[DUMP] worker=0 seq=%lu books sessions=%lu completed=%lu cancelled=%lu aborted=%lu active=%d balanced=%d abandoned=%lu recovered=%lu\n",
+      n, g.sessions, g.completed, g.cancelled, g.aborted, g.active, balanced, g.abandoned, g.abandoned_recovered);
     D("[DUMP] worker=0 seq=%lu cancelled=%lu", n, g.cancelled);
     for (int i = 0; i < CB__N; i++) D(" %s=%lu", CANCEL_NAME[i], g.cancel_by[i]);
     D("\n[DUMP] worker=0 seq=%lu refused server_at_capacity=%lu other=%lu\n", n, g.refused_cap, g.refused_other);
