@@ -77,7 +77,11 @@ typedef struct mynah_asr_offline_job {
     mynah_asr_word *words;
     int n_words;
     char detected[16];           /* DETECT_LANG */
-    int rc;                      /* 0 ok, -1 failed */
+    int rc;                      /* 0 ok, -1 failed, -3 dropped: client gone */
+    /* The requesting connection, probed before the job runs: a client that
+     * left while its request waited is not transcribed for nobody. has_peer 0
+     * = no connection to probe (the job always runs). */
+    int has_peer, peer_fd;
 
     int done;
     struct mynah_asr_offline_job *next;
@@ -179,6 +183,7 @@ typedef struct {
     unsigned long first_text_hist[14], finalize_hist[14], session_hist[13];
     double first_text_sum_ms, finalize_sum_ms, session_sum_s;
     unsigned long offline_done;
+    unsigned long offline_peer_gone;   /* dropped before inference: client gone */
     int  offline_pending, offline_max_pending;
     unsigned long cancel_by[MYNAH_ASR_SCHED_CANCEL__COUNT];
     double audio_seconds;          /* fed to the model: streams + offline jobs */

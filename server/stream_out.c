@@ -394,6 +394,27 @@ int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o) {
     return atomic_load_explicit(&o->failed, memory_order_acquire);
 }
 
+int mynah_asr_fd_peer_gone(int fd) {
+    if (fd < 0) return 0;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+#ifdef POLLRDHUP
+    pfd.events |= POLLRDHUP;
+#endif
+    pfd.revents = 0;
+    const int ready = poll(&pfd, 1, 0);
+    if (ready < 0) return errno != EINTR && errno != EAGAIN;
+    if (ready == 0) return 0;
+    if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) return 1;
+    /* POLLRDHUP alone could still have unread bytes in front of the FIN; the
+     * peek decides: 0 is the FIN itself, > 0 is a request still to be read */
+    char probe;
+    const ssize_t n = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) return 1;
+    return n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
 int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o) {
     return mynah_asr_stream_out_peer_gone_ex(o, 0);
 }

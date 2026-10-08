@@ -461,7 +461,11 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
         dj.kind = MYNAH_ASR_JOB_DETECT_LANG;
         dj.samples = samples;
         dj.n_samples = n_samples;
-        const int got = mynah_asr_sched_submit(&dj) == 0 && dj.detected[0] != '\0';
+        dj.has_peer = 1;
+        dj.peer_fd = fd;
+        const int drc = mynah_asr_sched_submit(&dj);
+        if (drc == -3) { free(samples); return 0; }   /* client gone: the caller closes */
+        const int got = drc == 0 && dj.detected[0] != '\0';
         if (got) snprintf(tag, sizeof(tag), "%s", dj.detected);
         /* map_lang is a table lookup on the model's config, not inference: it
          * stays on this thread rather than costing the scheduler a step. */
@@ -497,7 +501,15 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
         j.lookahead = f.lookahead;
         j.want_words = want_words;
         snprintf(j.lang, sizeof(j.lang), "%s", f.language);
+        j.has_peer = 1;
+        j.peer_fd = fd;
         const int rc = mynah_asr_sched_submit(&j);
+        if (rc == -3) {
+            /* the client left while the request waited: no inference ran, and
+             * there is nobody to answer; the caller closes the descriptor */
+            free(samples);
+            return 0;
+        }
         if (rc == -2) {
             /* --max-pending, and the same discipline as every other refusal:
              * writing a 503 and closing on a socket that may still hold a
@@ -1132,6 +1144,17 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
 
 /* ------------------------------------------------------------------- routing */
 static void handle_conn(int fd) {
+    /* A request that stops arriving (headers or body), or a client that stops
+     * reading its response, releases this HTTP thread after --idle-ms of
+     * silence instead of holding it for ever. Inactivity, not total time: a
+     * large upload that keeps moving is unaffected. The WebSocket path sets
+     * its own timeouts after the upgrade. */
+    {
+        struct timeval tv = {.tv_sec = g_idle_ms / 1000,
+                             .tv_usec = (g_idle_ms % 1000) * 1000};
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
     char hdr[MAX_HDR + 1];
     size_t got = 0;
     const char *hdr_end = NULL;

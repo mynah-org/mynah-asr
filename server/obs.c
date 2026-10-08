@@ -306,8 +306,11 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "mynah_asr_offline_jobs_total{worker=\"%s\"} %lu\n"
         "# HELP mynah_asr_offline_queued offline jobs waiting for a step right now.\n"
         "# TYPE mynah_asr_offline_queued gauge\n"
-        "mynah_asr_offline_queued{worker=\"%s\"} %d\n",
-        wl, st.offline_done, wl, st.offline_pending);
+        "mynah_asr_offline_queued{worker=\"%s\"} %d\n"
+        "# HELP mynah_asr_offline_peer_gone_total offline jobs dropped before inference: the client had left.\n"
+        "# TYPE mynah_asr_offline_peer_gone_total counter\n"
+        "mynah_asr_offline_peer_gone_total{worker=\"%s\"} %lu\n",
+        wl, st.offline_done, wl, st.offline_pending, wl, st.offline_peer_gone);
 
     /* S12-18: the rest of the session books. Every session claimed is counted
      * once when its slot is released: completed, cancelled (below, by reason),

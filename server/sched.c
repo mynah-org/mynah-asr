@@ -188,6 +188,7 @@ static struct {
      * /v1/health: relaxed atomics rather than a lock, so a health probe can
      * never queue behind a step. */
     _Atomic unsigned long steps, deltas, eous, cancelled, sessions, offline_jobs;
+    _Atomic unsigned long offline_peer_gone;
     /* S12-18: the terminal outcomes. `acct_mu` is taken by claim, release and
      * the snapshot -- a few times per SESSION, never per step -- so that
      * sessions == completed + cancelled + aborted + active holds exactly in
@@ -927,6 +928,32 @@ static int sched_run_jobs(void) {
     pthread_mutex_unlock(&g.mu);
     if (B == 0) return 0;
 
+    /* A request whose client left while it waited is answered with nothing
+     * and costs no inference (the REST zombie: a full transcription, stalling
+     * every stream on this worker, for a socket nobody reads). A job already
+     * inside the model below still runs to its end: the batched call has no
+     * abort point. */
+    mynah_asr_offline_job *gone[SCHED_MAX_OFFLINE_BATCH];
+    int n_gone = 0, kept = 0;
+    for (int b = 0; b < B; b++) {
+        if (batch[b]->has_peer && mynah_asr_fd_peer_gone(batch[b]->peer_fd)) {
+            batch[b]->rc = -3;
+            gone[n_gone++] = batch[b];
+        } else {
+            batch[kept++] = batch[b];
+        }
+    }
+    if (n_gone > 0) {
+        pthread_mutex_lock(&g.mu);
+        for (int b = 0; b < n_gone; b++) gone[b]->done = 1;
+        atomic_fetch_add_explicit(&g.offline_peer_gone, (unsigned long)n_gone,
+                                  memory_order_relaxed);
+        pthread_cond_broadcast(&g.job_done);
+        pthread_mutex_unlock(&g.mu);
+    }
+    B = kept;
+    if (B == 0) return 1;
+
     if (batch[0]->kind == MYNAH_ASR_JOB_DETECT_LANG) {
         mynah_asr_sched_assert_thread("mynah_asr_detect_lang");
         mynah_asr_offline_job *j = batch[0];
@@ -1467,6 +1494,7 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->deltas   = atomic_load_explicit(&g.deltas, memory_order_relaxed);
     out->eous     = atomic_load_explicit(&g.eous, memory_order_relaxed);
     out->offline_done = atomic_load_explicit(&g.offline_jobs, memory_order_relaxed);
+    out->offline_peer_gone = atomic_load_explicit(&g.offline_peer_gone, memory_order_relaxed);
     out->audio_seconds =
         (double)atomic_load_explicit(&g.audio_samples, memory_order_relaxed) /
         (double)g.sample_rate;
@@ -1612,6 +1640,7 @@ void mynah_asr_sched_health(cJSON *into) {
     cJSON *off = cJSON_AddObjectToObject(into, "offline");
     cJSON_AddNumberToObject(off, "queued", st.offline_pending);
     cJSON_AddNumberToObject(off, "done", (double)st.offline_done);
+    cJSON_AddNumberToObject(off, "peer_gone", (double)st.offline_peer_gone);
     cJSON_AddNumberToObject(off, "max_pending", st.offline_max_pending);
     cJSON_AddNumberToObject(into, "audio_seconds", st.audio_seconds);
 
