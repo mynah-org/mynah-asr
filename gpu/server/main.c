@@ -815,17 +815,26 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
                     "every slot of this GPU is in use", 1);
         return 1;
     }
+    /* the ingest's own descriptor BEFORE the upgrade: out of descriptors
+     * (EMFILE) is then a 503 the client can read, not a silent close right
+     * after a 101 */
+    const int rfd = dup(fd);
+    if (rfd < 0) {
+        pthread_mutex_lock(&g.mu); slot_release_locked(slot); pthread_mutex_unlock(&g.mu);
+        refuse_json(fd, 503, "Service Unavailable", "server_error", "server_at_capacity",
+                    "the server is out of file descriptors", 1);
+        return 1;
+    }
     char accept[40];
     ws_accept_key(key, accept, sizeof(accept));
     char resp[256];
     const int rn = snprintf(resp, sizeof(resp),
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept);
     if (write_all(fd, resp, (size_t)rn) != 0) {
+        close(rfd);
         pthread_mutex_lock(&g.mu); slot_release_locked(slot); pthread_mutex_unlock(&g.mu);
         return 0;
     }
-    const int rfd = dup(fd);
-    if (rfd < 0) { pthread_mutex_lock(&g.mu); slot_release_locked(slot); pthread_mutex_unlock(&g.mu); return 0; }
     struct timeval tv = {.tv_sec = g.idle_ms / 1000, .tv_usec = (g.idle_ms % 1000) * 1000};
     (void)setsockopt(rfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     mynah_asr_stream_out *out = mynah_asr_stream_out_start(fd, 0, 0);
