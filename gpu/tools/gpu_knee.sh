@@ -22,6 +22,9 @@
 #   CLIPIN    taskset CPU list for the load generator (other CPUs / another node)
 #   LANG_Q    lang query (default: auto)   LOOKAHEAD (default: 3)
 #   DEVICE    GPU ordinal (default: 0)     PORT (default: 8391)   SAMPLE_MS (default: 500)
+#   ONSETS    JSON {clip: speech onset s} from tools/bench/clip_onset.py; with it
+#             TTFP is also measured from the speech onset (ttfp_on95), which a
+#             clip that starts with silence does not inflate (default: none)
 #   TAG, OUT  results go to $OUT/$TAG      (default: ./gpu-knee-res/run)
 #   BIN       server binary                (default: ./mynah-asr-server-cuda)
 #
@@ -87,7 +90,7 @@ for C in $LEVELS; do
     # shellcheck disable=SC2086
     timeout $(( DUR + WARM + 120 )) $CP "$PY" tools/bench/stream_load.py --port "$PORT" --mode soak --streams "$C" \
         --duration $(( DUR + WARM )) --warmup "$WARM" --window 30 --seed 42 --lang "$LANG_Q" \
-        --lookahead "$LOOKAHEAD" --bank short,medium,long --class-bounds 8,20 --clips $CLIPS \
+        --lookahead "$LOOKAHEAD" --bank short,medium,long --class-bounds 8,20 --clips $CLIPS ${ONSETS:+--onsets "$ONSETS"} \
         --json "$R/load-C$C.json" > "$R/load-C$C.txt" 2>&1
     kill -USR1 "$SPID" 2>/dev/null; sleep 1
     # the sampler is the python process exec()ed into nvidia-smi
@@ -106,6 +109,7 @@ g = lambda k, q="p95": m.get(k, {}).get(q)  # noqa: E731
 f = lambda v, fmt="%.0f": "n/a" if v is None else fmt % v  # noqa: E731
 print(f"  C{sys.argv[2]} ready={sys.argv[3]}s ok={c['ok']}/{c['utterances']} err={c['errors']} rej={c['rejected']} "
       f"lag95={f(g('emission_lag_ms'))}ms fin95={f(g('finalization_lag_ms'))}ms ttfp95={f(g('ttfp_ms'))}ms "
+      f"ttfp_on95={f(g('ttfp_from_onset_ms'))}ms "
       f"backlog_max={f(g('backlog_s', 'max'), '%.2f')}s verdict={env.get('verdict', '?')}")
 PY
     sed -n 's/^\(\[SERVER-CONFIG\].*\)vram_used_at_ready_mb=\([0-9]*\).*/    vram_used_at_ready_mb=\2/p' "$L" | head -1
