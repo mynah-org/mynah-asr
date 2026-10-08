@@ -58,6 +58,20 @@ typedef struct {
 static fleet_page *g_pages;
 static int g_npages;
 
+/* The router's last consistent copy of every page (private memory, not
+ * shared). A read that cannot get a consistent copy -- the writer preempted
+ * mid-copy, or killed there, which leaves `seq` odd for ever -- sums the last
+ * good one instead of dropping the worker, so a fleet `_total` never goes
+ * backwards between two scrapes. Scrapes may run on several router threads:
+ * the cache is updated under its own mutex. */
+typedef struct {
+    int ok;
+    double t_pub;
+    mynah_asr_fleet_stats st;
+} fleet_last;
+static fleet_last *g_last;
+static pthread_mutex_t g_last_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static double fleet_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -73,6 +87,11 @@ int mynah_asr_fleet_map(int n) {
         return -1;
     }
     memset(p, 0, (size_t)n * sizeof(fleet_page));
+    g_last = calloc((size_t)n, sizeof(fleet_last));
+    if (!g_last) {
+        munmap(p, (size_t)n * sizeof(fleet_page));
+        return -1;
+    }
     g_pages = (fleet_page *)p;
     g_npages = n;
     return 0;
@@ -89,9 +108,10 @@ static void page_write(fleet_page *pg, const mynah_asr_fleet_stats *st) {
     atomic_store_explicit(&pg->published, 1, memory_order_release);
 }
 
-/* A consistent copy, or 0 when the page was never published. A worker killed
- * in the middle of a write leaves `seq` odd for ever: after a bounded number of
- * retries the torn copy is refused rather than summed. */
+/* A consistent copy, or 0 when the page was never published or no consistent
+ * copy came within the retry budget. A worker killed in the middle of a write
+ * leaves `seq` odd for ever: the torn copy is refused rather than summed, and
+ * mynah_asr_fleet_sum falls back to the router's last good copy. */
 static int page_read(const fleet_page *pg, mynah_asr_fleet_stats *out, double *t_pub) {
     if (!atomic_load_explicit(&pg->published, memory_order_acquire)) return 0;
     for (int tries = 0; tries < 1000; tries++) {
@@ -234,10 +254,20 @@ int mynah_asr_fleet_sum(mynah_asr_fleet_stats *sum, const int *dead,
     const double now = fleet_now();
     r->snapshot_age_max_s = 0.0;
     r->sessions_lost = 0;
+    pthread_mutex_lock(&g_last_mu);
     for (int i = 0; i < g_npages; i++) {
         mynah_asr_fleet_stats st;
         double t_pub = 0.0;
-        if (!page_read(&g_pages[i], &st, &t_pub)) continue;
+        if (page_read(&g_pages[i], &st, &t_pub)) {
+            g_last[i].ok = 1;
+            g_last[i].st = st;
+            g_last[i].t_pub = t_pub;
+        } else if (g_last[i].ok) {
+            st = g_last[i].st;      /* torn or stuck: the last good copy */
+            t_pub = g_last[i].t_pub;
+        } else {
+            continue;               /* never published */
+        }
         seen++;
         const int is_dead = dead != NULL && dead[i];
         /* A dead worker's counters stay (the totals never go backwards); its
@@ -251,6 +281,7 @@ int mynah_asr_fleet_sum(mynah_asr_fleet_stats *sum, const int *dead,
         const double age = now - t_pub;
         if (age > r->snapshot_age_max_s) r->snapshot_age_max_s = age;
     }
+    pthread_mutex_unlock(&g_last_mu);
     return seen;
 }
 
