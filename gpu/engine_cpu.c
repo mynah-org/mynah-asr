@@ -175,6 +175,9 @@ static size_t cpu_dispatch_map(const cpu_engine *e, char *buf, size_t cap) {
         mynah_asr_gemm_provider());
 }
 
+typedef struct { float *pcm; size_t n, cap; } stage_buf;
+static stage_buf *g_stage;   /* [cap], lazily */
+
 static int cpu_slot_reset(cpu_engine *e, int slot, const char *lang_in, int lookahead) {
     if (slot < 0 || slot >= e->cap) return -1;
     cpu_slot *s = &e->slots[slot];
@@ -190,11 +193,11 @@ static int cpu_slot_reset(cpu_engine *e, int slot, const char *lang_in, int look
         return -1;
     }
     s->in_use = 1; s->finished = 0; s->delta_len = 0; s->n_cb = 0; s->t0 = s->t1 = 0.0;
+    /* PCM staged by the previous session on this slot (cancelled, peer gone,
+     * or reset mid-utterance) never reaches the next utterance */
+    if (g_stage) g_stage[slot].n = 0;
     return 0;
 }
-
-typedef struct { float *pcm; size_t n, cap; } stage_buf;
-static stage_buf *g_stage;   /* [cap], lazily */
 
 /* what the library still needs for its next chunk, MINUS what is already
  * staged here: a slot with a whole chunk staged needs nothing more, so the
