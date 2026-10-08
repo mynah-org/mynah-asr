@@ -27,6 +27,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -37,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -122,6 +124,8 @@ static struct {
     hostprof hp;
     /* VRAM used on the device (all processes) when ready, and the most seen since */
     double vram_ready_mb, vram_peak_mb;
+    /* accept() out of descriptors / kernel memory: backed off, under mu */
+    unsigned long accept_backoffs;
 } g;
 
 static double now_s(void) {
@@ -1021,6 +1025,7 @@ static void health_json(cJSON *j) {
         cJSON_AddNumberToObject(st, "passes", (double)es.hprof_passes);
         cJSON_AddNumberToObject(st, "syncs", (double)es.hprof_syncs);
     }
+    cJSON_AddNumberToObject(j, "accept_backoffs", (double)g.accept_backoffs);
     cJSON *refused = cJSON_AddObjectToObject(j, "refused");
     cJSON_AddNumberToObject(refused, "server_at_capacity", (double)g.refused_cap);
     cJSON_AddNumberToObject(refused, "other", (double)g.refused_other);
@@ -1056,6 +1061,7 @@ static size_t metrics_text(char *b, size_t cap) {
     M("# TYPE mynah_asr_gpu_h2d_bytes_total counter\nmynah_asr_gpu_h2d_bytes_total %.0f\n", es.h2d_bytes);
     M("# TYPE mynah_asr_gpu_d2h_bytes_total counter\nmynah_asr_gpu_d2h_bytes_total %.0f\n", es.d2h_bytes);
     M("# TYPE mynah_asr_gpu_device_errors_total counter\nmynah_asr_gpu_device_errors_total %lu\n", es.errors);
+    M("# TYPE mynah_asr_accept_backoffs_total counter\nmynah_asr_accept_backoffs_total %lu\n", g.accept_backoffs);
     if (g.profile_host && k < cap)
         k += hostprof_metrics(&g.hp, es.hprof_us, ASR_HPROF_NAME, ASR_HPROF_PHASES, b + k, cap - k);
 #undef M
@@ -1101,8 +1107,8 @@ static void dump_stderr(void) {
         /* device-wide (every process on the GPU), from cudaMemGetInfo */
         const double used = (double)f.vram_used / 1048576.0;
         if (used > g.vram_peak_mb) g.vram_peak_mb = used;
-        D("[DUMP] worker=0 seq=%lu vram used_mb=%.0f ready_mb=%.0f peak_seen_mb=%.0f total_mb=%.0f\n",
-          n, used, g.vram_ready_mb, g.vram_peak_mb, (double)f.vram_total / 1048576.0);
+        D("[DUMP] worker=0 seq=%lu vram used_mb=%.0f ready_mb=%.0f peak_seen_mb=%.0f total_mb=%.0f accept_backoffs=%lu\n",
+          n, used, g.vram_ready_mb, g.vram_peak_mb, (double)f.vram_total / 1048576.0, g.accept_backoffs);
     }
     D("[DUMP] v=1 worker=0 seq=%lu end\n", n);
 #undef D
@@ -1223,6 +1229,41 @@ static void on_signal(int sig) {
     atomic_store(&g.shutdown, 1);
 }
 
+/* Every stream holds two descriptors for its life (the socket and the dup the
+ * ingest reads), plus the HTTP pool, the listeners, the CUDA driver's own and
+ * stdio. The usual soft limit is 1024, so past ~500 streams accept() would
+ * fail with EMFILE. Raise the SOFT limit to the HARD one (no privilege
+ * needed; the same rule as the CPU server's raise_nofile_limit), halving the
+ * ask when a sysctl below the hard limit refuses it, and say what it became. */
+static void raise_nofile_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        fprintf(stderr, "mynah-asr-server-cuda: WARNING RLIMIT_NOFILE is unreadable (%s)\n", strerror(errno));
+        return;
+    }
+    const rlim_t had = rl.rlim_cur;
+    rlim_t want = rl.rlim_max;
+#if defined(__APPLE__)
+    if (want == RLIM_INFINITY || want > (rlim_t)OPEN_MAX) want = (rlim_t)OPEN_MAX;
+#else
+    if (want == RLIM_INFINITY) want = (rlim_t)1048576;
+#endif
+    for (rlim_t n = want; n > had; n = had + (n - had) / 2) {
+        rl.rlim_cur = n;
+        if (setrlimit(RLIMIT_NOFILE, &rl) == 0) break;
+    }
+    struct rlimit now;
+    if (getrlimit(RLIMIT_NOFILE, &now) != 0) now = rl;
+    const unsigned long long need = 2ull * (unsigned long long)g.cap + (unsigned long long)g.http_threads + 64ull;
+    fprintf(stderr, "mynah-asr-server-cuda: RLIMIT_NOFILE soft %llu -> %llu (hard %llu); cap %d needs about %llu\n",
+            (unsigned long long)had, (unsigned long long)now.rlim_cur, (unsigned long long)now.rlim_max, g.cap, need);
+    if (now.rlim_cur != RLIM_INFINITY && (unsigned long long)now.rlim_cur < need)
+        fprintf(stderr, "mynah-asr-server-cuda: WARNING the descriptor ceiling %llu is below what --cap %d needs (~%llu): "
+                        "raise the hard limit (ulimit -Hn, LimitNOFILE=, --ulimit nofile) or lower --cap; past it accept() "
+                        "fails with EMFILE and the server backs off\n",
+                (unsigned long long)now.rlim_cur, g.cap, need);
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage: mynah-asr-server-cuda -m <model_dir> [-p PORT] [--host H] [--engine cuda|cpu]\n"
@@ -1277,6 +1318,7 @@ int main(int argc, char **argv) {
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
 
     signal(SIGPIPE, SIG_IGN);
+    raise_nofile_limit();
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
@@ -1363,7 +1405,26 @@ int main(int argc, char **argv) {
         if (rc <= 0) continue;
         if (p[0].revents & POLLIN) {
             const int fd = accept(g.listen_fd, NULL, NULL);
-            if (fd < 0) continue;
+            if (fd < 0) {
+                /* Out of descriptors or kernel memory is a capacity condition:
+                 * the listener stays readable, so a bare `continue` would spin
+                 * poll+accept at 100 % while the clients wait in the backlog
+                 * with no word in the log. Say so at most once a second, count
+                 * it, back off briefly; the streams in flight free theirs. */
+                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                    static double last_note;
+                    const double t = now_s();
+                    pthread_mutex_lock(&g.mu); g.accept_backoffs++; pthread_mutex_unlock(&g.mu);
+                    if (t - last_note >= 1.0) {
+                        last_note = t;
+                        fprintf(stderr, "mynah-asr-server-cuda: accept: %s; backing off (raise the open-file limit if this repeats)\n",
+                                strerror(errno));
+                    }
+                    const struct timespec pause = {0, 20 * 1000 * 1000};
+                    nanosleep(&pause, NULL);
+                }
+                continue;
+            }
             pthread_mutex_lock(&g_q.mu);
             if (g_q.len >= g_q.cap) {
                 pthread_mutex_unlock(&g_q.mu);
