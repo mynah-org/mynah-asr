@@ -120,7 +120,9 @@ def rung(path, log):
         return sum(v) / len(v) if v else None
     g = lambda k, q="p95": (m.get(k) or {}).get(q)
     return {
-        "C": man.get("concurrency"), "utt": cnt["ok"], "lost": cnt["errors"],
+        # whole run, warm-up included (S12-17); older runs only have `errors`
+        "C": man.get("concurrency"), "utt": cnt["ok"],
+        "lost": cnt.get("errors_total", cnt["errors"]),
         "rejected": cnt["rejected"], "paced": s["pacing"]["paced"],
         "audio_per_wall": g("audio_per_wall", "max"),
         "model_duty": avg("model_duty"), "busy": avg("busy_frac"),

@@ -266,8 +266,10 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
     float *cA = calloc((size_t)B * ccache_floats(&e), sizeof(float));
     /* 0 = "this stream had no chunk at that step": the streams run out at
      * different steps, so the grids are ragged and only the common cells count */
-    int qA[MAX_B * 64] = {0}, qB[MAX_B * 64] = {0}, nsteps = 0;
-    if (!A || !Bo || !kA || !vA || !cA) return -1;
+    float *kB = calloc(cache_floats(&e), sizeof(float));
+    float *vB = calloc(cache_floats(&e), sizeof(float));
+    int qA[MAX_B * 64] = {0}, qB[MAX_B * 64] = {0}, nsteps = 0, validA[MAX_B] = {0};
+    if (!A || !Bo || !kA || !vA || !cA || !kB || !vB) return -1;
 
     /* pass 1: every stream on its own, mynah_asr_enc_stream_step */
     for (;;) {
@@ -287,8 +289,11 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
         if (++nsteps >= max_steps) break;
     }
     for (int i = 0; i < B; i++) {
-        memcpy(kA + (size_t)i * cache_floats(&e), es[i].k_cache, cache_floats(&e) * sizeof(float));
-        memcpy(vA + (size_t)i * cache_floats(&e), es[i].v_cache, cache_floats(&e) * sizeof(float));
+        /* the LOGICAL K/V contents (src/kvcache.h): what the cache means, in
+         * whichever physical layout this process runs */
+        mynah_asr_kv_logical(&es[i].kv, 0, kA + (size_t)i * cache_floats(&e));
+        mynah_asr_kv_logical(&es[i].kv, 1, vA + (size_t)i * cache_floats(&e));
+        validA[i] = es[i].kv.valid;
         memcpy(cA + (size_t)i * ccache_floats(&e), es[i].conv_cache, ccache_floats(&e) * sizeof(float));
     }
 
@@ -351,8 +356,11 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
     for (int i = 0; i < B; i++) {
         const float *k = kA + (size_t)i * cache_floats(&e), *v = vA + (size_t)i * cache_floats(&e);
         const float *c = cA + (size_t)i * ccache_floats(&e);
-        if (memcmp(k, es[i].k_cache, cache_floats(&e) * sizeof(float)) != 0) cdiff++;
-        if (memcmp(v, es[i].v_cache, cache_floats(&e) * sizeof(float)) != 0) cdiff++;
+        const size_t lf = (size_t)e.enc.n_layers * (size_t)es[i].kv.valid * (size_t)e.enc.d_model;
+        mynah_asr_kv_logical(&es[i].kv, 0, kB);
+        mynah_asr_kv_logical(&es[i].kv, 1, vB);
+        if (es[i].kv.valid != validA[i] || memcmp(k, kB, lf * sizeof(float)) != 0) cdiff++;
+        if (es[i].kv.valid != validA[i] || memcmp(v, vB, lf * sizeof(float)) != 0) cdiff++;
         if (memcmp(c, es[i].conv_cache, ccache_floats(&e) * sizeof(float)) != 0) cdiff++;
     }
 
@@ -376,7 +384,7 @@ static int bitexact_one(encfix *ep, int quantize, clip *cs, int n_clips, int B) 
 
     mynah_asr_enc_batch_free(bb);
     for (int i = 0; i < B; i++) { mynah_asr_enc_stream_free(&es[i]); free(feats[i]); }
-    free(A); free(Bo); free(kA); free(vA); free(cA);
+    free(A); free(Bo); free(kA); free(vA); free(cA); free(kB); free(vB);
     return ok ? 0 : 1;
 }
 

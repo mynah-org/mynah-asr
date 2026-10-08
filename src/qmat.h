@@ -86,6 +86,19 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
 int mynah_asr_qmat_mul_rows(const mynah_asr_qmat *m, const float *x, float *out, int T,
                         int8_t *qx, float *sx);
 
+/* PRE-QUANTISED activations (S10-3 level 4). mynah_asr_qmat_mul_rows on an
+ * int8 matrix with a native kernel quantises each row on its own (per-row
+ * absmax) and then runs the GEMM. These split the two, so the row can be
+ * quantised by whichever parallel task produced it:
+ *   _prequant_ok  1 when mul_rows would take that native int8 path for m
+ *   _quant_row    the SAME per-row quantisation, returning the row's scale
+ *   _mul_rows_q   the SAME GEMM, over rows already in qx/sx
+ * Same bytes into the same kernel: bit-identical to mul_rows by construction. */
+int   mynah_asr_qmat_prequant_ok(const mynah_asr_qmat *m);
+float mynah_asr_qmat_quant_row(int8_t *qx, const float *x, int k);
+int   mynah_asr_qmat_mul_rows_q(const mynah_asr_qmat *m, const int8_t *qx, const float *sx,
+                                float *out, int T);
+
 /* Which implementation ran, counted per call (ENGINEERING.md §6: a fallback is
  * visible). Cheap relaxed atomics; read with mynah_asr_qmat_counter. */
 enum {
@@ -98,6 +111,16 @@ enum {
     MYNAH_ASR_QC__N
 };
 unsigned long long mynah_asr_qmat_counter(int which);
+
+/* Activation quantisation, by WHERE it ran (S10-3 level 4 mechanism proof):
+ * rows quantised by mul_rows on the calling thread and the wall they took,
+ * rows quantised by producers through quant_row, and GEMMs that consumed
+ * pre-quantised rows (mul_rows_q). Relaxed atomics, reset with the counters. */
+typedef struct {
+    unsigned long long caller_rows, caller_ns, caller_calls;
+    unsigned long long producer_rows, prequant_gemms;
+} mynah_asr_actq_stats;
+void mynah_asr_qmat_actq_stats(mynah_asr_actq_stats *out);
 void mynah_asr_qmat_counters_reset(void);
 
 /* ------------------------------------------------ which int8 MICRO-KERNEL ran

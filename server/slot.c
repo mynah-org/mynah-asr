@@ -166,6 +166,8 @@ static void slot_reset_queue_locked(mynah_asr_slot *s) {
     s->req = 0;
     s->cancel_reason = MYNAH_ASR_SLOT_CANCEL_NONE;
     s->req_lang[0] = '\0';
+    s->outcome = NULL;
+    s->abandoned = 0;
 }
 
 int mynah_asr_slot_claim(mynah_asr_slot *s, const char *lang, int lookahead,
@@ -189,6 +191,7 @@ int mynah_asr_slot_claim(mynah_asr_slot *s, const char *lang, int lookahead,
     s->t_open = now;
     s->t_first_delta = 0.0;
     s->t_first_audio = s->t_first_queued = 0.0;
+    s->first_text_counted = 0;
     s->last_arrival = 0.0;
     s->t_last_step = 0.0;   /* a pooled slot must not inherit the last session's */
     s->lag_sum_ms = s->lag_max_ms = 0.0;
@@ -239,6 +242,37 @@ void mynah_asr_slot_set_state(mynah_asr_slot *s, mynah_asr_slot_state st) {
     if (st == MYNAH_ASR_SLOT_DONE || st == MYNAH_ASR_SLOT_FREE)
         pthread_cond_broadcast(&s->space);
     slot_unlock(s);
+}
+
+void mynah_asr_slot_set_outcome(mynah_asr_slot *s, const char *code) {
+    slot_lock(s, "mynah_asr_slot_set_outcome");
+    if (s->outcome == NULL) s->outcome = code;
+    slot_unlock(s);
+}
+
+int mynah_asr_slot_finish(mynah_asr_slot *s, const char *code) {
+    slot_lock(s, "mynah_asr_slot_finish");
+    if (s->outcome == NULL) s->outcome = code;
+    s->state = MYNAH_ASR_SLOT_DONE;
+    const int abandoned = s->abandoned;
+    pthread_cond_broadcast(&s->space);
+    slot_unlock(s);
+    return abandoned;
+}
+
+int mynah_asr_slot_abandon(mynah_asr_slot *s) {
+    slot_lock(s, "mynah_asr_slot_abandon");
+    const int done = s->state == MYNAH_ASR_SLOT_DONE || s->state == MYNAH_ASR_SLOT_FREE;
+    if (!done) s->abandoned = 1;
+    slot_unlock(s);
+    return !done;
+}
+
+const char *mynah_asr_slot_outcome(mynah_asr_slot *s) {
+    slot_lock(s, "mynah_asr_slot_outcome");
+    const char *o = s->outcome;
+    slot_unlock(s);
+    return o;
 }
 
 /* True while the pusher still has a session to push into. */

@@ -324,6 +324,11 @@ unsigned long long mynah_asr_stream_batch_rows_stacked(void);
 void mynah_asr_stream_batch_share_stats(unsigned long long *shared,
                                     unsigned long long *total);
 
+/* The streaming K/V cache layout in use (src/kvcache.h: "shift", "ring",
+ * "slide"; "none" before any stream exists) and the bytes every cache in the
+ * process has copied so far: gather, commit and compaction (CACHE-RING-1). */
+void mynah_asr_stream_kv_stats(const char **layout, unsigned long long *bytes);
+
 /* The batched encoder step split by component, in nanoseconds, with the rows
  * and steps behind them. 9 slots; mynah_asr_stream_step_component_name names them.
  * The fitted cadence law makes the marginal per-row cost about 70 % of what a

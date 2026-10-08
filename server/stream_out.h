@@ -107,6 +107,18 @@ int mynah_asr_stream_out_failed(const mynah_asr_stream_out *o);
  * the send timeout, not this function's. */
 int mynah_asr_stream_out_peer_gone(mynah_asr_stream_out *o);
 
+/* The same, with `hard_only` set: only a reset or a socket error counts, never
+ * a half-close. For a stream flushing its tail, whose client may legally have
+ * shut its sending side and still be waiting for `done`. */
+int mynah_asr_stream_out_peer_gone_ex(mynah_asr_stream_out *o, int hard_only);
+
+/* The same probe on a bare descriptor that has no output ring: a REST request
+ * whose body was read and whose client waits for the response. Anything that
+ * says the client is gone counts, a FIN included -- an HTTP client that closed
+ * its side before the response is a client that left (the "499" case). Data
+ * still unread (a pipelined request) is NOT gone. Never blocks. */
+int mynah_asr_fd_peer_gone(int fd);
+
 /* No more messages will be enqueued: let the writer drain and close.
  * Non-blocking; the writer may still be draining when this returns. */
 void mynah_asr_stream_out_finish(mynah_asr_stream_out *o);

@@ -303,9 +303,19 @@ def yaml_features_section(fe: dict) -> dict:
 
 
 def yaml_encoder_section(enc: dict) -> dict:
-    assert enc.get("att_context_style", "regular") == "regular" \
-        and not enc.get("causal_downsampling", False), \
-        "only non-causal offline encoders from .nemo (for now)"
+    """The encoder block, offline or cache-aware, from a .nemo model_config.yaml.
+
+    NeMo has ONE ConformerEncoder and switches streaming on by configuration, so
+    this reads both. The two settings that decide it must agree: `chunked_limited`
+    attention without `causal_downsampling` (or the reverse) is a checkpoint we
+    have never seen and would silently mis-shape, so it is refused by name.
+    """
+    causal = bool(enc.get("causal_downsampling", False))
+    style = enc.get("att_context_style", "regular")
+    assert (style == "chunked_limited") == causal, (
+        f"att_context_style={style!r} with causal_downsampling={causal}: "
+        "cache-aware packs are chunked_limited AND causal, offline packs are "
+        "neither, and this is one of each")
     return {
         "n_layers": enc["n_layers"],
         "d_model": enc["d_model"],
@@ -313,15 +323,79 @@ def yaml_encoder_section(enc: dict) -> dict:
         "ffn_dim": enc["d_model"] * enc["ff_expansion_factor"],
         "conv_kernel": enc["conv_kernel_size"],
         "conv_norm": enc["conv_norm_type"],
-        "subsampling": enc["subsampling"],            # dw_striding (non-causal)
+        # the causal variant is a different frontend, not a flag on the same one:
+        # asymmetric padding, and it is what the streaming step is written for
+        "subsampling": enc["subsampling"] + ("_causal" if causal else ""),
         "subsampling_factor": enc["subsampling_factor"],
         "subsampling_conv_channels": enc["subsampling_conv_channels"],
         "use_bias": enc.get("use_bias", True),        # NeMo default: biases present
         "activation": "silu",
-        "att_context_style": enc.get("att_context_style", "regular"),
+        "att_context_style": style,
         "pos_emb_max_len": enc["pos_emb_max_len"],
         # xscaling: layer input scaled by sqrt(d_model) (older models)
         "xscaling": bool(enc.get("xscaling", False)),
+    }
+
+
+def build_streaming_rnnt_from_yaml(model_dir: Path, y: dict) -> dict:
+    """mynah.json for a CACHE-AWARE streaming RNNT pack that ships only a .nemo.
+
+    Nemotron reached this runtime through the HF-native path, because NVIDIA
+    publishes config.json and safetensors for it. parakeet_realtime_eou_120m-v1
+    publishes a .nemo and nothing else, so the same encoder family arrives by a
+    route that had no streaming branch. This is that branch; it produces the
+    same `streaming` block `build_nemotron` does, from the yaml's own fields.
+
+    No `prompt` section: this checkpoint has no language conditioning at all
+    (no `num_prompts`, no prompt dictionary), and the runtime already treats the
+    prompt projector as optional -- src/encoder.c takes the
+    "model without prompt" branch when the tensor is absent.
+    """
+    enc, dec = y["encoder"], y["decoder"]
+    fe = y["preprocessor"]
+    sub = enc["subsampling_factor"]
+
+    # att_context_size is either one [left, right] pair or a LIST of them: a
+    # multi-context checkpoint is trained to run at any of them (Nemotron 3.5
+    # ships four). Normalise to a list of pairs and keep NeMo's own ordering,
+    # whose first entry is the inference default.
+    acs = enc["att_context_size"]
+    presets = [list(acs)] if acs and not isinstance(acs[0], (list, tuple)) \
+        else [list(p) for p in acs]
+    for left, right in presets:
+        # NeMo raises on this; so do we, rather than build a pack whose chunk
+        # grid does not tile its own left context.
+        assert right >= 0 and left % (right + 1) == 0, (
+            f"att_context_size [{left}, {right}]: the left context must be a "
+            f"whole number of {right + 1}-frame chunks")
+
+    durations = (y.get("decoding") or {}).get("durations") or []
+    assert not durations, "a streaming TDT pack is not supported (RNNT only)"
+
+    return {
+        "mynah_asr_format": 1,
+        "name": model_dir.name,
+        "arch": "fastconformer_rnnt_streaming",
+        "engine": "nemotron-streaming",
+        "weights": "model.safetensors",
+        "features": yaml_features_section(fe),
+        "encoder": yaml_encoder_section(enc),
+        "decoder": {
+            "type": "rnnt_lstm",
+            "pred_hidden": dec["prednet"]["pred_hidden"],
+            "pred_layers": dec["prednet"]["pred_rnn_layers"],
+            "joint_hidden": y["joint"]["jointnet"]["joint_hidden"],
+            "joint_activation": y["joint"]["jointnet"]["activation"],
+            "vocab_size": y["joint"]["num_classes"] + 1,   # + blank
+            "blank_id": y["joint"]["num_classes"],
+            "max_symbols_per_step": y["decoding"]["greedy"]["max_symbols"],
+        },
+        "streaming": {
+            "att_context_presets": presets,
+            "default_preset_index": 0,
+            "encoder_frame_ms": fe["window_stride"] * sub * 1000.0,
+        },
+        "tokenizer": {"type": "spe_bpe", "pieces": "tokens.json"},
     }
 
 
@@ -525,6 +599,8 @@ def convert_from_nemo(model_dir: Path, nemo_file: Path) -> None:
             mynah["decoder"]["timestamp_tokens"] = False
     elif "ConvASRDecoder" in ycfg["decoder"]["_target_"]:
         mynah = build_parakeet_ctc_from_yaml(model_dir, ycfg)
+    elif ycfg["encoder"].get("att_context_style") == "chunked_limited":
+        mynah = build_streaming_rnnt_from_yaml(model_dir, ycfg)
     else:
         mynah = build_parakeet_tdt_from_yaml(model_dir, ycfg)
 

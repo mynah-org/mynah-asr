@@ -294,6 +294,46 @@ not cost a session. A binary frame larger than `--max-frame-bytes` does end it.
 `finalize` followed by more audio is simply the next utterance on the same
 socket: the stream is reset for you and `seq` keeps counting.
 
+**How a session ends, and what the server owes for it** (S12-17..20, measured
+by `tests/test_server_faults.sh`):
+
+| the client... | the server | counted as |
+|---|---|---|
+| sends a close frame (or `finalize`, then more of nothing) | flushes the tail, `done`, closes | `completed` |
+| sends `finalize`, then half-closes (FIN) | the same: a FIN after `finalize` is legal | `completed` |
+| disconnects with no close frame (FIN or RST) mid-utterance | **cancels**: no tail, no `done`; the model stops at the next step | `peer_gone` |
+| sends a close frame, then resets the connection | cancels the tail it asked for | `peer_gone` |
+| sends a close frame or `finalize`, then closes its socket (FIN) and is gone | cancels the tail once the server's unsolicited pong draws the reset (one round trip) | `peer_gone` |
+| stops sending, socket open | `error idle_timeout` after `--idle-ms` | `idle_timeout` |
+| stops in the middle of a frame | the same, through `SO_RCVTIMEO` | `idle_timeout` |
+| sends reserved bits, or a control frame over 125 bytes or fragmented (RFC 6455 5.2, 5.5) | `error protocol_error`, closes | `protocol_error` |
+
+Before 2026-09-25 a client that vanished without a close frame was FINALIZED:
+the rest of its ring (up to `--ring-seconds` of audio) ran through the model for
+nobody, and the session was counted nowhere. Speech hid it -- a delta written to
+a dead peer fails with `EPIPE` within a write or two -- but silence writes
+nothing: 27.4 s of audio were fed after a RST in `rst-mid-silent`, 0.00 s now.
+
+While the ingest waits for `done` it sends the client an **unsolicited pong**
+at once and every 500 ms, whatever `--ping-ms` says. A FIN after a close frame or
+a `finalize` is a legal half-close, so on its own it cannot end the session; but
+a client that closed its whole socket answers that write with a reset, the
+writer fails, and the tail stops at the next step (`close-then-fin-silent`,
+`finalize-then-fin-silent`). A pong and not a ping because RFC 6455 5.5.3 makes
+an unsolicited pong a one-way heartbeat that expects no answer: a client that
+half-closed cannot write a pong back, and a ping makes its library try
+(`half-close-ok` caught exactly that). The GPU server does the same.
+
+**REST clients that go away** (`tests/test_server_rest_faults.sh`): a request
+waits in the worker's offline queue and then runs inline on the scheduler
+thread. Before it runs, its connection is probed; a client that left (reset,
+error or FIN) is dropped with no inference and counted in
+`offline.peer_gone` / `mynah_asr_offline_peer_gone_total`. A request already
+inside the model still runs to its end (the batched call has no abort point).
+REST sockets carry `SO_RCVTIMEO`/`SO_SNDTIMEO` of `--idle-ms` (inactivity, not
+total time), so a body that stops arriving gets `400 incomplete_body` and a
+client that stops reading its response frees the thread.
+
 **The server pings** every `--ping-ms` (default 20000). A pong is not required —
 `--idle-ms` is the rule and the ping is only there to keep middleboxes from
 dropping an idle socket. Note the consequence, since it is measured rather than
@@ -333,8 +373,9 @@ message, an oversized frame) carries no `seq`: it is about the message the
 client just sent, not about the audio.
 
 **Error codes**: `idle_timeout` · `audio_limit` · `frame_too_large` ·
-`peer_gone` · `shutting_down` · `decode_failed` · `unknown_control` ·
-`language_not_served` · `unsupported_opcode` · `model_not_streaming`.
+`protocol_error` · `peer_gone` · `shutting_down` · `decode_failed` ·
+`unknown_control` · `language_not_served` · `unsupported_opcode` ·
+`model_not_streaming`.
 `audio_limit` is announced and then **finalised**: the audio already accepted is
 still owed a transcript, so the cap flushes the tail, emits `done` and closes.
 
@@ -372,6 +413,23 @@ router routes by and the same one a `model_not_found` quotes.
           "engine":"parakeet-tdt","streaming":false}]}
 ```
 
+**The session books.** Every session this worker claims ends in exactly ONE of
+`completed`, `cancelled` (by the code the client was sent, `cancelled_by`) or
+`aborted` (claimed, then released before the scheduler saw it: the 101 or the
+output writer could not be set up), and is counted once, when its slot goes back
+to FREE. Until then it is one of `slots.active`. `balanced` is
+
+    sessions == completed + cancelled + aborted + slots.active
+
+read in the same critical section as claim and release, so it holds in every
+snapshot, under load too: `false` is a counting bug, never load. A slot whose
+ingest gave up waiting for the scheduler (60 s + 5 s) is `abandoned.total`; the
+scheduler releases it when it finally ends the session (`abandoned.recovered`),
+so `total - recovered` is capacity lost right now. The prefork router keeps its
+own books per worker: `assigned = completed + lost + inflight`, where `lost` is
+the connections a worker held when it died (it is not respawned; the router
+logs `lost N connection(s)` and serves on with the rest).
+
 `/v1/health` reports **facts**: what this process actually did. The
 configuration it was given is on the `[SERVER-CONFIG]` banner line, printed once
 at start — a number that is configuration has no business in a counter, and a
@@ -380,11 +438,12 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 ```json
 {"status":"ok","inflight":2,"blas_budget":8,"threads":8,"worker":-1,
  "slots":{"active":2,"cap":4},"steps":312,"deltas":270,"eous":0,"sessions":9,
- "cancelled":1,
+ "completed":6,"aborted":0,"cancelled":1,"balanced":true,
+ "abandoned":{"total":0,"recovered":0},
  "cancelled_by":{"idle_timeout":1,"peer_gone":0,"frame_too_large":0,
                  "protocol_error":0,"shutting_down":0,"audio_limit":0,
                  "decode_failed":0,"other":0},
- "offline":{"queued":0,"done":4,"max_pending":8},
+ "offline":{"queued":0,"done":4,"peer_gone":0,"max_pending":8},
  "audio_seconds":5.229,
  "lag_ms":{"p50":144,"p95":312,"max":358.6,"count":270,"bucket_ms":8},
  "streaming":true,
@@ -411,7 +470,7 @@ health endpoint that reports both is one that will be quoted for the wrong one.
 | `steps`, `deltas`, `eous` | scheduler steps that fed a chunk, frames emitted |
 | `sessions` | slots claimed since start |
 | `cancelled`, `cancelled_by` | sessions ended early, bucketed **by the `code` the client was sent** — the counter and the error frame can never name two different things |
-| `offline` | REST jobs `queued` now, `done` since start, and `--max-pending` |
+| `offline` | REST jobs `queued` now, `done` since start, `peer_gone` (dropped before inference: the client had left), and `--max-pending` |
 | `audio_seconds` | seconds of audio fed to the model, streams and REST alike |
 | `lag_ms` | emission lag since start, from the 8 ms histogram (`bucket_ms`); `p50`/`p95` are therefore quantised to 8 ms, which is a measurement — a percentile computed from a mean is not |
 | `batch` | what the batched stream step did (S2-2b). `batched_steps_total` counts the calls, one per step that had a ready set; `rows_stacked_total` is the library's own count of encoder rows that went through the STACKED path, so **0 next to a non-zero `batched_steps_total` means every step degraded to per-stream steps** rather than a silent fallback; `ready_mean` is `ready_sum / batched_steps_total`; `step_wall_ms` is time spent inside the call (model only: building the set and the frames are outside it); `by_b` is the same sum/count split by ready-set size, which is what the cadence law `T_step(B) = a + b·B` is fitted from |
@@ -520,12 +579,70 @@ not have them. In a **multi-model** fleet those per-worker series carry a second
 label, `model`, naming the group that worker serves, so a scrape separates "the
 parakeet group is saturated" from "the fleet is busy". It is added only there and
 only then, because its value set is exactly the configured groups — bounded by
-the CLI before the first request, which is what the cardinality rule asks. A worker's own scheduler counters are exported by that worker
-only if it is given a metrics port of its own. Per-worker series are never
-summed here: a fleet total hides the one worker that stopped.
+the CLI before the first request, which is what the cardinality rule asks. The
+per-worker ROUTER series stay per worker: a fleet total alone would hide the one
+worker that stopped.
 
-**What is deliberately NOT exported.** No client-side latency: no TTFP, no stall
-rate, no "safe play start". Those are measured at the far end of a socket this
+### The service-wide series: `mynah_asr_fleet_*` (S12-21)
+
+Until 2026-09-25 the production topology exported no scheduler fact at all: the
+router answered /metrics and the router never enters the model. Now every worker
+publishes a compact snapshot of its counters into a shared page (mapped by the
+router before the fork, written every 250 ms under a seqlock, never blocking a
+step), and the router **sums** them. A single-process server renders the same
+series as a fleet of one, so a dashboard never needs to know the topology. No
+worker label; the only labels are `reason` and `le`.
+
+| series | type | |
+|---|---|---|
+| `mynah_asr_fleet_workers` · `_workers_up` | gauge | configured / alive |
+| `mynah_asr_fleet_worker_deaths_total` | counter | workers that died (never respawned today) |
+| `mynah_asr_fleet_sessions_total` | counter | sessions accepted (a slot claimed) |
+| `mynah_asr_fleet_sessions_completed_total` | counter | `done` + close |
+| `mynah_asr_fleet_sessions_cancelled_total{reason}` | counter | the code the client was sent; `peer_gone` = the client disconnected |
+| `mynah_asr_fleet_sessions_aborted_total` | counter | claimed, released before it started |
+| `mynah_asr_fleet_sessions_lost_total` | counter | held by a worker when it died (from its last snapshot) |
+| `mynah_asr_fleet_sessions_active` · `_slots` · `_slots_peak` | gauge | now / capacity of the live workers / sum of per-worker peaks |
+| `mynah_asr_fleet_books_balanced` · `_books_unbalanced_total` | gauge / counter | sessions = completed + cancelled + aborted + active in every live snapshot; anything but 1 / 0 is a counting bug |
+| `mynah_asr_fleet_slots_abandoned_total` · `_abandoned_recovered_total` | counter | a difference that grows is capacity leaking |
+| `mynah_asr_fleet_audio_seconds_total` | counter | audio fed to the model: the throughput unit |
+| `mynah_asr_fleet_model_busy_seconds_total` | counter | `rate()` ÷ workers = model duty |
+| `mynah_asr_fleet_steps_total` · `_deltas_total` | counter | |
+| `mynah_asr_fleet_offline_jobs_total` · `_offline_peer_gone_total` | counter | REST jobs run through the model / dropped before inference because the client had left |
+| `mynah_asr_fleet_backlog_seconds` · `_backlog_max_seconds` | gauge | audio queued in the rings, total and the worst stream |
+| `mynah_asr_fleet_emission_lag_seconds` | histogram | EXACT: every edge is a multiple of the 8 ms bucket |
+| `mynah_asr_fleet_first_text_seconds` | histogram | per session, first audio in to first text out, measured in the scheduler. It INCLUDES the audio before the first word and the client's own pacing: what a user waits, not a model latency, and not a first-WORD latency |
+| `mynah_asr_fleet_finalization_seconds` | histogram | per finalized utterance, last sample's arrival to `done` |
+| `mynah_asr_fleet_session_seconds` | histogram | claim to release, every outcome |
+| `mynah_asr_fleet_snapshot_age_seconds` | gauge | the oldest live snapshot: the staleness, stated |
+
+Correctness, and what it costs: a dead worker's page stays mapped in the router,
+so its counters stay in the totals (**no fleet counter ever goes backwards**)
+and what it still held becomes `sessions_lost_total`. A worker killed with
+SIGKILL loses what it did after its last publish (≤ 250 ms); its connections are
+still counted by the router (`mynah_asr_worker_lost_total`). Tested:
+`tests/fault_probe.py fleet-metrics` runs a deterministic mixed workload across
+two workers and requires the summed series to equal it exactly, and
+`worker-kill` requires monotonic totals, `worker_deaths_total` 1 and the held
+session in `sessions_lost_total`.
+
+**A first view (Grafana), one panel per operational question** -- shipped,
+with Prometheus scrape config, alerts and an OpenTelemetry collector example, in
+[`configs/observability/`](../configs/observability/README.md):
+
+| question | panel |
+|---|---|
+| Are requests being served? | `rate(mynah_asr_fleet_sessions_completed_total[1m])`, `rate(mynah_asr_fleet_audio_seconds_total[1m])` (seconds of audio per second = service RTF⁻¹) |
+| Are clients disconnecting or failing? | `sum by (reason) (rate(mynah_asr_fleet_sessions_cancelled_total[5m]))`, `rate(mynah_asr_refused_total[5m])` (router) |
+| Are sessions disappearing or becoming zombies? | `mynah_asr_fleet_books_balanced` (alert on 0), `increase(mynah_asr_fleet_books_unbalanced_total[1h])`, `mynah_asr_fleet_sessions_active` vs `mynah_asr_worker_inflight` summed |
+| Are slots being recovered? | `mynah_asr_fleet_slots_abandoned_total - mynah_asr_fleet_slots_abandoned_recovered_total` (alert on > 0 for 5 m) |
+| Is latency or backlog deteriorating? | `histogram_quantile(0.95, rate(mynah_asr_fleet_emission_lag_seconds_bucket[5m]))`, the same for finalization and first text, `mynah_asr_fleet_backlog_max_seconds` |
+| Did a worker die? | `mynah_asr_fleet_workers_up < mynah_asr_fleet_workers`, `increase(mynah_asr_fleet_worker_deaths_total[1h])`, `mynah_asr_fleet_sessions_lost_total` |
+| Is the fleet approaching saturation? | `mynah_asr_fleet_sessions_active / mynah_asr_fleet_slots`, `rate(mynah_asr_fleet_model_busy_seconds_total[1m]) / mynah_asr_fleet_workers_up`, 503s by code |
+
+**What is deliberately NOT exported.** No client-side latency: no TTFP as a
+client measures it, no stall rate, no "safe play start" (`first_text_seconds`
+above is the scheduler's own interval and says so). Those are measured at the far end of a socket this
 process does not own, and a server that reports them is reporting a guess. They
 belong to the benchmark harness (`tools/bench/`), which is the only thing that
 may quote them. **Cardinality** is a contract: the only labels are `worker`,

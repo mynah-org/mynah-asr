@@ -368,8 +368,10 @@ def write_manifest(path: Path, clips: "list[dict]", a, splits, per_class) -> dic
     by_class = {c: [k for k in clips if k["class"] == c] for c in CLASSES}
     audio_s = sum(k["duration_sec"] for k in clips)
     manifest = {
-        "bank": "stress-en",
-        "purpose": "stratified English bank for tools/bench/stream_load.py (SOAK/WAVE)",
+        "bank": f"stress-{a.lang}",
+        "language": a.lang,
+        "fleurs_config": a.config,
+        "purpose": f"stratified {a.lang} bank for tools/bench/stream_load.py (SOAK/WAVE)",
         "source": SOURCE,
         "url": URL,
         "licence": LICENCE,

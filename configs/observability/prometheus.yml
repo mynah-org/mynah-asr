@@ -1,0 +1,26 @@
+# Prometheus for mynah-asr-server (and mynah-asr-server-cuda): one scrape target
+# per server process. Under --prefork the ROUTER answers /metrics and carries the
+# service-wide mynah_asr_fleet_* series (summed from every worker's shared page),
+# so a prefork fleet is still ONE target.
+#
+# The server binds /metrics to 127.0.0.1 and refuses scrapes faster than 5/s
+# (burst 10): 5 s is far inside that and finer than the 250 ms publish period
+# matters for.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: mynah-asr
+    static_configs:
+      # mynah-asr-server ... --metrics-port 9101
+      - targets: ["127.0.0.1:9101"]
+        labels: {server: cpu}
+  - job_name: mynah-asr-cuda
+    static_configs:
+      # mynah-asr-server-cuda ... --metrics-port 9102
+      - targets: ["127.0.0.1:9102"]
+        labels: {server: gpu}

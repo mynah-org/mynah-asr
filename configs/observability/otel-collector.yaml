@@ -1,0 +1,44 @@
+# OpenTelemetry Collector: the same /metrics page, forwarded to any OTLP
+# backend. The server does not link an OTel SDK and does not push: the
+# collector's prometheus receiver scrapes the page exactly as Prometheus does
+# (same target, same 5 s), so one exposition feeds both worlds.
+#
+# Run: otelcol-contrib --config configs/observability/otel-collector.yaml
+# with OTEL_EXPORTER_OTLP_ENDPOINT pointing at your backend (Grafana Cloud,
+# Honeycomb, an OTLP-capable Prometheus/Mimir/Tempo stack, ...).
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: mynah-asr
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["127.0.0.1:9101"]
+              labels: {server: cpu}
+        - job_name: mynah-asr-cuda
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["127.0.0.1:9102"]
+              labels: {server: gpu}
+
+processors:
+  batch: {}
+  resource:
+    attributes:
+      - key: service.name
+        value: mynah-asr
+        action: upsert
+
+exporters:
+  otlphttp:
+    endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT}
+  # what was scraped, to the collector's own log: the first thing to check
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [resource, batch]
+      exporters: [otlphttp, debug]

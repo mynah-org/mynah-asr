@@ -73,6 +73,12 @@ size_t mynah_asr_greedy_scratch_floats(const mynah_asr_decoder *dec);
  * knows it exactly, and reconstructing it from frame indices outside would be a
  * second, worse answer. No effect unless MYNAH_ASR_TRACE_RNNT is on. */
 void mynah_asr_dec_trace_audio(double audio_s);
+/* Resolves the decoder's lazily-read diagnostic flags (trace, predictor probe,
+ * injection) now, on the calling thread, and returns 1 when any of them is
+ * active. Decoding streams in parallel (MYNAH_ASR_STREAM_PAR >= 3) calls it
+ * before the region and stays serial when it returns 1: the diagnostics share
+ * process-wide state and print per decision. */
+int mynah_asr_dec_diag_prime(void);
 
 int mynah_asr_greedy_decode_scratch(const mynah_asr_decoder *dec, mynah_asr_dec_state *s,
                                 const float *enc, int T, int *tokens, int *frames, int cap,

@@ -1,0 +1,90 @@
+# Alerts for mynah-asr. The rule every one of them follows: it fires on
+# something a LISTENER would notice (a lost session, text arriving late, a
+# refusal), and its threshold is an EXACT count -- the emission-lag histogram's
+# edges are multiples of the scheduler's 8 ms bucket, so a "fraction over
+# 320 ms" is counted, never interpolated from a quantile.
+groups:
+  - name: mynah-asr-integrity
+    rules:
+      - alert: MynahAsrDown
+        expr: up{job=~"mynah-asr.*"} == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.instance }} does not answer /metrics"
+      - alert: MynahAsrBooksUnbalanced
+        # sessions != completed + cancelled + aborted + active: a counting bug,
+        # or a session that vanished without an outcome
+        expr: mynah_asr_fleet_books_balanced == 0 or mynah_asr_sessions_balanced == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "session books do not balance on {{ $labels.instance }}"
+      - alert: MynahAsrSlotsLeaking
+        # a slot the ingest gave up on and the scheduler has not released yet:
+        # capacity that is not coming back on its own
+        expr: (mynah_asr_fleet_slots_abandoned_total - mynah_asr_fleet_slots_abandoned_recovered_total) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $value }} abandoned slot(s) not recovered for 5 minutes"
+      - alert: MynahAsrWorkerDied
+        expr: increase(mynah_asr_fleet_worker_deaths_total[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "a prefork worker died (workers are not respawned)"
+      - alert: MynahAsrSessionsLost
+        expr: increase(mynah_asr_fleet_sessions_lost_total[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $value }} live session(s) lost with a worker"
+      - alert: MynahAsrGpuDeviceErrors
+        expr: increase(mynah_asr_gpu_device_errors_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "CUDA errors on {{ $labels.instance }}: the engine is dead or dying"
+
+  - name: mynah-asr-service
+    rules:
+      - alert: MynahAsrEmissionLagOver320ms
+        # more than 5 % of transcript deltas published 320 ms or more after the
+        # audio they cover arrived (one chunk period at the v1 preset)
+        expr: |
+          1 - (
+            rate(mynah_asr_fleet_emission_lag_seconds_bucket{le="0.32"}[5m])
+            / rate(mynah_asr_fleet_emission_lag_seconds_count[5m])
+          ) > 0.05
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of deltas are 320 ms late or worse"
+      - alert: MynahAsrFinalizationOver640ms
+        expr: |
+          1 - (
+            rate(mynah_asr_fleet_finalization_seconds_bucket{le="0.64"}[5m])
+            / rate(mynah_asr_fleet_finalization_seconds_count[5m])
+          ) > 0.05
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of finals take 640 ms or more after the last sample"
+      - alert: MynahAsrBacklog
+        # audio received and not yet encoded, worst single stream: the server is
+        # falling behind before any client says so (qualification bound 0.640 s)
+        expr: mynah_asr_fleet_backlog_max_seconds > 0.64
+        for: 2m
+        labels: {severity: warn}
+        annotations:
+          summary: "a stream has {{ $value }}s of audio queued and not encoded"
+      - alert: MynahAsrRefusingAtCapacity
+        expr: sum by (instance) (rate(mynah_asr_refused_total{code="server_at_capacity"}[5m])) > 0
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "clients are refused with 503 server_at_capacity (rule 5: when full, refuse)"
+      - alert: MynahAsrNearSaturation
+        expr: mynah_asr_fleet_sessions_active / mynah_asr_fleet_slots > 0.9
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of stream slots in use for 10 minutes"
