@@ -1130,9 +1130,10 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
      * ping. Same 60 s ceiling as before. */
     int done = 0;
     for (int waited = 0; waited < 60000 && !done; waited += 250) {
+        /* the first ping goes at once: every step before the reset comes back
+         * is up to a chunk per step of audio computed for nobody */
+        if (!cancelled && !shutting && waited % 500 == 0) ws_enqueue(&w, 0x9, "", 0);
         done = mynah_asr_slot_wait_done(slot, 250);
-        if (!done && !cancelled && !shutting && waited % 500 == 250)
-            ws_enqueue(&w, 0x9, "", 0);
     }
     if (!done) {
         mynah_asr_slot_request(slot, MYNAH_ASR_SLOT_REQ_CANCEL, NULL,

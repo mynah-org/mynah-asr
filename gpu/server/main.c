@@ -870,8 +870,8 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
      * to answer with a reset, so the tail is not flushed for nobody. */
     int done = 0;
     for (int waited = 0; waited < 60000 && !done; waited += 250) {
+        if (!cancelled && !shutting && waited % 500 == 0) ws_enqueue(&w, 0x9, "", 0);
         done = slot_wait_done(slot, 250);
-        if (!done && !cancelled && !shutting && waited % 500 == 250) ws_enqueue(&w, 0x9, "", 0);
     }
     if (!done) { slot_request(slot, REQ_CANCEL, CB_PEER, NULL); done = slot_wait_done(slot, 5000); }
     close(rfd);
