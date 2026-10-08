@@ -82,6 +82,7 @@ typedef struct {
     double frame_sec;        /* one encoder frame, seconds */
     size_t vram_total, vram_used, vram_arena, vram_weights;  /* bytes; 0 on cpu */
     int graphs;              /* CUDA graphs in use (S14-8), 0 in phase 1 */
+    const char *pci_bus_id;  /* the GPU's PCI bus id ("0000:01:00.0"); NULL on cpu */
 } asr_engine_facts;
 
 /* Per-step counters the engine keeps, for the SIGUSR1 dump and /metrics. */

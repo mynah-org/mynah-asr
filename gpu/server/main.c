@@ -18,6 +18,7 @@
  *
  * This tree does not modify server/ or src/ (S14). */
 #include "asr_engine.h"
+#include "hostprof.h"
 
 #include "cJSON.h"
 #include "http_util.h"
@@ -90,7 +91,7 @@ static struct {
     /* config */
     const char *model_dir, *host, *engine_name, *precision, *gemm;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
-    int threads, ring_seconds, profile;
+    int threads, ring_seconds, profile, profile_host;
     long max_frame_bytes;
     double max_audio_seconds;
     /* state */
@@ -117,6 +118,10 @@ static struct {
     /* cohort accounting */
     unsigned long cohort_lanes_sum;
     double cohort_wait_ms_sum;
+    /* --profile-host (DIAGNOSTIC): the engine thread's wall per phase, under mu */
+    hostprof hp;
+    /* VRAM used on the device (all processes) when ready, and the most seen since */
+    double vram_ready_mb, vram_peak_mb;
 } g;
 
 static double now_s(void) {
@@ -424,6 +429,18 @@ static void *engine_main(void *arg) {
     float *stage = malloc(((size_t)g.ring_seconds * (size_t)g.facts.sample_rate + 1) * sizeof(float));
     if (!reqs || !outs || !lane || !arrival || !stage) { fprintf(stderr, "engine thread: out of memory\n"); _exit(70); }
 
+    /* --profile-host: every segment of the loop is charged to one phase, so
+     * the phases sum to the thread's wall; off, no clock is read for it */
+    const int hpf = g.profile_host;
+    hostprof_cycle hpc;
+    memset(&hpc, 0, sizeof(hpc));
+    asr_engine_stats es0, es1;
+    if (hpf) {
+        hpc.t = hostprof_now();
+        pthread_mutex_lock(&g.mu); g.hp.t_start = hpc.t; pthread_mutex_unlock(&g.mu);
+    }
+#define HPL(ph) do { if (hpf) hostprof_lap(&hpc, (ph)); } while (0)
+
     while (!atomic_load(&g.shutdown)) {
         /* 1. requests: cancel / reset / finalize, and staging of ready chunks */
         int n = 0;
@@ -472,16 +489,19 @@ static void *engine_main(void *arg) {
             if (need > 0 && s->ring_len >= need) take = need;
             else if (fin && need > 0 && s->ring_len > 0 && s->ring_len < need) take = s->ring_len;
             if (take > 0) {
+                HPL(HP_SCAN);
                 for (size_t k = 0; k < take; k++) stage[k] = s->ring[(s->ring_head + k) % s->ring_cap];
                 s->ring_head = (s->ring_head + take) % s->ring_cap;
                 s->ring_len -= take;
                 pthread_cond_broadcast(&s->space);
                 if (s->ready_since == 0.0) s->ready_since = s->ring_arrival;
+                HPL(HP_STAGE);
                 pthread_mutex_unlock(&s->mu);
                 if (asr_engine_slot_feed(g.eng, s->id, stage, take) != 0) engine_dead_exit();
                 pthread_mutex_lock(&g.mu);
                 g.audio_seconds += (double)take / 16000.0;
                 pthread_mutex_unlock(&g.mu);
+                if (hpf) { hostprof_lap(&hpc, HP_MEL); hpc.chunks++; }
                 pthread_mutex_lock(&s->mu);
             }
             /* the engine is told to finalize only once the ring is empty:
@@ -499,6 +519,7 @@ static void *engine_main(void *arg) {
             }
             pthread_mutex_unlock(&s->mu);
         }
+        HPL(HP_SCAN);
 
         /* 2. the cohort policy: step when the oldest ready chunk has waited
          * --cohort-ms, or the set is the whole arena; otherwise wait */
@@ -509,6 +530,7 @@ static void *engine_main(void *arg) {
             ts.tv_nsec += 20 * 1000000L;
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&g.wake, &g.mu, &ts);
+            if (hpf) { hostprof_lap(&hpc, HP_IDLE); hostprof_fold(&g.hp, &hpc, 0, 0, 0.0, 0.0); }
             pthread_mutex_unlock(&g.mu);
             continue;
         }
@@ -522,14 +544,23 @@ static void *engine_main(void *arg) {
             ts.tv_nsec += ns;
             while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&g.wake, &g.mu, &ts);
+            if (hpf) { hostprof_lap(&hpc, HP_COHORT_WAIT); hostprof_fold(&g.hp, &hpc, 0, 0, 0.0, 0.0); }
             pthread_mutex_unlock(&g.mu);
             continue;
         }
 
         /* 3. one batched step */
+        if (hpf) { asr_engine_get_stats(g.eng, &es0); hostprof_lap(&hpc, HP_SCAN); }
         const double t_step = now_s();
         if (asr_engine_step(g.eng, reqs, n, outs) != 0) engine_dead_exit();
         const double t_end = now_s();
+        double dev_wait_us = 0.0;
+        if (hpf) {
+            hostprof_lap(&hpc, HP_STEP);
+            asr_engine_get_stats(g.eng, &es1);
+            const int wph[3] = {ASR_HP_ENC_WAIT, ASR_HP_DEC_WAIT, ASR_HP_FINAL_WAIT};
+            for (int w = 0; w < 3; w++) dev_wait_us += es1.hprof_us[wph[w]] - es0.hprof_us[wph[w]];
+        }
         pthread_mutex_lock(&g.mu);
         g.cohorts++;
         g.cohort_lanes_sum += (unsigned long)n;
@@ -580,8 +611,15 @@ static void *engine_main(void *arg) {
                 }
             }
         }
-        (void)t_step;
+        if (hpf) {
+            hostprof_lap(&hpc, HP_PUBLISH);
+            pthread_mutex_lock(&g.mu);
+            hostprof_fold(&g.hp, &hpc, 1, n, dev_wait_us, t_step);
+            hostprof_rusage(&g.hp);
+            pthread_mutex_unlock(&g.mu);
+        }
     }
+#undef HPL
     /* shutdown: every live session is owed an error frame */
     for (int i = 0; i < g.cap; i++) {
         gslot *s = &g.slots[i];
@@ -957,6 +995,9 @@ static void health_json(cJSON *j) {
     cJSON_AddNumberToObject(ge, "vram_used_bytes", (double)f.vram_used);
     cJSON_AddNumberToObject(ge, "vram_weights_bytes", (double)f.vram_weights);
     cJSON_AddNumberToObject(ge, "vram_arena_bytes", (double)f.vram_arena);
+    cJSON_AddNumberToObject(ge, "vram_ready_mb", g.vram_ready_mb);
+    if ((double)f.vram_used / 1048576.0 > g.vram_peak_mb) g.vram_peak_mb = (double)f.vram_used / 1048576.0;
+    cJSON_AddNumberToObject(ge, "vram_peak_seen_mb", g.vram_peak_mb);
     cJSON_AddNumberToObject(ge, "decode_iters_total", (double)es.decode_iters);
     cJSON_AddNumberToObject(ge, "h2d_bytes_total", es.h2d_bytes);
     cJSON_AddNumberToObject(ge, "d2h_bytes_total", es.d2h_bytes);
@@ -967,6 +1008,18 @@ static void health_json(cJSON *j) {
         cJSON *pr = cJSON_AddObjectToObject(ge, "profile_ms");
         cJSON_AddNumberToObject(pr, "passes", (double)es.prof_passes);
         for (int i = 0; i < ASR_PROF_STAGES; i++) cJSON_AddNumberToObject(pr, ASR_PROF_NAME[i], es.prof_ms[i]);
+    }
+    if (g.profile_host) {
+        /* DIAGNOSTIC: microseconds of the engine thread's wall per phase, summed */
+        cJSON *hp = cJSON_AddObjectToObject(ge, "host_profile_us");
+        cJSON_AddNumberToObject(hp, "cycles", (double)g.hp.cycles);
+        cJSON_AddNumberToObject(hp, "lanes", (double)g.hp.lanes);
+        cJSON_AddNumberToObject(hp, "device_wait", g.hp.dev_wait_us);
+        for (int i = 0; i < HP__N; i++) cJSON_AddNumberToObject(hp, HP_NAME[i], g.hp.us[i]);
+        cJSON *st = cJSON_AddObjectToObject(hp, "step");
+        for (int i = 0; i < ASR_HPROF_PHASES; i++) cJSON_AddNumberToObject(st, ASR_HPROF_NAME[i], es.hprof_us[i]);
+        cJSON_AddNumberToObject(st, "passes", (double)es.hprof_passes);
+        cJSON_AddNumberToObject(st, "syncs", (double)es.hprof_syncs);
     }
     cJSON *refused = cJSON_AddObjectToObject(j, "refused");
     cJSON_AddNumberToObject(refused, "server_at_capacity", (double)g.refused_cap);
@@ -1003,6 +1056,8 @@ static size_t metrics_text(char *b, size_t cap) {
     M("# TYPE mynah_asr_gpu_h2d_bytes_total counter\nmynah_asr_gpu_h2d_bytes_total %.0f\n", es.h2d_bytes);
     M("# TYPE mynah_asr_gpu_d2h_bytes_total counter\nmynah_asr_gpu_d2h_bytes_total %.0f\n", es.d2h_bytes);
     M("# TYPE mynah_asr_gpu_device_errors_total counter\nmynah_asr_gpu_device_errors_total %lu\n", es.errors);
+    if (g.profile_host && k < cap)
+        k += hostprof_metrics(&g.hp, es.hprof_us, ASR_HPROF_NAME, ASR_HPROF_PHASES, b + k, cap - k);
 #undef M
     pthread_mutex_unlock(&g.mu);
     return k;
@@ -1010,6 +1065,7 @@ static size_t metrics_text(char *b, size_t cap) {
 
 static void dump_stderr(void) {
     asr_engine_stats es; asr_engine_get_stats(g.eng, &es);
+    asr_engine_facts f; asr_engine_get_facts(g.eng, &f);
     pthread_mutex_lock(&g.mu);
     const unsigned long n = ++g.dump_seq;
     const int balanced = g.sessions == g.completed + g.cancelled + g.aborted + (unsigned long)g.active;
@@ -1041,10 +1097,25 @@ static void dump_stderr(void) {
     unsigned long cnt = 0; for (int i = 0; i < LAG_BUCKETS; i++) cnt += g.lag_hist[i];
     D("[DUMP] worker=0 seq=%lu lag_ms p50=%.0f p95=%.0f max=%.1f count=%lu sum=%.0f bucket_ms=%d\n",
       n, hist_quantile(g.lag_hist, 0.5), hist_quantile(g.lag_hist, 0.95), g.lag_max_ms, cnt, g.lag_sum_ms, LAG_BUCKET_MS);
+    {
+        /* device-wide (every process on the GPU), from cudaMemGetInfo */
+        const double used = (double)f.vram_used / 1048576.0;
+        if (used > g.vram_peak_mb) g.vram_peak_mb = used;
+        D("[DUMP] worker=0 seq=%lu vram used_mb=%.0f ready_mb=%.0f peak_seen_mb=%.0f total_mb=%.0f\n",
+          n, used, g.vram_ready_mb, g.vram_peak_mb, (double)f.vram_total / 1048576.0);
+    }
     D("[DUMP] v=1 worker=0 seq=%lu end\n", n);
 #undef D
+    char *hb = NULL;
+    size_t hk = 0;
+    if (g.profile_host && (hb = malloc(16384)) != NULL) {
+        /* the rusage in g.hp is the ENGINE thread's, refreshed by it each cycle */
+        hk = hostprof_report(&g.hp, es.hprof_us, ASR_HPROF_NAME, ASR_HPROF_PHASES, es.hprof_passes,
+                             es.hprof_syncs, n, hb, 16384);
+    }
     pthread_mutex_unlock(&g.mu);
     fwrite(b, 1, k, stderr);
+    if (hb) { fwrite(hb, 1, hk, stderr); free(hb); }
     fflush(stderr);
 }
 
@@ -1159,6 +1230,7 @@ static void usage(void) {
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
         "       [--ring-seconds 30] [--gemm own|cublas] [--precision f32] [--engine-threads N (cpu engine pool)]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
+        "       [--profile-host (DIAGNOSTIC: the engine thread's wall per phase, [HOSTP] lines)]\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
 }
@@ -1184,6 +1256,7 @@ int main(int argc, char **argv) {
         else if (ARG("--engine-threads")) g.threads = atoi(v);
         else if (ARG("--ring-seconds")) g.ring_seconds = atoi(v);
         else if (strcmp(a, "--profile-stages") == 0) g.profile = 1;
+        else if (strcmp(a, "--profile-host") == 0) g.profile_host = 1;
         else if (ARG("--idle-ms")) g.idle_ms = atoi(v);
         else if (ARG("--ping-ms")) g.ping_ms = atoi(v);
         else if (ARG("--max-frame-bytes")) g.max_frame_bytes = atol(v);
@@ -1207,7 +1280,7 @@ int main(int argc, char **argv) {
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
-                          .profile = g.profile};
+                          .profile = g.profile, .profile_host = g.profile_host};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
@@ -1254,13 +1327,20 @@ int main(int argc, char **argv) {
     {
         char dm[4096];
         const size_t n = asr_engine_dispatch_map(g.eng, dm, sizeof(dm));
+        asr_engine_get_facts(g.eng, &g.facts);   /* VRAM as of now: weights, arena, scratch, context */
+        g.vram_ready_mb = g.vram_peak_mb = (double)g.facts.vram_used / 1048576.0;
         fprintf(stderr, "[SERVER-CONFIG] mynah-asr-server-cuda %s: engine=%s device=\"%s\" precision=%s gemm=%s model=%s "
-                        "cap=%d cohort_ms=%d lookahead_default=%d presets=%d vram_weights_mb=%.0f vram_arena_mb=%.0f graphs=%d profile_stages=%s\n",
+                        "cap=%d cohort_ms=%d lookahead_default=%d presets=%d vram_weights_mb=%.0f vram_arena_mb=%.0f graphs=%d profile_stages=%s "
+                        "profile_host=%s vram_used_at_ready_mb=%.0f vram_total_mb=%.0f\n",
                 MYNAH_ASR_BUILD, g.facts.name, g.facts.device ? g.facts.device : "-", g.facts.precision, g.facts.gemm,
                 g.facts.model_name, g.cap, g.cohort_ms, g.facts.default_lookahead, g.facts.n_lookaheads,
                 (double)g.facts.vram_weights / 1048576.0, (double)g.facts.vram_arena / 1048576.0, g.facts.graphs,
-                g.profile ? "on (DIAGNOSTIC)" : "off");
+                g.profile ? "on (DIAGNOSTIC)" : "off", g.profile_host ? "on (DIAGNOSTIC)" : "off",
+                g.vram_ready_mb, (double)g.facts.vram_total / 1048576.0);
         fwrite(dm, 1, n, stderr);
+        char topo[1024];
+        const size_t tn = host_topology_line(g.facts.pci_bus_id, topo, sizeof(topo));
+        fwrite(topo, 1, tn, stderr);
         fprintf(stderr, "mynah-asr-server-cuda: listening on %s:%d (%d http threads, %d stream slots, one engine thread)\n",
                 g.host, g.port, g.http_threads, g.cap);
         if (g.metrics_fd >= 0) fprintf(stderr, "mynah-asr-server-cuda: /metrics on 127.0.0.1:%d\n", g.metrics_port);

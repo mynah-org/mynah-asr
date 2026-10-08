@@ -39,7 +39,7 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 
 B := $(TOP)/build/gpu
 
-C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/http_util.o $(B)/stream_out.o
+C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
 CU_OBJ   := $(B)/gemm.o $(B)/kernels.o $(B)/engine.o
 
 .PHONY: all cpu clean test-kernels test-stream lib
@@ -59,6 +59,9 @@ $(B)/server_main.o: server/main.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/ws.o: server/ws.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/hostprof.o: server/hostprof.c server/hostprof.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/http_util.o: $(TOP)/server/http_util.c

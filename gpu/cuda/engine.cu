@@ -95,6 +95,7 @@ struct cuda_engine {
     char err[512] = {0};
     int dead = 0;
     std::string devname;
+    char pci_bus_id[32] = {0};
     int device = 0;   /* cudaSetDevice is per host thread: every op re-binds it */
     /* S14-6b: CUDA events at stage boundaries, one pass at a time */
     int prof = 0;
@@ -459,6 +460,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     e->device = cfg->device;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, cfg->device) == cudaSuccess) e->devname = prop.name;
+    if (cudaDeviceGetPCIBusId(e->pci_bus_id, (int)sizeof(e->pci_bus_id), cfg->device) != cudaSuccess) e->pci_bus_id[0] = '\0';
     if (e->prof)
         for (int i = 0; i < cuda_engine::EV_MAX; i++)
             if (cudaEventCreate(&e->ev[i]) != cudaSuccess) { snprintf(err, errcap, "cudaEventCreate failed"); delete e; return nullptr; }
@@ -555,6 +557,7 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
     if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) { f->vram_total = totb; f->vram_used = totb - freeb; }
     f->vram_arena = e->vram_arena; f->vram_weights = e->vram_weights;
     f->graphs = 0;
+    f->pci_bus_id = e->pci_bus_id;
 }
 
 static void cuda_stats(const cuda_engine *e, asr_engine_stats *s) { *s = e->st; }
