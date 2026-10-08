@@ -125,7 +125,7 @@ static const mynah_asr_flag g_flags[] = {
      NULL, NULL},
 
     {"MYNAH_ASR_STREAM_PAR", MYNAH_ASR_FLAG_KERNEL, "0 (off)",
-     "0/1/2: 1 runs the per-stream stages of the batched encoder step (attention core + K/V commit,"
+     "0..4: 1 runs the per-stream stages of the batched encoder step (attention core + K/V commit,"
      " conv mid) over streams on the pool instead of serially on the scheduler thread; 2 also runs"
      " SiLU per stream and each residual add + layer norm fused per row block; 3 also runs the"
      " per-stream VAD/mel front end and the greedy decode over streams, publishing deltas on the"
@@ -133,7 +133,7 @@ static const mynah_asr_flag g_flags[] = {
      " int8 activation quantisation into the parallel region that produced its rows (no new dispatch)."
      " Each stream/row"
      " touches only its own state, so the floats are the same: tests/test_stream_batch and"
-     " tests/test_kv_layout gate it. RESEARCH A/B (S10-3)",
+     " tests/test_kv_layout gate it at every level in make test. RESEARCH A/B (S10-3)",
      NULL, NULL},
 
     {"MYNAH_ASR_STREAM_PAR_DECODE", MYNAH_ASR_FLAG_KERNEL, "1 (level 3 on whenever STREAM_PAR >= 3)",
