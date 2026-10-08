@@ -1100,11 +1100,15 @@ static int listen_on(const char *host, int port) {
     return fd;
 }
 
+/* The handler only sets flags: taking g.mu or g_q.mu here would self-deadlock
+ * when the signal lands on a thread that already holds one (the qualification
+ * harness sends SIGUSR1 under load). The accept loop wakes at least every
+ * 250 ms, prints the dump and, on shutdown, broadcasts the condition vars. */
+static volatile sig_atomic_t g_dump_req;
+
 static void on_signal(int sig) {
-    if (sig == SIGUSR1) { dump_stderr(); return; }
+    if (sig == SIGUSR1) { g_dump_req = 1; return; }
     atomic_store(&g.shutdown, 1);
-    pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
-    pthread_mutex_lock(&g.mu); pthread_cond_broadcast(&g.wake); pthread_mutex_unlock(&g.mu);
 }
 
 static void usage(void) {
@@ -1234,6 +1238,7 @@ int main(int argc, char **argv) {
         struct pollfd p[2] = {{.fd = g.listen_fd, .events = POLLIN, .revents = 0},
                               {.fd = g.metrics_fd, .events = POLLIN, .revents = 0}};
         const int rc = poll(p, g.metrics_fd >= 0 ? 2 : 1, 250);
+        if (g_dump_req) { g_dump_req = 0; dump_stderr(); }
         if (rc <= 0) continue;
         if (p[0].revents & POLLIN) {
             const int fd = accept(g.listen_fd, NULL, NULL);
@@ -1257,6 +1262,8 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "mynah-asr-server-cuda: shutting down\n");
+    pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
+    pthread_mutex_lock(&g.mu); pthread_cond_broadcast(&g.wake); pthread_mutex_unlock(&g.mu);
     close(g.listen_fd);
     pthread_join(g.engine_thread, NULL);
     pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
