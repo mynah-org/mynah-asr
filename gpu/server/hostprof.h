@@ -16,8 +16,13 @@
  *   mel          asr_engine_slot_feed (the host streaming mel) + its book
  *   idle         waiting with nothing ready
  *   cohort_wait  waiting for the cohort timer (--cohort-ms)
- *   step         asr_engine_step (split by the engine's own phases)
+ *   step         asr_engine_step, or submit + finish with --stage-ahead
+ *                (split by the engine's own phases, which sum to it)
  *   publish      deltas, done frames, resets, lag books
+ *   window       the stage-ahead scan (ring copies + host mel of the next
+ *                chunks): between submit and finish, i.e. under the encoder
+ *                pass, and the pre-scan at the top of the loop (--stage-ahead
+ *                or a feed team); 0 with both off
  *
  * Threading: the engine thread accumulates a cycle locally and folds it into
  * the shared totals under the caller's lock; readers copy the totals under the
@@ -27,7 +32,7 @@
 
 #include <stddef.h>
 
-enum { HP_SCAN = 0, HP_STAGE, HP_MEL, HP_IDLE, HP_COHORT_WAIT, HP_STEP, HP_PUBLISH, HP__N };
+enum { HP_SCAN = 0, HP_STAGE, HP_MEL, HP_IDLE, HP_COHORT_WAIT, HP_STEP, HP_PUBLISH, HP_WINDOW, HP__N };
 extern const char *const HP_NAME[HP__N];
 
 #define HP_HIST_BUCKETS 800      /* 250 us buckets: 0 .. 200 ms, the last one open */

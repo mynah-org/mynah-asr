@@ -329,5 +329,6 @@ static const asr_engine_ops CPU_OPS = {
     ops_close, ops_facts, ops_stats, ops_lang_id, ops_lookahead_ok, ops_slot_reset, ops_slot_need,
     ops_slot_feed, ops_slot_ready, ops_slot_audio, ops_slot_text, ops_slot_lang, ops_step, ops_dead,
     ops_error, ops_dispatch,
+    NULL, NULL, NULL,   /* no split step, no feed team: the reference stays serial */
 };
 static const asr_engine_ops *cpu_ops(void) { return &CPU_OPS; }

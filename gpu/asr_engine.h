@@ -55,6 +55,16 @@ typedef struct {
                                 budget); 0 = the default min(cap, 128). A
                                 cohort above it runs as several passes; a row's
                                 result never depends on it (contract 4) */
+    int graphs;              /* cuda: 1 = the encoder pass replays a CUDA graph
+                                captured at open per (lane bucket, row bucket);
+                                0 (default) = launched kernel by kernel */
+    const char *graph_buckets; /* cuda: lane buckets, "8,16,32,64,128" (NULL = that) */
+    int warmup;              /* cuda: 1 = before open returns, run steps shaped
+                                like real traffic (first, steady and tail chunks
+                                at every lane bucket) on the idle slots, then
+                                reset every slot; 0 (default) = none */
+    int host_threads;        /* cuda: threads (caller included) that run the
+                                host mel of a slot_feed_batch; <= 1 = inline */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */
@@ -85,7 +95,10 @@ typedef struct {
     int sample_rate, n_mels;
     double frame_sec;        /* one encoder frame, seconds */
     size_t vram_total, vram_used, vram_arena, vram_weights;  /* bytes; 0 on cpu */
-    int graphs;              /* CUDA graphs in use (S14-8), 0 in phase 1 */
+    int graphs;              /* CUDA graph executables captured (0 = off) */
+    double graph_capture_ms; /* open: wall to capture + instantiate them */
+    double warmup_ms;        /* open: wall of the warm-up steps (0 = none) */
+    int host_threads;        /* threads that run a feed batch (1 = inline) */
     int pass_lanes;          /* lanes per encoder pass as resolved; 0 on cpu */
     const char *pci_bus_id;  /* the GPU's PCI bus id ("0000:01:00.0"); NULL on cpu */
 } asr_engine_facts;
@@ -105,7 +118,6 @@ typedef struct {
 #define ASR_PROF_STAGES 14
     double prof_ms[ASR_PROF_STAGES];
     unsigned long prof_passes;
-    double host_mel_ms;              /* wall in slot_feed (streaming mel), total */
     /* --profile-host: host wall inside asr_engine_step per phase, microseconds,
      * summed (ASR_HPROF_NAME). The *_wait phases are the engine thread blocked
      * on the device (cudaStreamSynchronize); the others are host work. All
@@ -114,6 +126,11 @@ typedef struct {
     double hprof_us[ASR_HPROF_PHASES];
     unsigned long hprof_passes;      /* encoder passes timed */
     unsigned long hprof_syncs;       /* device syncs waited on, total */
+    double host_mel_ms;              /* wall in slot_feed (streaming mel), total;
+                                        summed over threads with a feed team */
+    unsigned long graph_passes;      /* encoder passes replayed from a graph */
+    unsigned long eager_passes;      /* encoder passes launched kernel by kernel */
+    double submit_ms_sum, finish_ms_sum; /* wall in step_submit / step_finish */
 } asr_engine_stats;
 
 /* reset: pending slot resets enqueued; pass_build: lane selection,
@@ -151,6 +168,13 @@ typedef struct {
     int (*dead)(const asr_engine *e);
     const char *(*error)(const asr_engine *e);
     size_t (*dispatch_map)(const asr_engine *e, char *buf, size_t cap);
+    /* optional (NULL = not offered): the step split in two, so the caller can
+     * do host work while the encoder runs; see asr_engine_step_submit */
+    int (*step_submit)(asr_engine *e, const asr_step_req *reqs, int n, asr_step_out *outs);
+    int (*step_finish)(asr_engine *e, asr_step_out *outs);
+    /* optional: slot_feed for several DISTINCT slots, possibly in parallel */
+    int (*slot_feed_batch)(asr_engine *e, int n, const int *slots, const float *const *pcm,
+                           const size_t *ns);
 } asr_engine_ops;
 
 struct asr_engine { const asr_engine_ops *ops; };
@@ -183,6 +207,25 @@ static inline const char *asr_engine_slot_lang(const asr_engine *e, int slot) { 
  * tail). outs[i] answers reqs[i]. Returns 0, or -1 when the DEVICE failed --
  * then the engine is dead and the caller ends every session visibly. */
 static inline int asr_engine_step(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { return e->ops->step(e, r, n, o); }
+/* The same step in two halves (cuda): submit decides every lane, consumes its
+ * chunk from the slot's mel buffer, stages it and ENQUEUES the encoder; finish
+ * runs the label loop, waits and fills `outs` (the array given to submit).
+ * Between the two the caller may stage and feed the NEXT chunks of any slot
+ * (asr_engine_slot_need_samples / slot_feed / slot_feed_batch) -- a slot in
+ * flight included, its in-flight chunk is already out of its buffer -- but
+ * must not reset a slot or step. submit + finish == step, byte for byte. */
+static inline int asr_engine_can_split(const asr_engine *e) { return e->ops->step_submit && e->ops->step_finish; }
+static inline int asr_engine_step_submit(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { return e->ops->step_submit(e, r, n, o); }
+static inline int asr_engine_step_finish(asr_engine *e, asr_step_out *o) { return e->ops->step_finish(e, o); }
+/* slot_feed over n DISTINCT slots; the engine may spread the host mel over
+ * its feed team. Same result as n slot_feed calls in any order. */
+static inline int asr_engine_slot_feed_batch(asr_engine *e, int n, const int *slots,
+                                             const float *const *pcm, const size_t *ns) {
+    if (e->ops->slot_feed_batch) return e->ops->slot_feed_batch(e, n, slots, pcm, ns);
+    for (int i = 0; i < n; i++)
+        if (e->ops->slot_feed(e, slots[i], pcm[i], ns[i]) != 0) return -1;
+    return 0;
+}
 static inline int asr_engine_dead(const asr_engine *e) { return e->ops->dead(e); }
 static inline const char *asr_engine_error(const asr_engine *e) { return e->ops->error(e); }
 /* The kernel that runs for each operation, one line per op, as the process

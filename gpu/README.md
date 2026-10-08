@@ -68,7 +68,8 @@ the GPU's PCI id and NUMA node, the open-file limit).
 
 Every segment of the engine loop is charged to one phase, so the phases sum
 to the thread's wall: `scan`, `stage_copy`, `mel`, `idle`, `cohort_wait`,
-`step`, `publish`; and inside the step the engine's own phases `reset`,
+`step`, `publish`, `window` (the stage-ahead scan between submit and finish,
+under the encoder pass, which `step` then excludes); and inside the step the engine's own phases `reset`,
 `pass_build`, `enqueue` (host time to queue H2D + encoder + projector),
 `enc_wait` (blocked until the encoder pass is done), `dec_launch`, `dec_wait`,
 `final_wait`, `detok`. Each `[DUMP]` (SIGUSR1, shutdown) is followed by
@@ -98,6 +99,22 @@ level's profile.
   the `[GPU]` line, the server's VRAM and the `[HOSTP-LEVEL]` profile of the
   measured window. `gpu_qualify.sh` records the same topology and `[GPU]`
   lines and takes `--server-cpus` / `--gen-cpus`.
+
+## Serving-loop options (all default OFF until screened)
+
+| flag | what it does | identity |
+|---|---|---|
+| `--stage-ahead 1` | the step runs as `submit` (lanes decided, chunks taken out of the slots, staged into a per-pass pinned slab, H2D + encoder enqueued) and `finish` (label loop, wait, detokenise); between the two the engine thread stages and feeds the NEXT whole chunk of every slot that has one, i.e. the host mel runs under the encoder pass | byte-identical: each slot's feed sequence is the one the scan would make, only earlier |
+| `--host-threads N\|auto` | a feed team: the host mel of a staged batch runs on N threads (the engine thread included); `auto` = 1 up to 8 usable CPUs, 2 up to 16, 4 above, counting the affinity mask capped by the cgroup quota | byte-identical: one slot, one thread, same mel |
+| `--graphs buckets` (`--graph-buckets 8,16,32,64,128`) | the encoder pass (subsampling, 24 layers, projector) replays a CUDA graph captured at start-up per (lane bucket, row bucket of 64); padding lanes have q = 0 on a scratch slot, padding rows belong to no lane; the label loop stays eager | byte-identical: the GEMMs are row-stable in M, every other kernel is per row or per lane |
+| `--warmup 1` | before listening, steps shaped like real traffic (first, steady and tail chunks of the default preset at every lane bucket) on the idle slots, then every slot reset and the counters zeroed | byte-identical (gate C) |
+
+`tests/test_cuda_stream` gate C re-runs the gate-A cohorts with each option and
+with all of them, and requires the same per-step output (text, t0/t1, token
+count, finish) as the default engine. The banner's `[SERVER-CONFIG]
+serving-loop` line reports what resolved, the start-up time, the capture and
+warm-up times and the VRAM in use at ready; `[DUMP] ... loop` reports the
+window, the submit/finish split and graph vs eager passes.
 
 ## Status
 

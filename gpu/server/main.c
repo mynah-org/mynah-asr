@@ -17,6 +17,10 @@
  * transcription (the GPU server serves streams).
  *
  * This tree does not modify server/ or src/ (S14). */
+#ifdef __linux__
+#define _GNU_SOURCE   /* sched_getaffinity: the CPU budget of --host-threads auto */
+#include <sched.h>
+#endif
 #include "asr_engine.h"
 #include "hostprof.h"
 
@@ -70,6 +74,8 @@ typedef struct {
     size_t ring_cap, ring_len, ring_head;
     double ring_arrival;          /* when the newest sample landed */
     double ready_since;           /* when the ring first held a whole chunk (0 = not) */
+    double pre_ready;             /* --stage-ahead: the arrival of a chunk staged while
+                                     the previous one was in flight (0 = none) */
     int req;                      /* REQ_* bits */
     int cancel_code;              /* CB_* when REQ_CANCEL */
     char reset_lang[16];
@@ -94,6 +100,8 @@ static struct {
     const char *model_dir, *host, *engine_name, *precision, *gemm;
     int port, metrics_port, device, cap, cohort_ms, http_threads, idle_ms, ping_ms;
     int threads, ring_seconds, profile, profile_host, pass_lanes;
+    int stage_ahead, host_threads, graphs, warmup;
+    const char *graph_buckets;
     long max_frame_bytes;
     double max_audio_seconds;
     /* state */
@@ -126,6 +134,10 @@ static struct {
     double vram_ready_mb, vram_peak_mb;
     /* accept() out of descriptors / kernel memory: backed off, under mu */
     unsigned long accept_backoffs;
+    /* --stage-ahead: the window between submit and finish */
+    unsigned long windows, window_staged;
+    double window_ms_sum;
+    double startup_ms;
 } g;
 
 static double now_s(void) {
@@ -245,7 +257,7 @@ static void slot_release_locked(gslot *s) {
     s->state = SLOT_FREE;
     s->out = NULL;
     s->req = 0; s->done = 0; s->outcome = NULL; s->engine_open = 0; s->abandoned = 0;
-    s->ring_len = s->ring_head = 0; s->ready_since = 0.0;
+    s->ring_len = s->ring_head = 0; s->ready_since = 0.0; s->pre_ready = 0.0;
 }
 
 static gslot *slot_claim(const char *lang, int lookahead) {
@@ -262,7 +274,7 @@ static gslot *slot_claim(const char *lang, int lookahead) {
         memset(got->lag_hist, 0, sizeof(got->lag_hist));
         got->t_open = now_s(); got->t_first_audio = 0.0; got->first_text_counted = 0;
         got->outcome = NULL; got->done = 0; got->req = 0; got->cancel_code = 0;
-        got->ring_len = got->ring_head = 0; got->ready_since = 0.0; got->engine_open = 0;
+        got->ring_len = got->ring_head = 0; got->ready_since = 0.0; got->pre_ready = 0.0; got->engine_open = 0;
         g.sessions++; g.active++;
     }
     pthread_mutex_unlock(&g.mu);
@@ -423,6 +435,68 @@ static void engine_dead_exit(void) {
     _exit(70);
 }
 
+/* take `n` samples off the front of the slot's ring into dst (two memcpys) */
+static void ring_take(gslot *s, float *dst, size_t n) {
+    const size_t first = s->ring_cap - s->ring_head < n ? s->ring_cap - s->ring_head : n;
+    memcpy(dst, s->ring + s->ring_head, first * sizeof(float));
+    if (n > first) memcpy(dst + first, s->ring, (n - first) * sizeof(float));
+    s->ring_head = (s->ring_head + n) % s->ring_cap;
+    s->ring_len -= n;
+}
+
+/* The stage-ahead scan (--stage-ahead 1, or a feed team): every active slot
+ * whose ring holds the whole next chunk has it taken and fed, the host mel of
+ * all of them in ONE batch the engine may spread over its feed team. It runs
+ * between asr_engine_step_submit and _finish, i.e. under the encoder pass, and
+ * before the scan. It takes exactly what the scan would take (one chunk, the
+ * engine's own need), so a slot's feed sequence -- hence its mel, its chunks
+ * and its transcript -- is the same; only WHEN changes. Slots with a cancel,
+ * a reset or a finalize pending are left to the scan, which handles them in
+ * order (a finalize decides the tail; audio after a finalize belongs to the
+ * next utterance, after the reset that publish does). Engine thread only. */
+static struct {
+    float *buf;
+    size_t cap;
+    int *slot;
+    const float **pcm;
+    size_t *off, *ns;
+} g_stage;
+
+static int stage_scan(void) {
+    int k = 0;
+    size_t used = 0;
+    for (int i = 0; i < g.cap; i++) {
+        gslot *s = &g.slots[i];
+        pthread_mutex_lock(&s->mu);
+        if (s->state != SLOT_ACTIVE || (s->req & (REQ_CANCEL | REQ_RESET | REQ_FINALIZE))) { pthread_mutex_unlock(&s->mu); continue; }
+        const size_t need = asr_engine_slot_need_samples(g.eng, s->id);
+        if (need == 0 || s->ring_len < need) { pthread_mutex_unlock(&s->mu); continue; }
+        if (used + need > g_stage.cap) {
+            size_t nc = g_stage.cap ? g_stage.cap : 65536;
+            while (nc < used + need) nc *= 2;
+            float *nb = realloc(g_stage.buf, nc * sizeof(float));
+            if (!nb) { pthread_mutex_unlock(&s->mu); fprintf(stderr, "engine thread: out of memory\n"); _exit(70); }
+            g_stage.buf = nb; g_stage.cap = nc;
+        }
+        ring_take(s, g_stage.buf + used, need);
+        pthread_cond_broadcast(&s->space);
+        /* a slot in flight keeps its cohort's ready_since until publish */
+        if (s->ready_since == 0.0) s->ready_since = s->ring_arrival;
+        else if (s->pre_ready == 0.0) s->pre_ready = s->ring_arrival;
+        pthread_mutex_unlock(&s->mu);
+        g_stage.slot[k] = s->id; g_stage.off[k] = used; g_stage.ns[k] = need;
+        used += need;
+        k++;
+    }
+    if (k == 0) return 0;
+    for (int j = 0; j < k; j++) g_stage.pcm[j] = g_stage.buf + g_stage.off[j];
+    if (asr_engine_slot_feed_batch(g.eng, k, g_stage.slot, g_stage.pcm, g_stage.ns) != 0) engine_dead_exit();
+    pthread_mutex_lock(&g.mu);
+    g.audio_seconds += (double)used / 16000.0;
+    pthread_mutex_unlock(&g.mu);
+    return k;
+}
+
 static void *engine_main(void *arg) {
     (void)arg;
     mynah_asr_thread_set_name("mynah-gpu");
@@ -431,7 +505,16 @@ static void *engine_main(void *arg) {
     gslot **lane = calloc((size_t)g.cap, sizeof(*lane));
     double *arrival = calloc((size_t)g.cap, sizeof(double));
     float *stage = malloc(((size_t)g.ring_seconds * (size_t)g.facts.sample_rate + 1) * sizeof(float));
-    if (!reqs || !outs || !lane || !arrival || !stage) { fprintf(stderr, "engine thread: out of memory\n"); _exit(70); }
+    g_stage.slot = calloc((size_t)g.cap, sizeof(int));
+    g_stage.pcm = calloc((size_t)g.cap, sizeof(float *));
+    g_stage.off = calloc((size_t)g.cap, sizeof(size_t));
+    g_stage.ns = calloc((size_t)g.cap, sizeof(size_t));
+    if (!reqs || !outs || !lane || !arrival || !stage || !g_stage.slot || !g_stage.pcm || !g_stage.off || !g_stage.ns) {
+        fprintf(stderr, "engine thread: out of memory\n"); _exit(70);
+    }
+    /* --stage-ahead: the step in two halves around the stage-ahead scan */
+    const int split = g.stage_ahead && asr_engine_can_split(g.eng);
+    const int pre = g.stage_ahead || g.host_threads > 1;
 
     /* --profile-host: every segment of the loop is charged to one phase, so
      * the phases sum to the thread's wall; off, no clock is read for it */
@@ -446,6 +529,7 @@ static void *engine_main(void *arg) {
 #define HPL(ph) do { if (hpf) hostprof_lap(&hpc, (ph)); } while (0)
 
     while (!atomic_load(&g.shutdown)) {
+        if (pre) { (void)stage_scan(); HPL(HP_WINDOW); }
         /* 1. requests: cancel / reset / finalize, and staging of ready chunks */
         int n = 0;
         double oldest = 0.0;
@@ -494,9 +578,7 @@ static void *engine_main(void *arg) {
             else if (fin && need > 0 && s->ring_len > 0 && s->ring_len < need) take = s->ring_len;
             if (take > 0) {
                 HPL(HP_SCAN);
-                for (size_t k = 0; k < take; k++) stage[k] = s->ring[(s->ring_head + k) % s->ring_cap];
-                s->ring_head = (s->ring_head + take) % s->ring_cap;
-                s->ring_len -= take;
+                ring_take(s, stage, take);
                 pthread_cond_broadcast(&s->space);
                 if (s->ready_since == 0.0) s->ready_since = s->ring_arrival;
                 HPL(HP_STAGE);
@@ -556,7 +638,17 @@ static void *engine_main(void *arg) {
         /* 3. one batched step */
         if (hpf) { asr_engine_get_stats(g.eng, &es0); hostprof_lap(&hpc, HP_SCAN); }
         const double t_step = now_s();
-        if (asr_engine_step(g.eng, reqs, n, outs) != 0) engine_dead_exit();
+        double win_ms = 0.0;
+        int win_k = 0;
+        if (split) {
+            if (asr_engine_step_submit(g.eng, reqs, n, outs) != 0) engine_dead_exit();
+            HPL(HP_STEP);
+            const double t_w = now_s();
+            win_k = stage_scan();                  /* under the encoder pass */
+            win_ms = (now_s() - t_w) * 1e3;
+            HPL(HP_WINDOW);
+            if (asr_engine_step_finish(g.eng, outs) != 0) engine_dead_exit();
+        } else if (asr_engine_step(g.eng, reqs, n, outs) != 0) engine_dead_exit();
         const double t_end = now_s();
         double dev_wait_us = 0.0;
         if (hpf) {
@@ -566,6 +658,7 @@ static void *engine_main(void *arg) {
             for (int w = 0; w < 3; w++) dev_wait_us += es1.hprof_us[wph[w]] - es0.hprof_us[wph[w]];
         }
         pthread_mutex_lock(&g.mu);
+        if (split) { g.windows++; g.window_ms_sum += win_ms; g.window_staged += (unsigned long)win_k; }
         g.cohorts++;
         g.cohort_lanes_sum += (unsigned long)n;
         g.cohort_wait_ms_sum += waited_ms;
@@ -577,7 +670,8 @@ static void *engine_main(void *arg) {
             const asr_step_out *o = &outs[a];
             if (o->stepped) {
                 pthread_mutex_lock(&s->mu);
-                s->ready_since = 0.0;
+                s->ready_since = s->pre_ready;     /* 0 unless staged ahead */
+                s->pre_ready = 0.0;
                 s->steps++;
                 pthread_mutex_unlock(&s->mu);
                 pthread_mutex_lock(&g.mu); g.steps++; pthread_mutex_unlock(&g.mu);
@@ -630,6 +724,7 @@ static void *engine_main(void *arg) {
         if (s->state == SLOT_ACTIVE) { frame_error(s, "shutting_down", "the server is shutting down"); end_session(s, "shutting_down"); }
     }
     free(reqs); free(outs); free(lane); free(arrival); free(stage);
+    free(g_stage.buf); free(g_stage.slot); free(g_stage.pcm); free(g_stage.off); free(g_stage.ns);
     return NULL;
 }
 
@@ -1017,6 +1112,11 @@ static void health_json(cJSON *j) {
     cJSON_AddNumberToObject(ge, "d2h_bytes_total", es.d2h_bytes);
     cJSON_AddNumberToObject(ge, "device_errors_total", (double)es.errors);
     cJSON_AddNumberToObject(ge, "graphs", f.graphs);
+    cJSON_AddNumberToObject(ge, "graph_passes_total", (double)es.graph_passes);
+    cJSON_AddNumberToObject(ge, "eager_passes_total", (double)es.eager_passes);
+    cJSON_AddNumberToObject(ge, "stage_ahead", g.stage_ahead);
+    cJSON_AddNumberToObject(ge, "host_threads", g.host_threads);
+    cJSON_AddNumberToObject(ge, "startup_ms", g.startup_ms);
     cJSON_AddNumberToObject(ge, "host_mel_ms_total", es.host_mel_ms);
     if (es.prof_passes > 0) {
         cJSON *pr = cJSON_AddObjectToObject(ge, "profile_ms");
@@ -1098,6 +1198,11 @@ static void dump_stderr(void) {
       n, g.cohorts, g.cohorts ? (double)g.cohort_lanes_sum / (double)g.cohorts : 0.0,
       g.cohorts ? g.cohort_wait_ms_sum / (double)g.cohorts : 0.0,
       es.steps ? es.step_wall_ms_sum / (double)es.steps : 0.0, es.decode_iters);
+    D("[DUMP] worker=0 seq=%lu loop stage_ahead=%d host_threads=%d windows=%lu window_ms_mean=%.2f staged_in_window=%lu "
+      "submit_ms_mean=%.2f finish_ms_mean=%.2f graph_passes=%lu eager_passes=%lu host_mel_ms=%.1f\n",
+      n, g.stage_ahead, g.host_threads, g.windows, g.windows ? g.window_ms_sum / (double)g.windows : 0.0, g.window_staged,
+      es.steps ? es.submit_ms_sum / (double)es.steps : 0.0, es.steps ? es.finish_ms_sum / (double)es.steps : 0.0,
+      es.graph_passes, es.eager_passes, es.host_mel_ms);
     if (es.prof_passes > 0) {
         double tot = 0.0;
         for (int i = 0; i < ASR_PROF_STAGES; i++) tot += es.prof_ms[i];
@@ -1274,6 +1379,37 @@ static void raise_nofile_limit(void) {
                 (unsigned long long)now.rlim_cur, g.cap, need);
 }
 
+/* The CPUs this process may really use: the affinity mask, capped by a
+ * cgroup CPU quota (v2 cpu.max, else v1 cfs) -- a container's mask often
+ * names every host CPU while its quota grants a fraction of them. */
+static int usable_cpus(void) {
+    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) n = CPU_COUNT(&set);
+#endif
+    double quota = -1.0;
+    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char q[32] = "";
+        double period = 0.0;
+        if (fscanf(f, "%31s %lf", q, &period) == 2 && strcmp(q, "max") != 0 && period > 0.0) quota = atof(q) / period;
+        fclose(f);
+    } else {
+        FILE *fq = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r"), *fp = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+        double q = -1.0, period = 0.0;
+        if (fq && fp && fscanf(fq, "%lf", &q) == 1 && fscanf(fp, "%lf", &period) == 1 && q > 0.0 && period > 0.0) quota = q / period;
+        if (fq) fclose(fq);
+        if (fp) fclose(fp);
+    }
+    if (quota > 0.0 && (int)quota < n) n = (int)quota < 1 ? 1 : (int)quota;
+    return n < 1 ? 1 : n;
+}
+
+/* --host-threads auto: no team up to 8 usable CPUs (the engine thread, the
+ * ingest and the writers need them), 2 up to 16, 4 above */
+static int host_threads_auto(int cpus) { return cpus <= 8 ? 1 : cpus <= 16 ? 2 : 4; }
+
 static void usage(void) {
     fprintf(stderr,
         "usage: mynah-asr-server-cuda -m <model_dir> [-p PORT] [--host H] [--engine cuda|cpu]\n"
@@ -1283,6 +1419,13 @@ static void usage(void) {
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "       [--profile-host (DIAGNOSTIC: the engine thread's wall per phase, [HOSTP] lines)]\n"
         "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
+        "       [--stage-ahead 0|1] [--host-threads N|auto] [--graphs off|buckets] [--graph-buckets 8,16,32,64,128]\n"
+        "       [--warmup 0|1]  (all default off: 0, 1 thread, off, -, 0)\n"
+        "  --stage-ahead 1: stage and feed the next chunks while the encoder pass runs (byte-identical)\n"
+        "  --host-threads: threads (engine thread included) for the host mel of a staged batch; auto =\n"
+        "  1 up to 8 usable CPUs, 2 up to 16, 4 above (affinity and cgroup quota)\n"
+        "  --graphs buckets: the encoder pass replays CUDA graphs captured at start-up per lane/row bucket\n"
+        "  --warmup 1: before listening, run traffic-shaped steps at every lane bucket, then reset\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
 }
@@ -1293,6 +1436,9 @@ int main(int argc, char **argv) {
     g.max_frame_bytes = 1 << 20; g.max_audio_seconds = 0.0; g.engine_name = "cuda";
     g.precision = "f32"; g.gemm = "own"; g.threads = 0; g.ring_seconds = 30;
     int dispatch_map = 0;
+    const double t_start = now_s();
+    g.host_threads = 1;
+    const char *host_threads_arg = "1";
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1317,6 +1463,15 @@ int main(int argc, char **argv) {
         else if (ARG("--metrics-port")) g.metrics_port = atoi(v);
         else if (ARG("--gemm")) g.gemm = v;
         else if (ARG("--precision")) g.precision = v;
+        else if (ARG("--stage-ahead")) g.stage_ahead = atoi(v);
+        else if (ARG("--host-threads")) host_threads_arg = v;
+        else if (ARG("--graphs")) {
+            if (strcmp(v, "off") == 0) g.graphs = 0;
+            else if (strcmp(v, "buckets") == 0) g.graphs = 1;
+            else { fprintf(stderr, "--graphs must be off or buckets\n"); return 2; }
+        }
+        else if (ARG("--graph-buckets")) g.graph_buckets = v;
+        else if (ARG("--warmup")) g.warmup = atoi(v);
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
         else if (strcmp(a, "--version") == 0) { printf("mynah-asr-server-cuda %s\n", MYNAH_ASR_BUILD); return 0; }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
@@ -1329,13 +1484,21 @@ int main(int argc, char **argv) {
     if (g.ring_seconds < 1) g.ring_seconds = 1;
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
     if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
+    const int cpus = usable_cpus();
+    if (strcmp(host_threads_arg, "auto") == 0) g.host_threads = host_threads_auto(cpus);
+    else g.host_threads = atoi(host_threads_arg);
+    if (g.host_threads < 1) g.host_threads = 1;
+    g.stage_ahead = g.stage_ahead ? 1 : 0;
+    g.warmup = g.warmup ? 1 : 0;
 
     signal(SIGPIPE, SIG_IGN);
     raise_nofile_limit();
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
-                          .profile = g.profile, .profile_host = g.profile_host, .pass_lanes = g.pass_lanes};
+                          .profile = g.profile, .profile_host = g.profile_host, .pass_lanes = g.pass_lanes,
+                          .graphs = g.graphs, .graph_buckets = g.graph_buckets,
+                          .warmup = g.warmup, .host_threads = g.host_threads};
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
@@ -1344,6 +1507,9 @@ int main(int argc, char **argv) {
         return strstr(err, "not compiled") ? 78 : 1;
     }
     asr_engine_get_facts(g.eng, &g.facts);
+    /* what resolved: the reference engine has no feed team */
+    if (g.facts.host_threads < 1) g.facts.host_threads = 1;
+    g.host_threads = g.facts.host_threads;
     if (dispatch_map) {
         char buf[4096];
         const size_t n = asr_engine_dispatch_map(g.eng, buf, sizeof(buf));
@@ -1396,6 +1562,12 @@ int main(int argc, char **argv) {
         char topo[1024];
         const size_t tn = host_topology_line(g.facts.pci_bus_id, topo, sizeof(topo));
         fwrite(topo, 1, tn, stderr);
+        g.startup_ms = (now_s() - t_start) * 1e3;
+        fprintf(stderr, "[SERVER-CONFIG] serving-loop stage_ahead=%d split=%s host_threads=%d usable_cpus=%d graphs=%d "
+                        "graph_capture_ms=%.0f warmup=%d warmup_ms=%.0f vram_used_mb=%.0f vram_total_mb=%.0f startup_ms=%.0f\n",
+                g.stage_ahead, asr_engine_can_split(g.eng) ? "yes" : "no", g.host_threads, cpus, g.facts.graphs,
+                g.facts.graph_capture_ms, g.warmup, g.facts.warmup_ms, (double)g.facts.vram_used / 1048576.0,
+                (double)g.facts.vram_total / 1048576.0, g.startup_ms);
         fprintf(stderr, "mynah-asr-server-cuda: listening on %s:%d (%d http threads, %d stream slots, one engine thread)\n",
                 g.host, g.port, g.http_threads, g.cap);
         if (g.metrics_fd >= 0) fprintf(stderr, "mynah-asr-server-cuda: /metrics on 127.0.0.1:%d\n", g.metrics_port);

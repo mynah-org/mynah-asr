@@ -15,7 +15,7 @@
 #include <sched.h>
 #endif
 
-const char *const HP_NAME[HP__N] = {"scan", "stage_copy", "mel", "idle", "cohort_wait", "step", "publish"};
+const char *const HP_NAME[HP__N] = {"scan", "stage_copy", "mel", "idle", "cohort_wait", "step", "publish", "window"};
 
 double hostprof_now(void) {
     struct timespec ts;
