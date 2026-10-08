@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define GPU_SS_STAGES 3
 #define GPU_QMAX_HARD 32      /* a bound on q for the shared-memory tiles */
@@ -57,9 +58,19 @@ struct gpu_model_dims {
     int V, Hdec, pred_layers, blank, max_symbols;
 };
 
+/* Storage of the K/V ring (--kv-dtype). f32 is the reference; bf16 halves the
+ * bytes; int8 stores symmetric codes with one f32 scale per (position, head),
+ * scale = max|x| / 127 (a quarter of the bytes plus H floats per position). */
+#define GPU_KV_F32  0
+#define GPU_KV_BF16 1
+#define GPU_KV_INT8 2
+
 /* The arena: one pointer per tensor, indexed by slot inside the kernels. */
 struct gpu_arena {
-    float *kv;                 /* [cap][L][2][left][d]                        */
+    int kv_dtype;              /* GPU_KV_*                                     */
+    float *kv;                 /* [cap][L][2][left][d], f32 ring (else null)  */
+    void *kvq;                 /* [cap][L][2][left][d], bf16/int8 ring        */
+    float *kv_scale;           /* [cap][L][2][left][H], int8 ring only        */
     float *conv_cache;         /* [cap][L][k-1][d]                            */
     float *ss_cache[GPU_SS_STAGES]; /* [cap][C_in_s][F_s]                     */
     float *dec_h, *dec_c;      /* [cap][pred_layers][Hdec]                    */
@@ -97,6 +108,14 @@ size_t k_gemm_splitk_workspace_floats(int Mmax, int N, int K);
 void k_gemm_force_config(int cfg);
 int k_gemm_config_count(void);
 const char *k_gemm_config_name(int cfg);
+
+/* weight-only int8 (gemm_w8.cu, --weights int8): W[n][k] = S[n] * Q[n][k],
+ * the CPU's per-row symmetric codes; the v1 fixed-order chain over (float)Q,
+ * scaled once per output. Row-stable by construction, NOT bit-identical to
+ * the f32 kernels. Q must be 4-byte aligned. */
+cudaError_t k_gemm_w8(const float *A, int lda, const int8_t *Q, const float *S, const float *bias,
+                      float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                      cudaStream_t s);
 
 /* ------------------------------------------------------------- elementwise */
 /* out[r] = LN(x[r]) * w + b over d, eps 1e-5, mean/var in double as the CPU;
