@@ -21,6 +21,7 @@
 #       [--cohort-ms 40] [--cap 192] [--lang auto] [--lookahead 3] [--ref-c 4] [--gemm own|splitk|own-tc] [--precision f32|bf16]
 #       [--reference-file <run>/reference.json] [--out ~/asr-evidence/gpu]
 #       [--server-cpus 0-31] [--gen-cpus 64-95]   (taskset; the GPU's NUMA node for the server)
+#       [--server-args "--stage-ahead 1 --graphs buckets ..."]   (extra server options, every server)
 #
 # Every run records a [TOPOLOGY] line (gpu/tools/topology.sh: GPU, driver, the
 # GPU's NUMA node, CPU, usable CPUs incl. the cgroup quota, the pinning) and,
@@ -36,7 +37,7 @@ MODEL=""; PHASE=all; LADDER="96 128 144 160"; LADDER_S=90; SOAK_C=128; SOAK_S=18
 SEED=42; COHORT=40; CAP=192; LANG_Q=auto; LOOKAHEAD=3; REF_C=4; REF_IN=""
 CORPUS=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; MIN_PEAK_DBFS=-30
 WARMUP=30; WINDOW=60; DUMP_EVERY=30; OUT="$HOME/asr-evidence/gpu"; PORT=8291; BIN=./mynah-asr-server-cuda; GEMM=own; PREC=f32
-SRV_CPUS=""; GEN_CPUS=""
+SRV_CPUS=""; GEN_CPUS=""; SRV_ARGS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MODEL="$2"; shift 2 ;;
@@ -65,6 +66,7 @@ while [ $# -gt 0 ]; do
         --server-cpus) SRV_CPUS="$2"; shift 2 ;;
         --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
         --precision) PREC="$2"; shift 2 ;;
+        --server-args) SRV_ARGS="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "gpu_qualify: unknown option: $1" >&2; exit 2 ;;
     esac
@@ -132,7 +134,7 @@ GP=""; [ -n "$GEN_CPUS" ] && GP="taskset -c $GEN_CPUS"
 gpu/tools/topology.sh ${SRV_CPUS:+--server-cpus "$SRV_CPUS"} ${GEN_CPUS:+--gen-cpus "$GEN_CPUS"} > "$RUN/topology.txt" 2>&1
 cat "$RUN/topology.txt" | tee -a "$RUN/run.log"
 nvidia-smi -q > "$RUN/nvidia-smi.txt" 2>&1
-"$BIN" -m "$MODEL" --gemm "$GEMM" --precision "$PREC" --dispatch-map > "$RUN/dispatch.txt" 2>&1 || die "the server could not print its dispatch map (see dispatch.txt)"
+"$BIN" -m "$MODEL" --gemm "$GEMM" --precision "$PREC" $SRV_ARGS --dispatch-map > "$RUN/dispatch.txt" 2>&1 || die "the server could not print its dispatch map (see dispatch.txt)"
 UNKNOWN=$(sed -n 's/^\([0-9][0-9]*\) row(s) UNKNOWN.*/\1/p' "$RUN/dispatch.txt" | tail -1)
 [ "${UNKNOWN:-1}" = "0" ] || die "dispatch map has UNKNOWN rows or none at all"
 OTHERS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -c .)
@@ -153,7 +155,7 @@ fi
 # ------------------------------------------------------------ server lifecycle
 SRV=""; DUMPER=""; SMI=""
 start_server() {   # start_server <tag>
-    $SP "$BIN" -m "$MODEL" -p "$PORT" --gemm "$GEMM" --precision "$PREC" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" \
+    $SP "$BIN" -m "$MODEL" -p "$PORT" --gemm "$GEMM" --precision "$PREC" --cap "$CAP" --threads $(( CAP + 32 )) --cohort-ms "$COHORT" $SRV_ARGS \
         --metrics-port $(( PORT + 1000 )) > "$RUN/server-$1.log" 2>&1 &
     SRV=$!
     for i in $(seq 1 300); do curl -sf -m 2 "http://localhost:$PORT/v1/health" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -273,7 +275,7 @@ cat > "$RUN/manifest.json" <<JSON
   "connection_ceiling": $(( CAP + 32 )), "server_cpus": "${SRV_CPUS:-container}", "gen_cpus": "${GEN_CPUS:-container}",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA", "corpus": "$CORPUS", "corpus_sample": $CORPUS_SAMPLE,
   "corpus_seed": $CORPUS_SEED, "min_peak_dbfs": $MIN_PEAK_DBFS, "reference_concurrency": $REF_C,
-  "lang": "$LANG_Q", "configuration": "gpu-s14",
+  "lang": "$LANG_Q", "configuration": "gpu-s14", "server_args": "$SRV_ARGS",
   "ladder": "$LADDER", "ladder_seconds": $LADDER_S,
   "soak_concurrency": $SOAK_C, "soak_seconds": $SOAK_S, "soaks": $SOAKS,
   "warmup_s": $WARMUP, "window_s": $WINDOW, "dump_every_s": $DUMP_EVERY,
