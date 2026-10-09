@@ -36,6 +36,12 @@ ap.add_argument("--max-dur", type=float, default=20.0)
 ap.add_argument("--tag", required=True)
 ap.add_argument("--out", default="/root/ft/runs")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--init", default="", help="start from this .nemo instead of --stock (stage 2 from the plain-IT best)")
+ap.add_argument("--eou-append", type=int, default=0, help="stage 2: target = text + <EOU> (NVIDIA EOU dataset semantics)")
+ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of trailing silence after the speech")
+ap.add_argument("--pad-min", type=float, default=1.0)
+ap.add_argument("--pad-max", type=float, default=3.0)
+ap.add_argument("--fastemit", type=float, default=0.0)
 a = ap.parse_args()
 random.seed(a.seed); torch.manual_seed(a.seed)
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
@@ -44,12 +50,12 @@ dev = "cuda"
 from nemo.collections.asr.models import EncDecRNNTBPEModel
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 
-m = EncDecRNNTBPEModel.restore_from(a.stock, map_location=dev)
+m = EncDecRNNTBPEModel.restore_from(a.init or a.stock, map_location=dev)
 m.joint._fuse_loss_wer = False
 tk = m.tokenizer
 V = tk.vocab_size                       # 1026 incl. <EOU>/<EOB>; blank = V
 loss_fn = RNNTLoss(num_classes=V, reduction="mean_batch", loss_name="warprnnt_numba",
-                   loss_kwargs={"fastemit_lambda": 0.0})
+                   loss_kwargs={"fastemit_lambda": a.fastemit})
 
 
 def norm(t):
@@ -66,8 +72,9 @@ def load(path):
 rows = [r for r in load(a.manifest) if r.get("duration", 0) <= a.max_dur and norm(r["text"])]
 if a.n:
     rows = rows[: a.n]
+EOU_ID = tk.token_to_id("<EOU>")
 for r in rows:
-    r["ids"] = tk.text_to_ids(norm(r["text"]))
+    r["ids"] = tk.text_to_ids(norm(r["text"])) + ([EOU_ID] if a.eou_append else [])
 val = [r for r in load(a.val)][:: max(1, len(load(a.val)) // a.val_n)][: a.val_n] if a.val else []
 print(f"== plain-{a.tag}: train {len(rows)} utts {sum(r['duration'] for r in rows) / 3600:.3f} h, val {len(val)}", flush=True)
 
@@ -101,8 +108,13 @@ def audio(r):
     return x
 
 
-def batch(rs):
+def batch(rs, train=False):
     xs = [audio(r) for r in rs]
+    if train and a.pad_prob > 0:   # trailing silence with a faint noise floor (stage 2)
+        xs = [np.concatenate([x, (np.random.randn(int(16000 * random.uniform(a.pad_min, a.pad_max))) * 10 ** (random.uniform(-90, -60) / 20)).astype(np.float32)])
+              if random.random() < a.pad_prob else x for x in xs]
+    if not train and a.eou_append:  # evaluation of stage 2: 2 s of trailing quiet so an EOU can fire
+        xs = [np.concatenate([x, (np.random.randn(32000) * 10 ** (-75 / 20)).astype(np.float32)]) for x in xs]
     L = max(len(x) for x in xs)
     X = torch.zeros(len(xs), L)
     for i, x in enumerate(xs):
@@ -172,7 +184,7 @@ while step < a.steps:
     if not order:
         order = list(range(len(rows))); random.shuffle(order)
     rs = [rows[i] for i in order[: a.bs]]; order = order[a.bs:]
-    X, lens, Y, ylens = batch(rs)
+    X, lens, Y, ylens = batch(rs, train=True)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         e, el = encode(X, lens)
         d, _, _ = m.decoder(targets=Y, target_length=ylens)
