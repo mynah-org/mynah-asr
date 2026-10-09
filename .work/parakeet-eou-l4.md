@@ -329,11 +329,13 @@ not touch quality: profile unloaded, C1, C32, C256 and near the knee
 (`--profile-stages`, `--profile-host`); per point, normalised per AUDIO
 SECOND and side by side with Nemotron: GPU compute ms, host ms, kernel
 launches, GEMM ms, RNNT predictor+joint ms; plus GEMM shapes, graph coverage,
-syncs/H2D per chunk, serialised per-stream work. Decision rule: if the
-EOU/Nemotron cost ratio per audio second is far from the parameter/FLOP
-ratio (~5x), the backend is leaving performance on the table and targeted
-A/Bs follow (each with its byte-identity / quality gate); if it is close,
-no kernel work. No optimisation before a proven bottleneck.
+syncs/H2D per chunk, serialised per-stream work. Decision rule: the parameter ratio (~5x) is a REFERENCE, not a target —
+inference cost does not scale linearly with parameters (fixed per-chunk host
+and launch costs, mel, RNNT predictor/joint, GEMM shapes and chunking scale
+differently). If the EOU is much smaller but its GPU ms per audio second
+drops surprisingly little against Nemotron's, profile-guided optimisation is
+warranted (targeted A/Bs, each with its byte-identity / quality gate); a 5x
+is not chased. No optimisation before a proven bottleneck.
 
 ## 4. Measurements
 
