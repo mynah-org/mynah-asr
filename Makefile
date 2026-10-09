@@ -596,6 +596,7 @@ check:
 	@out=$$(python3 tools/bench/streaming_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(python3 tools/bench/stream_load.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(python3 tools/eval/eou_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
+	@out=$$(python3 finetune/tests/test_finetune.py 2>&1) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_partial_quality.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_verdict.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_promote.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
