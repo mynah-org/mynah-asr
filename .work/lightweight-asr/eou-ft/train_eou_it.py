@@ -93,7 +93,7 @@ def build_train_manifest(subset, out_dir, trim=True):
 
 
 # --------------------------------------------------------------------------- model
-def build_model(stock_path, tok_dir, trainer=None):
+def build_model(stock_path, tok_dir, trainer=None, warm_dec_joint=False):
     from omegaconf import OmegaConf, open_dict
 
     from nemo.collections.asr.models import EncDecRNNTBPEModel
@@ -116,9 +116,16 @@ def build_model(stock_path, tok_dir, trainer=None):
         cfg.target = "nemo.collections.asr.models.asr_eou_models.EncDecRNNTBPEEOUModel"
     model = EncDecRNNTBPEEOUModel(cfg=cfg, trainer=trainer)
     sd_stock = stock.state_dict()
-    keep = {k: v for k, v in sd_stock.items() if k.startswith(("encoder.", "preprocessor."))}
+    # NVIDIA guidance for a new vocabulary: keep encoder+preprocessor, reinitialise
+    # decoder+joint. --warm-dec-joint is an EXPERIMENTAL arm: the new vocabulary has
+    # the SAME size and the same <EOU>/<EOB>/blank ids, so the stock prediction net
+    # and joint are kept too (text rows change meaning and are retrained; blank and
+    # <EOU> keep their trained behaviour). Measured motivation: the cold arm learned
+    # (loss 44.9 on text+<EOU> vs 192.9 text-only) yet greedy decoding emitted nothing.
+    pre = ("encoder.", "preprocessor.") + (("decoder.", "joint.") if warm_dec_joint else ())
+    keep = {k: v for k, v in sd_stock.items() if k.startswith(pre)}
     missing, unexpected = model.load_state_dict(keep, strict=False)
-    bad = [k for k in missing if k.startswith(("encoder.", "preprocessor."))]
+    bad = [k for k in missing if k.startswith(pre)]
     assert not bad and not unexpected, f"encoder load: missing {bad[:5]} unexpected {unexpected[:5]}"
     stream_after = {k: OmegaConf.to_container(model.cfg.encoder, resolve=True).get(k) for k in STREAM_KEYS}
     assert stream_after == stream_before, (stream_before, stream_after)
@@ -277,6 +284,7 @@ def main():
     ap.add_argument("--val-n", type=int, default=200)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--warm-dec-joint", type=int, default=int(os.environ.get("WARM_DEC_JOINT", "0") or 0), choices=[0, 1])
     ap.add_argument("--save-ckpt", type=int, default=int(os.environ.get("SAVE_CKPT", "0") or 0), choices=[0, 1])
     ap.add_argument("--rate-usd-h", type=float, default=float(os.environ.get("RATE_USD_H", "0") or 0))
     ap.add_argument("--stream-n", type=int, default=6)
@@ -305,7 +313,8 @@ def main():
     from omegaconf import OmegaConf, open_dict
 
     pl.seed_everything(a.seed)
-    model, minfo = build_model(a.stock, a.tokenizer)
+    model, minfo = build_model(a.stock, a.tokenizer, warm_dec_joint=bool(a.warm_dec_joint))
+    minfo["warm_dec_joint"] = bool(a.warm_dec_joint)
     print(f"  model: {json.dumps(minfo, default=str)}", flush=True)
 
     # trainable set
