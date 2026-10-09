@@ -272,3 +272,11 @@ branch when the next rung does not beat the previous by > 1 abs WER on FLEURS it
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | C0 | canary-180m | 0 | — | — | — | — | — | — | — | — | — | n/a |
 | E0 | eou-120m | 0 | — | — | — | — | — | n/a | n/a | n/a | — | — |
+
+## Economics are a measured result, not an estimate (decided 2026-10-09)
+
+The $4-16 figure above is an ESTIMATE from a third-party throughput number and
+is not quoted anywhere as a result. Every FT run records, from its own logs:
+audio-hours per GPU-hour, samples/s, peak allocated and reserved VRAM, epoch
+wall time, total GPU-hours, and cost per epoch and per run at the box's actual
+hourly rate (the rate is written down when the box is rented).

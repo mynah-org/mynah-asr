@@ -315,4 +315,48 @@ must pass before the next one is run:
 
 ## 4. Measurements
 
-(none yet)
+### 2026-10-09, L40S box, q1: FLEURS EN test 200 clips, f32, CPU CLI stream (build 4378448, BEFORE the model-EOU reset)
+
+Command: `.work/lightweight-asr/jobs/q1.sh` (tools/eval/lang_gate.py, the
+streaming_metrics normaliser; bank: tools/fetch_eval_bank.py --n 200).
+
+| model | WER mean | WER* (format-free) | CER mean | pooled WER | S / D / I | empty |
+|---|---|---|---|---|---|---|
+| EOU 120M (no reset) | 0.1607 | 0.3106 | 0.1194 | 0.3014 | 291 / **1001** / 85 | **20.0 %** (40/200) |
+| Nemotron, lang en | 0.1155 | 0.0863 | 0.0685 | 0.1160 | 373 / 60 / 97 | 0 % |
+| Nemotron, lang auto | 0.1227 | 0.0985 | 0.0738 | 0.1237 | 377 / 93 / 95 | 0.5 % |
+
+(The mean WER of the EOU arm excludes nothing: an empty transcript is WER 1;
+the mean is lower than the pooled number because the empty clips are short.)
+
+### NeMo reference parity (gate 6 against the reference implementation)
+
+`.work/lightweight-asr/jobs/nemo_ref.{sh,py}`: NeMo 3.0.0, the same `.nemo`,
+`EncDecRNNTBPEModel.transcribe` on CPU, special tokens kept. On the 40 clips
+Mynah returned empty plus 40 it transcribed:
+
+- the 40 transcribed clips: Mynah text == NeMo text on **40/40** once `<EOU>`
+  is removed from NeMo's;
+- the 40 empty clips: NeMo is empty on **40/40** as well — 33 with no token at
+  all, 7 with a lone `<EOU>` and nothing after it (no reset in an offline
+  `transcribe`).
+
+So the 20 % empty rate is the CHECKPOINT on this audio, not a Mynah defect;
+the 7 "EOU first, then silent" clips are what the model-EOU reset addresses.
+Why the checkpoint emits nothing on 33 FLEURS clips is open (read speech,
+levels, leading silence: to be probed, not assumed).
+
+### g1: end-to-end gate on the GPU (build aabc16f, `.work/lightweight-asr/jobs/g1.sh`)
+
+- CUDA engine loads the pack: dispatch map 0 UNKNOWN, `post-encoder
+  encproj-only`; start-up with defaults bf16 own-tc, 9 graphs, 1195 ms,
+  **1940 MiB VRAM** (Nemotron with the same defaults: 6862 MiB).
+- `tests/test_cuda_stream --lookahead 1` on A+1 s+B, fleurs_1521, fleurs_1534,
+  fleurs_long: gate A (batch identity, repeat, slot independence), gate B
+  (CPU f32 == GPU, text AND model eous: 7.69/20.28 s on A+B, 7 eous on
+  fleurs_long) and gate C (stage-ahead, host threads, graphs, warm-up, all
+  together) **PASS in f32 own and in bf16 own-tc** (bf16: same text and eous
+  as CPU f32 on these 4 clips; bank-level parity is q2).
+- CPU server vs CUDA server WebSocket frames on A+1 s+B: **identical**, eou
+  frames `{"source":"model","t":7.69}` and `{"t":20.28}`.
+

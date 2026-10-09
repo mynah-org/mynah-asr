@@ -163,4 +163,18 @@ end-to-end gate.
 
 ## 4. Measurements
 
-(none yet)
+### 2026-10-09, L40S box, q1: FLEURS test 200 clips per language, f32, CPU CLI offline (build 4378448)
+
+Same bank, scorer and normaliser as the EOU/Nemotron rows in
+`.work/parakeet-eou-l4.md` (Nemotron streams; Canary is offline — the rows
+compare quality, not serving semantics).
+
+| model / lang | WER mean | WER* | CER mean | pooled WER | S / D / I | empty |
+|---|---|---|---|---|---|---|
+| Canary 180M, en | **0.0970** | 0.0669 | 0.0658 | 0.0987 | 261 / 88 / 102 | 1.0 % |
+| Nemotron, en (lang en) | 0.1155 | 0.0863 | 0.0685 | 0.1160 | 373 / 60 / 97 | 0 % |
+| Canary 180M, fr | **0.0886** | 0.0601 | 0.0521 | 0.0867 | 310 / 46 / 102 | 0 % |
+| Nemotron, fr (lang fr) | 0.1310 | 0.1018 | 0.0652 | 0.1266 | 489 / 47 / 133 | 0 % |
+
+DE/ES: `tools/fetch_eval_bank.py` now knows de/es/it (lw-eou-metrics); not run yet.
+
