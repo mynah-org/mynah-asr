@@ -71,7 +71,7 @@ def once():
         if not (run / "metrics.json").exists():
             continue
         put_dir(run, f"runs/{run.name}", f"run-{run.name}")
-        if "-e" in run.name or run.name.startswith("eou"):
+        if "-e" in run.name or run.name.startswith(("eou", "plain-")):
             put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}")
         # full Lightning state (optimizer, scheduler, scaler, step) where a run saved one
         put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}")
