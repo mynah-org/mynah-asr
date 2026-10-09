@@ -43,6 +43,16 @@ make -C gpu test-stream           # tests/test_cuda_stream           (GPU + pack
 ./mynah-asr-server-cuda -m ... --dispatch-map      # what each op resolves to, then exit
 ```
 
+A pack without Nemotron's language-prompt projector (`parakeet-realtime-eou-120m`:
+one preset `[70, 1]`, English only) is served too: the encoder output goes
+straight into the encoder projector, as `src/encoder.c` does, and the dispatch
+map adds a `post-encoder encproj-only` row. Such a pack serves no `lang`: a
+query or `reset` without one (or with `lang=` empty) runs the model, any
+explicit tag -- `auto` included -- is refused with 400 `language_not_served`,
+as the CPU server refuses it. Drive it with `--lang ''` / `LANG_Q=''` and
+lookahead 1 in `gpu_qualify.sh` / `gpu_knee.sh`, and
+`tests/test_cuda_stream <pack> --lookahead 1`.
+
 The banner prints what RESOLVED (engine, device, precision, GEMM, VRAM, cohort);
 `/v1/health` carries the session books, the lag histogram and the engine's
 counters; `SIGUSR1` prints the `[DUMP]` lines `tools/bench/v2_verdict.py` reads.

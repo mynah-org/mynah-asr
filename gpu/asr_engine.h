@@ -199,11 +199,15 @@ static inline void asr_engine_close(asr_engine *e) { if (e) e->ops->close(e); }
 static inline void asr_engine_get_facts(const asr_engine *e, asr_engine_facts *f) { e->ops->facts(e, f); }
 static inline void asr_engine_get_stats(const asr_engine *e, asr_engine_stats *s) { e->ops->stats(e, s); }
 /* Language tag -> prompt id (-1 = not served); NULL/"auto" -> the default. A
- * config lookup, never inference. */
+ * config lookup, never inference. On a pack without a language prompt (the
+ * Parakeet realtime EOU model) the cuda engine serves only the default: NULL
+ * or "" -> 0, every explicit tag ("auto" included) -> -1, which the server
+ * turns into 400 language_not_served -- what the CPU server answers. */
 static inline int asr_engine_lang_id(const asr_engine *e, const char *lang) { return e->ops->lang_id(e, lang); }
 static inline int asr_engine_lookahead_ok(const asr_engine *e, int la) { return e->ops->lookahead_ok(e, la); }
 /* A new utterance on slot `slot`: caches emptied, decoder at SOS, mel reset,
- * text emptied; `lang` is the tag (NULL/"auto" = the pack's default). 0 = ok. */
+ * text emptied; `lang` is the tag (NULL/"auto" = the pack's default; a pack
+ * without a prompt accepts only NULL, "" and "auto"). 0 = ok. */
 static inline int asr_engine_slot_reset(asr_engine *e, int slot, const char *lang, int la) { return e->ops->slot_reset(e, slot, lang, la); }
 /* Samples the slot still needs before its next chunk is complete. */
 static inline size_t asr_engine_slot_need_samples(const asr_engine *e, int slot) { return e->ops->slot_need_samples(e, slot); }
