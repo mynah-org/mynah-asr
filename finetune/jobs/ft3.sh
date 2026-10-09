@@ -9,11 +9,12 @@
 # Env: SUBSET (20h), EPOCHS (13: IT epochs; steps grow by 1/(1-ratio)),
 #      ARMS (B), REPLAY_RATIO (0.2), REPLAY_H (2 h per language),
 #      TAG_SUFFIX (-e<EPOCHS>-rp<ratio%>), RATE_USD_H, T_TRAIN (21600 s).
-#   tmux new -d -s ft3 'bash /root/ft3.sh 2>&1 | tee /root/ft/logs/ft3.log'
+# Produced the 2026-10-09 multilingual replay run B4-20h-e13-rp20 with the defaults.
+#   FT_ROOT=/root/ft tmux new -d -s ft3 'bash finetune/jobs/ft3.sh 2>&1 | tee /root/ft/logs/ft3.log'
 set -u
-K=/root/ft-kit
-FT=${FT_ROOT:-/root/ft}
-PY=${VENV:-/root/nemo-venv}/bin/python
+. "$(dirname "$0")/gpu_lock.sh"
+K=$FINETUNE/canary
+FT=$FT_ROOT
 SUBSET=${SUBSET:-20h}; EPOCHS=${EPOCHS:-13}; ARMS=${ARMS:-B}
 REPLAY_RATIO=${REPLAY_RATIO:-0.2}; REPLAY_H=${REPLAY_H:-2}
 pct=$(awk "BEGIN{printf \"%d\", ${REPLAY_RATIO} * 100 + 0.5}")
@@ -23,13 +24,13 @@ export REPLAY_H FT_ROOT=$FT
 marker=$FT/done/replay-${REPLAY_H}h
 if [ ! -e "$marker" ]; then
     echo "== ft3 replay data ${REPLAY_H} h/lang $(date +%T); free $(df -h --output=avail "$FT" | tail -1)"
-    timeout "${T_DATA:-7200}" "$PY" "$K/data_replay.py" --hours-per-lang "$REPLAY_H" \
+    timeout "${T_DATA:-7200}" "$PY" "$K/replay.py" --hours-per-lang "$REPLAY_H" \
         || { echo "== FT3-FAILED data rc=$? $(date +%T)"; exit 1; }
     date '+%F %T' >"$marker"
 fi
 
-exec 9>/root/gpu.lock; flock 9
+gpu_lock
 echo "== ft3 lock held $(date +%T) subset=$SUBSET epochs=$EPOCHS arms=$ARMS replay=$REPLAY_RATIO tag+=$TAG_SUFFIX"
 SUBSET=$SUBSET EPOCHS=$EPOCHS ARMS=$ARMS REPLAY_RATIO=$REPLAY_RATIO TAG_SUFFIX=$TAG_SUFFIX SAVE_CKPT=1 \
-    T_TRAIN=${T_TRAIN:-21600} RATE_USD_H=${RATE_USD_H:-0} bash $K/train_canary_it.sh
+    T_TRAIN=${T_TRAIN:-21600} RATE_USD_H=${RATE_USD_H:-0} bash $K/train_it.sh
 echo "== FT3-DONE rc=$? $(date +%T)"
