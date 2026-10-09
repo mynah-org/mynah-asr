@@ -71,8 +71,12 @@ def once():
         if not (run / "metrics.json").exists():
             continue
         put_dir(run, f"runs/{run.name}", f"run-{run.name}")
-        if "-e" in run.name:
+        if "-e" in run.name or run.name.startswith("eou"):
             put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}")
+        # full Lightning state (optimizer, scheduler, scaler, step) where a run saved one
+        put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}")
+    put_dir("/root/eou-kit", "recipe/eou-kit", "eou-kit")
+    put_dir("/root/ft/models/tok-eou-it", "tokenizers/eou-it", "tok-eou-it")
     put_dir("/root/ft/logs", "logs", f"logs-{int(time.time() // 3600)}")
 
 
