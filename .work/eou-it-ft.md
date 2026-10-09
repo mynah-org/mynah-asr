@@ -137,3 +137,42 @@ until only blank remains. With the encoder untouched and a working start,
 this is near-causal evidence that the TRAINING RECIPE drives the RNNT to the
 blank solution (suspects above), not the language transfer or the
 initialisation. Stopped here for the session, per the stop/go rule.
+
+## The two-stage path WORKS (2026-10-09 evening, `eou-ft/plain_it.py`, `jobs/chain_it.sh`, `jobs/m1.sh`)
+
+Correction of approach: NVIDIA's EOU recipe starts from an ASR that already
+knows the language, keeps its vocabulary and appends two tokens. So: stage 1 =
+plain Italian ASR from the STOCK model with the STOCK tokenizer (Italian
+de-accented: the English SPE maps accented vowels to <unk>, 1.8 % of tokens;
+otherwise 2.8 tokens/word, round-trips), stock decoder/joint, FastEmit 0, no
+padding, no gain; stage 2 = text + <EOU> targets from the stage-1 best.
+Minimal PyTorch loop (no Lightning/lhotse). Scores below are accent-insensitive.
+
+| run | data | encoder | steps | MLS-it val WER / CER | empty | EOU | wall |
+|---|---|---|---|---|---|---|---|
+| A0 micro-overfit | 32 utts | frozen | 400 | train set: 26.5 (100) -> 1.1 (200) -> 0.0 (300) | 0 | n/a | 65 s |
+| B1 | 5 h | frozen | 1500 (died in eval at ~1750) | 69.9 (250) -> 59.1 (1500) / 26.6 | 11/200 | 0 | ~6 min |
+| P40 | 40 h | top 4 unfrozen (lr 3e-5), dec/joint 3e-4 | 4000 | 54.7 (500) -> 48.2 (1000) -> 42.3 (2500) -> **41.7 / 12.3** | 0 | 0 | 813 s |
+| S2 (stage 2) | 40 h, text+<EOU>, 50 % with 1-3 s trailing quiet | same | 1500, lr 1e-4, FastEmit 0 | **40.4 / 12.5** | 0 | **98 %** | 436 s |
+
+B1/B2 died in NeMo's batched greedy decoding (CUDA graphs: "illegal memory
+access" in batched_hyps_to_hypotheses) during an eval, not in training; the
+loop now evaluates with the per-utterance greedy decoder.
+
+Inside Mynah (m1; pack converted with tools/convert_nemo.py, CLI stream f32):
+- FLEURS-it test 200 clips (out of domain: training is MLS audiobooks):
+  WER 55.12 / CER 18.97 pooled, 0 empty, model <EOU> on 175/200 clips.
+- eou_metrics (60 clips, Silero speech end, gap 1 s): speech end -> EOU p50
+  2346 / p90 3770 / p95 3866 ms; missed 1 s 95 %, 2 s 60 %, never 10 %;
+  premature 0 % at every pause threshold; A + 1 s + B: EOU in the gap 58.3 %,
+  latency p50 330 / p90 522 ms.
+- CUDA: tests/test_cuda_stream gates A/B/C PASS on 4 Italian clips, CPU f32 ==
+  GPU incl. the model eous (e.g. 1 @ 19.32 s); the CUDA server starts in
+  500 ms, bf16 own-tc, 9 graphs, 1940 MiB VRAM — the stock EOU's profile.
+Artifacts: HF private repo runs/plain-p40-b2pol, runs/plain-s2-eou-p40-b2pol
+(final.nemo + last.ckpt torch state), size-verified.
+Open: endpoint decision slower than the English stock on single clips
+(s2b tests FastEmit 0.03 as the one changed variable); FLEURS gap (domain
+and/or level: no gain augmentation was used tonight); accents (add the
+accented vowels as appended tokens, as NVIDIA appends <EOU>/<EOB>); replicate
+on FR or DE to show it is a method, not a lucky language.

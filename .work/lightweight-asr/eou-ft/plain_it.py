@@ -36,6 +36,12 @@ ap.add_argument("--max-dur", type=float, default=20.0)
 ap.add_argument("--tag", required=True)
 ap.add_argument("--out", default="/root/ft/runs")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--init", default="", help="start from this .nemo instead of --stock (stage 2 from the plain-IT best)")
+ap.add_argument("--eou-append", type=int, default=0, help="stage 2: target = text + <EOU> (NVIDIA EOU dataset semantics)")
+ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of trailing silence after the speech")
+ap.add_argument("--pad-min", type=float, default=1.0)
+ap.add_argument("--pad-max", type=float, default=3.0)
+ap.add_argument("--fastemit", type=float, default=0.0)
 a = ap.parse_args()
 random.seed(a.seed); torch.manual_seed(a.seed)
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
@@ -44,12 +50,22 @@ dev = "cuda"
 from nemo.collections.asr.models import EncDecRNNTBPEModel
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 
-m = EncDecRNNTBPEModel.restore_from(a.stock, map_location=dev)
+m = EncDecRNNTBPEModel.restore_from(a.init or a.stock, map_location=dev)
 m.joint._fuse_loss_wer = False
+# Evaluation decodes with the per-utterance greedy loop: NeMo's batched greedy
+# (CUDA-graph label loop) hit "illegal memory access" in batched_hyps_to_hypotheses
+# mid-run on this box (b1 after step 1500, b2 at step 500).
+from omegaconf import open_dict
+_dc = m.cfg.decoding
+with open_dict(_dc):
+    _dc.strategy = "greedy"
+    if "greedy" in _dc:
+        _dc.greedy.use_cuda_graph_decoder = False
+m.change_decoding_strategy(_dc)
 tk = m.tokenizer
 V = tk.vocab_size                       # 1026 incl. <EOU>/<EOB>; blank = V
 loss_fn = RNNTLoss(num_classes=V, reduction="mean_batch", loss_name="warprnnt_numba",
-                   loss_kwargs={"fastemit_lambda": 0.0})
+                   loss_kwargs={"fastemit_lambda": a.fastemit})
 
 
 def norm(t):
@@ -66,8 +82,9 @@ def load(path):
 rows = [r for r in load(a.manifest) if r.get("duration", 0) <= a.max_dur and norm(r["text"])]
 if a.n:
     rows = rows[: a.n]
+EOU_ID = tk.token_to_id("<EOU>")
 for r in rows:
-    r["ids"] = tk.text_to_ids(norm(r["text"]))
+    r["ids"] = tk.text_to_ids(norm(r["text"])) + ([EOU_ID] if a.eou_append else [])
 val = [r for r in load(a.val)][:: max(1, len(load(a.val)) // a.val_n)][: a.val_n] if a.val else []
 print(f"== plain-{a.tag}: train {len(rows)} utts {sum(r['duration'] for r in rows) / 3600:.3f} h, val {len(val)}", flush=True)
 
@@ -101,18 +118,24 @@ def audio(r):
     return x
 
 
-def batch(rs):
+def batch(rs, train=False):
     xs = [audio(r) for r in rs]
+    if train and a.pad_prob > 0:   # trailing silence with a faint noise floor (stage 2)
+        xs = [np.concatenate([x, (np.random.randn(int(16000 * random.uniform(a.pad_min, a.pad_max))) * 10 ** (random.uniform(-90, -60) / 20)).astype(np.float32)])
+              if random.random() < a.pad_prob else x for x in xs]
+    if not train and a.eou_append:  # evaluation of stage 2: 2 s of trailing quiet so an EOU can fire
+        xs = [np.concatenate([x, (np.random.randn(32000) * 10 ** (-75 / 20)).astype(np.float32)]) for x in xs]
     L = max(len(x) for x in xs)
     X = torch.zeros(len(xs), L)
     for i, x in enumerate(xs):
         X[i, : len(x)] = torch.from_numpy(x)
     lens = torch.tensor([len(x) for x in xs])
-    U = max(len(r["ids"]) for r in rs)
+    ids = [r.get("ids") or [0] for r in rs]   # validation rows carry no ids (targets unused there)
+    U = max(len(t) for t in ids)
     Y = torch.zeros(len(rs), U, dtype=torch.long)
-    for i, r in enumerate(rs):
-        Y[i, : len(r["ids"])] = torch.tensor(r["ids"])
-    ylens = torch.tensor([len(r["ids"]) for r in rs])
+    for i, t in enumerate(ids):
+        Y[i, : len(t)] = torch.tensor(t)
+    ylens = torch.tensor([len(t) for t in ids])
     return X.to(dev), lens.to(dev), Y.to(dev), ylens.to(dev)
 
 
@@ -172,7 +195,7 @@ while step < a.steps:
     if not order:
         order = list(range(len(rows))); random.shuffle(order)
     rs = [rows[i] for i in order[: a.bs]]; order = order[a.bs:]
-    X, lens, Y, ylens = batch(rs)
+    X, lens, Y, ylens = batch(rs, train=True)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         e, el = encode(X, lens)
         d, _, _ = m.decoder(targets=Y, target_length=ylens)
@@ -200,8 +223,12 @@ while step < a.steps:
             rec.update({"val_wer": round(vw, 2), "val_cer": round(vc, 2), "val_empty": sum(1 for h in vh if not h.strip()),
                         "val_eou_rate": round(veo / len(val), 3), "val_nonblank": round(float(np.mean(vnb)), 4)})
             print(f"  VAL {json.dumps({k: rec[k] for k in rec if k.startswith('val')})}", flush=True)
-            if best is None or vw < best:
-                best = vw
+            # stage 2 keeps EOU: best = lowest WER among evals with EOU on >= 80 % of the
+            # val clips AND <= 10 % empty; until one qualifies, the most EOU (fewest empties) wins
+            ok = rec["val_eou_rate"] >= 0.8 and rec["val_empty"] <= 0.1 * len(val)
+            score = vw if not a.eou_append else (vw if ok else 1000 - 100 * rec["val_eou_rate"] + rec["val_empty"])
+            if best is None or score < best:
+                best = score
                 m.save_to(str(out / "final.nemo"))
                 torch.save({"model": m.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
                             "args": vars(a)}, out / "last.ckpt")

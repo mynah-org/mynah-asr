@@ -70,11 +70,14 @@ def once():
     for run in sorted(Path("/root/ft/runs").glob("*/")):
         if not (run / "metrics.json").exists():
             continue
-        put_dir(run, f"runs/{run.name}", f"run-{run.name}")
-        if "-e" in run.name or run.name.startswith("eou"):
-            put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}")
-        # full Lightning state (optimizer, scheduler, scaler, step) where a run saved one
-        put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}")
+        # keys carry the file mtime: a run that rewrites its best checkpoint or its
+        # metrics while training (plain_it.py) gets the new version re-uploaded
+        mt = lambda f: int((run / f).stat().st_mtime) if (run / f).exists() else 0
+        put_dir(run, f"runs/{run.name}", f"run-{run.name}-{mt('metrics.json')}")
+        if "-e" in run.name or run.name.startswith(("eou", "plain-")):
+            put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}-{mt('final.nemo')}")
+        # full training state (optimizer, scheduler, step) where a run saved one
+        put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}-{mt('last.ckpt')}")
     put_dir("/root/eou-kit", "recipe/eou-kit", "eou-kit")
     put_dir("/root/ft/models/tok-eou-it", "tokenizers/eou-it", "tok-eou-it")
     put_dir("/root/ft/logs", "logs", f"logs-{int(time.time() // 3600)}")
