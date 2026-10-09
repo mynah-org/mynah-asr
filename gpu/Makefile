@@ -40,8 +40,9 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 
 B := $(TOP)/build/gpu
 
-C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
-CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
+C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/offline_engine.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o \
+            $(B)/rest.o $(B)/http_util.o $(B)/stream_out.o
+CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o $(B)/aed_stub.o
 
 .PHONY: all cpu clean test-kernels test-stream bank-transcribe lib
 all: $(TOP)/mynah-asr-server-cuda
@@ -65,6 +66,12 @@ $(B)/ws.o: server/ws.c
 $(B)/hostprof.o: server/hostprof.c server/hostprof.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/rest.o: server/rest.c server/rest.h server/http_io.h asr_offline.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/offline_engine.o: offline_engine.c asr_offline.h aed_gpu.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/http_util.o: $(TOP)/server/http_util.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -84,8 +91,11 @@ $(TOP)/mynah-asr-server-cuda: $(C_OBJ) $(CU_OBJ) $(TOP)/libmynah_asr.a
 $(B)/engine_stub.o: cuda/engine_stub.c asr_engine.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(TOP)/mynah-asr-server-cuda-cpuonly: $(C_OBJ) $(B)/engine_stub.o $(TOP)/libmynah_asr.a
-	$(CC) $(CFLAGS) -o $@ $(C_OBJ) $(B)/engine_stub.o $(LDLIBS)
+$(B)/aed_stub.o: cuda/aed_stub.c aed_gpu.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TOP)/mynah-asr-server-cuda-cpuonly: $(C_OBJ) $(B)/engine_stub.o $(B)/aed_stub.o $(TOP)/libmynah_asr.a
+	$(CC) $(CFLAGS) -o $@ $(C_OBJ) $(B)/engine_stub.o $(B)/aed_stub.o $(LDLIBS)
 
 # tests
 $(B)/test_cuda_kernels.o: $(TOP)/tests/test_cuda_kernels.cu cuda/kernels.cuh

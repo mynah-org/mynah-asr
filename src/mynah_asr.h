@@ -200,6 +200,48 @@ int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                            const size_t *n_samples, int batch, const char *const *langs,
                            int lookahead, char **texts, char (*langs_out)[16]);
 
+/* 1 when an offline transcription with this `lang` (including the "src>tgt"
+ * translation form) would be accepted by the model, 0 when it would fail. A
+ * config lookup, never inference. A server checks it BEFORE admitting a request
+ * into a batch: the batch path is all-or-nothing, so one bad tag would otherwise
+ * fail every item batched with it. */
+int mynah_asr_lang_supported(const mynah_asr_model *m, const char *lang);
+
+/* ----------------------------------------------------------------- offload
+ * An accelerator (the CUDA server's AED engine, gpu/cuda/aed.cu) takes over the
+ * two heavy halves of the OFFLINE path -- the encoder and the AED greedy decode
+ * -- while the library keeps everything around them: segmentation, the mel front
+ * end, the canary2 prompt, the generation budget, detokenisation and the
+ * stitching of segments. So a transcript through an offload differs from the
+ * library's only by the arithmetic of the two hooks, never by the host logic.
+ *
+ * encode: the post-projector encoder output for `n` segments, exactly what
+ *   the library's batched encoder returns: feats[i] [t_mel[i], n_mels] (valid
+ *   frames), prompt_ids[i] as the library resolved them; outs[i] receives a
+ *   malloc'd [t_outs[i], d_out] the library frees. 0 = ok. NULL = the library's
+ *   own encoder. Never called for the raw (pre-projector) output.
+ * aed_decode: greedy AED decode of `n` segments with the library's stopping
+ *   rule (EOS, the per-item cap, the decoder's max_seq): enc[i] [t_enc[i],
+ *   d_enc]; prompts[i]/n_prompts[i] the canary2 prompt; tokens[i] has room for
+ *   caps[i] ids, n_out[i] receives the count (prompt and EOS excluded). 0 = ok.
+ *   from_encode = 1 when enc[] are, in order, the buffers the SAME offload's
+ *   encode returned in the call just before (the offload may keep them resident
+ *   and skip the upload); 0 otherwise. NULL = the library's own decoder.
+ *
+ * A model with an offload installed must be driven by one thread at a time
+ * (the offload owns one device queue). NULL `o` removes it. The offload is NOT
+ * used by the streaming API, language detection or the word aligner, which
+ * keep the library's own arithmetic. */
+typedef struct {
+    int (*encode)(void *ud, const float *const *feats, const int *t_mel, int n, int n_mels,
+                  const int *prompt_ids, float **outs, int *t_outs);
+    int (*aed_decode)(void *ud, int from_encode, const float *const *enc, const int *t_enc,
+                      int n, const int *const *prompts, const int *n_prompts, int eos,
+                      const int *caps, int *const *tokens, int *n_out);
+    void *ud;
+} mynah_asr_offload;
+void mynah_asr_set_offload(mynah_asr_model *m, const mynah_asr_offload *o);
+
 /* --------------------------------------------------------------- streaming
  * Cache-aware, latency = (lookahead+1) * 80 ms. Text emitted through the callback
  * is ALWAYS final (monotonic greedy, never retracted): is_final = true. */

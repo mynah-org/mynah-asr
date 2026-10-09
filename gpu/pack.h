@@ -33,6 +33,18 @@ typedef struct {
     double frame_sec;
 } asr_pack;
 
+/* What a pack asks of the server, read from its mynah.json before anything is
+ * loaded: the capability decides the engine, never the model's name.
+ *   ASR_PACK_STREAM        an RNNT pack: the cache-aware streaming engine
+ *                          (asr_engine.h), which still refuses what it cannot serve
+ *   ASR_PACK_OFFLINE_AED   an attention encoder-decoder (decoder.type
+ *                          "aed_transformer", Canary): no streaming API exists for
+ *                          it, so the offline engine (asr_offline.h) serves REST
+ *                          and the WebSocket is refused with model_not_streaming
+ * -1 with the reason in err when mynah.json is missing or unreadable. */
+enum { ASR_PACK_STREAM = 0, ASR_PACK_OFFLINE_AED = 1 };
+int asr_pack_mode(const char *dir, char *err, size_t errcap);
+
 /* Opens `dir`. Refuses (with the reason in err) anything the streaming step
  * cannot serve: no presets, biases, batch_norm, xscaling, non-causal conv,
  * per-feature normalisation, a subsampling factor other than 8, a TDT head, an
