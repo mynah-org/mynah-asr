@@ -6,8 +6,10 @@
 # (fallback cu126; NeMo 3.0.0 requires torch>=2.6.0 and its own cu12 extra
 # pins torch==2.12.0+cu126). Then: extra deps, the leaderboard normaliser
 # (pinned commit), the Canary 180M checkpoint, and a GPU/bf16 check.
-#   tmux new -d -s ft 'bash setup.sh 2>&1 | tee -a /root/ft/logs/setup.log'
-. "$(dirname "$0")/common.sh"
+#   FT_ROOT=/root/ft tmux new -d -s ft 'bash setup.sh 2>&1 | tee -a /root/ft/logs/setup.log'
+# Env: VENV (/root/nemo-venv), TORCH_CUDA ("cu128 cu126"), TORCH_VERSION, FORCE_TORCH,
+#      WITH_RNNT=1 (numba-cuda + numpy<2.4 for the EOU kit's RNNT loss), OAL_SHA.
+. "$(dirname "$0")/env.sh"
 [ -x "$PY" ] || { echo "no venv python at $PY (set VENV=...)"; exit 2; }
 
 cuda_ok() { "$PY" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; }
@@ -50,6 +52,16 @@ if step setup-deps; then
     ok setup-deps
 fi
 
+# The NeMo RNNT loss (EOU kit, finetune/eou/) runs on numba's CUDA target. Measured
+# 2026-10-09 with NeMo 3.0.0: numba 0.68 needs the separate `numba-cuda` package,
+# and numba-cuda 0.30.4 needs numpy < 2.4. Canary (AED) does not need it.
+if [ "${WITH_RNNT:-0}" = 1 ] && step setup-rnnt-loss; then
+    timeout 1200 uv pip install --python "$PY" numba-cuda "numpy<2.4" || fail setup-rnnt-loss $?
+    "$PY" -c "import numba, numpy; from numba import cuda; print('   numba', numba.__version__, 'numpy', numpy.__version__, 'cuda', cuda.is_available())" \
+        || fail setup-rnnt-loss 5
+    ok setup-rnnt-loss
+fi
+
 if step setup-normalizer; then
     # HF Open ASR Leaderboard normaliser, pinned (Apache-2.0; Whisper-derived)
     sha=${OAL_SHA:-67e8bd6acea240819ad67080f6f31e15d4a90da5}
@@ -58,7 +70,7 @@ if step setup-normalizer; then
         curl -fsSL --retry 5 -o "$d/$f" "https://raw.githubusercontent.com/huggingface/open_asr_leaderboard/$sha/normalizer/$f" \
             || fail setup-normalizer $?
     done
-    "$PY" -c "import sys; sys.path.insert(0,'$KIT'); import ftlib; r=ftlib.selfcheck_normalizer(); print('   normaliser self-check:', r); sys.exit(0 if r=='ok' else 1)" \
+    "$PY" -c "import sys; sys.path.insert(0,'$COMMON'); import ftlib; r=ftlib.selfcheck_normalizer(); print('   normaliser self-check:', r); sys.exit(0 if r=='ok' else 1)" \
         || fail setup-normalizer 5
     ok setup-normalizer
 fi

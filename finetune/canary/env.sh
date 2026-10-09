@@ -1,14 +1,16 @@
 #!/bin/bash
-# shellcheck disable=SC2034  # KIT, PY, V are used by the scripts that source this file
+# shellcheck disable=SC2034  # KIT, COMMON, PY, V are used by the scripts that source this file
 # Sourced by every step script of the Canary 180M Italian kit.
-# Layout on the box:  $FT (default /root/ft) = data, models, runs, logs, markers.
-#                     $KIT = this directory (scripts only, no state).
+# Layout on the box:  $FT = $FT_ROOT (REQUIRED, e.g. /root/ft) = data, models, runs, logs, markers.
+#                     $KIT = this directory (scripts only, no state); $COMMON = ../common.
 # Every step writes $FT/done/<step> on success and is skipped when re-run;
 # delete the marker to redo a step.
 set -u
-FT=${FT_ROOT:-/root/ft}
+: "${FT_ROOT:?set FT_ROOT explicitly (data, models and runs root, e.g. /root/ft)}"
+FT=$FT_ROOT
 export FT_ROOT=$FT
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+COMMON=$(cd "$KIT/../common" && pwd)
 V=${VENV:-/root/nemo-venv}
 PY=$V/bin/python
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1

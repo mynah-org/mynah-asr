@@ -29,6 +29,15 @@ Accounting (written to <run>/metrics.json):
   loader is infinite, so an "epoch" = the subset's hours of audio processed),
   total GPU-hours (whole process) and cost at RATE_USD_H. Training wall time
   excludes the in-loop validation passes, which are reported separately.
+
+Provenance: <run>/run.json (finetune/common/runmeta.py) is written before the
+first step and completed at the end. FT_ROOT must be set explicitly and
+--subset given; --dry-run resolves and prints the configuration (steps, LR per
+group, replay mix) without loading NeMo or touching the GPU.
+
+Validated recipe (2026-10-09, L40S): --arm B --top-n 4 --lr 2e-4
+--enc-lr-scale 0.3 --batch-duration 300, bf16; --subset 40h --epochs 7 (IT
+specialist) or --subset 20h --epochs 13 --replay-ratio 0.2 (multilingual).
 """
 from __future__ import annotations
 
@@ -40,8 +49,10 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE), str(HERE.parent / "common")]
 import ftlib  # noqa: E402
+import runmeta  # noqa: E402
 
 FT = ftlib.FT
 T_PROC = time.time()
@@ -75,7 +86,7 @@ def configure_arm(model, arm, top_n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--init", default=str(FT / "models" / "canary-180m-flash-it.nemo"))
-    ap.add_argument("--subset", default="5h")
+    ap.add_argument("--subset", required=True, help="5h | 20h | 40h (manifests/train_<subset>.json)")
     ap.add_argument("--arm", default="A", choices=["A", "B", "C"])
     ap.add_argument("--top-n", type=int, default=4, help="arm B: encoder layers unfrozen from the top")
     ap.add_argument("--epochs", type=float, default=10.0, help="sets max_steps if --max-steps is not given")
@@ -106,22 +117,19 @@ def main():
                     help="score de/es/fr FLEURS forgetting probes before/after (always on when --replay-ratio > 0)")
     ap.add_argument("--save-ckpt", type=int, default=int(os.environ.get("SAVE_CKPT", "0") or 0), choices=[0, 1],
                     help="also write <run>/last.ckpt (full Lightning state: optimizer, scheduler, AMP, step)")
+    ap.add_argument("--resume-ckpt", default=None,
+                    help="continue from a saved last.ckpt (trainer.fit(ckpt_path=...)); needs --max-steps above its step")
+    ap.add_argument("--base-model-id", default="nvidia/canary-180m-flash", help="recorded in run.json")
+    ap.add_argument("--base-model-revision", default=None, help="HF revision of the base checkpoint, if known")
+    ap.add_argument("--dry-run", action="store_true", help="resolve + print the config, write nothing, no NeMo/GPU")
     a = ap.parse_args()
+    runmeta.require_root()
 
     tag = a.tag or f"{a.arm}{a.top_n if a.arm == 'B' else ''}-{a.subset}{'-gain' if a.gain_aug else ''}"
     out = FT / "runs" / tag
     if (out / "metrics.json").exists():
         print(f"== skip {tag}: {out}/metrics.json exists")
         return 0
-    out.mkdir(parents=True, exist_ok=True)
-
-    import lightning.pytorch as pl
-    import torch
-    from omegaconf import OmegaConf, open_dict
-
-    from nemo.collections.asr.models import EncDecMultiTaskModel
-
-    pl.seed_everything(a.seed)
     man = FT / "manifests"
     train_man = man / f"train_{a.subset}.json"
     hours = json.loads((FT / "hours.json").read_text())
@@ -131,7 +139,9 @@ def main():
         it_rows = ftlib.read_manifest(train_man)
         rows, replay_info = ftlib.mix_replay(it_rows, ftlib.read_manifest(man / "replay_train.json"), a.replay_ratio, a.seed)
         train_man = out / "train_mix.json"
-        ftlib.write_manifest(train_man, rows)
+        if not a.dry_run:
+            out.mkdir(parents=True, exist_ok=True)
+            ftlib.write_manifest(train_man, rows)
         train_s = replay_info["it_s"] + replay_info["replay_s"]
         print(f"  replay mix: {replay_info}", flush=True)
     # epochs are counted on the training manifest, so with replay the IT data is
@@ -139,6 +149,45 @@ def main():
     max_steps = a.max_steps or max(50, math.ceil(a.epochs * train_s / a.batch_duration))
     warmup = max(10, int(a.warmup_frac * max_steps))
 
+    freeze = {"A": "encoder frozen (eval mode); decoder, enc->dec projection, embedding/head trainable",
+              "B": f"encoder frozen except the top {a.top_n} layers (lr x{a.enc_lr_scale}); decoder etc. trainable",
+              "C": f"everything trainable; encoder lr x{a.enc_lr_scale}"}[a.arm]
+    tok_dir = FT / "tokenizers"
+    run = runmeta.build(
+        "finetune/canary/train_it.py", vars(a), probe_env=not a.dry_run,
+        base_model={"id": a.base_model_id, "revision": a.base_model_revision, "path": a.init,
+                    "sha256": None if a.dry_run else runmeta.sha256_path(a.init)},
+        tokenizer={"path": str(tok_dir), "sha256": runmeta.sha256_path(tok_dir) if tok_dir.exists() else None,
+                   "note": "aggregate tokenizer inside --init (spl_tokens,en,de,es,fr + it appended); "
+                           "tokenizers/ = canary/tokenizer_it.py work dir + surgery_report.json"},
+        data={"dataset": "MLS-it train (nested speaker-balanced subsets, canary/prepare_it.py)", "subset": a.subset,
+              "manifest": str(train_man), "hours": round(train_s / 3600, 4), "subset_hours": round(subset_s / 3600, 4),
+              "utterances": sum(1 for _ in open(man / f"train_{a.subset}.json", encoding="utf-8")),
+              "replay": replay_info},
+        seed=a.seed,
+        optimizer={"name": "adamw", "betas": [0.9, 0.98], "weight_decay": a.weight_decay, "grad_clip": 1.0,
+                   "precision": "bf16-mixed", "batch_duration_s": a.batch_duration, "num_buckets": a.num_buckets},
+        lr_groups={"default": a.lr, **({"encoder": a.lr * a.enc_lr_scale} if a.arm in ("B", "C") else {})},
+        scheduler={"name": "CosineAnnealing", "warmup_steps": warmup, "min_lr": a.lr * 0.01},
+        fastemit_lambda=None,
+        augmentation={"gain": {"lo_db": a.gain_lo_db, "hi_db": a.gain_hi_db, "prob": a.gain_prob} if a.gain_aug else None},
+        eou_plain_mix=None, freeze_policy={"arm": a.arm, "top_n": a.top_n if a.arm == "B" else None, "desc": freeze},
+        max_steps=max_steps, epochs=a.epochs,
+        notes="Canary 180M -> Italian (validated recipe: arm B, top 4, lr 2e-4, enc x0.3, 300 s batches)")
+    runmeta.print_resolved(run)
+    if a.dry_run:
+        print(f"== dry run: {tag} -> {out} (nothing written)")
+        return 0
+    out.mkdir(parents=True, exist_ok=True)
+    runmeta.write(out / "run.json", run, status="started")
+
+    import lightning.pytorch as pl
+    import torch
+    from omegaconf import OmegaConf, open_dict
+
+    from nemo.collections.asr.models import EncDecMultiTaskModel
+
+    pl.seed_everything(a.seed)
     model = EncDecMultiTaskModel.restore_from(a.init, map_location="cpu")
     pre = ftlib.preprocessor_info(model)
     print(f"  preprocessor: {pre}", flush=True)
@@ -242,7 +291,7 @@ def main():
     lv_before = {"it_val": ftlib.level_sweep(model, val_sets, "it", levels),
                  "en": ftlib.level_sweep(model, {"fleurs_en": man / "en_sanity.json"}, "en", levels)} if levels else None
 
-    trainer.fit(model)
+    trainer.fit(model, ckpt_path=a.resume_ckpt)
     torch.cuda.synchronize()
     t_end = time.time()
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
@@ -254,10 +303,7 @@ def main():
     if a.save_ckpt:
         try:  # never lose final.nemo + the evals over the optional checkpoint
             trainer.save_checkpoint(str(out / "last.ckpt"))
-            ckpt = {"path": str(out / "last.ckpt"), "size_gb": round((out / "last.ckpt").stat().st_size / 2**30, 3),
-                    "global_step": trainer.global_step,
-                    "resume": "same run: trainer.fit(model, ckpt_path=<last.ckpt>) with the same max_steps/schedule "
-                              "(restores optimizer, scheduler, AMP scaler, step); a NEW stage only needs --init final.nemo"}
+            ckpt = runmeta.ckpt_record(out / "last.ckpt", trainer.global_step, "lightning", runmeta.LIGHTNING_RESUME)
             print(f"  saved {ckpt['path']} ({ckpt['size_gb']} GB, step {ckpt['global_step']})", flush=True)
         except Exception as e:
             ckpt = {"error": repr(e)}
@@ -315,6 +361,10 @@ def main():
                 "final = last step). GPU-hours = wall time on 1 GPU.",
     }
     ftlib.write_json(out / "metrics.json", m)
+    runmeta.write(out / "run.json", run, status="done", outputs={
+        "final_nemo": str(out / "final.nemo"), "metrics": str(out / "metrics.json"), "checkpoint": ckpt,
+        "steps_done": state["steps"], "fleurs_it_wer": final["fleurs_it"]["wer"] if final else None,
+        "mls_it_wer": final["mls_it"]["wer"] if final else None, "forget_wer_delta": m["forget_wer_delta"]})
     with open(FT / "runs" / "summary.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({k: m[k] for k in ("tag", "subset_hours_exact", "steps_done", "equiv_epochs",
                                               "audio_h_per_gpu_h", "samples_per_s", "peak_alloc_gb", "peak_reserved_gb",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Italian data for the Canary 180M fine-tuning kit.
+"""Italian data for the Canary 180M fine-tuning kit (finetune/canary/prepare_it.py).
 
 Sources (all CC-BY-4.0, public on the HF Hub, no token needed):
   - MLS Italian, facebook/multilingual_librispeech (parquet, config `italian`):
@@ -45,8 +45,9 @@ import urllib.request
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 import ftlib  # noqa: E402
+from subsets import balanced_order, merge_by_share, nested_cuts  # noqa: E402,F401
 
 FT = ftlib.FT
 SR = ftlib.SR
@@ -279,53 +280,7 @@ def synthetic_meta():
 # --------------------------------------------------------------------------
 
 
-def balanced_order(groups, cap_s, seed):
-    """groups: {speaker: [utt...]} -> one deterministic sequence of utts.
-
-    Each step takes the next (shuffled) utterance of the speaker with the least
-    duration so far, skipping speakers at `cap_s`. Every prefix of the sequence
-    is therefore speaker-balanced and capped, and cutting it at 5 / 20 / 40 h
-    yields NESTED subsets by construction.
-    """
-    rng = random.Random(seed)
-    spk = sorted(groups)
-    rng.shuffle(spk)
-    queues = {}
-    for s in spk:
-        q = list(groups[s])
-        rng.shuffle(q)
-        queues[s] = q
-    acc = {s: 0.0 for s in spk}
-    rank = {s: i for i, s in enumerate(spk)}
-    seq = []
-    live = set(spk)
-    while live:
-        s = min(live, key=lambda x: (acc[x], rank[x]))
-        q = queues[s]
-        if not q or acc[s] >= cap_s:
-            live.discard(s)
-            continue
-        u = q.pop()
-        acc[s] += u["duration"]
-        seq.append(u)
-    return seq
-
-
-def merge_by_share(seqs, shares):
-    """Interleave ordered source sequences so each prefix keeps the target
-    duration shares (a source that runs out simply stops contributing)."""
-    pos = {k: 0 for k in seqs}
-    acc = {k: 0.0 for k in seqs}
-    out = []
-    while True:
-        live = [k for k in seqs if pos[k] < len(seqs[k])]
-        if not live:
-            return out
-        k = min(live, key=lambda x: (acc[x] / shares[x], x))
-        u = seqs[k][pos[k]]
-        pos[k] += 1
-        acc[k] += u["duration"]
-        out.append(u)
+# balanced_order / merge_by_share / nested_cuts: finetune/common/subsets.py
 
 
 def stage_plan(a, synthetic=False):
@@ -406,13 +361,7 @@ def stage_plan(a, synthetic=False):
         shares["cv"] = CV_SHARE
     seq = merge_by_share(seqs, shares)
 
-    cuts, acc, k = {}, 0.0, 0
-    targets = sorted(float(h) for h in a.hours.split(","))
-    for h in targets:
-        while k < len(seq) and acc + seq[k]["duration"] <= h * 3600 + 1e-6:
-            acc += seq[k]["duration"]
-            k += 1
-        cuts[f"{h:g}h"] = k  # prefix length -> nested
+    cuts = nested_cuts(seq, a.hours)  # prefix lengths -> nested
     need = seq[: max(cuts.values())]
 
     # ---- English forgetting probe: first N FLEURS en_us test clips (sorted) ----

@@ -4,9 +4,9 @@
 # rows, and VERIFY (old rows bit-identical, EN transcripts identical, it ids in
 # range) before writing $FT/models/canary-180m-flash-it.nemo.
 #   IT_VOCAB=1024 bash tokenizer_it.sh
-. "$(dirname "$0")/common.sh"
+. "$(dirname "$0")/env.sh"
 if step tokenizer; then
-    [ -e "$FT/done/data" ] || { echo "run data_it.sh first"; exit 2; }
+    [ -e "$FT/done/data" ] || { echo "run prepare_it.sh first"; exit 2; }
     timeout "${T_TOK:-2400}" "$PY" "$KIT/tokenizer_it.py" "$@" || fail tokenizer $?
     ok tokenizer
 fi

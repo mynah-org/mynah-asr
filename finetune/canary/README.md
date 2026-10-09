@@ -1,9 +1,10 @@
-# Canary 180M -> Italian: restartable fine-tuning kit
+# Canary 180M -> Italian: restartable fine-tuning kit (VALIDATED)
 
-Track C of `.work/lightweight-asr-ft.md` (C0 zero-shot probe, C1 tokenizer
-surgery, C2/C3 smoke fine-tunes) as scripts for one rented Linux GPU box.
+The Canary track of `finetune/README.md` (C0 zero-shot probe, C1 tokenizer
+surgery, C2/C3 fine-tunes, replay) as scripts for one rented Linux GPU box.
+Measured results and the validated recipe: `finetune/README.md`.
 Nothing here runs on the dev laptop except syntax checks and the synthetic
-plan (`python3 data_it.py --synthetic`).
+plan (`python3 prepare_it.py --synthetic`).
 
 Target box: Ubuntu 24.04, NVIDIA L40S 48 GB now (L4 24 GB is the target the
 defaults are sized for), driver 575 (CUDA <= 12.9), ~20 GB free disk,
@@ -15,52 +16,55 @@ checkpoint are public.
 
 | file | step | what it does |
 |---|---|---|
-| `common.sh` | - | paths (`FT_ROOT`, default `/root/ft`; `VENV`, default `/root/nemo-venv`), `step`/`ok` marker helpers, disk guard |
+| `env.sh` | - | paths (`FT_ROOT`, default `/root/ft`; `VENV`, default `/root/nemo-venv`), `step`/`ok` marker helpers, disk guard |
 | `setup.sh` | 1 | replaces torch in the venv with the same version built for **cu128** (fallback cu126), adds `num2words regex soundfile pyarrow sentencepiece protobuf`, fetches the Open ASR Leaderboard normaliser (pinned commit) and checks our copy against it, downloads `canary-180m-flash.nemo`, verifies CUDA + bf16 + `import nemo` |
-| `data_it.sh` / `data_it.py` | 2 | MLS it + FLEURS it/en -> 16 kHz mono PCM16 wav + NeMo/lhotse manifests, frozen eval, nested 5/20/40 h cuts, exact hours |
-| `data_replay.py` | 2b | optional replay pool against forgetting: FLEURS train en_us/de_de/es_419/fr_fr capped at `REPLAY_H` (2) h each -> `manifests/replay_train.json` (source_lang = target_lang = the row's language, pnc=yes), plus 100-clip FLEURS test probes `eval_fleurs_{de,es,fr}.json`; ~1 GB of wav |
+| `prepare_it.sh` / `prepare_it.py` | 2 | MLS it + FLEURS it/en -> 16 kHz mono PCM16 wav + NeMo/lhotse manifests, frozen eval, nested 5/20/40 h cuts, exact hours |
+| `replay.py` | 2b | optional replay pool against forgetting: FLEURS train en_us/de_de/es_419/fr_fr capped at `REPLAY_H` (2) h each -> `manifests/replay_train.json` (source_lang = target_lang = the row's language, pnc=yes), plus 100-clip FLEURS test probes `eval_fleurs_{de,es,fr}.json`; ~1 GB of wav |
 | `tokenizer_it.sh` / `tokenizer_it.py` | 3 | `it` SentencePiece on the training-pool text, appended after `fr`, row copy-back, verification |
-| `probe.sh` / `probe_zeroshot.py` | 4 | C0: untouched model with `<|it|>` (and `es`/`fr` floors) on the frozen IT eval + EN sanity |
-| `train_canary_it.sh` / `train_canary_it.py` | 5 | smoke fine-tunes, arm A then B, with per-run accounting JSON |
+| `probe_it.sh` / `probe_it.py` | 4 | C0: untouched model with `<|it|>` (and `es`/`fr` floors) on the frozen IT eval + EN sanity |
+| `train_it.sh` / `train_it.py` | 5 | smoke fine-tunes, arm A then B, with per-run accounting JSON |
 | `eval_it.py` | 6 | WER/CER with S/D/I on the frozen IT eval for any `.nemo` |
 | `report.py` | - | markdown summary of everything measured |
-| `ftlib.py` | - | manifests, normaliser, WER/CER/S/D/I, the shared decode loop |
+| `../common/ftlib.py` | - | manifests, normaliser, WER/CER/S/D/I, the shared decode loop, replay mix, gain aug |
+| `../common/subsets.py` | - | speaker-balanced nested subsets |
+| `../common/runmeta.py` | - | `run.json` provenance + checkpoint records |
 | `run_all.sh` | 1-5 | all of the above in order |
 
 ## Command order on the box
 
 ```bash
 # from the dev machine: copy the kit (scripts only, ~60 KB)
-scp -r .work/lightweight-asr/ft root@BOX:/root/ft-kit
+scp -r finetune root@BOX:/root/finetune     # the whole dir: canary/ needs ../common/
 
-# on the box
+# on the box (FT_ROOT is required by every step; SUBSET by the training step)
+export FT_ROOT=/root/ft
 mkdir -p /root/ft/logs
-bash /root/ft-kit/data_it.sh --dry-run          # optional: metadata + plan only, prints hours (needs setup-deps first)
-RATE_USD_H=<price per GPU-hour> \
-  tmux new -d -s ft 'bash /root/ft-kit/run_all.sh 2>&1 | tee -a /root/ft/logs/run_all.log'
+bash /root/finetune/canary/prepare_it.sh --dry-run          # optional: metadata + plan only, prints hours (needs setup-deps first)
+SUBSET=5h RATE_USD_H=<price per GPU-hour> \
+  tmux new -d -s ft 'bash /root/finetune/canary/run_all.sh 2>&1 | tee -a /root/ft/logs/run_all.log'
 # or one step at a time, same order:
-bash /root/ft-kit/setup.sh
-bash /root/ft-kit/data_it.sh                     # add --with-fleurs-train to put FLEURS train in the pool
-bash /root/ft-kit/tokenizer_it.sh
-bash /root/ft-kit/probe.sh
-RATE_USD_H=... bash /root/ft-kit/train_canary_it.sh                    # A-5h, then B4-5h
-RATE_USD_H=... ARMS=B TOP_N=8 bash /root/ft-kit/train_canary_it.sh     # another rung, e.g. B8
-RATE_USD_H=... GAIN_AUG=1 ARMS=A bash /root/ft-kit/train_canary_it.sh   # level A/B: A-5h-gain vs A-5h
-RATE_USD_H=... SUBSET=20h ARMS="A B" bash /root/ft-kit/train_canary_it.sh
-/root/nemo-venv/bin/python /root/ft-kit/eval_it.py --nemo /root/ft/runs/A-5h/final.nemo --en
-/root/nemo-venv/bin/python /root/ft-kit/report.py
+bash /root/finetune/canary/setup.sh
+bash /root/finetune/canary/prepare_it.sh                     # add --with-fleurs-train to put FLEURS train in the pool
+bash /root/finetune/canary/tokenizer_it.sh
+bash /root/finetune/canary/probe.sh
+SUBSET=5h RATE_USD_H=... bash /root/finetune/canary/train_it.sh          # A-5h, then B4-5h
+SUBSET=5h RATE_USD_H=... ARMS=B TOP_N=8 bash /root/finetune/canary/train_it.sh     # another rung, e.g. B8
+SUBSET=5h RATE_USD_H=... GAIN_AUG=1 ARMS=A bash /root/finetune/canary/train_it.sh   # level A/B: A-5h-gain vs A-5h
+RATE_USD_H=... SUBSET=20h ARMS="A B" bash /root/finetune/canary/train_it.sh
+/root/nemo-venv/bin/python /root/finetune/canary/eval_it.py --nemo /root/ft/runs/A-5h/final.nemo --en
+/root/nemo-venv/bin/python /root/finetune/canary/report.py
 ```
 
 Every step is guarded by `timeout` and leaves a marker in `/root/ft/done/`;
 re-running any script skips finished steps (delete a marker to redo one).
-`data_it.py` has its own stage markers (`data-meta`, `data-plan`, `data-audio`,
+`prepare_it.py` has its own stage markers (`data-meta`, `data-plan`, `data-audio`,
 `data-manifests`); the audio stage only fetches files that are missing, so a
 killed download resumes. A killed training run restarts from step 0 (runs are
-short; no mid-run checkpoint), a finished run is skipped because its
+short; no mid-run checkpoint; `run.json` keeps status "started"), a finished run is skipped because its
 `runs/<tag>/metrics.json` exists. To change the plan (seed, hours, FLEURS
 train), delete `done/data*`, `plan.json` and `manifests/`.
 
-Replay (`REPLAY_RATIO=0.2`, needs `data_replay.py` first): the IT manifest is
+Replay (`REPLAY_RATIO=0.2`, needs `replay.py` first): the IT manifest is
 mixed with replay rows so ~20 % of the training audio hours are en/de/es/fr
 (rows sampled from the pool with the run seed, whole file shuffled), steps grow
 so the IT data is still seen `EPOCHS` times, and `metrics.json` gets a
@@ -181,7 +185,7 @@ empties in the loudest quintile. Canary 180M must be checked the same way:
   NeMo 3.0.0's lhotse loader has no plain gain/volume option (it offers noise
   mixing, speed perturbation, RIR, low-pass, codec compression and a
   clipping-with-gain transform), so this is a Lightning callback
-  (`ftlib.make_gain_aug`) and its applied-dB statistics are logged in
+  (`common/ftlib.make_gain_aug`) and its applied-dB statistics are logged in
   `metrics.json`. For Canary it is OFF by default and run as a recorded A/B
   (`A-5h` vs `A-5h-gain`, same seed and steps). It is meant to be ON by default
   for the EOU 120M arm (`normalize: NA`) when that trainer is added; the

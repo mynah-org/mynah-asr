@@ -3,11 +3,11 @@
 
 Long Italian-only training erodes the base languages (FLEURS en WER 6.9 -> 40
 after 3,120 steps with a frozen encoder). This step builds a small replay pool
-of the model's original languages so train_canary_it.py --replay-ratio can mix
+of the model's original languages so train_it.py --replay-ratio can mix
 them back in, plus per-language forgetting probes.
 
 Source: FLEURS (google/fleurs, CC-BY-4.0), same tsv + streamed-tarball path as
-data_it.py (fleurs_tsv / fleurs_stream; tarballs are streamed, never stored).
+prepare_it.py (fleurs_tsv / fleurs_stream; tarballs are streamed, never stored).
   train  en_us, de_de, es_419, fr_fr: capped at --hours-per-lang (env REPLAY_H,
          default 2 h) each; 1-20 s clips; deterministic (seed) order that takes
          one reading of every sentence before a second one (more sentences per
@@ -37,9 +37,10 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import data_it  # noqa: E402
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE), str(HERE.parent / "common")]
 import ftlib  # noqa: E402
+import prepare_it as data_it  # noqa: E402
 
 # FLEURS config -> canary2 language code (all four are sub-tokenizers of the base model)
 LANGS = {"en_us": "en", "de_de": "de", "es_419": "es", "fr_fr": "fr"}
