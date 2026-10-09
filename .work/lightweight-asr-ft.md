@@ -355,3 +355,26 @@ side transfers; WER is limited by the decoder still learning Italian
 (lexicon/orthography). Every run costs about a third of an L40S GPU-hour
 including evals (~10 min of actual training). Artifacts: private HF repo
 (final.nemo for -e runs, metrics/evals/logs for all).
+
+### ft3: multilingual replay (2026-10-09, `.work/lightweight-asr/jobs/ft3.sh`)
+
+B4, 20 h Italian x 13 epochs (3900 steps: the Italian data is still seen 13
+times), 20 % of the training hours from FLEURS train en/de/es/fr (2 h per
+language, CC-BY-4.0), SAVE_CKPT=1. Forgetting on 100 FLEURS test clips per
+language (leaderboard normalisers):
+
+| | no replay (B4 20 h e13) | replay 20 % | base model |
+|---|---|---|---|
+| FLEURS-it WER / CER | 43.58 / 13.23 | 44.17 / 13.44 | ~100 (no Italian text tokens) |
+| MLS-it WER / CER | 30.34 / 7.25 | 30.27 / 7.17 | ~100 |
+| FLEURS-en WER | 52.33 | 7.96 | 6.86 |
+| FLEURS-de WER | n/a | 9.80 | 8.86 |
+| FLEURS-es WER | n/a | 8.33 | 5.63 |
+| FLEURS-fr WER | n/a | 10.41 | 10.25 |
+
+Italian is essentially free of cost and the four original languages stay
+close to the base (+1.1 / +0.9 / +2.7 / +0.2): Canary 180M can be EXTENDED
+to EN/DE/ES/FR/IT with 20 % replay, not only specialised. 0.393 GPU-h incl.
+evals; peak 8.33 GB. Full resume checkpoint: last.ckpt 1.43 GB, step 3900
+(`trainer.fit(model, ckpt_path=last.ckpt)`), on the private HF repo with
+final.nemo, both size-verified.

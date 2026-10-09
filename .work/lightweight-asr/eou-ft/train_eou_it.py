@@ -105,6 +105,12 @@ def build_model(stock_path, tok_dir, trainer=None):
     with open_dict(cfg):
         cfg.tokenizer.dir = str(tok_dir)
         cfg.tokenizer.type = "bpe"
+        # The stock cfg points these at nemo: artifacts of the OLD tokenizer; the
+        # monolingual setup registers model_path as an artifact and fails on a
+        # missing key (TypeError on None), so point all three at the new files.
+        cfg.tokenizer.model_path = str(Path(tok_dir) / "tokenizer.model")
+        cfg.tokenizer.vocab_path = str(Path(tok_dir) / "vocab.txt")
+        cfg.tokenizer.spe_tokenizer_vocab = str(Path(tok_dir) / "tokenizer.vocab")
         for k in ("train_ds", "validation_ds", "test_ds"):
             cfg.pop(k, None)
         cfg.target = "nemo.collections.asr.models.asr_eou_models.EncDecRNNTBPEEOUModel"
