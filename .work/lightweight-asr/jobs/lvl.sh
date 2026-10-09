@@ -48,4 +48,9 @@ run() {  # tag model bank extra
 run eou-peak $E peak "" & run eou-rms $E rms "" & run eou-agc $E agc "" & run nemo-peak $M peak "" &
 wait
 for t in eou-peak eou-rms eou-agc nemo-peak; do echo "--- $t"; grep -E "WER |CER |pooled|empty" $O/$t.txt; done
+# EOU behaviour on the peak-normalised bank: separates "level" from "endpointing"
+timeout 3600 python3 tools/eval/eou_metrics.py -m $E --manifest $O/bank-peak/manifest.json --root $O/bank-peak \
+    --mode both --gaps 0.6,1,2 --vad models/silero-vad --limit 100 --jobs 14 --work-dir $O/eouw-peak \
+    --json $O/eou-metrics-peak.json >$O/eou-metrics-peak.txt 2>&1
+echo "== lvl eou_metrics-peak rc=$? $(date +%T)"; tail -14 $O/eou-metrics-peak.txt
 echo "== LVL-DONE $(date +%T)"

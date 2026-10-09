@@ -313,6 +313,28 @@ must pass before the next one is run:
 10. only then the concurrency ladder on the CUDA server, Nemotron and EOU on
     the same card, same methodology.
 
+## 3b. Latency decomposition and the CUDA perf audit (decided 2026-10-09)
+
+Visible EOU latency ~= L_model (audio time) + L_server (wall clock):
+- L_model: `tools/eval/eou_metrics.py`, run faster than real time, the eou's
+  `t` = end of the encoder frame that emitted it -> acoustic evidence the
+  checkpoint needs after the speech end. Architectural floor: 160 ms chunk +
+  1 frame (80 ms) lookahead. Kernels cannot reduce this term; only the
+  checkpoint (FT / endpointing data) or an external VAD/silence policy can.
+- L_server: `lag_ms` of the eou frames in the l1 ladder, per C.
+
+The l1 ladder is an ARCHITECTURAL BASELINE: the CUDA path was tuned on
+Nemotron and this model just entered it. After l1, a perf audit that does
+not touch quality: profile unloaded, C1, C32, C256 and near the knee
+(`--profile-stages`, `--profile-host`); per point, normalised per AUDIO
+SECOND and side by side with Nemotron: GPU compute ms, host ms, kernel
+launches, GEMM ms, RNNT predictor+joint ms; plus GEMM shapes, graph coverage,
+syncs/H2D per chunk, serialised per-stream work. Decision rule: if the
+EOU/Nemotron cost ratio per audio second is far from the parameter/FLOP
+ratio (~5x), the backend is leaving performance on the table and targeted
+A/Bs follow (each with its byte-identity / quality gate); if it is close,
+no kernel work. No optimisation before a proven bottleneck.
+
 ## 4. Measurements
 
 ### 2026-10-09, L40S box, q1: FLEURS EN test 200 clips, f32, CPU CLI stream (build 4378448, BEFORE the model-EOU reset)
