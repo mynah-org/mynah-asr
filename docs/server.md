@@ -368,7 +368,7 @@ emit an end-of-utterance token (`<EOU>`/`<EOB>` in its `tokens.json`, e.g.
 `"source":"model"` and `"backchannel"` (true for `<EOB>`):
 
 ```json
-{"type":"eou","t":7.69,"source":"model","backchannel":false,"seq":19,"audio_s":7.80,"lag_ms":4}
+{"type":"eou","t":7.69,"source":"model","backchannel":false,"seq":19,"audio_s":7.69,"lag_ms":4}
 ```
 
 `t` is the end of the encoder frame that emitted the token. It follows the
