@@ -136,6 +136,11 @@ int mynah_asr_enc_stream_init_layout(mynah_asr_enc_stream *es, const mynah_asr_e
 void mynah_asr_enc_stream_free(mynah_asr_enc_stream *es);
 /* Back to the first-chunk state (empty caches), keeping every allocation. */
 void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es);
+/* Empty caches (K/V ring, conv cache, subsampling caches zeroed) but the chunk
+ * CADENCE kept: the next chunk is a steady one (sub*(r+1) mel frames), so the
+ * mel stream's chunk boundaries do not move. The model-side end of an utterance
+ * inside a continuing stream (the pack's <EOU>, src/mynah_asr.c). */
+void mynah_asr_enc_stream_reset_keep_cadence(mynah_asr_enc_stream *es);
 
 /* Mel frames required by the next chunk (first: 1+8r, then 8(r+1)). */
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es);

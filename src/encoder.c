@@ -737,6 +737,11 @@ void mynah_asr_enc_stream_reset(mynah_asr_enc_stream *es) {
     es->sa_pe_K = 0;
 }
 
+void mynah_asr_enc_stream_reset_keep_cadence(mynah_asr_enc_stream *es) {
+    mynah_asr_enc_stream_reset(es);
+    es->ss.first = 0;
+}
+
 int mynah_asr_enc_stream_need(const mynah_asr_enc_stream *es) {
     const int sub = es->enc->ss.sub_factor;
     return es->kv.valid == 0 && es->ss.first ? 1 + sub * es->right

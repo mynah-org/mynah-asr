@@ -41,6 +41,7 @@ struct mynah_asr_model {
     int left_ctx, default_right;    /* att context from the default preset */
     int lookaheads[8], n_lookaheads;
     int default_prompt;
+    int eou_id, eob_id;             /* <EOU>/<EOB> in the RNNT vocab, -1 = absent */
     double frame_sec;               /* duration of one encoder frame (hop*sub/sr) */
     double seg_sec;                 /* offline per-segment limit (default 300 s) */
     mynah_asr_vad *vad;             /* optional (mynah_asr_enable_vad): NULL = energy split */
@@ -383,6 +384,12 @@ mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant) {
      * vocabulary has no such piece, and the trace then prints -1 rather than
      * guessing an id. */
     m->dec.word_mark = mynah_asr_tok_find(&m->tok, "\u2581");
+    /* The model-side end of utterance: a pack trained for it carries <EOU> (and
+     * <EOB>, end of backchannel) as ordinary RNNT outputs (NeMo's ASR-EOU
+     * recipe appends both to the SentencePiece vocabulary). The capability is
+     * the pack's vocabulary, resolved here; -1 everywhere else, and the stream
+     * path then behaves exactly as without this code. */
+    mynah_asr_eou_ids(&m->tok, m->dec.vocab, m->dec.blank, &m->eou_id, &m->eob_id);
     return m;
 
 fail:
@@ -779,6 +786,11 @@ struct mynah_asr_stream {
     int vhave, vframe;
     int eou_pending;            /* a span closed: report it on the next callback */
     double eou_sec;
+    /* the model's own end of utterance (<EOU>/<EOB>): NULL frames = the pack
+     * has neither token and none of this runs */
+    int *eou_frames;            /* [q * max_symbols] frame of each token of a chunk */
+    int model_eou_pending;      /* MYNAH_ASR_EOU_MODEL(_BACKCHANNEL), 0 = none */
+    double model_eou_sec;
 };
 
 /* Can the CACHE-AWARE streaming path serve THIS pack?
@@ -863,6 +875,11 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
     s->tokens = malloc((size_t)s->cap_tokens * sizeof(int));
     /* per-chunk scratch carved once (S1-3): after warm-up a chunk allocates nothing */
     s->dec_scr = malloc(mynah_asr_greedy_scratch_floats(&m->dec) * sizeof(float));
+    if ((m->eou_id >= 0 || m->eob_id >= 0) &&
+        !(s->eou_frames = malloc((size_t)s->es.q * (size_t)m->dec.max_symbols * sizeof(int)))) {
+        mynah_asr_stream_close(s);
+        return NULL;
+    }
     if (!s->mel_buf || !s->enc_buf || !s->tokens || !s->dec_scr ||
         mynah_asr_detok_init(&s->detok, STREAM_TEXT_RESERVE) != 0) {
         mynah_asr_stream_close(s);
@@ -891,6 +908,7 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
     mynah_asr_vad_close(s->vad);
     mynah_asr_detok_free(&s->detok);
     free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->vbuf); free(s->dec_scr);
+    free(s->eou_frames);
     free(s);
 }
 
@@ -932,6 +950,8 @@ int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
     s->vhave = 0;
     s->eou_pending = 0;
     s->eou_sec = 0.0;
+    s->model_eou_pending = 0;
+    s->model_eou_sec = 0.0;
     return 0;
 }
 
@@ -961,6 +981,37 @@ static int stream_pull_mel(mynah_asr_stream *s, const float *audio, size_t n) {
 /* Decode the q encoder frames already in s->enc_buf, append them to the
  * incremental transcript and emit the delta. Shared by the single and the
  * batched step: the text a stream produces cannot depend on which one ran. */
+/* The model's end of utterance. When this chunk's tokens hold <EOU> or <EOB>,
+ * the event is armed for stream_publish (after the chunk's delta) and the
+ * MODEL state is reset now, the chunk being fully decoded: encoder caches
+ * emptied with the chunk cadence kept, predictor back at SOS. This mirrors the
+ * reference streaming service of NeMo (nemo/agents/voice_agent/pipecat/
+ * services/nemo/streaming_asr.py, transcribe(): <EOU>/<EOB> in the chunk's
+ * text -> is_final and reset_state(), i.e. a fresh encoder cache and a blank
+ * hypothesis, applied after the whole chunk was decoded). The token itself
+ * never reaches the text: the detokeniser strips <...> markers.
+ *
+ * Its time is the end of the encoder frame that emitted it: the chunk ends at
+ * mel frame `next_frame` (the stream pulls exactly one chunk), its frame k at
+ * next_frame - (q-1-k)*sub. The CUDA engine (gpu/cuda/engine.cu) computes the
+ * same number from the same mel stream. */
+static void stream_model_eou(mynah_asr_stream *s, int q, const int *tok, int n, long t_abs0) {
+    const mynah_asr_model *m = s->m;
+    int hit = -1, kind = 0;
+    for (int i = 0; i < n && hit < 0; i++) {
+        if (tok[i] == m->eou_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL; }
+        else if (tok[i] == m->eob_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL_BACKCHANNEL; }
+    }
+    if (hit < 0) return;
+    const int k = (int)(s->eou_frames[hit] - t_abs0);
+    long mel_end = s->mel.next_frame - (long)(q - 1 - k) * m->enc.ss.sub_factor;
+    if (mel_end < 0) mel_end = 0;
+    s->model_eou_pending = kind;
+    s->model_eou_sec = (double)mel_end * (double)m->feat.hop_length / (double)m->feat.sample_rate;
+    mynah_asr_enc_stream_reset_keep_cadence(&s->es);
+    mynah_asr_dec_state_reset(&m->dec, &s->dec);
+}
+
 /* Split in two for MYNAH_ASR_STREAM_PAR >= 3: `stream_decode` touches only
  * this stream (decoder state, tokens, detokeniser) and may run on a pool
  * thread; `stream_publish` calls the callback and must run on the caller, in
@@ -975,10 +1026,14 @@ static int stream_decode(mynah_asr_stream *s, int q, int trace_audio, const char
         s->tokens = nb;
     }
     if (trace_audio) mynah_asr_dec_trace_audio((double)s->samples_fed / (double)m->feat.sample_rate);
+    const long t_abs0 = s->dec.t_abs;
+    int cap = s->cap_tokens - s->n_tokens;
+    if (s->eou_frames && cap > q * m->dec.max_symbols) cap = q * m->dec.max_symbols;
     const int added = mynah_asr_greedy_decode_scratch(&m->dec, &s->dec, s->enc_buf, q,
-                                                 s->tokens + s->n_tokens, NULL,
-                                                 s->cap_tokens - s->n_tokens, s->dec_scr);
+                                                 s->tokens + s->n_tokens, s->eou_frames,
+                                                 cap, s->dec_scr);
     s->mel_have = 0;
+    if (s->eou_frames && added > 0) stream_model_eou(s, q, s->tokens + s->n_tokens, added, t_abs0);
 
     /* Always append, even without a callback: the incremental transcript must
      * see every token exactly once, whereas the old whole-history detokenisation
@@ -1028,6 +1083,21 @@ static void stream_publish(mynah_asr_stream *s, const char *text, mynah_asr_resu
             cb(&res, ud);
             s->chars_emitted = total;
             s->emitted_t1 = t1;
+        }
+    }
+    if (s->model_eou_pending) {
+        const int kind = s->model_eou_pending;
+        s->model_eou_pending = 0;
+        if (cb) {
+            mynah_asr_result res = {
+                .text = "",
+                .t0 = s->model_eou_sec, .t1 = s->model_eou_sec,
+                .is_final = true,
+                .lang = s->lang[0] ? s->lang : NULL,
+                .is_eou = true,
+                .eou_source = kind,
+            };
+            cb(&res, ud);
         }
     }
 }

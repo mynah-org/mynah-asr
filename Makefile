@@ -135,6 +135,7 @@ CFLAGS += -DMYNAH_ASR_BUILD='"$(MYNAH_ASR_BUILD)"'
 MODEL_DIR ?= models/nemotron-3.5-asr-streaming-0.6b
 PARAKEET_DIR ?= models/parakeet-tdt-0.6b-v3
 PARAKEET110_DIR ?= models/parakeet-tdt_ctc-110m
+EOU_MODEL_DIR ?= models/parakeet-realtime-eou-120m
 VAD_DIR ?= models/silero-vad
 VAD_WAV ?= samples/long/en_long.wav
 
@@ -237,6 +238,9 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_vad.sh $(VAD_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP vad parity: $(VAD_DIR)/silero_vad.onnx or uv missing (see tests/test_vad.sh)"; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
+	@sh tests/test_model_eou.sh $(EOU_MODEL_DIR) $(MODEL_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP model-eou: $(EOU_MODEL_DIR) not converted (parakeet_realtime_eou_120m-v1)"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@sh tests/test_server_stream.sh $(MODEL_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP server-stream: model, binaries or python3 missing"; \
