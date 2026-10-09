@@ -7,6 +7,9 @@
 #                             run on a device
 #   make -C gpu test-stream   tests/test_cuda_stream (GPU + pack)
 #   make -C gpu bank-transcribe  tests/cuda_bank_transcribe (a bank offline, {clip: text})
+#   make -C gpu test-aed      tests/test_cuda_aed (GPU + an AED pack: parity with the
+#                             library, batch identity); test-aed-cpu builds it with the
+#                             stub (no nvcc) so it compiles everywhere and skips
 #
 # The library (../libmynah_asr.a, `make lib` at the top) and the two reusable
 # server modules (../server/http_util.c, ../server/stream_out.c) are used
@@ -40,10 +43,11 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 
 B := $(TOP)/build/gpu
 
-C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
-CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
+C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/offline_engine.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o \
+            $(B)/rest.o $(B)/http_util.o $(B)/stream_out.o
+CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o $(B)/aed.o
 
-.PHONY: all cpu clean test-kernels test-stream bank-transcribe lib
+.PHONY: all cpu clean test-kernels test-stream bank-transcribe test-aed test-aed-cpu lib
 all: $(TOP)/mynah-asr-server-cuda
 cpu: $(TOP)/mynah-asr-server-cuda-cpuonly
 
@@ -65,6 +69,12 @@ $(B)/ws.o: server/ws.c
 $(B)/hostprof.o: server/hostprof.c server/hostprof.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/rest.o: server/rest.c server/rest.h server/http_io.h asr_offline.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/offline_engine.o: offline_engine.c asr_offline.h aed_gpu.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/http_util.o: $(TOP)/server/http_util.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -74,6 +84,7 @@ $(B)/stream_out.o: $(TOP)/server/stream_out.c
 $(B)/%.o: cuda/%.cu cuda/kernels.cuh asr_engine.h pack.h
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+$(B)/aed.o: aed_gpu.h
 
 # the product: both engines linked, cuda the default
 $(TOP)/mynah-asr-server-cuda: $(C_OBJ) $(CU_OBJ) $(TOP)/libmynah_asr.a
@@ -84,8 +95,11 @@ $(TOP)/mynah-asr-server-cuda: $(C_OBJ) $(CU_OBJ) $(TOP)/libmynah_asr.a
 $(B)/engine_stub.o: cuda/engine_stub.c asr_engine.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(TOP)/mynah-asr-server-cuda-cpuonly: $(C_OBJ) $(B)/engine_stub.o $(TOP)/libmynah_asr.a
-	$(CC) $(CFLAGS) -o $@ $(C_OBJ) $(B)/engine_stub.o $(LDLIBS)
+$(B)/aed_stub.o: cuda/aed_stub.c aed_gpu.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(TOP)/mynah-asr-server-cuda-cpuonly: $(C_OBJ) $(B)/engine_stub.o $(B)/aed_stub.o $(TOP)/libmynah_asr.a
+	$(CC) $(CFLAGS) -o $@ $(C_OBJ) $(B)/engine_stub.o $(B)/aed_stub.o $(LDLIBS)
 
 # tests
 $(B)/test_cuda_kernels.o: $(TOP)/tests/test_cuda_kernels.cu cuda/kernels.cuh
@@ -109,6 +123,17 @@ bank-transcribe: $(TOP)/tests/cuda_bank_transcribe
 $(TOP)/tests/cuda_bank_transcribe: $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
 	$(NVCC) $(GENCODE) -o $@ $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
 
+$(B)/test_cuda_aed.o: $(TOP)/tests/test_cuda_aed.c asr_offline.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+test-aed: $(TOP)/tests/test_cuda_aed
+$(TOP)/tests/test_cuda_aed: $(B)/test_cuda_aed.o $(B)/offline_engine.o $(B)/pack.o $(CU_OBJ) $(TOP)/libmynah_asr.a
+	$(NVCC) $(GENCODE) -o $@ $(B)/test_cuda_aed.o $(B)/offline_engine.o $(B)/pack.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
+test-aed-cpu: $(TOP)/tests/test_cuda_aed_cpuonly
+$(TOP)/tests/test_cuda_aed_cpuonly: $(B)/test_cuda_aed.o $(B)/offline_engine.o $(B)/aed_stub.o $(TOP)/libmynah_asr.a
+	$(CC) $(CFLAGS) -o $@ $(B)/test_cuda_aed.o $(B)/offline_engine.o $(B)/aed_stub.o $(LDLIBS)
+
 clean:
 	rm -rf $(B) $(TOP)/mynah-asr-server-cuda $(TOP)/mynah-asr-server-cuda-cpuonly \
-	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe
+	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe \
+	       $(TOP)/tests/test_cuda_aed $(TOP)/tests/test_cuda_aed_cpuonly

@@ -186,3 +186,150 @@ compare quality, not serving semantics).
 
 DE/ES: `tools/fetch_eval_bank.py` now knows de/es/it (lw-eou-metrics); not run yet.
 
+
+## 5. CUDA server design (2026-10-09)
+
+Goal: `mynah-asr-server-cuda` serves Canary 180M Flash with honest offline
+semantics -- the final transcript of a file, batched across requests on the
+GPU -- and never presents it as streaming (3a).
+
+### 5.1 Contract (mirrors the CPU server for the same pack)
+
+- `POST /v1/audio/transcriptions` and `/v1/audio/translations` (multipart
+  `file`, `language`, `response_format` json|text|verbose_json, `model`,
+  `target_language`; or a raw WAV body): the final transcript, nothing before it.
+  Same fields and formats as `server/main.c` `handle_transcribe`.
+- `GET /v1/audio/stream`: `400 model_not_streaming` BEFORE the upgrade, no
+  Retry-After -- what the CPU server answers (`server/main.c` `handle_ws_stream`).
+  The WebSocket is not "accepted and answered at finalisation": that would be a
+  second contract for the same pack on two servers, and a client could not tell
+  it from a stalled stream. A client that has a file POSTs it.
+- `/v1/models` says `"engine":"aed","streaming":false`; `/v1/health` says
+  `"mode":"offline","streaming":false` with request books
+  (`total = completed + failed + refused_* + queued + inflight`, `balanced`).
+- Admission: `--cap` requests queued + in flight; past it `503
+  server_at_capacity` with Retry-After (rule 5). A language the pack refuses is a
+  `400 language_not_supported` before admission (`mynah_asr_lang_supported`), so
+  it cannot fail a batch.
+
+### 5.2 Capability, not model name
+
+`asr_pack_mode` (`gpu/pack.c`) reads `decoder.type` from `mynah.json`:
+`aed_transformer` -> `ASR_PACK_OFFLINE_AED` -> the offline mode
+(`gpu/server/rest.c`), everything else -> the streaming engine unchanged. No
+`if canary` anywhere: canary-1b-flash / 1b-v2 take the same route (their encoder
+fits the same kernels; only VRAM and T_max change).
+
+### 5.3 A sibling interface, not asr_engine
+
+`gpu/asr_engine.h` is a per-slot, per-chunk step whose every call returns the
+text one chunk appended. An AED decoder keeps no state between calls and only
+has text once it has the whole segment, so behind that interface it would
+either fake partials or run a step that does nothing until finalisation. The
+honest unit is a request, hence `gpu/asr_offline.h`: `transcribe(n files) ->
+n final texts`, one thread, the server's batcher.
+
+### 5.4 One host half: the library, through an offload seam
+
+The transcript must equal the CPU library's default decoding. Everything that
+is not arithmetic -- WAV, segmentation on silence (30 s limit), the
+per-feature mel, the canary2 prompt and its defaults, the generation budget
+`T + max_generation_delta`, the greedy stopping rule, detokenisation, segment
+stitching -- already exists once in `src/mynah_asr.c`. Re-implementing it in
+`gpu/` would be a second path (rule 2). So the library gains one narrow seam,
+`mynah_asr_offload` (`src/mynah_asr.h`): two optional hooks, `encode` (feats ->
+post-projector encoder output, the batched encoder's contract) and `aed_decode`
+(greedy decode of n segments with the library's stopping rule). NULL hooks =
+the library's own code, byte for byte as before; no CPU path changes. The batch
+path calls `aed_decode` once per wave (all its segments), the single path with
+n = 1.
+
+`gpu/offline_engine.c` = the library model (f32) + optionally the GPU offload:
+`--engine cpu` is the reference (the CPU server's `mynah_asr_transcribe_batch`
+call), `--engine cuda` the same call with `gpu/cuda/aed.cu` installed.
+
+### 5.5 The GPU engine (`gpu/cuda/aed.cu`)
+
+Weights: the library's own loaders (`mynah_asr_encoder_init`,
+`mynah_asr_aed_init`) over the f32 pack, uploaded once. The batch_norm of the
+conv module is folded at load into a per-channel affine (the library's
+`bn_fold`, the same scale/shift the CPU applies); folding it further into the
+depthwise weights was rejected because it changes the association of the sums
+against the CPU.
+
+Encoder, per wave of n <= `--batch` segments:
+- dw_striding subsampling on the HOST with the library's code (per segment,
+  ~10 % of the encoder FLOPs, non-causal pad 1/1); a later step can move it.
+- the conformer layers on the device over PACKED rows `[sum T, d]` (no padding,
+  no masks: a segment's rows are contiguous and every per-segment kernel reads
+  its own offset/length):
+  ½FFN (+bias, SiLU) -> LN -> q/k/v (+bias) -> full-context rel-pos attention
+  -> o (+bias, accumulate) -> LN -> pw1 (+bias) -> GLU -> 'same' depthwise k9
+  (+bias) -> BN affine -> SiLU -> pw2 (+bias, accumulate) -> ½FFN -> LN.
+  GEMMs: the own row-stable f32 kernel (`k_gemm_wt`), or own-tc bf16 as the A/B
+  arm (`--precision bf16 --gemm own-tc`; split count from the weight's shape
+  only). Attention: one block per (row, head), scores over the segment's T keys
+  in shared memory, `rk` read from the rel-pos TABLE the library builds and
+  checks (`mynah_asr_enc_relpos_table_init`, kmax = T_max): rk(T)[p] =
+  RK[p + kmax - T], so the index of key j for query t is `kmax - 1 + j - t`,
+  identical values to the CPU's per-T projection.
+- T_max = frames of 1.1 x the segment limit (the planner's largest segment);
+  a longer segment fails that request, never the process.
+- the post-projector output stays RESIDENT for the decoder (`from_encode`).
+
+Decoder (AED, greedy), all segments of the wave stepped together:
+- `enc_dec_proj` and the cross K/V of every layer once per wave over the packed
+  rows; a per-segment self K/V cache `[sum max_len, d]` per layer.
+- step p: one row per live segment: embedding + pos[p] + LN -> per layer
+  (LN, q/k/v, append k/v at p, attention over [0..p], o accumulate; LN, cq,
+  cross-attention over the segment's T rows, co accumulate; LN, FFN ReLU,
+  accumulate) -> final LN -> head -> argmax (lowest index among equal maxima,
+  the CPU's `>` rule). The host applies the library's rule per segment: inside
+  the prompt the next token is the prompt's; else EOS ends it, the cap ends it,
+  max_len = min(n_prompt + cap, max_seq) ends it. A finished segment leaves the
+  step (rows compacted), so per-request stop costs nothing to the others.
+- LN of the decoder reproduces `src/decoder_aed.c` `ln` (mean/var in double,
+  the normalised value in double before the cast), attention scores
+  `scale * q.k`, softmax `exp(s - max)` / sum.
+- `--aed-decoder host` installs only the encoder hook: the library's CPU decoder
+  decodes (stage 2, and the A/B arm).
+
+### 5.6 Batch invariance and parity
+
+- Contract 4 by construction: a GEMM row is one fixed-order fma chain over k
+  (`gpu/cuda/gemm.cu`), every attention/conv/norm reads only its segment's rows,
+  the decoder's rows are per segment. Gated, not trusted:
+  `tests/test_cuda_aed` transcribes each clip alone, all together and in a
+  rotated order, and requires identical bytes.
+- Parity with the CPU library (f32): byte identity of FLOATS is impossible --
+  the GEMM reduction order differs from `src/sgemm.c` / BLAS, and the
+  transcendental functions differ (`expf`, sigmoid) -- so the gate is on
+  TRANSCRIPTS: byte-identical to the library on the committed FLEURS clips
+  (`samples/en`, `samples/fr`); a difference is reported per clip with its CER,
+  and the bf16 arm is gated on WER against the f32 transcripts, never on bytes.
+
+### 5.7 Stages
+
+1. pack capability, the seam, the offline engine with the cpu reference, the
+   server's offline mode (REST + 400 on the WebSocket), the GPU engine refusing
+   clearly.
+2. GPU encoder, library CPU decoder (`--aed-decoder host`).
+3. GPU decoder, batched across the wave (`--aed-decoder gpu`, the default).
+
+All three are written; none has run on a GPU yet (written on a machine without
+nvcc: the .cu was syntax-checked with clang's CUDA front end only). Box order:
+`make lib && make && make -C gpu && make -C gpu test-aed`, then
+`tests/test_cuda_aed models/canary-180m-flash` (f32: gates A, B, C),
+`... --aed-decoder host` (stage 2 alone), `... --precision bf16` (CER report),
+`tests/test_cuda_aed_server.sh models/canary-180m-flash 8297 cuda`.
+
+### 5.8 Open after the first box run
+
+- Subsampling on the device (it is per segment on the host today; measure its
+  share with `host_subsampling_ms_total` in /v1/health first).
+- The decoder steps one row per segment through M <= --batch GEMMs and syncs
+  once per step for the argmax: launch-bound at small batch; CUDA graphs per
+  (rows) or a device-side stopping rule are the candidates, after a profile.
+- bf16 own-tc: a WER gate on `samples/eval-bank` (en, fr) against f32 before it
+  could become a default.
+- canary-1b-flash / 1b-v2: same code path; VRAM and T_max to check.

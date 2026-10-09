@@ -3,6 +3,13 @@
  *   GET  /v1/audio/stream        WebSocket: s16le/f32le 16 kHz in, JSON frames out
  *   GET  /v1/health, /v1/models  facts; GET /metrics (also on --metrics-port)
  *
+ * A pack that cannot stream (an attention encoder-decoder, Canary: the
+ * capability asr_pack_mode reads from mynah.json) switches the process to the
+ * OFFLINE mode (rest.c): POST /v1/audio/transcriptions and /translations
+ * answer the final transcript of a file, batched across requests on the GPU,
+ * and the WebSocket is refused before the upgrade with 400
+ * model_not_streaming -- the CPU server's contract for the same pack.
+ *
  * Design (.work/cuda-batched-streaming-server.md): ingest threads read the
  * sockets into per-slot PCM rings and never touch the engine; ONE engine thread
  * stages a chunk per ready slot, gathers a cohort (`--cohort-ms`), runs one
@@ -14,7 +21,7 @@
  * What is deliberately NOT here: prefork (a CUDA context does not survive
  * fork), a hidden CPU fallback (a dead engine ends every session with
  * `internal_error` and the process exits 70), VAD/eou (S14-8), REST offline
- * transcription (the GPU server serves streams).
+ * transcription of a STREAMING pack (501: the CPU server's).
  *
  * This tree does not modify server/ or src/ (S14). */
 #ifdef __linux__
@@ -22,7 +29,11 @@
 #include <sched.h>
 #endif
 #include "asr_engine.h"
+#include "asr_offline.h"
 #include "hostprof.h"
+#include "http_io.h"
+#include "pack.h"
+#include "rest.h"
 
 #include "cJSON.h"
 #include "http_util.h"
@@ -139,6 +150,12 @@ static struct {
     unsigned long windows, window_staged;
     double window_ms_sum;
     double startup_ms;
+    /* the offline mode (an AED pack): rest.c serves, the streaming engine,
+     * slots and engine thread do not exist */
+    int offline;
+    asr_offline *off;
+    int batch;
+    const char *aed_decoder;
 } g;
 
 static double now_s(void) {
@@ -166,7 +183,7 @@ static double hist_quantile(const unsigned long *h, double q) {
 }
 
 /* ------------------------------------------------------------ socket io */
-static int write_all(int fd, const void *buf, size_t n) {
+int write_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
     while (n > 0) {
         const ssize_t w = send(fd, p, n, 0);
@@ -178,7 +195,7 @@ static int write_all(int fd, const void *buf, size_t n) {
 }
 
 /* write, half-close, drain briefly, close: a refusal the client can READ */
-static void linger_close(int fd, const char *resp, size_t n) {
+void linger_close(int fd, const char *resp, size_t n) {
     if (resp && n) (void)write_all(fd, resp, n);
     shutdown(fd, SHUT_WR);
     struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
@@ -193,8 +210,8 @@ static void linger_close(int fd, const char *resp, size_t n) {
     close(fd);
 }
 
-static void refuse_json(int fd, int code, const char *status, const char *type,
-                        const char *errcode, const char *msg, int retry_after) {
+void refuse_json(int fd, int code, const char *status, const char *type,
+                 const char *errcode, const char *msg, int retry_after) {
     pthread_mutex_lock(&g.mu);
     if (retry_after > 0) g.refused_cap++; else g.refused_other++;
     pthread_mutex_unlock(&g.mu);
@@ -209,7 +226,7 @@ static void refuse_json(int fd, int code, const char *status, const char *type,
     linger_close(fd, resp, (size_t)n);
 }
 
-static void send_json(int fd, int code, cJSON *j) {
+void send_json(int fd, int code, cJSON *j) {
     char *s = cJSON_PrintUnformatted(j);
     if (!s) return;
     char head[256];
@@ -222,7 +239,7 @@ static void send_json(int fd, int code, cJSON *j) {
     free(s);
 }
 
-static void send_text(int fd, int code, const char *ctype, const char *body, size_t len) {
+void send_text(int fd, int code, const char *ctype, const char *body, size_t len) {
     char head[256];
     const int n = snprintf(head, sizeof(head),
         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
@@ -1198,6 +1215,13 @@ static size_t metrics_text(char *b, size_t cap) {
 }
 
 static void dump_stderr(void) {
+    if (g.offline) {
+        char ob[2048];
+        const size_t on = rest_dump(ob, sizeof(ob), ++g.dump_seq);
+        fwrite(ob, 1, on, stderr);
+        fflush(stderr);
+        return;
+    }
     asr_engine_stats es; asr_engine_get_stats(g.eng, &es);
     asr_engine_facts f; asr_engine_get_facts(g.eng, &f);
     pthread_mutex_lock(&g.mu);
@@ -1265,7 +1289,7 @@ static void serve_metrics_fd(int fd) {
     if (poll(&p, 1, 200) > 0) (void)recv(fd, req, sizeof(req), 0);
     char *body = malloc(65536);
     if (body) {
-        const size_t n = metrics_text(body, 65536);
+        const size_t n = g.offline ? rest_metrics_text(body, 65536) : metrics_text(body, 65536);
         send_text(fd, 200, "text/plain; version=0.0.4", body, n);
         free(body);
     }
@@ -1292,6 +1316,44 @@ static void handle_http(int fd) {
     char *query = strchr(target, '?');
     if (query) *query++ = '\0';
     const char *path = target;
+    if (g.offline) {
+        const size_t head_len = (size_t)(strstr(hdr, "\r\n\r\n") - hdr) + 4;
+        if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/health") == 0) {
+            cJSON *j = cJSON_CreateObject();
+            rest_health_json(j);
+            send_json(fd, 200, j);
+            cJSON_Delete(j);
+            linger_close(fd, NULL, 0);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+            cJSON *j = cJSON_CreateObject();
+            cJSON *arr = cJSON_AddArrayToObject(j, "data");
+            cJSON *m = cJSON_CreateObject();
+            cJSON_AddStringToObject(m, "id", g.facts.model_name);
+            cJSON_AddStringToObject(m, "object", "model");
+            cJSON_AddStringToObject(m, "owned_by", "mynah");
+            cJSON_AddStringToObject(m, "engine", "aed");
+            cJSON_AddBoolToObject(m, "streaming", 0);
+            cJSON_AddBoolToObject(m, "default", 1);
+            cJSON_AddItemToArray(arr, m);
+            send_json(fd, 200, j);
+            cJSON_Delete(j);
+            linger_close(fd, NULL, 0);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/metrics") == 0) {
+            serve_metrics_fd(fd);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/audio/stream") == 0) {
+            /* before the upgrade, no Retry-After: an AED pack will never grow a
+             * stream API (the CPU server's refusal, server/main.c) */
+            refuse_json(fd, 400, "Bad Request", "invalid_request_error", "model_not_streaming",
+                        "this model is offline-only (attention encoder-decoder): POST the file "
+                        "to /v1/audio/transcriptions for its final transcript", 0);
+        } else if (strcmp(method, "POST") == 0 && (strcmp(path, "/v1/audio/transcriptions") == 0 ||
+                                                   strcmp(path, "/v1/audio/translations") == 0)) {
+            rest_handle(fd, hdr, head_len, got, query, strcmp(path, "/v1/audio/translations") == 0);
+        } else {
+            refuse_json(fd, 404, "Not Found", "invalid_request_error", "not_found", "unknown route", 0);
+        }
+        return;
+    }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/health") == 0) {
         cJSON *j = cJSON_CreateObject();
         health_json(j);
@@ -1316,9 +1378,11 @@ static void handle_http(int fd) {
         serve_metrics_fd(fd);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/audio/stream") == 0) {
         if (!handle_ws_stream(fd, hdr, query)) close(fd);
-    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/audio/transcriptions") == 0) {
+    } else if (strcmp(method, "POST") == 0 && (strcmp(path, "/v1/audio/transcriptions") == 0 ||
+                                               strcmp(path, "/v1/audio/translations") == 0)) {
         refuse_json(fd, 501, "Not Implemented", "invalid_request_error", "not_implemented",
-                    "the GPU server serves streams; offline transcription is the CPU server's", 0);
+                    "this pack streams: the GPU server serves it over the WebSocket; offline "
+                    "transcription of a streaming pack is the CPU server's", 0);
     } else {
         refuse_json(fd, 404, "Not Found", "invalid_request_error", "not_found", "unknown route", 0);
     }
@@ -1440,6 +1504,10 @@ static void usage(void) {
         "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
         "       [--stage-ahead 0|1] [--host-threads N|auto] [--graphs off|buckets] [--graph-buckets 8,16,32,64,128]\n"
         "       [--warmup 0|1]  (cuda engine defaults: 1, auto, buckets, 8,16,32,64,128, 1; cpu engine: off)\n"
+        "  offline mode (an AED pack, e.g. Canary; chosen from the pack, never by a flag):\n"
+        "       [--batch N (requests per GPU batch, default min(cap, 16))] [--cohort-ms MS (the gather window)]\n"
+        "       [--aed-decoder gpu|host (host = the library's CPU decoder after the GPU encoder)]\n"
+        "       --cap N = requests admitted (queued + in flight), past it 503 server_at_capacity\n"
         "  --stage-ahead 1: stage and feed the next chunks while the encoder pass runs (byte-identical)\n"
         "  --host-threads: threads (engine thread included) for the host mel of a staged batch; auto =\n"
         "  1 up to 8 usable CPUs, 2 up to 16, 4 above (affinity and cgroup quota)\n"
@@ -1447,6 +1515,140 @@ static void usage(void) {
         "  --warmup 1: before listening, run traffic-shaped steps at every lane bucket, then reset\n"
         "  --threads is the HTTP pool (v2 meaning): a WebSocket stream holds one of its threads for its life,\n"
         "  so it is the connection ceiling; default cap + 8.\n");
+}
+
+/* the HTTP pool, the accept loop and the pool's join: shared by both modes */
+static pthread_t *g_pool;
+static void pool_start(void) {
+    g_q.cap = g.http_threads * 2 + 16;
+    g_q.q = calloc((size_t)g_q.cap, sizeof(int));
+    pthread_mutex_init(&g_q.mu, NULL); pthread_cond_init(&g_q.cv, NULL);
+    g_pool = calloc((size_t)g.http_threads, sizeof(pthread_t));
+    for (int i = 0; i < g.http_threads; i++) pthread_create(&g_pool[i], NULL, http_worker, NULL);
+}
+static void pool_join(void) {
+    pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
+    for (int i = 0; i < g.http_threads; i++) pthread_join(g_pool[i], NULL);
+}
+static void accept_loop(void) {
+    while (!atomic_load(&g.shutdown)) {
+        struct pollfd p[2] = {{.fd = g.listen_fd, .events = POLLIN, .revents = 0},
+                              {.fd = g.metrics_fd, .events = POLLIN, .revents = 0}};
+        const int rc = poll(p, g.metrics_fd >= 0 ? 2 : 1, 250);
+        if (g_dump_req) { g_dump_req = 0; dump_stderr(); }
+        if (rc <= 0) continue;
+        if (p[0].revents & POLLIN) {
+            const int fd = accept(g.listen_fd, NULL, NULL);
+            if (fd < 0) {
+                /* Out of descriptors or kernel memory is a capacity condition:
+                 * the listener stays readable, so a bare `continue` would spin
+                 * poll+accept at 100 % while the clients wait in the backlog
+                 * with no word in the log. Say so at most once a second, count
+                 * it, back off briefly; the streams in flight free theirs. */
+                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                    static double last_note;
+                    const double t = now_s();
+                    pthread_mutex_lock(&g.mu); g.accept_backoffs++; pthread_mutex_unlock(&g.mu);
+                    if (t - last_note >= 1.0) {
+                        last_note = t;
+                        fprintf(stderr, "mynah-asr-server-cuda: accept: %s; backing off (raise the open-file limit if this repeats)\n",
+                                strerror(errno));
+                    }
+                    const struct timespec pause = {0, 20 * 1000 * 1000};
+                    nanosleep(&pause, NULL);
+                }
+                continue;
+            }
+            pthread_mutex_lock(&g_q.mu);
+            if (g_q.len >= g_q.cap) {
+                pthread_mutex_unlock(&g_q.mu);
+                /* every HTTP thread busy and the queue full: refuse, visibly */
+                refuse_json(fd, 503, "Service Unavailable", "server_error", "server_at_capacity",
+                            "every http thread is busy; raise --http-threads", 1);
+                continue;
+            }
+            g_q.q[(g_q.head + g_q.len) % g_q.cap] = fd;
+            g_q.len++;
+            pthread_cond_signal(&g_q.cv);
+            pthread_mutex_unlock(&g_q.mu);
+        }
+        if (g.metrics_fd >= 0 && (p[1].revents & POLLIN)) {
+            const int fd = accept(g.metrics_fd, NULL, NULL);
+            if (fd >= 0) serve_metrics_fd(fd);
+        }
+    }
+    fprintf(stderr, "mynah-asr-server-cuda: shutting down\n");
+}
+
+/* The offline mode: an AED pack. The engine resolved, the banner printed, the
+ * same HTTP pool and accept loop, rest.c behind the routes. */
+static int offline_main(int cuda_engine, int dispatch_map, double t_start) {
+    char err[512] = "";
+    if (g.batch <= 0) g.batch = g.cap < 16 ? g.cap : 16;
+    if (g.batch > g.cap) g.batch = g.cap;
+    /* the offline engine has no own-v2/splitk/cublas arms (yet): auto above
+     * resolved to own-tc+bf16 on sm_80+ or own+f32; an explicit other arm is refused */
+    asr_offline_cfg oc = {.model_dir = g.model_dir, .engine = g.engine_name, .device = g.device,
+                          .max_items = g.batch, .precision = g.precision, .gemm = g.gemm,
+                          .decoder = g.aed_decoder, .threads = g.threads};
+    if (!cuda_engine && strcmp(g.engine_name, "cpu") != 0) {
+        fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n");
+        return 2;
+    }
+    g.off = asr_offline_open(&oc, err, sizeof(err));
+    if (!g.off) {
+        fprintf(stderr, "mynah-asr-server-cuda: the %s offline engine did not open: %s\n", g.engine_name, err);
+        return strstr(err, "not compiled") ? 78 : 1;
+    }
+    asr_offline_facts of;
+    asr_offline_get_facts(g.off, &of);
+    memset(&g.facts, 0, sizeof(g.facts));
+    g.facts.name = of.name; g.facts.device = of.device; g.facts.precision = of.precision;
+    g.facts.gemm = of.gemm; g.facts.model_name = of.model_name; g.facts.sample_rate = of.sample_rate;
+    char dm[4096];
+    const size_t dn = asr_offline_dispatch_map(g.off, dm, sizeof(dm));
+    if (dispatch_map) {
+        fwrite(dm, 1, dn, stdout);
+        printf("0 row(s) UNKNOWN\n");
+        asr_offline_close(g.off);
+        return 0;
+    }
+    raise_nofile_limit();
+    pthread_mutex_init(&g.mu, NULL);
+    pthread_cond_init(&g.wake, NULL);
+    g.t0 = now_s();
+    rest_cfg rc = {.eng = g.off, .cap = g.cap, .batch = g.batch, .window_ms = g.cohort_ms,
+                   .max_audio_seconds = g.max_audio_seconds};
+    if (rest_start(&rc) != 0) { fprintf(stderr, "mynah-asr-server-cuda: the batcher did not start\n"); return 1; }
+    g.listen_fd = listen_on(g.host, g.port);
+    if (g.listen_fd < 0) { fprintf(stderr, "mynah-asr-server-cuda: cannot listen on %s:%d: %s\n", g.host, g.port, strerror(errno)); return 1; }
+    g.metrics_fd = -1;
+    if (g.metrics_port > 0) {
+        g.metrics_fd = listen_on("127.0.0.1", g.metrics_port);
+        if (g.metrics_fd < 0) { fprintf(stderr, "mynah-asr-server-cuda: cannot listen on the metrics port %d: %s\n", g.metrics_port, strerror(errno)); return 1; }
+    }
+    asr_offline_get_facts(g.off, &of);
+    g.startup_ms = (now_s() - t_start) * 1e3;
+    fprintf(stderr, "[SERVER-CONFIG] mynah-asr-server-cuda %s: mode=offline engine=%s kind=aed device=\"%s\" precision=%s gemm=%s "
+                    "decoder=%s model=%s cap=%d batch=%d window_ms=%d segment_s=%.0f streaming=no vram_weights_mb=%.0f "
+                    "vram_scratch_mb=%.0f vram_used_mb=%.0f vram_total_mb=%.0f startup_ms=%.0f\n",
+            MYNAH_ASR_BUILD, of.name, of.device ? of.device : "-", of.precision, of.gemm, of.decoder,
+            of.model_name, g.cap, g.batch, g.cohort_ms, of.seg_sec, (double)of.vram_weights / 1048576.0,
+            (double)of.vram_scratch / 1048576.0, (double)of.vram_used / 1048576.0,
+            (double)of.vram_total / 1048576.0, g.startup_ms);
+    fwrite(dm, 1, dn, stderr);
+    fprintf(stderr, "mynah-asr-server-cuda: listening on %s:%d (%d http threads, offline AED: REST only, "
+                    "the WebSocket answers 400 model_not_streaming)\n", g.host, g.port, g.http_threads);
+    if (g.metrics_fd >= 0) fprintf(stderr, "mynah-asr-server-cuda: /metrics on 127.0.0.1:%d\n", g.metrics_port);
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGUSR1, on_signal);
+    pool_start();
+    accept_loop();
+    close(g.listen_fd);
+    rest_stop();
+    pool_join();
+    dump_stderr();
+    asr_offline_close(g.off);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -1498,6 +1700,8 @@ int main(int argc, char **argv) {
         else if (ARG("--warmup")) { g.warmup = atoi(v); warmup_set = 1; }
         else if (ARG("--kv-dtype")) g.kv_dtype = v;
         else if (ARG("--weights")) g.weights = v;
+        else if (ARG("--batch")) g.batch = atoi(v);
+        else if (ARG("--aed-decoder")) g.aed_decoder = v;
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
         else if (strcmp(a, "--version") == 0) { printf("mynah-asr-server-cuda %s\n", MYNAH_ASR_BUILD); return 0; }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
@@ -1511,6 +1715,10 @@ int main(int argc, char **argv) {
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
     if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
     const int cuda_engine = strcmp(g.engine_name, "cuda") == 0;
+    /* the offline AED engine keeps f32 own unless an arm is asked for
+     * explicitly: its bf16 has no quality gate yet (section 5.6) */
+    const int prec_auto = g.precision == NULL || strcmp(g.precision, "auto") == 0;
+    const int gemm_auto = g.gemm == NULL || strcmp(g.gemm, "auto") == 0;
     /* --precision/--gemm auto (the default): the fixed-order bf16 tensor-core
      * GEMM on sm_80+ (S14-8c: batch-invariant, 498-clip bank WER 0.14469 vs
      * 0.14483 for f32, device time per pass -55%), the f32 own GEMM elsewhere,
@@ -1543,8 +1751,19 @@ int main(int argc, char **argv) {
     g.warmup = g.warmup ? 1 : 0;
 
     signal(SIGPIPE, SIG_IGN);
-    raise_nofile_limit();
     char err[512] = "";
+    {
+        /* an unreadable pack takes the streaming path, whose engine reports
+         * the device, then the pack, in that order (CI greps the first) */
+        const int mode = asr_pack_mode(g.model_dir, err, sizeof(err));
+        g.offline = mode == ASR_PACK_OFFLINE_AED;
+        err[0] = '\0';
+    }
+    if (g.offline) {
+        if (prec_auto && gemm_auto) { g.precision = "f32"; g.gemm = "own"; }
+        return offline_main(cuda_engine, dispatch_map, t_start);
+    }
+    raise_nofile_limit();
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
                           .profile = g.profile, .profile_host = g.profile_host, .pass_lanes = g.pass_lanes,
@@ -1627,66 +1846,14 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGUSR1, on_signal);
 
-    g_q.cap = g.http_threads * 2 + 16;
-    g_q.q = calloc((size_t)g_q.cap, sizeof(int));
-    pthread_mutex_init(&g_q.mu, NULL); pthread_cond_init(&g_q.cv, NULL);
-    pthread_t *pool = calloc((size_t)g.http_threads, sizeof(pthread_t));
-    for (int i = 0; i < g.http_threads; i++) pthread_create(&pool[i], NULL, http_worker, NULL);
+    pool_start();
     pthread_create(&g.engine_thread, NULL, engine_main, NULL);
-
-    while (!atomic_load(&g.shutdown)) {
-        struct pollfd p[2] = {{.fd = g.listen_fd, .events = POLLIN, .revents = 0},
-                              {.fd = g.metrics_fd, .events = POLLIN, .revents = 0}};
-        const int rc = poll(p, g.metrics_fd >= 0 ? 2 : 1, 250);
-        if (g_dump_req) { g_dump_req = 0; dump_stderr(); }
-        if (rc <= 0) continue;
-        if (p[0].revents & POLLIN) {
-            const int fd = accept(g.listen_fd, NULL, NULL);
-            if (fd < 0) {
-                /* Out of descriptors or kernel memory is a capacity condition:
-                 * the listener stays readable, so a bare `continue` would spin
-                 * poll+accept at 100 % while the clients wait in the backlog
-                 * with no word in the log. Say so at most once a second, count
-                 * it, back off briefly; the streams in flight free theirs. */
-                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-                    static double last_note;
-                    const double t = now_s();
-                    pthread_mutex_lock(&g.mu); g.accept_backoffs++; pthread_mutex_unlock(&g.mu);
-                    if (t - last_note >= 1.0) {
-                        last_note = t;
-                        fprintf(stderr, "mynah-asr-server-cuda: accept: %s; backing off (raise the open-file limit if this repeats)\n",
-                                strerror(errno));
-                    }
-                    const struct timespec pause = {0, 20 * 1000 * 1000};
-                    nanosleep(&pause, NULL);
-                }
-                continue;
-            }
-            pthread_mutex_lock(&g_q.mu);
-            if (g_q.len >= g_q.cap) {
-                pthread_mutex_unlock(&g_q.mu);
-                /* every HTTP thread busy and the queue full: refuse, visibly */
-                refuse_json(fd, 503, "Service Unavailable", "server_error", "server_at_capacity",
-                            "every http thread is busy; raise --http-threads", 1);
-                continue;
-            }
-            g_q.q[(g_q.head + g_q.len) % g_q.cap] = fd;
-            g_q.len++;
-            pthread_cond_signal(&g_q.cv);
-            pthread_mutex_unlock(&g_q.mu);
-        }
-        if (g.metrics_fd >= 0 && (p[1].revents & POLLIN)) {
-            const int fd = accept(g.metrics_fd, NULL, NULL);
-            if (fd >= 0) serve_metrics_fd(fd);
-        }
-    }
-    fprintf(stderr, "mynah-asr-server-cuda: shutting down\n");
+    accept_loop();
     pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
     pthread_mutex_lock(&g.mu); pthread_cond_broadcast(&g.wake); pthread_mutex_unlock(&g.mu);
     close(g.listen_fd);
     pthread_join(g.engine_thread, NULL);
-    pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
-    for (int i = 0; i < g.http_threads; i++) pthread_join(pool[i], NULL);
+    pool_join();
     dump_stderr();
     asr_engine_close(g.eng);
     return 0;

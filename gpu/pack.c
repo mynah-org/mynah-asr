@@ -36,6 +36,15 @@ static const char *jstr(const cJSON *o, const char *k) {
     return j && cJSON_IsString(j) ? j->valuestring : NULL;
 }
 
+int asr_pack_mode(const char *dir, char *err, size_t errcap) {
+    cJSON *cfg = load_json(dir, "mynah.json");
+    if (!cfg) { snprintf(err, errcap, "%s/mynah.json is missing or not JSON", dir); return -1; }
+    const char *dtype = jstr(cJSON_GetObjectItem(cfg, "decoder"), "type");
+    const int mode = dtype && strcmp(dtype, "aed_transformer") == 0 ? ASR_PACK_OFFLINE_AED : ASR_PACK_STREAM;
+    cJSON_Delete(cfg);
+    return mode;
+}
+
 #define FAIL(...) do { snprintf(err, errcap, __VA_ARGS__); asr_pack_close(p); return -1; } while (0)
 
 int asr_pack_open(asr_pack *p, const char *dir, char *err, size_t errcap) {

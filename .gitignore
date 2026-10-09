@@ -94,4 +94,6 @@ mynah-asr-server-cuda
 mynah-asr-server-cuda-cpuonly
 tests/test_cuda_kernels
 tests/test_cuda_stream
+tests/test_cuda_aed
+tests/test_cuda_aed_cpuonly
 tests/cuda_bank_transcribe

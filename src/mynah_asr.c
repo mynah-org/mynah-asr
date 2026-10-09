@@ -50,6 +50,10 @@ struct mynah_asr_model {
     /* scratch of the batched stream step (S1-4), carved on first use / reserve:
      * one per model because one scheduler thread owns a model */
     mynah_asr_enc_batch *batch;
+    /* an accelerator's encoder / AED decode for the offline path (NULL hooks =
+     * the library's own); see mynah_asr_set_offload */
+    mynah_asr_offload off;
+    int off_from_encode;            /* the enc being decoded came from off.encode */
 };
 
 /* Default per-segment limit for offline decoding. Full-attention/AED models
@@ -159,8 +163,14 @@ static int eng_decode_aed(struct mynah_asr_model *m, const float *enc, int T,
     const int cap = (ts ? 3 * T : T) + m->aed.max_gen_delta;
     *frames = NULL;                                  /* times live in the <|N|> tokens */
     *tokens = malloc((size_t)cap * sizeof(int));
-    return *tokens ? mynah_asr_aed_decode(&m->aed, enc, T, pids, n_p, m->aed_eos,
-                                      *tokens, cap) : -1;
+    if (!*tokens) return -1;
+    if (m->off.aed_decode) {                         /* an accelerator decodes, same rule */
+        const int *pp = pids;
+        int n_out = 0;
+        return m->off.aed_decode(m->off.ud, m->off_from_encode, &enc, &T, 1, &pp, &n_p,
+                                 m->aed_eos, &cap, tokens, &n_out) == 0 ? n_out : -1;
+    }
+    return mynah_asr_aed_decode(&m->aed, enc, T, pids, n_p, m->aed_eos, *tokens, cap);
 }
 
 static const mynah_asr_engine ENG_RNNT = {"rnnt-tdt", 0, eng_decode_rnnt};
@@ -554,6 +564,50 @@ static void batch_decode_worker(void *ctx, int b) {
     free(frames);
 }
 
+/* The encoder of one wave: the offload's when one is installed, else the
+ * library's weight-stationary batched forward. Same contract either way. */
+static int encode_wave(mynah_asr_model *m, const float *const *feats, const int *valids, int W,
+                       const int *prompts, int right, float **encs, int *t_encs) {
+    if (m->off.encode) {
+        m->off_from_encode = 1;
+        return m->off.encode(m->off.ud, feats, valids, W, m->feat.n_mels, prompts, encs, t_encs);
+    }
+    m->off_from_encode = 0;
+    return mynah_asr_encoder_forward_batch(&m->enc, feats, valids, W, m->feat.n_mels, prompts,
+                                           m->left_ctx, right, encs, t_encs);
+}
+
+/* The AED decode of one wave through the offload: the SAME prompt, budget and
+ * detokenisation as batch_decode_worker -> eng_decode_aed, with the decode of
+ * every segment of the wave in one call (the accelerator batches the steps).
+ * want_ts is 0 here exactly as in batch_decode_worker (no AED words in a batch). */
+static void aed_decode_wave(batch_ctx *c, int W) {
+    mynah_asr_model *m = c->m;
+    int (*pids)[MYNAH_ASR_AED_PROMPT_MAX] = calloc((size_t)W, sizeof(*pids));
+    const int **pp = calloc((size_t)W, sizeof(*pp));
+    int *np = calloc((size_t)W, sizeof(int)), *caps = calloc((size_t)W, sizeof(int));
+    int *n_out = calloc((size_t)W, sizeof(int));
+    int **toks = calloc((size_t)W, sizeof(*toks));
+    int ok = pids && pp && np && caps && n_out && toks;
+    for (int i = 0; ok && i < W; i++) {
+        if (!c->encs[i]) { ok = 0; break; }
+        np[i] = aed_build_prompt(m, c->langs ? c->langs[i] : NULL, pids[i], 0);
+        if (np[i] <= 0) { ok = 0; break; }
+        pp[i] = pids[i];
+        caps[i] = c->t_encs[i] + m->aed.max_gen_delta;
+        toks[i] = malloc((size_t)caps[i] * sizeof(int));
+        if (!toks[i]) ok = 0;
+    }
+    if (ok && m->off.aed_decode(m->off.ud, m->off_from_encode, (const float *const *)c->encs,
+                                c->t_encs, W, pp, np, m->aed_eos, caps, toks, n_out) != 0)
+        ok = 0;
+    for (int i = 0; ok && i < W; i++)
+        c->texts[i] = mynah_asr_detokenize(&m->tok, toks[i], n_out[i],
+                                           c->langs_out ? c->langs_out[i] : NULL);
+    for (int i = 0; toks && i < W; i++) free(toks[i]);
+    free(pids); free(pp); free(np); free(caps); free(n_out); free(toks);
+}
+
 int mynah_asr_transcribe_batch(mynah_asr_model *m, const float *const *samples,
                            const size_t *n_samples, int batch, const char *const *langs,
                            int lookahead, char **texts, char (*langs_out)[16]) {
@@ -691,11 +745,13 @@ int mynah_asr_transcribe_batch_ts(mynah_asr_model *m, const float *const *sample
         int ok = 1;
         for (int i = 0; i < W; i++)
             if (!feats[i]) ok = 0;
-        if (ok && mynah_asr_encoder_forward_batch(&m->enc, (const float *const *)feats, valids,
-                                             W, m->feat.n_mels, wprompts, m->left_ctx,
-                                             right, encs, t_encs) != 0)
+        if (ok && encode_wave(m, (const float *const *)feats, valids, W, wprompts, right,
+                              encs, t_encs) != 0)
             ok = 0;
-        if (ok) mynah_asr_parallel_for(W, batch_decode_worker, &c);
+        if (ok && m->is_aed && m->off.aed_decode && m->engine == m->engine_dflt)
+            aed_decode_wave(&c, W);
+        else if (ok)
+            mynah_asr_parallel_for(W, batch_decode_worker, &c);
 
         /* stitch each segment onto its item (same helper as the single path) */
         for (int i = 0; i < W && ok; i++) {
@@ -1577,6 +1633,22 @@ static int aed_build_prompt(const mynah_asr_model *m, const char *lang, int *ids
 
 int mynah_asr_can_translate(const mynah_asr_model *m) { return m->is_aed; }
 
+int mynah_asr_lang_supported(const mynah_asr_model *m, const char *lang) {
+    if (!m) return 0;
+    if (m->is_aed) {
+        int ids[MYNAH_ASR_AED_PROMPT_MAX];
+        return aed_build_prompt(m, lang, ids, 0) > 0;
+    }
+    return resolve_prompt(m, lang) != -2;
+}
+
+void mynah_asr_set_offload(mynah_asr_model *m, const mynah_asr_offload *o) {
+    if (!m) return;
+    if (o) m->off = *o;
+    else memset(&m->off, 0, sizeof(m->off));
+    m->off_from_encode = 0;
+}
+
 int mynah_asr_set_target_lang(mynah_asr_model *m, const char *lang) {
     if (!lang || !*lang) { m->aed_target[0] = '\0'; return 0; }
     if (!m->is_aed) {
@@ -1724,12 +1796,23 @@ static char *transcribe_segment(mynah_asr_model *m, const float *samples, size_t
     if (!feats) return NULL;
 
     const mynah_asr_engine *eng = m->engine;
-    int T_enc;
-    float *enc = eng->raw_encoder
-        ? mynah_asr_encoder_forward_raw(&m->enc, feats, valid, m->feat.n_mels,
-                                    m->left_ctx, right, &T_enc)
-        : mynah_asr_encoder_forward(&m->enc, feats, valid, m->feat.n_mels, prompt,
-                                m->left_ctx, right, &T_enc);
+    int T_enc = 0;
+    float *enc = NULL;
+    m->off_from_encode = 0;
+    if (!eng->raw_encoder && m->off.encode) {        /* an accelerator's encoder */
+        const float *fp = feats;
+        if (m->off.encode(m->off.ud, &fp, &valid, 1, m->feat.n_mels, &prompt, &enc, &T_enc) != 0) {
+            free(enc);
+            enc = NULL;
+        }
+        m->off_from_encode = enc != NULL;
+    } else {
+        enc = eng->raw_encoder
+            ? mynah_asr_encoder_forward_raw(&m->enc, feats, valid, m->feat.n_mels,
+                                        m->left_ctx, right, &T_enc)
+            : mynah_asr_encoder_forward(&m->enc, feats, valid, m->feat.n_mels, prompt,
+                                    m->left_ctx, right, &T_enc);
+    }
     free(feats);
     if (!enc) return NULL;
 
