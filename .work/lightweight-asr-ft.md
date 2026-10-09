@@ -280,3 +280,21 @@ is not quoted anywhere as a result. Every FT run records, from its own logs:
 audio-hours per GPU-hour, samples/s, peak allocated and reserved VRAM, epoch
 wall time, total GPU-hours, and cost per epoch and per run at the box's actual
 hourly rate (the rate is written down when the box is rented).
+
+## Kit (Track C, Canary 180M): `.work/lightweight-asr/ft/`
+
+Restartable scripts for one rented GPU box (tmux, `timeout` on every long step,
+marker files in `/root/ft/done/`): `setup.sh` (torch -> cu128 wheel in the NeMo
+3.0.0 venv, normaliser, checkpoint, CUDA/bf16 check) -> `data_it.sh` (MLS it +
+FLEURS it/en, frozen eval = FLEURS it test + MLS it test, nested 5/20/40 h MLS
+cuts, exact hours; Common Voice optional) -> `tokenizer_it.sh` (C1: `it` SPE
+appended after `fr`, 5,248 old rows copied back, EN identity check) ->
+`probe.sh` (C0) -> `train_canary_it.sh` (C2 arm A frozen encoder, C3 arm B
+top-N layers; per-run audio-h/GPU-h, samples/s, peak VRAM, epoch wall,
+GPU-hours, cost at `RATE_USD_H`, EN forgetting) -> `eval_it.py` (WER/CER with
+S/D/I, level sweep at -3/-20/-40 dBFS peak). Level robustness is measured
+before/after every run and random-gain augmentation is a recorded A/B option
+(motivated by the EOU 120M empty-transcript finding on quiet clips). Command
+order, wall-time and disk estimates: `.work/lightweight-asr/ft/README.md`.
+Track E (EOU 120M) is not in the kit yet; its trainer should reuse
+`ftlib.make_gain_aug` with gain ON by default.
