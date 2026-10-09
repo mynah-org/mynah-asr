@@ -16,10 +16,17 @@
     python3 tools/bench/stream_load.py --mode soak --streams 64 --duration 900 \
         --abort-pct 20 --abort-seed 7 --clips samples/*/*.wav --port 8090 --json fault.json
 
-Standard library only, so it runs on a bare box with no venv.  One PROCESS per stream (a
-thread cannot pace many streams under the GIL).  Each stream plays its clip in `--frame-ms`
-frames on a monotonic schedule and records the send time of every frame, the arrival time
-of every server frame, and the pacing lateness.
+Standard library only, so it runs on a bare box with no venv.  By default one PROCESS per
+stream (a thread cannot pace many streams under the GIL); `--mux N` instead runs N worker
+processes, each an asyncio loop multiplexing its share of the streams, for concurrencies
+where a thousand interpreters would compete with the server for the CPU.  Both transports
+share every function that frames, parses or records (`_utt_*`, `_stream_*`).  Each stream
+plays its clip in `--frame-ms` frames on a monotonic schedule and records the send time of
+every frame, the arrival time of every server frame, and the pacing lateness; the
+generator's own lateness and CPU are reported under `summary.generator` in every run.
+
+    # the same SOAK, 16 event-loop workers instead of 1024 processes
+    python3 tools/bench/stream_load.py --mode soak --streams 1024 --mux 16 ...
 
 **Every metric is defined in `tools/bench/streaming_metrics.py`** and nothing is computed
 here: two harnesses with two definitions of "emission lag p95" produce two numbers that
@@ -34,6 +41,7 @@ REJECTION, not an error: it is the admission ladder working, and it is counted s
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import hashlib
 import json
@@ -42,6 +50,7 @@ import multiprocessing as mp
 import os
 import platform
 import random
+import resource
 import shutil
 import socket
 import struct
@@ -73,35 +82,52 @@ def mono() -> float:
 
 
 # ---------------------------------------------------------------- websocket framing (client)
+#
+# The bytes are built by ONE set of functions and written by two transports: a blocking
+# socket (one process per stream, the default) and a non-blocking one driven by an event
+# loop (`--mux`). Neither transport may frame, parse or interpret a frame on its own.
+
+
+def _ws_mask(payload: bytes, mask: bytes) -> bytes:
+    """`payload` XOR the repeated 4-byte `mask` (RFC 6455 5.3), as one integer XOR: the
+    same bytes as the per-byte loop, without a Python iteration per audio byte."""
+    n = len(payload)
+    if not n:
+        return b""
+    m = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(payload, "little") ^ int.from_bytes(m, "little")).to_bytes(n, "little")
+
+
+def _ws_header(opcode: int, n: int) -> bytes:
+    header = bytes([0x80 | opcode])
+    if n < 126:
+        header += bytes([0x80 | n])
+    elif n < 65536:
+        header += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:
+        header += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    return header
+
+
+def ws_frame(opcode: int, payload: bytes) -> bytes:
+    """One masked client frame."""
+    mask = os.urandom(4)
+    return _ws_header(opcode, len(payload)) + mask + _ws_mask(payload, mask)
+
+
+def ws_frame_partial(opcode: int, payload: bytes) -> bytes:
+    """Fault injection: a frame header for all of `payload`, then only half of it."""
+    n = len(payload)
+    mask = os.urandom(4)
+    return _ws_header(opcode, n) + mask + _ws_mask(payload[:max(1, n // 2)], mask)
 
 
 def ws_send(sock: socket.socket, opcode: int, payload: bytes) -> None:
-    mask = os.urandom(4)
-    header = bytes([0x80 | opcode])
-    n = len(payload)
-    if n < 126:
-        header += bytes([0x80 | n])
-    elif n < 65536:
-        header += bytes([0x80 | 126]) + struct.pack(">H", n)
-    else:
-        header += bytes([0x80 | 127]) + struct.pack(">Q", n)
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    sock.sendall(header + mask + masked)
+    sock.sendall(ws_frame(opcode, payload))
 
 
 def ws_send_partial(sock: socket.socket, opcode: int, payload: bytes) -> None:
-    """Fault injection: a frame header for all of `payload`, then only half of it."""
-    n = len(payload)
-    header = bytes([0x80 | opcode])
-    if n < 126:
-        header += bytes([0x80 | n])
-    elif n < 65536:
-        header += bytes([0x80 | 126]) + struct.pack(">H", n)
-    else:
-        header += bytes([0x80 | 127]) + struct.pack(">Q", n)
-    mask = os.urandom(4)
-    half = bytes(b ^ mask[i % 4] for i, b in enumerate(payload[:max(1, n // 2)]))
-    sock.sendall(header + mask + half)
+    sock.sendall(ws_frame_partial(opcode, payload))
 
 
 def ws_recv(sock: socket.socket) -> "tuple[int, bytes]":
@@ -123,28 +149,39 @@ def ws_recv(sock: socket.socket) -> "tuple[int, bytes]":
     return opcode, rd(plen) if plen else b""
 
 
+def ws_upgrade_request(host: str, port: int, path: str) -> bytes:
+    key = base64.b64encode(os.urandom(16)).decode()
+    return (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n").encode()
+
+
+def ws_parse_upgrade(resp: bytes):
+    """(status line, headers, bytes after the head) of the server's answer."""
+    head, _, rest = resp.partition(b"\r\n\r\n")
+    lines = head.decode(errors="replace").split("\r\n")
+    status = lines[0] if lines else "no response"
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return status, headers, rest
+
+
 def ws_connect(host: str, port: int, path: str, timeout: float):
     """(sock|None, status line, headers).  A refusal arrives as an HTTP status before the
     upgrade, by design (`docs/server.md`), so the client reads a status, not a reset."""
     sock = socket.create_connection((host, port), timeout=timeout)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    key = base64.b64encode(os.urandom(16)).decode()
-    sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
-                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                  f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+    sock.sendall(ws_upgrade_request(host, port, path))
     resp = b""
     while b"\r\n\r\n" not in resp:
         part = sock.recv(4096)
         if not part:
             break
         resp += part
-    head = resp.split(b"\r\n\r\n", 1)[0].decode(errors="replace").split("\r\n")
-    status = head[0] if head else "no response"
-    headers = {}
-    for line in head[1:]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
+    status, headers, _ = ws_parse_upgrade(resp)
     if " 101 " not in status:
         sock.close()
         return None, status or "no response", headers
@@ -382,7 +419,15 @@ def _set_aborted(rec: dict) -> None:
     rec["error"] = (f"aborted by the client at {ab['point']} ({ab['method']}, planned)")
     rec["error_kind"] = M.ABORTED
 
-# ---------------------------------------------------------------- one stream (one process)
+# ---------------------------------------------------------------- one stream: the shared state
+#
+# An utterance is the same state machine in both transports: build the record, apply the
+# fault plan, connect (or be refused), read frames into events, send the audio on its
+# schedule, abort or finalize, and pass the record through the "no done is never OK" net.
+# Every step that WRITES the record is one of the functions below, called by both
+# `run_utterance` (blocking socket + reader thread, one process per stream) and
+# `arun_utterance` (one event loop multiplexing many streams, `--mux`). The two differ only
+# in how they wait; what they record cannot diverge.
 
 
 def _fail(rec: dict, kind: str, msg: str) -> None:
@@ -418,6 +463,118 @@ def stream_path(a) -> str:
     return "/v1/audio/stream" + ("?" + "&".join(q) if q else "")
 
 
+def _utt_begin(a, clip: str, pcm: bytes, cls: str, plan):
+    """(record, pcm to send, abort point, frame bytes, frame count)."""
+    frame_bytes = int(16000 * a.frame_ms / 1000) * 2
+    n_frames = max(1, (len(pcm) + frame_bytes - 1) // frame_bytes)
+    rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
+           "events": [], "done_t": None, "t_start": mono(), "error": None, "error_kind": None,
+           "rejected": False, "status": None, "lang": None, "retry_after": None}
+    point = None
+    if plan:
+        rec["abort"] = dict(plan, executed=False)
+        point = plan["point"]
+        if point in M.ABORT_SILENT:
+            pcm = bytes(len(pcm))                  # zeros: the server will write nothing
+    return rec, pcm, point, frame_bytes, n_frames
+
+
+def _utt_refused(rec: dict, status: str, headers: dict) -> None:
+    # a refusal before the upgrade is the admission ladder working, not a failure
+    rec["rejected"] = " 503 " in status
+    rec["retry_after"] = headers.get("retry-after")
+    _fail(rec, "rejected" if rec["rejected"] else "http_error", f"refused: {status}")
+
+
+def _utt_reader_timeout(a, point) -> float:
+    # an idle-open abort waits for the server's idle_timeout: the reader must not time
+    # out first (a recv already blocked keeps the timeout it started with)
+    return (max(a.done_timeout, a.abort_idle_max_s + 1.0) if point == "idle_open"
+            else a.done_timeout)
+
+
+def _utt_n_send(a, point, n_frames: int) -> int:
+    """How many frames go out before an abort that happens inside the audio."""
+    if point in ("before_first_partial", "before_first_partial_silence"):
+        return min(n_frames, max(1, math.ceil(ABORT_EARLY_S * 1000.0 / a.frame_ms - 1e-9)))
+    if point in ("mid_utterance", "mid_utterance_silence", "partial_frame", "idle_open"):
+        return min(n_frames, max(1, math.ceil(n_frames * ABORT_MID_FRACTION)))
+    return n_frames
+
+
+def _utt_on_frame(rec: dict, op: int, payload: bytes, now: float) -> bool:
+    """One server frame, received at `now`, into the record. True: the reader stops."""
+    if op == 0x8:
+        # the server closed before `done`: a lost utterance, never an OK one
+        code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else None
+        rec["server_code"] = rec.get("server_code") or f"close {code}"
+        _fail(rec, "server_disconnect", f"server close frame without done (code {code})")
+        return True
+    if op != 0x1:
+        return False                             # a ping is never answered
+    try:
+        msg = json.loads(payload)
+    except ValueError as e:
+        _fail(rec, "protocol_error", f"reader: unparsable text frame: {e}")
+        return True
+    # v2 carries `type`/`seq`/`audio_s`/`lag_ms`; v1 carries `text`/`audio_seconds`
+    # and `{"done":true}`.  Both are normalised to the metrics module's event.
+    kind = msg.get("type")
+    if kind is None:
+        kind = "done" if msg.get("done") else "delta"
+    aud = msg.get("audio_s", msg.get("audio_seconds"))
+    ev = {"t": now, "type": kind, "text": msg.get("text") or "",
+          "audio_s": None if aud is None else float(aud),
+          "lag_ms": None if msg.get("lag_ms") is None else float(msg["lag_ms"])}
+    rec["events"].append(ev)
+    if kind == "done":
+        rec["done_t"] = now
+        rec["lang"] = msg.get("lang") or msg.get("language")
+        return True
+    if kind == "error":
+        rec["server_code"] = str(msg.get("code"))
+        _fail(rec, "server_error", f"server error: {msg.get('code')} {msg.get('message')}")
+        return True
+    return False
+
+
+def _utt_sent(rec: dict, i: int, frame_bytes: int, n_pcm: int, due: float, t_sent: float):
+    rec["sends"].append([t_sent, min((i + 1) * frame_bytes, n_pcm) / 32000.0])
+    rec["late_ms"].append(max(0.0, (t_sent - due) * 1000.0))
+
+
+def _utt_idle_verdict(rec: dict, reader_alive: bool) -> None:
+    """After an idle-open abort waited for the server: who ended the session."""
+    ab = rec["abort"]
+    if reader_alive or rec.get("error_kind") == "timeout":
+        ab["server_end"] = "client_bound"      # we gave up first, and close
+    elif rec.get("server_code") == "idle_timeout":
+        ab["server_end"] = "idle_timeout"
+    else:
+        ab["server_end"] = rec.get("server_code") or rec.get("error_kind") or "eof"
+    ab["server_said"] = rec["error"]
+    ab["t_end"] = mono()
+
+
+def _utt_idle_aborted(rec: dict) -> None:
+    rec["error"] = None                        # the server's reply to our silence
+    _set_aborted(rec)
+
+
+def _utt_end(rec: dict) -> dict:
+    if rec["error_kind"] == M.ABORTED:
+        return rec
+    if rec["done_t"] is None:
+        # the net under every path above: no `done` is never OK
+        if rec["events"]:
+            _fail(rec, "no_done", "the utterance ended without a done frame")
+        else:
+            _fail(rec, "no_events", "the utterance ended without any server frame")
+    return rec
+
+# ---------------------------------------------------------------- one stream (one process)
+
+
 def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
     """One utterance, recorded in the input format of `streaming_metrics`.
 
@@ -431,17 +588,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
 
     `plan` (fault injection, `fault_plan`) makes the utterance abort at its planned point;
     the record then carries `abort` with what actually happened."""
-    frame_bytes = int(16000 * a.frame_ms / 1000) * 2
-    n_frames = max(1, (len(pcm) + frame_bytes - 1) // frame_bytes)
-    rec = {"clip": clip, "class": cls, "audio_s": len(pcm) / 32000.0, "sends": [], "late_ms": [],
-           "events": [], "done_t": None, "t_start": mono(), "error": None, "error_kind": None,
-           "rejected": False, "status": None, "lang": None, "retry_after": None}
-    point = None
-    if plan:
-        rec["abort"] = dict(plan, executed=False)
-        point = plan["point"]
-        if point in M.ABORT_SILENT:
-            pcm = bytes(len(pcm))                  # zeros: the server will write nothing
+    rec, pcm, point, frame_bytes, n_frames = _utt_begin(a, clip, pcm, cls, plan)
     path = stream_path(a)
     try:
         sock, status, headers = ws_connect(a.host, a.port, path, timeout=a.connect_timeout)
@@ -450,10 +597,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
         return rec
     rec["status"] = status
     if sock is None:
-        # a refusal before the upgrade is the admission ladder working, not a failure
-        rec["rejected"] = " 503 " in status
-        rec["retry_after"] = headers.get("retry-after")
-        _fail(rec, "rejected" if rec["rejected"] else "http_error", f"refused: {status}")
+        _utt_refused(rec, status, headers)
         return rec
 
     stop = threading.Event()
@@ -462,39 +606,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
         try:
             while not stop.is_set():
                 op, payload = ws_recv(sock)
-                now = mono()
-                if op == 0x8:
-                    # the server closed before `done`: a lost utterance, never an OK one
-                    code = struct.unpack(">H", payload[:2])[0] if len(payload) >= 2 else None
-                    rec["server_code"] = rec.get("server_code") or f"close {code}"
-                    _fail(rec, "server_disconnect",
-                          f"server close frame without done (code {code})")
-                    break
-                if op != 0x1:
-                    continue                         # a ping is never answered
-                try:
-                    msg = json.loads(payload)
-                except ValueError as e:
-                    _fail(rec, "protocol_error", f"reader: unparsable text frame: {e}")
-                    break
-                # v2 carries `type`/`seq`/`audio_s`/`lag_ms`; v1 carries `text`/`audio_seconds`
-                # and `{"done":true}`.  Both are normalised to the metrics module's event.
-                kind = msg.get("type")
-                if kind is None:
-                    kind = "done" if msg.get("done") else "delta"
-                aud = msg.get("audio_s", msg.get("audio_seconds"))
-                ev = {"t": now, "type": kind, "text": msg.get("text") or "",
-                      "audio_s": None if aud is None else float(aud),
-                      "lag_ms": None if msg.get("lag_ms") is None else float(msg["lag_ms"])}
-                rec["events"].append(ev)
-                if kind == "done":
-                    rec["done_t"] = now
-                    rec["lang"] = msg.get("lang") or msg.get("language")
-                    break
-                if kind == "error":
-                    rec["server_code"] = str(msg.get("code"))
-                    _fail(rec, "server_error",
-                          f"server error: {msg.get('code')} {msg.get('message')}")
+                if _utt_on_frame(rec, op, payload, mono()):
                     break
         except OSError as e:                         # timeout, EOF, reset
             if not stop.is_set():
@@ -503,19 +615,11 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
             if not stop.is_set():
                 _fail(rec, "client_exception", f"reader: {type(e).__name__}: {e}")
 
-    # an idle-open abort waits for the server's idle_timeout: the reader must not time
-    # out first (a recv already blocked keeps the timeout it started with)
-    sock.settimeout(max(a.done_timeout, a.abort_idle_max_s + 1.0) if point == "idle_open"
-                    else a.done_timeout)
+    sock.settimeout(_utt_reader_timeout(a, point))
     th = threading.Thread(target=reader, daemon=True)
     th.start()
     period = a.frame_ms / 1000.0 / a.pace
-    # how many frames go out before an abort that happens inside the audio
-    n_send = n_frames
-    if point in ("before_first_partial", "before_first_partial_silence"):
-        n_send = min(n_frames, max(1, math.ceil(ABORT_EARLY_S * 1000.0 / a.frame_ms - 1e-9)))
-    elif point in ("mid_utterance", "mid_utterance_silence", "partial_frame", "idle_open"):
-        n_send = min(n_frames, max(1, math.ceil(n_frames * ABORT_MID_FRACTION)))
+    n_send = _utt_n_send(a, point, n_frames)
     t0 = mono()
     try:
         for i in range(n_send):
@@ -524,9 +628,7 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
             if due > now:
                 time.sleep(due - now)              # the schedule, never a spin
             ws_send(sock, 0x2, pcm[i * frame_bytes:(i + 1) * frame_bytes])
-            t_sent = mono()
-            rec["sends"].append([t_sent, min((i + 1) * frame_bytes, len(pcm)) / 32000.0])
-            rec["late_ms"].append(max(0.0, (t_sent - due) * 1000.0))
+            _utt_sent(rec, i, frame_bytes, len(pcm), due, mono())
         if point == "partial_frame" and not rec["error"]:
             # a header announcing a whole frame, the mask and half of its payload: the
             # server is left inside ws_read_exact when the connection drops
@@ -542,18 +644,9 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
                 # silence on an open socket: no audio, no close, no pong. The reader keeps
                 # listening, so the server's own verdict (idle_timeout) is what ends it.
                 th.join(a.abort_idle_max_s)
-                ab = rec["abort"]
-                if th.is_alive() or rec.get("error_kind") == "timeout":
-                    ab["server_end"] = "client_bound"      # we gave up first, and close
-                elif rec.get("server_code") == "idle_timeout":
-                    ab["server_end"] = "idle_timeout"
-                else:
-                    ab["server_end"] = rec.get("server_code") or rec.get("error_kind") or "eof"
-                ab["server_said"] = rec["error"]
-                ab["t_end"] = mono()
+                _utt_idle_verdict(rec, th.is_alive())
                 stop.set()
-                rec["error"] = None                 # the server's reply to our silence
-                _set_aborted(rec)
+                _utt_idle_aborted(rec)
         else:
             ws_send(sock, 0x8, b"")                # close = finalize, then `done`
             if point == "during_finalization":
@@ -576,14 +669,50 @@ def run_utterance(a, clip: str, pcm: bytes, cls: str, plan=None) -> dict:
             pass
     if rec["error_kind"] == M.ABORTED:
         th.join(1.0)                               # the reader was woken by SHUT_RD
-        return rec
-    if rec["done_t"] is None:
-        # the net under every path above: no `done` is never OK
-        if rec["events"]:
-            _fail(rec, "no_done", "the utterance ended without a done frame")
-        else:
-            _fail(rec, "no_events", "the utterance ended without any server frame")
-    return rec
+    return _utt_end(rec)
+
+
+def _stream_clip_lengths(schedule) -> dict:
+    clip_s = {}
+    for c in set(schedule):
+        try:
+            clip_s[c] = wav_audio_s(c)
+        except (OSError, EOFError, wave.Error, SystemExit):
+            clip_s[c] = None
+    return clip_s
+
+
+def _stream_next(a, idx: int, k: int, schedule, classes_of, stride, clip_s):
+    """(clip, class, plan, start mark) of utterance `k` of stream `idx`."""
+    clip = schedule_clip(schedule, idx, k, stride)
+    cls = classes_of.get(clip, "n/a")
+    plan = fault_plan(a.abort_seed, a.abort_pct, idx, k, a.abort_method) \
+        if getattr(a, "abort_pct", 0) > 0 else None
+    # the plan rides on the start mark too, so an utterance that never reports (a
+    # dead or terminated stream) is still accounted against its planned abort; so
+    # does the clip's length, the most such an utterance can have sent
+    mark = {"_mark": "start", "stream": idx, "rep": k, "t": mono(), "clip": clip,
+            "class": cls, "abort": plan, "audio_s": clip_s.get(clip)}
+    return clip, cls, plan, mark
+
+
+def _stream_exception_record(clip, cls, plan, e) -> dict:
+    return {"clip": clip, "class": cls, "audio_s": 0.0, "sends": [], "late_ms": [],
+            "events": [], "done_t": None, "t_start": mono(), "rejected": False,
+            "error": f"client: {type(e).__name__}: {e}",
+            "error_kind": "client_exception", "abort": plan}
+
+
+def _stream_backoff_s(rec: dict):
+    """Seconds to wait after a rejection (Retry-After, clamped), or None."""
+    if not rec["rejected"]:
+        return None
+    # honour Retry-After rather than hammering a full fleet (never a busy wait)
+    try:
+        back = float(rec["retry_after"])
+    except (TypeError, ValueError):
+        back = 0.25
+    return min(max(back, 0.05), 5.0)
 
 
 def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
@@ -601,12 +730,7 @@ def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
     harness must be counted, not turned into a silently dead stream."""
     stride = a.streams if stride is None else stride
     pcms = {}
-    clip_s = {}
-    for c in set(schedule):
-        try:
-            clip_s[c] = wav_audio_s(c)
-        except (OSError, EOFError, wave.Error, SystemExit):
-            clip_s[c] = None
+    clip_s = _stream_clip_lengths(schedule)
     deadline = a._t0 + a.duration if a.mode == "soak" else None
     k = 0
     reason = "repeat"
@@ -616,36 +740,303 @@ def stream_main(a, idx: int, schedule, classes_of, q, stride=None) -> None:
         if deadline is not None and mono() >= deadline:
             reason = "deadline"
             break
-        clip = schedule_clip(schedule, idx, k, stride)
-        cls = classes_of.get(clip, "n/a")
-        plan = fault_plan(a.abort_seed, a.abort_pct, idx, k, a.abort_method) \
-            if getattr(a, "abort_pct", 0) > 0 else None
-        # the plan rides on the start mark too, so an utterance that never reports (a
-        # dead or terminated stream) is still accounted against its planned abort; so
-        # does the clip's length, the most such an utterance can have sent
-        q.put({"_mark": "start", "stream": idx, "rep": k, "t": mono(), "clip": clip,
-               "class": cls, "abort": plan, "audio_s": clip_s.get(clip)})
+        clip, cls, plan, mark = _stream_next(a, idx, k, schedule, classes_of, stride, clip_s)
+        q.put(mark)
         try:
             if clip not in pcms:
                 pcms[clip] = load_pcm(clip)
             rec = run_utterance(a, clip, pcms[clip], cls, plan)
         except Exception as e:                       # noqa: BLE001 — counted, not raised
-            rec = {"clip": clip, "class": cls, "audio_s": 0.0, "sends": [], "late_ms": [],
-                   "events": [], "done_t": None, "t_start": mono(), "rejected": False,
-                   "error": f"client: {type(e).__name__}: {e}",
-                   "error_kind": "client_exception", "abort": plan}
+            rec = _stream_exception_record(clip, cls, plan, e)
         rec["stream"] = idx
         rec["rep"] = k
         q.put(rec)
         k += 1
-        if rec["rejected"]:
-            # honour Retry-After rather than hammering a full fleet (never a busy wait)
-            try:
-                back = float(rec["retry_after"])
-            except (TypeError, ValueError):
-                back = 0.25
-            time.sleep(min(max(back, 0.05), 5.0))
+        back = _stream_backoff_s(rec)
+        if back is not None:
+            time.sleep(back)
     q.put({"_mark": "end", "stream": idx, "t": mono(), "started": k, "reason": reason})
+
+# ---------------------------------------------------- many streams, one event loop (--mux)
+#
+# One process per stream costs a Python interpreter and a reader thread per stream: at
+# C=1024 that is a thousand processes competing with the server for the same CPU quota,
+# and at C=1536 the box refused to start a thread. `--mux N` runs N worker processes, each
+# an asyncio loop over raw non-blocking sockets driving its share of the streams (stream i
+# on worker i mod N). Same schedule, same frames, same marks, same records (the `_utt_*`
+# and `_stream_*` functions above); what changes is that a send can be late because the
+# loop was busy with another stream. That lateness is MEASURED, never assumed away: every
+# send's `late_ms` as before, plus a probe of the loop's own wake-up lag, both reported
+# under `summary.generator`.
+
+
+async def _aio(aw, timeout: float):
+    """`aw` bounded by `timeout`, failing the way a blocking socket's timeout fails."""
+    try:
+        return await asyncio.wait_for(aw, timeout)
+    except asyncio.TimeoutError:
+        raise socket.timeout("timed out") from None
+
+
+class _AioWS:
+    """A client WebSocket over a non-blocking socket: the bytes of `ws_frame`, the parse of
+    `ws_recv`, the timeouts of `socket.settimeout`."""
+
+    def __init__(self, loop, sock: socket.socket, buf: bytes = b""):
+        self.loop, self.sock, self.buf = loop, sock, bytearray(buf)
+
+    async def send(self, data: bytes, timeout: float) -> None:
+        try:
+            n = self.sock.send(data)               # the common case: the buffer has room
+        except (BlockingIOError, InterruptedError):
+            n = 0
+        if n < len(data):
+            await _aio(self.loop.sock_sendall(self.sock, memoryview(data)[n:]), timeout)
+
+    async def _fill(self, n: int, timeout: float) -> None:
+        while len(self.buf) < n:
+            part = await _aio(self.loop.sock_recv(self.sock, 65536), timeout)
+            if not part:
+                raise ConnectionError("connection closed")
+            self.buf += part
+
+    async def recv(self, timeout: float) -> "tuple[int, bytes]":
+        await self._fill(2, timeout)
+        opcode = self.buf[0] & 0x0F
+        plen = self.buf[1] & 0x7F
+        hl = 2
+        if plen == 126:
+            await self._fill(4, timeout)
+            plen = struct.unpack(">H", self.buf[2:4])[0]
+            hl = 4
+        elif plen == 127:
+            await self._fill(10, timeout)
+            plen = struct.unpack(">Q", self.buf[2:10])[0]
+            hl = 10
+        await self._fill(hl + plen, timeout)
+        payload = bytes(self.buf[hl:hl + plen])
+        del self.buf[:hl + plen]
+        return opcode, payload
+
+
+async def aws_connect(loop, addrs, host: str, port: int, path: str, timeout: float):
+    """`ws_connect` on a non-blocking socket: (sock|None, status, headers, early bytes).
+    `addrs` is getaddrinfo's answer, resolved once per worker (a resolver thread per
+    connect is what this mode exists to avoid); tried in order, as create_connection."""
+    if isinstance(addrs, OSError):
+        raise addrs
+    sock, err = None, None
+    for family, stype, proto, _, sa in addrs:
+        s = socket.socket(family, stype, proto)
+        s.setblocking(False)
+        try:
+            await _aio(loop.sock_connect(s, sa), timeout)
+            sock = s
+            break
+        except OSError as e:
+            err = e
+            s.close()
+    if sock is None:
+        raise err or OSError("getaddrinfo returned an empty list")
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        await _AioWS(loop, sock).send(ws_upgrade_request(host, port, path), timeout)
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            part = await _aio(loop.sock_recv(sock, 4096), timeout)
+            if not part:
+                break
+            resp += part
+    except BaseException:
+        sock.close()
+        raise
+    status, headers, rest = ws_parse_upgrade(resp)
+    if " 101 " not in status:
+        sock.close()
+        return None, status or "no response", headers, b""
+    return sock, status, headers, rest
+
+
+async def _stop_task(t) -> None:
+    """The reader is stopped: it records nothing after this (`stop.set()` of the thread)."""
+    if not t.done():
+        t.cancel()
+    try:
+        await t
+    except BaseException:                          # noqa: BLE001 — its result is the record
+        pass
+
+
+async def arun_utterance(a, clip: str, pcm: bytes, cls: str, plan, addrs) -> dict:
+    """`run_utterance` on the event loop, step for step."""
+    loop = asyncio.get_running_loop()
+    rec, pcm, point, frame_bytes, n_frames = _utt_begin(a, clip, pcm, cls, plan)
+    path = stream_path(a)
+    try:
+        sock, status, headers, early = await aws_connect(loop, addrs, a.host, a.port, path,
+                                                         a.connect_timeout)
+    except OSError as e:
+        _fail(rec, "connect_error", f"connect: {e}")
+        return rec
+    rec["status"] = status
+    if sock is None:
+        _utt_refused(rec, status, headers)
+        return rec
+
+    ws = _AioWS(loop, sock, early)
+    rto = _utt_reader_timeout(a, point)
+
+    async def reader() -> None:
+        try:
+            while True:
+                op, payload = await ws.recv(rto)
+                if _utt_on_frame(rec, op, payload, mono()):
+                    break
+        except OSError as e:                         # timeout, EOF, reset
+            _fail(rec, _kind_of_oserror(e), f"reader: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                       # noqa: BLE001 — recorded, not raised
+            _fail(rec, "client_exception", f"reader: {type(e).__name__}: {e}")
+
+    rt = loop.create_task(reader())
+    period = a.frame_ms / 1000.0 / a.pace
+    n_send = _utt_n_send(a, point, n_frames)
+    t0 = mono()
+    try:
+        for i in range(n_send):
+            due = t0 + i * period
+            now = mono()
+            if due > now:
+                await asyncio.sleep(due - now)     # the schedule, never a spin
+            await ws.send(ws_frame(0x2, pcm[i * frame_bytes:(i + 1) * frame_bytes]), rto)
+            _utt_sent(rec, i, frame_bytes, len(pcm), due, mono())
+        if point == "partial_frame" and not rec["error"]:
+            await ws.send(ws_frame_partial(0x2, pcm[n_send * frame_bytes:
+                                                    (n_send + 1) * frame_bytes]
+                                           or bytes(frame_bytes)), rto)
+        if point in M.ABORT_HANGUP:
+            if _mark_abort(rec):
+                await _stop_task(rt)
+                _hard_close(sock, plan["method"])
+                _set_aborted(rec)
+        elif point == "idle_open":
+            if _mark_abort(rec):
+                await asyncio.wait({rt}, timeout=a.abort_idle_max_s)
+                _utt_idle_verdict(rec, not rt.done())
+                await _stop_task(rt)
+                _utt_idle_aborted(rec)
+        else:
+            await ws.send(ws_frame(0x8, b""), rto)  # close = finalize, then `done`
+            if point == "during_finalization":
+                if _mark_abort(rec):
+                    await _stop_task(rt)
+                    _hard_close(sock, plan["method"])
+                    _set_aborted(rec)
+            else:
+                await asyncio.wait({rt}, timeout=a.done_timeout)
+                if not rt.done():
+                    _fail(rec, "timeout", "timeout waiting for done")
+    except OSError as e:
+        await asyncio.wait({rt}, timeout=0.5)      # let the reader name the cause first
+        _fail(rec, _kind_of_oserror(e), f"send: {e}")
+    finally:
+        await _stop_task(rt)
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return _utt_end(rec)
+
+
+async def astream_main(a, idx: int, schedule, classes_of, q, stride, clip_s, pcms,
+                       addrs) -> None:
+    """`stream_main` on the event loop: the same marks, records and back-off."""
+    deadline = a._t0 + a.duration if a.mode == "soak" else None
+    k = 0
+    reason = "repeat"
+    while True:
+        if a.mode == "wave" and k >= a.repeat:
+            break
+        if deadline is not None and mono() >= deadline:
+            reason = "deadline"
+            break
+        clip, cls, plan, mark = _stream_next(a, idx, k, schedule, classes_of, stride, clip_s)
+        q.put(mark)
+        try:
+            if clip not in pcms:
+                pcms[clip] = load_pcm(clip)
+            rec = await arun_utterance(a, clip, pcms[clip], cls, plan, addrs)
+        except Exception as e:                       # noqa: BLE001 — counted, not raised
+            rec = _stream_exception_record(clip, cls, plan, e)
+        rec["stream"] = idx
+        rec["rep"] = k
+        q.put(rec)
+        k += 1
+        back = _stream_backoff_s(rec)
+        if back is not None:
+            await asyncio.sleep(back)
+    q.put({"_mark": "end", "stream": idx, "t": mono(), "started": k, "reason": reason})
+
+
+LOOP_PROBE_S = 0.05
+
+
+def mux_main(a, wid: int, idxs, schedule, classes_of, q, stride) -> None:
+    """One `--mux` worker: the streams `idxs` on one event loop, plus a probe that measures
+    how late the loop wakes up (what every stream on it may lose, on sends AND on receive
+    stamps). The probe's samples go to the parent as a `gen` mark."""
+    clip_s = _stream_clip_lengths(schedule)
+    pcms = {}
+    try:
+        addrs = socket.getaddrinfo(a.host, a.port, 0, socket.SOCK_STREAM)
+    except OSError as e:
+        addrs = e                                  # every connect fails with it, counted
+
+    async def probe(lags, done) -> None:
+        while not done.is_set():
+            t = mono()
+            await asyncio.sleep(LOOP_PROBE_S)
+            lags.append(round((mono() - t - LOOP_PROBE_S) * 1000.0, 3))
+
+    async def run() -> None:
+        lags, done = [], asyncio.Event()
+        pt = asyncio.get_running_loop().create_task(probe(lags, done))
+        await asyncio.gather(*(astream_main(a, i, schedule, classes_of, q, stride, clip_s,
+                                            pcms, addrs) for i in idxs))
+        done.set()
+        await _stop_task(pt)
+        q.put({"_mark": "gen", "worker": wid, "streams": len(idxs), "loop_lag_ms": lags,
+               "t": mono()})
+
+    asyncio.run(run())
+
+
+def generator_report(records, gens, cpu, wall, mode, workers, frame_ms) -> dict:
+    """The load generator's own account: how late its sends were against their schedule
+    (every frame of every utterance, pooled), how late its event loops woke up, and the
+    CPU it burned. A lag the server did not cause shows up here first."""
+    late = [x for r in records for x in (r.get("late_ms") or [])]
+    lags = [x for g in gens for x in (g.get("loop_lag_ms") or [])]
+
+    def dist(xs):
+        if not xs:
+            return {"n": 0, "p50": None, "p95": None, "p99": None, "max": None}
+        return {"n": len(xs), "p50": M.pct(xs, 50), "p95": M.pct(xs, 95),
+                "p99": M.pct(xs, 99), "max": max(xs)}
+    out = {"mode": mode, "workers": workers,
+           "send_late_ms": dict(dist(late), over_half_frame=sum(
+               1 for x in late if x > frame_ms / 2.0)),
+           "loop_lag_ms": dist(lags) if mode == "mux" else None,
+           "cpu_s": cpu, "wall_s": wall,
+           "cores": round(cpu["total"] / wall, 3) if wall > 0 else None}
+    return out
+
+
+def _fmt_dist(d) -> str:
+    if not d or not d.get("n"):
+        return "n/a"
+    return f"{d['p50']:.2f}/{d['p95']:.2f}/{d['max']:.1f}"
 
 # ------------------------------------------------------------------------------- manifest
 
@@ -901,7 +1292,7 @@ def _fake_ws_server():
     return port, srv.close
 
 
-def _self_test_faults(check, port) -> None:
+def _self_test_faults(check, port, mux=0) -> None:
     """Fault injection: the plan is deterministic and spread, and a short soak with half of
     its utterances aborted accounts every abort at its point, keeps conservation, leaves
     the healthy utterances OK, and matches the fake server's books, sessions and audio.
@@ -935,7 +1326,8 @@ def _self_test_faults(check, port) -> None:
     check({x["method"] for x in only if x} == {"rst", "idle"}, "--abort-method rst: no FIN")
 
     n_streams, dur = 4, 9
-    print(f"fault soak: {n_streams} streams, {dur} s, 50% aborted, against the fake server")
+    print(f"fault soak: {n_streams} streams, {dur} s, 50% aborted, against the fake server"
+          + (f" (--mux {mux})" if mux else ""))
     tmp = tempfile.mkdtemp(prefix="stream_load_selftest_")
     clips = []
     for j, secs in enumerate((1.0, 1.2, 1.4)):
@@ -951,7 +1343,8 @@ def _self_test_faults(check, port) -> None:
            "--streams", str(n_streams), "--duration", str(dur), "--warmup", "0",
            "--window", "2", "--bank", "short", "--host", "127.0.0.1", "--port", str(port),
            "--lang", "soak", "--done-timeout", "5", "--abort-pct", "50",
-           "--abort-seed", "11", "--abort-idle-max-s", "3", "--json", out, "--clips"] + clips
+           "--abort-seed", "11", "--abort-idle-max-s", "3", "--mux", str(mux),
+           "--json", out, "--clips"] + clips
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if not os.path.exists(out):
         check(False, f"the soak wrote its JSON (exit {r.returncode}): {r.stderr[-400:]}")
@@ -1028,6 +1421,14 @@ def _self_test_faults(check, port) -> None:
     # The exit code is not what this checks: a slow runner that cannot pace at 1x makes
     # the run INVALID (exit 2; seen on the macOS CI runner) while the fault section is
     # printed all the same. What must hold is that the report runs to its end.
+    g = s.get("generator") or {}
+    check(g.get("mode") == ("mux" if mux else "process")
+          and g.get("send_late_ms", {}).get("n", 0) > 0 and g.get("cpu_s", {}).get("workers", 0) > 0
+          and (g.get("loop_lag_ms") or {}).get("n", 0 if not mux else -1) != -1
+          and ((g.get("loop_lag_ms") or {}).get("n", 0) > 0) == bool(mux),
+          f"the generator reports its mode, send lateness, CPU and (mux) loop lag: "
+          f"{g.get('mode')} late {g.get('send_late_ms', {}).get('n')} sends, "
+          f"cpu {g.get('cpu_s')}")
     check(r.returncode in (0, 1, 2) and "fault injection:" in r.stdout
           and "residual model work:" in r.stdout,
           f"the report prints the fault section (exit {r.returncode}"
@@ -1077,6 +1478,16 @@ def self_test() -> int:
         abort_idle_max_s = 3.0
     A.port = port
     pcm = b"\x00\x00" * 4800                        # 0.3 s: three frames
+    print("framing: the integer mask is the per-byte mask of RFC 6455")
+    for n in (0, 1, 3, 4, 5, 125, 3200, 70000):
+        pl, mk = os.urandom(n), os.urandom(4)
+        check(_ws_mask(pl, mk) == bytes(b ^ mk[i % 4] for i, b in enumerate(pl)),
+              f"mask of {n} bytes")
+
+    def via_loop(a, clip, pcm_, cls, plan=None):
+        addrs = socket.getaddrinfo(a.host, a.port, 0, socket.SOCK_STREAM)
+        return asyncio.run(arun_utterance(a, clip, pcm_, cls, plan, addrs))
+
     for scen, want in (("done", None), ("close", "server_disconnect"),
                        ("close_silent", "server_disconnect"),
                        ("close_early", "server_disconnect"), ("eof", "server_disconnect"),
@@ -1088,6 +1499,15 @@ def self_test() -> int:
         got = M.outcome(u)
         check(got == (want or "ok") and (want is None) == (rec["error"] is None),
               f"{scen:<13} -> {got:<17} error={rec['error']!r}")
+        arec = via_loop(A, "x.wav", pcm, "short")
+        agot = M.outcome(M.analyze_utterance(arec, frame_ms=100, pace=1.0))
+        same = (agot == got and arec["error_kind"] == rec["error_kind"]
+                and len(arec["sends"]) == len(rec["sends"])
+                and [e["type"] for e in arec["events"]] == [e["type"] for e in rec["events"]]
+                and [e["text"] for e in arec["events"]] == [e["text"] for e in rec["events"]]
+                and set(arec) == set(rec))
+        check(same, f"{scen:<13}    event loop: the same record ({agot}, "
+                    f"error={arec['error']!r})")
         if scen in ("close", "close_silent", "close_early"):
             # the planted fault of AUDIT gap 1: before 2026-09-25 the reader broke on the
             # close frame without recording anything, and `aggregate` counted these OK
@@ -1103,6 +1523,10 @@ def self_test() -> int:
     # a statement, not `bad += ...`: `check` counts into `bad` itself, and an augmented
     # assignment would read `bad` BEFORE the call and overwrite what the call counted
     _self_test_faults(check, port)
+    # the event-loop transport, against a fresh fake server (its books are absolute)
+    port2, close2 = _fake_ws_server()
+    _self_test_faults(check, port2, mux=2)
+    close2()
     close()
     # A port nobody listens on. NOT the fake server's own port: on Linux the stream
     # processes are forked and inherit its listening socket, so a straggler can keep
@@ -1114,6 +1538,8 @@ def self_test() -> int:
     A.lang = "done"
     rec = run_utterance(A, "x.wav", pcm, "short")
     check(M.outcome(rec) == "connect_error", f"closed port  -> {M.outcome(rec)}")
+    rec = via_loop(A, "x.wav", pcm, "short")
+    check(M.outcome(rec) == "connect_error", f"closed port  -> {M.outcome(rec)} (event loop)")
 
     print(f"\nstream_load self-test: {'FAIL' if bad else 'PASS'} ({bad} failures)")
     return 1 if bad else 0
@@ -1139,6 +1565,11 @@ def build_args():
     ap.add_argument("--repeat", type=int, default=1, help="WAVE: utterances per stream, back to back")
     ap.add_argument("--connect-timeout", type=float, default=10.0)
     ap.add_argument("--done-timeout", type=float, default=60.0)
+    ap.add_argument("--mux", type=int, default=0, metavar="N",
+                    help="N worker processes, each an event loop multiplexing its share of "
+                         "the streams (stream i on worker i mod N); 0 (default) = one process "
+                         "per stream. Same schedule, frames and records; the generator's own "
+                         "lateness is reported under summary.generator either way")
     ap.add_argument("--json", help="write the manifest, the summary and every utterance here")
     ap.add_argument("--reference", help="JSON {clip: expected_text}; mismatches invalidate the run")
     ap.add_argument("--keep-events", type=int, default=0, metavar="N",
@@ -1202,6 +1633,8 @@ def main() -> int:
         raise SystemExit("--abort-pct is a percentage, 0..100")
     if a.abort_seed is None:
         a.abort_seed = a.seed
+    if a.mux < 0:
+        raise SystemExit("--mux is a worker count, >= 0 (0 = one process per stream)")
     try:
         b0, b1 = (float(x) for x in a.class_bounds.split(","))
     except ValueError:
@@ -1239,15 +1672,26 @@ def main() -> int:
     thr["marginal_factor"] = a.marginal_factor
 
     health_before = health(a.host, a.port)
+    ru0 = (resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN))
     a._t0 = mono()
     q: mp.Queue = mp.Queue()
-    procs = [mp.Process(target=stream_main, args=(a, i, schedule, classes_of, q, stride),
-                        daemon=True)
-             for i in range(a.streams)]
+    if a.mux:
+        n_workers = min(a.mux, a.streams)
+        procs = [mp.Process(target=mux_main,
+                            args=(a, w, list(range(w, a.streams, n_workers)), schedule,
+                                  classes_of, q, stride), daemon=True)
+                 for w in range(n_workers)]
+        proc_of = {i: i % n_workers for i in range(a.streams)}
+    else:
+        n_workers = a.streams
+        procs = [mp.Process(target=stream_main, args=(a, i, schedule, classes_of, q, stride),
+                            daemon=True)
+                 for i in range(a.streams)]
+        proc_of = {i: i for i in range(a.streams)}
     for p in procs:
         p.start()
 
-    records, starts, ends = [], [], {}
+    records, starts, ends, gens = [], [], {}, []
 
     def take(msg) -> None:
         mark = msg.get("_mark") if isinstance(msg, dict) else None
@@ -1255,6 +1699,8 @@ def main() -> int:
             starts.append(msg)
         elif mark == "end":
             ends[msg["stream"]] = msg
+        elif mark == "gen":
+            gens.append(msg)
         else:
             records.append(msg)
 
@@ -1286,13 +1732,21 @@ def main() -> int:
         except Exception:                           # noqa: BLE001
             break
     wall = mono() - a._t0
+    ru1 = (resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN))
+    # user + system CPU of the parent and of the joined stream/worker processes
+    used = [sum(getattr(r1, f) - getattr(r0, f) for f in ("ru_utime", "ru_stime"))
+            for r0, r1 in zip(ru0, ru1)]
+    cpu = {"parent": round(used[0], 3), "workers": round(used[1], 3),
+           "total": round(used[0] + used[1], 3)}
 
     # Reconcile the marks with the records: every started utterance ends in exactly one
-    # outcome, and every stream is accounted for (streaming_metrics.reconcile).
+    # outcome, and every stream is accounted for (streaming_metrics.reconcile). In --mux a
+    # stream is `terminated` when its worker was, and it had not reported its end mark.
     status = {i: {"end_t": (ends.get(i) or {}).get("t"),
                   "started": (ends.get(i) or {}).get("started"),
-                  "exitcode": p.exitcode, "terminated": i in terminated}
-              for i, p in enumerate(procs)}
+                  "exitcode": procs[proc_of[i]].exitcode,
+                  "terminated": proc_of[i] in terminated and i not in ends}
+              for i in range(a.streams)}
     longest = max((d for v in bank.values() for _, d in v), default=0.0)
     # "one utterance" of tolerance: the longest clip at this pace, plus the longest
     # Retry-After sleep a rejected stream takes before it looks at the clock again
@@ -1305,6 +1759,8 @@ def main() -> int:
         deadline=(a._t0 + a.duration) if a.mode == "soak" else None,
         tol_s=tol_s, repeat=a.repeat if a.mode == "wave" else None)
     records.extend(synth)
+    gen = generator_report(records, gens, cpu, wall, "mux" if a.mux else "process",
+                           n_workers, a.frame_ms)
     if a.abort_pct > 0:
         # the aborted sessions are cancelled server-side within a step; wait for the
         # slots to come back before reading the counters the cross-check compares
@@ -1350,6 +1806,7 @@ def main() -> int:
                           streams=streams_report)
     if expected is not None and n_reported < expected:
         summary["counts"]["missing"] = expected - n_reported
+    summary["generator"] = gen
     if summary.get("faults"):
         summary["faults"]["server"] = server_crosscheck(health_before, health_after, summary,
                                                         chunk_ms=chunk_ms)
@@ -1363,7 +1820,9 @@ def main() -> int:
         "client_host": platform.node(), "client_platform": platform.platform(),
         "python": platform.python_version(), "tree": git_rev(),
         "server_url": f"http://{a.host}:{a.port}", "mode": a.mode.upper(),
-        "concurrency": a.streams, "repeat": a.repeat if a.mode == "wave" else None,
+        "concurrency": a.streams,
+        "load_generator": {"mode": gen["mode"], "workers": n_workers},
+        "repeat": a.repeat if a.mode == "wave" else None,
         "duration_s": a.duration if a.mode == "soak" else None,
         "warmup_s": warmup, "window_s": window,
         "bank": {k: [{"clip": c, "audio_s": round(d, 3), "sha256": sha256(c)} for c, d in v]
@@ -1401,6 +1860,12 @@ def main() -> int:
             f"{k}:{len(v)}" for k, v in manifest["bank"].items()))
     print(f"  wall {wall:.1f} s")
     print(M.format_summary(summary, env, indent="  "))
+    print(f"  generator: {gen['mode']} x{n_workers}  cpu {cpu['total']:.1f} s "
+          f"({gen['cores'] or 0:.2f} cores; workers {cpu['workers']:.1f}, parent "
+          f"{cpu['parent']:.1f})  send lateness p50/p95/max ms "
+          f"{_fmt_dist(gen['send_late_ms'])} ({gen['send_late_ms']['over_half_frame']} over "
+          f"half a frame)" + (f"  loop lag p50/p95/max ms {_fmt_dist(gen['loop_lag_ms'])}"
+                              if gen["loop_lag_ms"] else ""))
     for name, d in sorted(summary.get("drift", {}).items()):
         if name != "emission_lag_ms" or not d.get("windows"):
             continue
