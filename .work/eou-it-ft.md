@@ -92,7 +92,7 @@ Fixes needed before the first step ran: tokenizer paths in the model cfg
 | eou-it-5h-e52 (cold) | trainable | reinitialised | 1e-3, 3e-4 | 2987 | 404 -> ~10 | 100 / 100 (all empty) | 0 |
 | eou-it-5h-e52-warm | trainable | stock | 1e-3, 3e-4 | stopped at ~1600 | | in-loop VAL 100 / 100 at 1000 and 1500 | 0 |
 | eou-it-5h-e26-frz (cold) | FROZEN | reinitialised | 1e-3, - | 1494 | ~119 at 1200 | 99.57 / 99.69 (VAL 98 at 500 -> 99 at 1000) | 0 |
-| eou-it-5h-e26-frz-warm | FROZEN | stock | 1e-3, - | 1494 | (see below) | | |
+| eou-it-5h-e26-frz-warm | FROZEN | stock | 1e-3, - | 1494 | 441 (50) -> 179 (500) -> 187 (1000) -> 154 (1450) | 100 / 100: no text token at 500 already; EOU rate 0.72/0.83 at 500 -> 0.03/0.12 at the end | decays to ~0 |
 
 Diagnostics on the cold checkpoint (`blankdiag.py`, `batchprobe.py`, CPU):
 - greedy empty on TRAIN and eval clips; max(non-blank) - blank < 0 on every
@@ -129,3 +129,11 @@ padding distribution vs the NVIDIA recipe's actual settings.
    check (different audio -> different hypotheses).
 4. Only then 5 h -> 20 h, and EOU-aware second stage (incomplete-utterance
    negatives, backchannels) per the NVIDIA recipe.
+
+Reading of the last arm (frozen stock encoder + stock decoder/joint, i.e.
+starting from a model that decodes): the training loop first switches off
+EVERY text token (at step 500 the model emits only <EOU>), then <EOU> too,
+until only blank remains. With the encoder untouched and a working start,
+this is near-causal evidence that the TRAINING RECIPE drives the RNNT to the
+blank solution (suspects above), not the language transfer or the
+initialisation. Stopped here for the session, per the stop/go rule.

@@ -47,3 +47,27 @@ All performance numbers are L40S; the L4 rerun is owed.
    (in-domain CER 7 %), the decoder still learns the language.
 4. EOU 120M -> Italian did NOT work tonight: see the EOU section; the failure
    is isolated to the training recipe, reproducible, and archived.
+
+## EOU 120M -> Italian: what happened
+
+Four arms on MLS-it 5 h (cold/warm decoder+joint x trainable/frozen encoder),
+lr 1e-3 on decoder/joint, the NVIDIA EOU recipe's padding (3-6 s, p 0.9) and
+FastEmit 0.03: all end at WER ~100 with empty greedy output. Diagnostics
+(`.work/eou-it-ft.md`): the objective converges while the RNNT becomes an
+audio-independent text prior (beam-4 returns the same sentence for every
+input, blank wins every frame); a real batch is sane; freezing the encoder
+does not help; starting from the working stock model with a frozen encoder,
+the loop removes text tokens first and <EOU> next. The recipe/optimisation
+is the cause; the next session starts with a micro-overfit and a
+one-variable-at-a-time ablation ladder (documented), not with a bigger run.
+Training economics measured: ~1,190 audio-h per GPU-h with the full encoder
+(16.9-17.3 GB peak), ~2,050 frozen (8.1 GB, fits an L4).
+
+## Is EOU-120M a credible base for cheap per-language streaming specialists?
+
+Not yet answered. As a SERVING base it is excellent (CUDA parity incl. EOU,
+~2x Nemotron's sessions, 1.9 GiB idle). As a FINE-TUNING base, tonight's
+recipe failed for a reason isolated to the training loop, not to the model;
+the acoustic side is not the limit (Canary's encoder of the same family
+transferred to Italian at 7 % in-domain CER). The answer needs the ablation
+ladder (one evening of GPU at most, given ~0.1 GPU-h per 5 h run).
