@@ -3,6 +3,12 @@
 
     cd tools && uv run python fetch_eval_bank.py --dry-run
     cd tools && uv run python fetch_eval_bank.py --n 200
+    cd tools && uv run python fetch_eval_bank.py --n 200 --langs de,es,it \
+        --out ../samples/eval-bank-xl
+
+The manifest is rewritten with exactly the languages of the run, so a DE/ES/IT
+fetch goes to its own --out: pointing it at the EN/FR bank would replace that
+bank's manifest.
 
 WHY.  `samples/` holds 2 French and 2 short English utterances. That is a
 DIAGNOSTIC corpus: it has told us a great deal about mechanisms, and it cannot
@@ -40,7 +46,11 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = "https://huggingface.co/datasets/google/fleurs/resolve/main/data"
 CACHE = Path("/tmp/fleurs-eval")
 SR = 16000
-LANGS = {"en": "en_us", "fr": "fr_fr"}
+# FLEURS config names (google/fleurs on the Hub). EN/FR are the default bank;
+# DE/ES/IT are fetched only when asked for (--langs de,es,it), so the default run
+# and its manifest are unchanged. Spanish in FLEURS is Latin-American (es_419):
+# there is no es_es config.
+LANGS = {"en": "en_us", "fr": "fr_fr", "de": "de_de", "es": "es_419", "it": "it_it"}
 
 
 def load_records(cfg, split):
@@ -97,7 +107,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n", type=int, default=200, help="utterances per language")
     ap.add_argument("--split", default="test")
-    ap.add_argument("--langs", default="en,fr")
+    ap.add_argument("--langs", default="en,fr",
+                    help=f"comma list from {','.join(LANGS)}; default en,fr")
     ap.add_argument("--out", default=str(ROOT / "samples" / "eval-bank"))
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
