@@ -472,3 +472,25 @@ on this audio (the card's 160 ms p50 is on TTS dialogue audio). Levers for it:
 endpointing data in FT, or an external VAD/silence policy; not kernels.
 Implication for FT: random gain augmentation (the MLS-it pool sits at peak
 p50 -7 dBFS, clean levels).
+
+### l2: multiplexed load generator + EOU beyond C1024 (2026-10-09, `.work/lightweight-asr/jobs/l2.sh`)
+
+Same method as l1; `stream_load.py --mux 16` (lw-async-load) where marked.
+
+| run | C | lag p95 | final p95 | worst window p95 | RSS growth | audio/wall | SM % busy | W mean | verdict (own bound) |
+|---|---|---|---|---|---|---|---|---|---|
+| EOU, old generator | 1024 | 158 ms | 218 ms | 172 ms | 1.172x | 764x | 30.5 | 152 | NOT (drift, RSS) |
+| EOU, mux 16 | 1024 | 161 ms | 218 ms | 173 ms | 1.157x | 765x | 30.8 | 111 | NOT (lag by 1 ms, drift, RSS) |
+| EOU, mux 16 | 1536 | 301 ms | 409 ms | 305 ms | 1.103x | 1135x | 42.7 | 141 | NOT (lag, drift vs 160) |
+| EOU, mux 16 | 2048 | 19380 ms | 24152 ms | 21144 ms | 1.095x | 727x | 40.2 | 127 | NOT (collapse) |
+| Nemotron, mux 16 | 1024 | 505 ms | 759 ms | 547 ms | 1.049x | 721x | 56.7 | 186 | NOT (lag, final, drift) |
+
+- The generator was NOT the limit at C1024: old and mux agree within 3 ms on
+  every latency; l1's C1024 readings stand, and the EOU's RSS growth at C1024
+  is the server's (to be looked at in the audit).
+- EOU knee between C1536 and C2048, reached with the GPU at ~40 % busy SM:
+  host/scheduler-bound, the first target of the 3b audit.
+- Against a COMMON 320 ms lag bound: Nemotron's last passing rung is C768
+  (C1024 = 505 ms); the EOU stays under it up to C1536 (301 ms; one window at
+  305 ms, finalisation 409 ms < 500) -> about 2x the sessions on this L40S,
+  with idle VRAM 1.9 vs 6.9 GiB. Screens, not soaks; L4 rerun owed.
