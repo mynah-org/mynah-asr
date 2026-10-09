@@ -403,3 +403,32 @@ levels, leading silence: to be probed, not assumed).
 - CPU server vs CUDA server WebSocket frames on A+1 s+B: **identical**, eou
   frames `{"source":"model","t":7.69}` and `{"t":20.28}`.
 
+
+### l1: first concurrency screen, CUDA server, L40S (2026-10-09, build aabc16f)
+
+`.work/lightweight-asr/jobs/l1.sh`: gpu_qualify ladder, 150 s rungs, fresh
+server per rung, PR #4 defaults (bf16 own-tc, stage-ahead, graphs, warm-up,
+host threads), cohort 40 ms, server on CPUs 0-31,64-95, generator on
+32-63,96-127, stress-en 498 (seed 42), judged against the q2 unloaded
+references; EOU cap 2048 lookahead 1, Nemotron cap 1024 lookahead 3, lang auto.
+Same C side by side (absolute numbers; the bounds differ: EOU 160 ms,
+Nemotron 320 ms, i.e. (lookahead+1) x 80):
+
+| C | model | verdict (own bound) | lag p95 | final p95 | worst window p95 | SM % busy | W mean | RSS growth | audio/wall |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 | Nemotron 0.6B | QUALIFIED | 56 ms | 64 ms | 56 ms | 34.6 | 151 | 1.033x | 389x |
+| 512 | EOU 120M | QUALIFIED | 48 ms | 54 ms | 49 ms | 19.5 | 107 | 1.058x | 390x |
+| 768 | Nemotron 0.6B | QUALIFIED | 106 ms | 125 ms | 116 ms | 44.3 | 170 | 1.050x | 573x |
+| 1024 | Nemotron 0.6B | NOT (lag, final, drift) | 542 ms | 796 ms | 562 ms | 55.7 | 184 (sw_power_cap) | 1.059x | 716x |
+| 1024 | EOU 120M | NOT (drift 176 > 160; RSS 1.177x > 1.15x) | 148 ms | 218 ms | 176 ms | 31.2 | 148 | 1.177x | 764x |
+
+Every rung: 0 errors, 0 rejected, 498/498 transcripts identical to the
+unloaded reference. EOU C1536/C2048 NOT MEASURED: the load generator died
+(`RuntimeError: can't start new thread`; stream_load.py is one process + one
+reader thread per stream). The container CPU quota (~30.7) is SHARED by the
+server and ~C generator processes, so the C1024 rungs of both models may be
+partly generator-limited: a multiplexed generator (lw-async-load) and an A/B
+against the old one come before any C >= 1024 claim.
+Reading: at C1024 the EOU's lag is 3.7x lower than Nemotron's at ~0.56x the
+busy SM and -36 W; the GPU cost ratio (~1.8x) is far below the parameter
+ratio, which is what the 3b perf audit is for. Screens, not soaks.
