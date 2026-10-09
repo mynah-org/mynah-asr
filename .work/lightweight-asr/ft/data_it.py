@@ -75,8 +75,18 @@ def curl(url, dst, timeout_s=3600):
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    subprocess.run(["curl", "-fsSL", "--retry", "5", "--max-time", str(timeout_s), "-C", "-", "-o", str(tmp), url],
-                   check=True)
+    # HTTP/1.1 and an outer retry: the Hub's HTTP/2 streams were seen cancelled
+    # mid-transfer (curl exit 92), which --retry does not cover; -C - resumes.
+    cmd = ["curl", "-fsSL", "--http1.1", "--retry", "8", "--retry-all-errors", "--max-time", str(timeout_s),
+           "-C", "-", "-o", str(tmp), url]
+    for attempt in range(5):
+        r = subprocess.run(cmd)
+        if r.returncode == 0:
+            break
+        print(f"curl rc={r.returncode} on {url} (attempt {attempt + 1}/5), resuming", flush=True)
+        time.sleep(10 * (attempt + 1))
+    else:
+        raise subprocess.CalledProcessError(r.returncode, cmd)
     os.replace(tmp, dst)
 
 
