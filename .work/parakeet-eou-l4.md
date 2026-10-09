@@ -326,8 +326,27 @@ streaming_metrics normaliser; bank: tools/fetch_eval_bank.py --n 200).
 | Nemotron, lang en | 0.1155 | 0.0863 | 0.0685 | 0.1160 | 373 / 60 / 97 | 0 % |
 | Nemotron, lang auto | 0.1227 | 0.0985 | 0.0738 | 0.1237 | 377 / 93 / 95 | 0.5 % |
 
-(The mean WER of the EOU arm excludes nothing: an empty transcript is WER 1;
-the mean is lower than the pooled number because the empty clips are short.)
+CORRECTION (same day): lang_gate's "WER mean" is over NON-EMPTY transcripts
+only; the empty ones are counted in "empty" and in the pooled WER. So 0.1607
+is already the EOU's WER on the 160 clips it accepted; with the blanks the
+pooled WER is 0.3014.
+
+Diagnostic, NOT a headline (conditioning on the model's own acceptance is
+cherry-picking): the SAME 160 clips the EOU accepted, every model scored on
+them:
+
+| same 160 clips | WER | WER* | CER |
+|---|---|---|---|
+| EOU 120M | 0.1607 | 0.1383 | 0.1194 |
+| Nemotron, lang en | 0.1074 | 0.0792 | 0.0640 |
+| Nemotron, lang auto | 0.1103 | 0.0821 | 0.0648 |
+| Canary 180M (offline) | 0.0964 | 0.0673 | 0.0674 |
+
+Paired against Nemotron (lang en) on those 160: EOU better on 29, worse on
+71, tied on 60. The 40 blank clips are not hard audio (Nemotron 0.148,
+Canary 0.100 on them) and are shorter (7.4 s mean vs 11.0 s). Reading: BOTH
+a high catastrophic-blank rate AND lower quality when it does transcribe
+(CER nearly 2x Nemotron's) on this bank. Both matter for what an FT can fix.
 
 ### NeMo reference parity (gate 6 against the reference implementation)
 
