@@ -15,6 +15,7 @@ extern "C" {
 #include "../asr_engine.h"
 #include "../pack.h"
 }
+#include "../../src/mynah_asr.h"   /* MYNAH_ASR_EOU_* */
 #include "kernels.cuh"
 
 #include <cublas_v2.h>
@@ -58,6 +59,8 @@ struct pass_lane {
     int slot, n_mel, first, last, q;
     double t1;                  /* audio fed when the chunk was taken: the delta's t1 */
     int fin;                    /* this chunk ends the utterance */
+    long mel_end;               /* mel frames of the slot's stream up to the end of
+                                   this chunk: places a model <EOU> in time */
 };
 
 /* one encoder pass: its lanes, its counts, and how it launches */
@@ -113,6 +116,11 @@ struct cuda_engine {
      * as src/encoder.c (mynah_asr_encoder_post_scratch) does: no prompt weights,
      * no cat/mid/fused scratch, no prompt GEMMs, and the slots carry prompt -1. */
     int has_prompt = 0;
+    /* the model's own end of utterance (<EOU>/<EOB> in the pack's vocabulary,
+     * src/tokenizer.h mynah_asr_eou_ids): -1 = absent, and then nothing below
+     * that reads them runs (no tok_frame download, no reset) */
+    int eou_id = -1, eob_id = -1;
+    int *h_tok_frame = nullptr; /* pinned, only with eou_id/eob_id */
     float *d_emb = nullptr, *d_wih[MYNAH_ASR_MAX_PRED_LAYERS] = {}, *d_whh[MYNAH_ASR_MAX_PRED_LAYERS] = {},
           *d_bsum[MYNAH_ASR_MAX_PRED_LAYERS] = {}, *d_proj_w = nullptr, *d_proj_b = nullptr,
           *d_head_w = nullptr, *d_head_b = nullptr;
@@ -470,6 +478,8 @@ static int alloc_scratch(cuda_engine *e) {
     for (auto &p : e->passes) p.lanes.reserve(B);
     CK(e, "pinned tok", cudaHostAlloc((void **)&e->h_tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
     CK(e, "pinned meta", cudaHostAlloc((void **)&e->h_meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaHostAllocPortable));
+    if (e->eou_id >= 0 || e->eob_id >= 0)
+        CK(e, "pinned tok frame", cudaHostAlloc((void **)&e->h_tok_frame, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
     return 0;
 }
 
@@ -741,6 +751,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         if (s + 1 < GPU_SS_STAGES) dm.F[s + 1] = dm.Fo[s];
     }
     e->has_prompt = enc.prompt_l1_w != nullptr;
+    mynah_asr_eou_ids(&e->pack.tok, e->pack.dec.vocab, e->pack.dec.blank, &e->eou_id, &e->eob_id);
     dm.dout = enc.d_out; dm.np = e->has_prompt ? enc.num_prompts : 0; dm.inter = e->has_prompt ? enc.prompt_inter : 0;
     dm.V = e->pack.dec.vocab; dm.Hdec = e->pack.dec.hidden; dm.pred_layers = e->pack.dec.n_layers;
     dm.blank = e->pack.dec.blank; dm.max_symbols = e->pack.dec.max_symbols;
@@ -804,6 +815,7 @@ static void cuda_close(cuda_engine *e) {
     if (e->h_resets) cudaFreeHost(e->h_resets);
     if (e->h_tok) cudaFreeHost(e->h_tok);
     if (e->h_meta) cudaFreeHost(e->h_meta);
+    if (e->h_tok_frame) cudaFreeHost(e->h_tok_frame);
     asr_pack_close(&e->pack);
     cudaDeviceReset();
     delete e;
@@ -1096,6 +1108,7 @@ static void pass_stage(cuda_engine *e, int p, const asr_step_req *reqs) {
         if (s.mel_have > 0)
             memmove(s.mel_buf, s.mel_buf + (size_t)l.n_mel * nm, (size_t)s.mel_have * nm * sizeof(float));
         s.first = 0;
+        l.mel_end = s.mel.next_frame - (long)s.mel_have;
         l.t1 = (double)s.samples_fed / (double)e->pack.feat.sample_rate;
         l.fin = l.last || (reqs[l.req].finalize && s.mel_finished && s.mel_have == 0);
         if (l.fin) s.finished = 1;
@@ -1144,6 +1157,34 @@ static int pass_launch(cuda_engine *e, int p) {
 
 /* the label loop of pass p (its encoder enqueued), the D2H, the wait, and the
  * host half: detokenise each lane into outs */
+/* The model's end of utterance, as the CPU library's stream_model_eou: when
+ * the lane's tokens hold <EOU>/<EOB>, report it on the step's output with
+ * the end of the encoder frame that emitted it, and queue a reset of the
+ * slot's MODEL state -- K/V ring, conv and subsampling caches, predictor at
+ * SOS (k_slots_reset, applied at the next submit, before any later chunk of
+ * this slot) -- with the host side untouched: mel stream, chunk cadence
+ * (s.first stays 0: a steady chunk over zeroed caches, as
+ * mynah_asr_enc_stream_reset_keep_cadence), text and time base go on.
+ * The emitting frame k is the token's tok_frame minus the slot's t_abs, both
+ * read after the encoder advanced t_abs by q (kv_advance_kernel), i.e. k is
+ * the label loop's dec_t at the emission. */
+static void cuda_model_eou(cuda_engine *e, const pass_lane &l, const int *tok, int ntok, asr_step_out &o) {
+    const int *fr = e->h_tok_frame + (size_t)l.slot * e->ar.tok_cap;
+    int hit = -1, kind = 0;
+    for (int i = 0; i < ntok && hit < 0; i++) {
+        if (tok[i] == e->eou_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL; }
+        else if (tok[i] == e->eob_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL_BACKCHANNEL; }
+    }
+    if (hit < 0) return;
+    const int k = (int)((long long)fr[hit] - e->h_meta[l.slot].t_abs);
+    long mel_end = l.mel_end - (long)(l.q - 1 - k) * e->pack.enc.ss.sub_factor;
+    if (mel_end < 0) mel_end = 0;
+    o.eou = kind;
+    o.eou_t = (double)mel_end * (double)e->pack.feat.hop_length / (double)e->pack.feat.sample_rate;
+    slot_host &s = e->slots[(size_t)l.slot];
+    if (!s.reset_pending) { s.reset_pending = 1; e->pending_resets.push_back(l.slot); }
+}
+
 static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     const gpu_model_dims &dm = e->dm;
     const pass_rec &ps = e->passes[(size_t)p];
@@ -1186,6 +1227,8 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     prof_mark(e, PS_D2H);
     CK(e, "d2h tok", cudaMemcpyAsync(e->h_tok, e->ar.tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     CK(e, "d2h meta", cudaMemcpyAsync(e->h_meta, e->ar.meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaMemcpyDeviceToHost, e->stream));
+    if (e->h_tok_frame)
+        CK(e, "d2h tok frame", cudaMemcpyAsync(e->h_tok_frame, e->ar.tok_frame, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     prof_mark(e, PS_OTHER);
     hp = hp_lap(e, ASR_HP_DEC_LAUNCH, hp);
     CK(e, "sync", cudaStreamSynchronize(e->stream));
@@ -1218,6 +1261,7 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
             o.text = ""; o.t0 = s.emitted_t1; o.t1 = l.t1;
         }
         if (l.fin) o.finished = 1;
+        if (e->h_tok_frame) cuda_model_eou(e, l, tok, ntok, o);
     }
     (void)hp_lap(e, ASR_HP_DETOK, hp);
     return 0;
@@ -1238,6 +1282,7 @@ static int cuda_step_submit(cuda_engine *e, const asr_step_req *reqs, int n, asr
     for (int i = 0; i < n; i++) {
         outs[i].text = ""; outs[i].t0 = outs[i].t1 = 0.0;
         outs[i].n_tokens = 0; outs[i].finished = 0; outs[i].stepped = 0;
+        outs[i].eou = 0; outs[i].eou_t = 0.0;
     }
     /* pending resets first: a slot reset since the last step starts clean */
     if (!e->pending_resets.empty()) {
@@ -1265,7 +1310,7 @@ static int cuda_step_submit(cuda_engine *e, const asr_step_req *reqs, int n, asr
             s.mel_finished = 1;
         }
         const int need = slot_need_mel(e, s);
-        pass_lane l = {i, slot, 0, s.first, 0, 0, 0.0, 0};
+        pass_lane l = {i, slot, 0, s.first, 0, 0, 0.0, 0, 0};
         if (s.mel_have >= need) {
             l.n_mel = need; l.last = 0;
         } else if (reqs[i].finalize && s.mel_have > 0) {

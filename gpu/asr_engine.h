@@ -83,6 +83,12 @@ typedef struct {
     int n_tokens;            /* tokens emitted by this step */
     int finished;            /* the padded tail was processed: `done` is due */
     int stepped;             /* an encoder chunk (or the tail) ran for this slot */
+    int eou;                 /* the MODEL ended an utterance in this step (a pack
+                                with <EOU>/<EOB>): MYNAH_ASR_EOU_MODEL or
+                                MYNAH_ASR_EOU_MODEL_BACKCHANNEL, 0 = none. The
+                                model state is reset, the slot goes on. */
+    double eou_t;            /* its time: the end of the encoder frame that
+                                emitted it (src/mynah_asr.c stream_model_eou) */
 } asr_step_out;
 
 typedef struct {

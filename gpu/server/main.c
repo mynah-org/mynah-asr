@@ -26,6 +26,7 @@
 
 #include "cJSON.h"
 #include "http_util.h"
+#include "mynah_asr.h"
 #include "stream_out.h"
 #include "ws.h"
 
@@ -118,7 +119,7 @@ static struct {
     unsigned long abandoned, abandoned_recovered;
     unsigned long cancel_by[CB__N];
     int active;
-    unsigned long steps, deltas, cohorts;
+    unsigned long steps, deltas, cohorts, eous;
     double audio_seconds;
     unsigned long lag_hist[LAG_BUCKETS];
     double lag_sum_ms, lag_max_ms;
@@ -376,6 +377,17 @@ static void frame_delta(gslot *s, const asr_step_out *o, double lag_ms) {
     cJSON_AddStringToObject(j, "language", lang);
     cJSON_AddNumberToObject(j, "audio_seconds", o->t1);
     frame_common(j, s, o->t1, lag_ms);
+    frame_send(s, j);
+}
+/* the model's own end of utterance (a pack with <EOU>/<EOB>): the CPU
+ * server's eou frame (server/sched.c), field for field; the session goes on */
+static void frame_eou(gslot *s, const asr_step_out *o, double lag_ms) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "type", "eou");
+    cJSON_AddNumberToObject(j, "t", o->eou_t);
+    cJSON_AddStringToObject(j, "source", "model");
+    cJSON_AddBoolToObject(j, "backchannel", o->eou == MYNAH_ASR_EOU_MODEL_BACKCHANNEL);
+    frame_common(j, s, o->eou_t, lag_ms);
     frame_send(s, j);
 }
 static void frame_done(gslot *s) {
@@ -690,6 +702,12 @@ static void *engine_main(void *arg) {
                 g.lag_sum_ms += lag_ms;
                 if (lag_ms > g.lag_max_ms) g.lag_max_ms = lag_ms;
                 pthread_mutex_unlock(&g.mu);
+            }
+            if (o->eou) {
+                double lag_ms = arrival[a] > 0.0 ? (t_end - arrival[a]) * 1e3 : 0.0;
+                if (lag_ms < 0.0) lag_ms = 0.0;
+                frame_eou(s, o, lag_ms);
+                pthread_mutex_lock(&g.mu); g.eous++; pthread_mutex_unlock(&g.mu);
             }
             if (o->finished) {
                 pthread_mutex_lock(&s->mu);
@@ -1060,7 +1078,7 @@ static void health_json(cJSON *j) {
     cJSON_AddNumberToObject(sl, "cap", g.cap);
     cJSON_AddNumberToObject(j, "steps", (double)g.steps);
     cJSON_AddNumberToObject(j, "deltas", (double)g.deltas);
-    cJSON_AddNumberToObject(j, "eous", 0);
+    cJSON_AddNumberToObject(j, "eous", (double)g.eous);
     cJSON_AddNumberToObject(j, "sessions", (double)g.sessions);
     cJSON_AddNumberToObject(j, "completed", (double)g.completed);
     cJSON_AddNumberToObject(j, "aborted", (double)g.aborted);
@@ -1192,8 +1210,8 @@ static void dump_stderr(void) {
     D("[DUMP] worker=0 seq=%lu build=%s precision=%s gemm=%s cohort_ms=%d\n", n, MYNAH_ASR_BUILD, g.facts.precision, g.facts.gemm, g.cohort_ms);
     D("[DUMP] worker=0 seq=%lu model=%s engine=rnnt quant=%s streaming=yes lookahead_default=%d chunk_ms=%.0f\n",
       n, g.facts.model_name, g.facts.precision, g.facts.default_lookahead, (g.facts.default_lookahead + 1) * g.facts.frame_sec * 1000.0);
-    D("[DUMP] worker=0 seq=%lu slots active=%d cap=%d sessions=%lu steps=%lu deltas=%lu eous=0 audio_s=%.1f\n",
-      n, g.active, g.cap, g.sessions, g.steps, g.deltas, g.audio_seconds);
+    D("[DUMP] worker=0 seq=%lu slots active=%d cap=%d sessions=%lu steps=%lu deltas=%lu eous=%lu audio_s=%.1f\n",
+      n, g.active, g.cap, g.sessions, g.steps, g.deltas, g.eous, g.audio_seconds);
     D("[DUMP] worker=0 seq=%lu cohorts=%lu lanes_mean=%.2f wait_ms_mean=%.1f step_wall_ms_mean=%.2f decode_iters=%lu\n",
       n, g.cohorts, g.cohorts ? (double)g.cohort_lanes_sum / (double)g.cohorts : 0.0,
       g.cohorts ? g.cohort_wait_ms_sum / (double)g.cohorts : 0.0,

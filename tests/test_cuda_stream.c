@@ -59,12 +59,25 @@
 
 #define MAXC 256
 
-typedef struct { char *text; char *log; } utt;
+typedef struct { char *text; char *log; char *eous; } utt;
+
+/* the model's own ends of utterance (a pack with <EOU>/<EOB>): "kind@t;" each,
+ * compared between alone, cohort, the serving-loop arms and the CPU library */
+static void add_eou(utt *u, int kind, double t) {
+    char rec[48];
+    snprintf(rec, sizeof(rec), "%d@%.4f;", kind, t);
+    const size_t a = u->eous ? strlen(u->eous) : 0, b = strlen(rec);
+    char *n = realloc(u->eous, a + b + 1);
+    if (!n) return;
+    memcpy(n + a, rec, b + 1);
+    u->eous = n;
+}
 
 /* the per-step record gate C compares: text, window, tokens, finish */
 static void log_step(utt *u, const asr_step_out *o) {
     char rec[64];
-    snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d:", o->t0, o->t1, o->n_tokens, o->finished);
+    if (o->eou) snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d,eou%d@%.4f:", o->t0, o->t1, o->n_tokens, o->finished, o->eou, o->eou_t);
+    else snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d:", o->t0, o->t1, o->n_tokens, o->finished);
     const char *parts[2] = {rec, o->text ? o->text : ""};
     for (int k = 0; k < 2; k++) {
         const size_t a = u->log ? strlen(u->log) : 0, b = strlen(parts[k]);
@@ -96,7 +109,7 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
     int done[MAXC];
     for (int i = 0; i < n; i++) {
         if (asr_engine_slot_reset(e, i, langs[i], g_lookahead) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
-        off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL;
+        off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL; out[i].eous = NULL;
     }
     for (int guard = 0; guard < 100000; guard++) {
         int nreq = 0, alive = 0;
@@ -137,6 +150,7 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
         for (int k = 0; k < nreq; k++) {
             if (outs[k].stepped || outs[k].finished) log_step(&out[reqs[k].slot], &outs[k]);
             cat_text(&out[reqs[k].slot], outs[k].text);
+            if (outs[k].eou) add_eou(&out[reqs[k].slot], outs[k].eou, outs[k].eou_t);
             if (outs[k].finished) done[reqs[k].slot] = 1;
         }
     }
@@ -145,7 +159,10 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
 
 typedef struct { utt *u; } cb_ctx;
 static void on_res(const mynah_asr_result *r, void *ud) {
-    if (r->is_eou) return;
+    if (r->is_eou) {
+        if (r->eou_source != MYNAH_ASR_EOU_VAD) add_eou(((cb_ctx *)ud)->u, r->eou_source, r->t1);
+        return;
+    }
     cat_text(((cb_ctx *)ud)->u, r->text);
 }
 
@@ -355,11 +372,13 @@ int main(int argc, char **argv) {
         mynah_asr_stream_finish(s, on_res, &c);
         mynah_asr_stream_close(s);
         const char *a = cpu.text ? cpu.text : "", *b = alone[i].text ? alone[i].text : "";
-        const int same = strcmp(a, b) == 0;
+        const char *ea = cpu.eous ? cpu.eous : "", *eb = alone[i].eous ? alone[i].eous : "";
+        const int same = strcmp(a, b) == 0 && strcmp(ea, eb) == 0;
         if (!same) differs++;
-        printf("%s B cpu-f32 vs gpu %-30s %s\n", same ? "OK  " : "DIFF", clips[i], same ? "identical" : "differs");
-        if (!same) printf("       cpu f32 : %s\n       gpu f32 : %s\n", a, b);
-        free(cpu.text);
+        printf("%s B cpu-f32 vs gpu %-30s %s%s%s\n", same ? "OK  " : "DIFF", clips[i], same ? "identical" : "differs",
+               ea[0] ? "  model eou " : "", ea[0] ? ea : "");
+        if (!same) printf("       cpu f32 : %s [%s]\n       gpu f32 : %s [%s]\n", a, ea, b, eb);
+        free(cpu.text); free(cpu.eous);
     }
     mynah_asr_free(m);
     asr_engine_close(e);
