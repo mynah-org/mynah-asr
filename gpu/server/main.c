@@ -1715,6 +1715,10 @@ int main(int argc, char **argv) {
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
     if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
     const int cuda_engine = strcmp(g.engine_name, "cuda") == 0;
+    /* the offline AED engine keeps f32 own unless an arm is asked for
+     * explicitly: its bf16 has no quality gate yet (section 5.6) */
+    const int prec_auto = g.precision == NULL || strcmp(g.precision, "auto") == 0;
+    const int gemm_auto = g.gemm == NULL || strcmp(g.gemm, "auto") == 0;
     /* --precision/--gemm auto (the default): the fixed-order bf16 tensor-core
      * GEMM on sm_80+ (S14-8c: batch-invariant, 498-clip bank WER 0.14469 vs
      * 0.14483 for f32, device time per pass -55%), the f32 own GEMM elsewhere,
@@ -1755,7 +1759,10 @@ int main(int argc, char **argv) {
         g.offline = mode == ASR_PACK_OFFLINE_AED;
         err[0] = '\0';
     }
-    if (g.offline) return offline_main(cuda_engine, dispatch_map, t_start);
+    if (g.offline) {
+        if (prec_auto && gemm_auto) { g.precision = "f32"; g.gemm = "own"; }
+        return offline_main(cuda_engine, dispatch_map, t_start);
+    }
     raise_nofile_limit();
     asr_engine_cfg cfg = {.model_dir = g.model_dir, .cap = g.cap, .device = g.device,
                           .precision = g.precision, .gemm = g.gemm, .threads = g.threads,
