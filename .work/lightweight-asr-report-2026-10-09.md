@@ -94,7 +94,7 @@ turn-taking, +1.2 WER. Training cost: ~13.5 min (stage 1, 40 h) + ~7 min
 (stage 2) on one L40S. So: YES, EOU-120M is a credible base for cheap per-language
 streaming specialists; endpoint latency and accents are the open work. Details:
 `.work/eou-it-ft.md`. Code: `finetune/eou/two_stage.py` (branch lw-finetune-tooling).
-Final HF revision: d836773ad2863d352095898608c45e4bd1e5c950 (230 files, 14 .nemo,
+Final HF revision after the French replica: 53af0e304c1f70c6bd44cac5de4980fa9581b1f0 (237 files, 16 .nemo, 11 checkpoints, survival-final3.tgz verified; earlier d836773: 230 files, 14 .nemo,
 9 checkpoints, survival-final2.tgz verified); HF token removed from the box.
 
 ## French replica (same night, no tuning)
