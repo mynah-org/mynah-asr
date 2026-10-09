@@ -280,6 +280,26 @@ stream_out). Target: C=128 on a 4-vCPU, 24 GB-class cloud GPU instance
 - [~] S14-14 **2026-10-08 L4: 55 graph execs captured in 0.19 s, warm-up 1.06 s, start-up 0.65 -> 1.93 s, +244 MiB VRAM; byte-identical; default off, knee A/B owed.** CUDA graphs of the encoder pass per lane x row bucket (`--graphs buckets`, padding lanes q = 0 on a scratch slot, padding rows owned by no lane), traffic-shaped start-up warm-up (`--warmup 1`); the label loop stays eager → [`.work/cuda-stage-ahead-graphs.md`](.work/cuda-stage-ahead-graphs.md)
 - [ ] S14-9 Multi-GPU: one process per GPU behind the v2 router (SCM_RIGHTS handoff exists); not before S14-7 → [`.work/cuda-batched-streaming-server.md`](.work/cuda-batched-streaming-server.md)
 
+### S15 — Lightweight ASR: Parakeet EOU / Canary / low-data language adaptation → [`.work/lightweight-asr-plan.md`](.work/lightweight-asr-plan.md)
+
+Opened 2026-10-09 on `research/lightweight-asr`. Question: can the small models
+already supported (EOU 120M, Canary 180M Flash) be a much cheaper tier than
+Nemotron 0.6B at competitive quality, and cheap to adapt to new EU languages
+(Italian first)? Nemotron 0.6B is the baseline. Measurements first; no claim
+without same-audio, same-normaliser evidence. Primary GPU L4; the first session
+runs on an L40S, its performance numbers labelled as such.
+
+- [ ] S15-1 Audit of what works today for EOU 120M and Canary (CPU, CUDA, server, EOU, streaming semantics, tests), upstream facts verified → [`.work/parakeet-eou-l4.md`](.work/parakeet-eou-l4.md), [`.work/canary-180m-l4.md`](.work/canary-180m-l4.md), [`.work/lightweight-asr-upstream.md`](.work/lightweight-asr-upstream.md)
+- [ ] S15-2 EOU 120M quality on a common open EN bank vs Nemotron, same normaliser: WER/CER, S/D/I, EOU (premature, missed/late, speech-end to EOU) → [`.work/parakeet-eou-l4.md`](.work/parakeet-eou-l4.md)
+- [ ] S15-3 EOU 120M on the CUDA server: C1, step, first partial, finalisation, EOU latency, RTFx, VRAM, SM %, W; ladder to the knee; bottleneck; A/B of the PR #4 levers on this model with a quality gate → [`.work/parakeet-eou-l4.md`](.work/parakeet-eou-l4.md)
+- [ ] S15-4 Canary 180M quality EN/DE/ES/FR on open sets; English on the same audio as S15-2 → [`.work/canary-180m-l4.md`](.work/canary-180m-l4.md)
+- [ ] S15-5 Canary streaming verdict from primary sources and the code (no fake streaming mode) → [`.work/canary-180m-l4.md`](.work/canary-180m-l4.md)
+- [ ] S15-6 Canary performance in the semantics it has (offline/batched): speed, batch scaling, VRAM, C1, server concurrency → [`.work/canary-180m-l4.md`](.work/canary-180m-l4.md)
+- [ ] S15-7 Official NeMo FT / vocabulary-adaptation recipes, the Granary Italian guide, what transfers to 180M / 120M → [`.work/lightweight-asr-ft.md`](.work/lightweight-asr-ft.md)
+- [ ] S15-8 Italian open datasets with licences, held-out eval, 5/20/40 h subsets → [`.work/lightweight-asr-ft.md`](.work/lightweight-asr-ft.md)
+- [ ] S15-9 Cheapest Italian FT smoke test (Canary first; EOU feasibility incl. EOU behaviour), GPU-hours and cost; expand only on evidence → [`.work/lightweight-asr-ft.md`](.work/lightweight-asr-ft.md)
+- [ ] S15-10 Decision matrix filled from measurements → [`.work/lightweight-asr-plan.md`](.work/lightweight-asr-plan.md)
+
 ## Durable contract (changes only when a decision changes)
 
 1. Config-driven: every model number comes from the converted pack's
