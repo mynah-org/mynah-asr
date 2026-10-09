@@ -15,6 +15,7 @@ extern "C" {
 #include "../asr_engine.h"
 #include "../pack.h"
 }
+#include "../../src/mynah_asr.h"   /* MYNAH_ASR_EOU_* */
 #include "kernels.cuh"
 
 #include <cublas_v2.h>
@@ -58,6 +59,8 @@ struct pass_lane {
     int slot, n_mel, first, last, q;
     double t1;                  /* audio fed when the chunk was taken: the delta's t1 */
     int fin;                    /* this chunk ends the utterance */
+    long mel_end;               /* mel frames of the slot's stream up to the end of
+                                   this chunk: places a model <EOU> in time */
 };
 
 /* one encoder pass: its lanes, its counts, and how it launches */
@@ -108,6 +111,16 @@ struct cuda_engine {
           *d_ss_pw_b[2] = {nullptr, nullptr}, *d_ss_lin_w = nullptr, *d_ss_lin_b = nullptr;
     float *d_pl1_w = nullptr, *d_pl1_b = nullptr, *d_pl2_w = nullptr, *d_pl2_b = nullptr,
           *d_ep_w = nullptr, *d_ep_b = nullptr;
+    /* the pack has Nemotron's language-prompt projector. Without it (Parakeet
+     * realtime EOU) the encoder output goes straight into the encoder projector,
+     * as src/encoder.c (mynah_asr_encoder_post_scratch) does: no prompt weights,
+     * no cat/mid/fused scratch, no prompt GEMMs, and the slots carry prompt -1. */
+    int has_prompt = 0;
+    /* the model's own end of utterance (<EOU>/<EOB> in the pack's vocabulary,
+     * src/tokenizer.h mynah_asr_eou_ids): -1 = absent, and then nothing below
+     * that reads them runs (no tok_frame download, no reset) */
+    int eou_id = -1, eob_id = -1;
+    int *h_tok_frame = nullptr; /* pinned, only with eou_id/eob_id */
     float *d_emb = nullptr, *d_wih[MYNAH_ASR_MAX_PRED_LAYERS] = {}, *d_whh[MYNAH_ASR_MAX_PRED_LAYERS] = {},
           *d_bsum[MYNAH_ASR_MAX_PRED_LAYERS] = {}, *d_proj_w = nullptr, *d_proj_b = nullptr,
           *d_head_w = nullptr, *d_head_b = nullptr;
@@ -411,8 +424,11 @@ static int alloc_scratch(cuda_engine *e) {
     DM(e->xs, R * d, "xs"); DM(e->tmp, R * d, "tmp"); DM(e->tmp2, R * (size_t)dm.ffn, "tmp2");
     DM(e->xn, R * d, "xn"); DM(e->kn, R * d, "kn"); DM(e->vn, R * d, "vn"); DM(e->qs, R * d, "qs");
     DM(e->ctx, R * d, "ctx"); DM(e->h2, R * 2 * d, "h2"); DM(e->cmid, R * d, "cmid");
-    DM(e->cat, R * (size_t)(dm.d + dm.np), "cat"); DM(e->mid, R * (size_t)dm.inter, "mid");
-    DM(e->fused, R * d, "fused"); DM(e->enc, R * (size_t)dm.dout, "enc");
+    if (e->has_prompt) {
+        DM(e->cat, R * (size_t)(dm.d + dm.np), "cat"); DM(e->mid, R * (size_t)dm.inter, "mid");
+        DM(e->fused, R * d, "fused");
+    }
+    DM(e->enc, R * (size_t)dm.dout, "enc");
     DM(e->s0, (size_t)e->Pmax[0] * dm.C, "s0"); DM(e->s1a, (size_t)e->Pmax[1] * dm.C, "s1a");
     DM(e->s1, (size_t)e->Pmax[1] * dm.C, "s1"); DM(e->s2a, (size_t)e->Pmax[2] * dm.C, "s2a");
     DM(e->s2, (size_t)e->Pmax[2] * dm.C, "s2");
@@ -431,6 +447,7 @@ static int alloc_scratch(cuda_engine *e) {
                               {R_, dm.d, dm.d}, {R_, 2 * dm.d, dm.d}, {R_, dm.inter, dm.d + dm.np}, {R_, dm.d, dm.inter},
                               {R_, dm.dout, dm.d}, {B_, dm.V, dm.Hdec}, {B_, 4 * dm.Hdec, dm.Hdec}, {B_, dm.Hdec, dm.Hdec}};
         for (size_t i = 0; i < sizeof(shp) / sizeof(shp[0]); i++) {
+            if (!e->has_prompt && (shp[i][1] <= 0 || shp[i][2] <= 0)) continue;   /* the absent prompt GEMMs */
             if (e->gemm_tc) {
                 const size_t f = k_gemm_tc_workspace_floats(shp[i][0], shp[i][1], shp[i][2]);
                 if (f > e->tc_ws_floats) e->tc_ws_floats = f;
@@ -461,6 +478,8 @@ static int alloc_scratch(cuda_engine *e) {
     for (auto &p : e->passes) p.lanes.reserve(B);
     CK(e, "pinned tok", cudaHostAlloc((void **)&e->h_tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
     CK(e, "pinned meta", cudaHostAlloc((void **)&e->h_meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaHostAllocPortable));
+    if (e->eou_id >= 0 || e->eob_id >= 0)
+        CK(e, "pinned tok frame", cudaHostAlloc((void **)&e->h_tok_frame, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
     return 0;
 }
 
@@ -539,10 +558,12 @@ static int upload_weights(cuda_engine *e) {
     }
     UP(e->d_ss_lin_w, (const float *)ss.lin_w->data, d * C * (size_t)dm.Fo[GPU_SS_STAGES - 1], "ss lin_w");
     UP(e->d_ss_lin_b, (const float *)ss.lin_b->data, d, "ss lin_b");
-    UP(e->d_pl1_w, enc.prompt_l1_w, (size_t)dm.inter * (size_t)(dm.d + dm.np), "prompt_l1_w");
-    UP(e->d_pl1_b, enc.prompt_l1_b, (size_t)dm.inter, "prompt_l1_b");
-    UP(e->d_pl2_w, enc.prompt_l2_w, d * (size_t)dm.inter, "prompt_l2_w");
-    UP(e->d_pl2_b, enc.prompt_l2_b, d, "prompt_l2_b");
+    if (e->has_prompt) {
+        UP(e->d_pl1_w, enc.prompt_l1_w, (size_t)dm.inter * (size_t)(dm.d + dm.np), "prompt_l1_w");
+        UP(e->d_pl1_b, enc.prompt_l1_b, (size_t)dm.inter, "prompt_l1_b");
+        UP(e->d_pl2_w, enc.prompt_l2_w, d * (size_t)dm.inter, "prompt_l2_w");
+        UP(e->d_pl2_b, enc.prompt_l2_b, d, "prompt_l2_b");
+    }
     UP(e->d_ep_w, enc.encproj_w, (size_t)dm.dout * d, "encproj_w");
     UP(e->d_ep_b, enc.encproj_b, (size_t)dm.dout, "encproj_b");
     const size_t H = (size_t)dm.Hdec;
@@ -603,8 +624,9 @@ static int tc_weights(cuda_engine *e) {
     for (int i = 0; i < 2; i++)
         if (tc_weight(e, e->d_ss_pw_w[i], C * C)) return -1;
     if (tc_weight(e, e->d_ss_lin_w, d * C * (size_t)dm.Fo[GPU_SS_STAGES - 1]) ||
-        tc_weight(e, e->d_pl1_w, (size_t)dm.inter * (size_t)(dm.d + dm.np)) ||
-        tc_weight(e, e->d_pl2_w, d * (size_t)dm.inter) || tc_weight(e, e->d_ep_w, (size_t)dm.dout * d) ||
+        (e->has_prompt && (tc_weight(e, e->d_pl1_w, (size_t)dm.inter * (size_t)(dm.d + dm.np)) ||
+                           tc_weight(e, e->d_pl2_w, d * (size_t)dm.inter))) ||
+        tc_weight(e, e->d_ep_w, (size_t)dm.dout * d) ||
         tc_weight(e, e->d_proj_w, H * H) || tc_weight(e, e->d_head_w, (size_t)dm.V * H))
         return -1;
     for (int l = 0; l < dm.pred_layers; l++)
@@ -728,11 +750,13 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         dm.Fo[s] = (dm.F[s] + 3 - 3) / 2 + 1;
         if (s + 1 < GPU_SS_STAGES) dm.F[s + 1] = dm.Fo[s];
     }
-    dm.dout = enc.d_out; dm.np = enc.num_prompts; dm.inter = enc.prompt_inter;
+    e->has_prompt = enc.prompt_l1_w != nullptr;
+    mynah_asr_eou_ids(&e->pack.tok, e->pack.dec.vocab, e->pack.dec.blank, &e->eou_id, &e->eob_id);
+    dm.dout = enc.d_out; dm.np = e->has_prompt ? enc.num_prompts : 0; dm.inter = e->has_prompt ? enc.prompt_inter : 0;
     dm.V = e->pack.dec.vocab; dm.Hdec = e->pack.dec.hidden; dm.pred_layers = e->pack.dec.n_layers;
     dm.blank = e->pack.dec.blank; dm.max_symbols = e->pack.dec.max_symbols;
     if (dm.H * dm.dk != dm.d || dm.Hdec != dm.dout || dm.kmax < dm.left + e->pack.qmax ||
-        e->pack.qmax > GPU_QMAX_HARD || dm.left + e->pack.qmax > GPU_KMAX_HARD || !enc.prompt_l1_w) {
+        e->pack.qmax > GPU_QMAX_HARD || dm.left + e->pack.qmax > GPU_KMAX_HARD) {
         snprintf(err, errcap, "model geometry outside what the kernels serve (H*dk=%d d=%d Hdec=%d dout=%d kmax=%d left=%d qmax=%d prompt=%s)",
                  dm.H * dm.dk, dm.d, dm.Hdec, dm.dout, dm.kmax, dm.left, e->pack.qmax, enc.prompt_l1_w ? "yes" : "no");
         cuda_close(e); return nullptr;
@@ -791,6 +815,7 @@ static void cuda_close(cuda_engine *e) {
     if (e->h_resets) cudaFreeHost(e->h_resets);
     if (e->h_tok) cudaFreeHost(e->h_tok);
     if (e->h_meta) cudaFreeHost(e->h_meta);
+    if (e->h_tok_frame) cudaFreeHost(e->h_tok_frame);
     asr_pack_close(&e->pack);
     cudaDeviceReset();
     delete e;
@@ -826,7 +851,14 @@ static void cuda_facts(const cuda_engine *e, asr_engine_facts *f) {
 }
 
 static void cuda_stats(const cuda_engine *e, asr_engine_stats *s) { *s = e->st; }
-static int cuda_lang_id(const cuda_engine *e, const char *lang) { return asr_pack_lang_id(&e->pack, lang); }
+/* A pack without a prompt serves no language tag: only the default (NULL or
+ * "") is served, and every explicit tag -- "auto" included -- is refused, the
+ * answer the CPU server gives (server/main.c ws_parse_query: mynah_asr_lang_id
+ * is -1 on a model without a prompt dictionary -> 400 language_not_served). */
+static int cuda_lang_id(const cuda_engine *e, const char *lang) {
+    if (!e->has_prompt) return !lang || !lang[0] ? 0 : -1;
+    return asr_pack_lang_id(&e->pack, lang);
+}
 static int cuda_lookahead_ok(const cuda_engine *e, int la) { return asr_pack_lookahead_ok(&e->pack, la); }
 static int cuda_dead(const cuda_engine *e) { return e->dead; }
 static const char *cuda_error(const cuda_engine *e) { return e->err; }
@@ -864,6 +896,12 @@ static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
         : e->ar.kv_dtype == GPU_KV_BF16 ? "round-to-nearest-even, NOT bit-identical to f32" : "reference",
         (double)e->vram_kv / (double)(e->cap > 0 ? e->cap : 1) / 1048576.0,
         gl, e->team ? "feed-team" : "inline", e->host_threads);
+    /* only on a pack without a language prompt: a Nemotron map is unchanged */
+    if (!e->has_prompt && k0 < cap) {
+        k0 += (size_t)snprintf(buf + k0, cap - k0,
+            "post-encoder      encproj-only   no language prompt in the pack: prompt concat + 2 GEMMs skipped\n");
+        if (k0 >= cap) k0 = cap - 1;
+    }
     return k0;
 }
 
@@ -871,8 +909,12 @@ static size_t cuda_dispatch_map(const cuda_engine *e, char *buf, size_t cap) {
 
 static int cuda_slot_reset(cuda_engine *e, int slot, const char *lang, int lookahead) {
     if (e->dead || slot < 0 || slot >= e->cap) return -1;
-    const int prompt_id = asr_pack_lang_id(&e->pack, lang);
-    if (!asr_pack_lookahead_ok(&e->pack, lookahead) || prompt_id < 0) return -1;
+    /* without a prompt the slot carries -1 (never read: no prompt cat runs) and
+     * only the default tag is accepted -- "auto" being the server's own name
+     * for the default it fills in when the client sent no lang */
+    const int prompt_id = e->has_prompt ? asr_pack_lang_id(&e->pack, lang) : -1;
+    const int lang_ok = e->has_prompt ? prompt_id >= 0 : (!lang || !lang[0] || strcmp(lang, "auto") == 0);
+    if (!asr_pack_lookahead_ok(&e->pack, lookahead) || !lang_ok) return -1;
     slot_host &s = e->slots[(size_t)slot];
     mynah_asr_mel_stream_reset(&s.mel);
     s.mel_have = 0; s.first = 1; s.lookahead = lookahead; s.prompt = prompt_id;
@@ -1011,6 +1053,12 @@ static int enqueue_encoder(cuda_engine *e, int B, int R, int P1, int P2) {
     CK(e, "kv advance", k_kv_advance(dm, e->ar, e->d_rows, B, e->stream));
 
     /* prompt + projector */
+    if (!e->has_prompt) {
+        /* no prompt: encoder_projector only, straight from the stack's output
+         * (src/encoder.c mynah_asr_encoder_post_scratch, the Parakeet branch) */
+        if (gemm(e, e->xs, dm.d, e->d_ep_w, e->d_ep_b, e->enc, dm.dout, R, dm.dout, dm.d, 0, 0) != 0) return -1;
+        return 0;
+    }
     CK(e, "prompt cat", k_prompt_cat(e->xs, e->d_rows, B, dm.d, dm.np, e->cat, e->stream));
     if (gemm(e, e->cat, dm.d + dm.np, e->d_pl1_w, e->d_pl1_b, e->mid, dm.inter, R, dm.inter, dm.d + dm.np, 0, 1) != 0) return -1;
     if (gemm(e, e->mid, dm.inter, e->d_pl2_w, e->d_pl2_b, e->fused, dm.d, R, dm.d, dm.inter, 0, 0) != 0) return -1;
@@ -1060,6 +1108,7 @@ static void pass_stage(cuda_engine *e, int p, const asr_step_req *reqs) {
         if (s.mel_have > 0)
             memmove(s.mel_buf, s.mel_buf + (size_t)l.n_mel * nm, (size_t)s.mel_have * nm * sizeof(float));
         s.first = 0;
+        l.mel_end = s.mel.next_frame - (long)s.mel_have;
         l.t1 = (double)s.samples_fed / (double)e->pack.feat.sample_rate;
         l.fin = l.last || (reqs[l.req].finalize && s.mel_finished && s.mel_have == 0);
         if (l.fin) s.finished = 1;
@@ -1108,6 +1157,34 @@ static int pass_launch(cuda_engine *e, int p) {
 
 /* the label loop of pass p (its encoder enqueued), the D2H, the wait, and the
  * host half: detokenise each lane into outs */
+/* The model's end of utterance, as the CPU library's stream_model_eou: when
+ * the lane's tokens hold <EOU>/<EOB>, report it on the step's output with
+ * the end of the encoder frame that emitted it, and queue a reset of the
+ * slot's MODEL state -- K/V ring, conv and subsampling caches, predictor at
+ * SOS (k_slots_reset, applied at the next submit, before any later chunk of
+ * this slot) -- with the host side untouched: mel stream, chunk cadence
+ * (s.first stays 0: a steady chunk over zeroed caches, as
+ * mynah_asr_enc_stream_reset_keep_cadence), text and time base go on.
+ * The emitting frame k is the token's tok_frame minus the slot's t_abs, both
+ * read after the encoder advanced t_abs by q (kv_advance_kernel), i.e. k is
+ * the label loop's dec_t at the emission. */
+static void cuda_model_eou(cuda_engine *e, const pass_lane &l, const int *tok, int ntok, asr_step_out &o) {
+    const int *fr = e->h_tok_frame + (size_t)l.slot * e->ar.tok_cap;
+    int hit = -1, kind = 0;
+    for (int i = 0; i < ntok && hit < 0; i++) {
+        if (tok[i] == e->eou_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL; }
+        else if (tok[i] == e->eob_id) { hit = i; kind = MYNAH_ASR_EOU_MODEL_BACKCHANNEL; }
+    }
+    if (hit < 0) return;
+    const int k = (int)((long long)fr[hit] - e->h_meta[l.slot].t_abs);
+    long mel_end = l.mel_end - (long)(l.q - 1 - k) * e->pack.enc.ss.sub_factor;
+    if (mel_end < 0) mel_end = 0;
+    o.eou = kind;
+    o.eou_t = (double)mel_end * (double)e->pack.feat.hop_length / (double)e->pack.feat.sample_rate;
+    slot_host &s = e->slots[(size_t)l.slot];
+    if (!s.reset_pending) { s.reset_pending = 1; e->pending_resets.push_back(l.slot); }
+}
+
 static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     const gpu_model_dims &dm = e->dm;
     const pass_rec &ps = e->passes[(size_t)p];
@@ -1150,6 +1227,8 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     prof_mark(e, PS_D2H);
     CK(e, "d2h tok", cudaMemcpyAsync(e->h_tok, e->ar.tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     CK(e, "d2h meta", cudaMemcpyAsync(e->h_meta, e->ar.meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaMemcpyDeviceToHost, e->stream));
+    if (e->h_tok_frame)
+        CK(e, "d2h tok frame", cudaMemcpyAsync(e->h_tok_frame, e->ar.tok_frame, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
     prof_mark(e, PS_OTHER);
     hp = hp_lap(e, ASR_HP_DEC_LAUNCH, hp);
     CK(e, "sync", cudaStreamSynchronize(e->stream));
@@ -1182,6 +1261,7 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
             o.text = ""; o.t0 = s.emitted_t1; o.t1 = l.t1;
         }
         if (l.fin) o.finished = 1;
+        if (e->h_tok_frame) cuda_model_eou(e, l, tok, ntok, o);
     }
     (void)hp_lap(e, ASR_HP_DETOK, hp);
     return 0;
@@ -1202,6 +1282,7 @@ static int cuda_step_submit(cuda_engine *e, const asr_step_req *reqs, int n, asr
     for (int i = 0; i < n; i++) {
         outs[i].text = ""; outs[i].t0 = outs[i].t1 = 0.0;
         outs[i].n_tokens = 0; outs[i].finished = 0; outs[i].stepped = 0;
+        outs[i].eou = 0; outs[i].eou_t = 0.0;
     }
     /* pending resets first: a slot reset since the last step starts clean */
     if (!e->pending_resets.empty()) {
@@ -1229,7 +1310,7 @@ static int cuda_step_submit(cuda_engine *e, const asr_step_req *reqs, int n, asr
             s.mel_finished = 1;
         }
         const int need = slot_need_mel(e, s);
-        pass_lane l = {i, slot, 0, s.first, 0, 0, 0.0, 0};
+        pass_lane l = {i, slot, 0, s.first, 0, 0, 0.0, 0, 0};
         if (s.mel_have >= need) {
             l.n_mel = need; l.last = 0;
         } else if (reqs[i].finalize && s.mel_have > 0) {

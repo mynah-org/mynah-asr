@@ -20,7 +20,9 @@
 #   SRV_ARGS  extra server arguments, e.g. "--profile-host --pass-lanes cap"
 #   PIN       taskset CPU list for the server (the GPU's NUMA node), e.g. 0-31
 #   CLIPIN    taskset CPU list for the load generator (other CPUs / another node)
-#   LANG_Q    lang query (default: auto)   LOOKAHEAD (default: 3)
+#   LANG_Q    lang query (default: auto; LANG_Q='' omits the key, which a
+#             pack without a language prompt needs: it refuses any lang,
+#             "auto" included)                LOOKAHEAD (default: 3)
 #   DEVICE    GPU ordinal (default: 0)     PORT (default: 8391)   SAMPLE_MS (default: 500)
 #   ONSETS    JSON {clip: speech onset s} from tools/bench/clip_onset.py; with it
 #             TTFP is also measured from the speech onset (ttfp_on95), which a
@@ -37,7 +39,7 @@ LEVELS=${LEVELS:-"32 64"}; DUR=${DUR:-60}; WARM=${WARM:-20}
 MODEL=${MODEL:-models/nemotron-3.5-asr-streaming-0.6b}
 TOP=$(printf '%s\n' $LEVELS | sort -n | tail -1)
 CAP=${CAP:-$(( TOP + 16 ))}; COHORT=${COHORT:-40}; GEMM=${GEMM:-own}; SRV_ARGS=${SRV_ARGS:-}
-LANG_Q=${LANG_Q:-auto}; LOOKAHEAD=${LOOKAHEAD:-3}; DEVICE=${DEVICE:-0}; PORT=${PORT:-8391}
+LANG_Q=${LANG_Q-auto}; LOOKAHEAD=${LOOKAHEAD:-3}; DEVICE=${DEVICE:-0}; PORT=${PORT:-8391}
 SAMPLE_MS=${SAMPLE_MS:-500}; TAG=${TAG:-run}; OUT=${OUT:-$PWD/gpu-knee-res}; BIN=${BIN:-./mynah-asr-server-cuda}
 PY=${PY:-python3}
 [ -n "${CLIPS:-}" ] || { echo "gpu_knee: CLIPS is required (16 kHz WAVs)" >&2; exit 2; }

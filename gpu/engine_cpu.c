@@ -27,6 +27,8 @@ typedef struct {
     size_t delta_len, delta_cap;
     double t0, t1;
     int n_cb;
+    int eou;                 /* the first model end of utterance of the step */
+    double eou_t;
 } cpu_slot;
 
 typedef struct cpu_engine cpu_engine;
@@ -45,7 +47,11 @@ struct cpu_engine {
 
 static void on_result(const mynah_asr_result *res, void *ud) {
     cpu_slot *s = (cpu_slot *)ud;
-    if (res->is_eou || !res->text) return;
+    if (res->is_eou) {
+        if (res->eou_source != MYNAH_ASR_EOU_VAD && !s->eou) { s->eou = res->eou_source; s->eou_t = res->t1; }
+        return;
+    }
+    if (!res->text) return;
     const size_t n = strlen(res->text);
     if (s->delta_len + n + 1 > s->delta_cap) {
         size_t nc = s->delta_cap ? s->delta_cap : 256;
@@ -258,11 +264,12 @@ static int cpu_step(cpu_engine *e, const asr_step_req *reqs, int n, asr_step_out
     for (int i = 0; i < n; i++) {
         outs[i].text = ""; outs[i].t0 = outs[i].t1 = 0.0;
         outs[i].n_tokens = 0; outs[i].finished = 0; outs[i].stepped = 0;
+        outs[i].eou = 0; outs[i].eou_t = 0.0;
         const int slot = reqs[i].slot;
         if (slot < 0 || slot >= e->cap) continue;
         cpu_slot *s = &e->slots[slot];
         if (!s->stream || !s->in_use || s->finished) { if (s->finished) outs[i].finished = 1; continue; }
-        s->delta_len = 0; s->n_cb = 0;
+        s->delta_len = 0; s->n_cb = 0; s->eou = 0;
         if (s->delta) s->delta[0] = '\0';
         const size_t need = mynah_asr_stream_need_samples(s->stream);
         const size_t have = g_stage ? g_stage[slot].n : 0;
@@ -279,6 +286,7 @@ static int cpu_step(cpu_engine *e, const asr_step_req *reqs, int n, asr_step_out
             outs[i].finished = 1; outs[i].stepped = 1;
             outs[i].text = s->delta ? s->delta : ""; outs[i].t0 = s->t0; outs[i].t1 = s->t1;
             if (s->n_cb == 0) outs[i].t0 = outs[i].t1 = mynah_asr_stream_audio_seconds(s->stream);
+            outs[i].eou = s->eou; outs[i].eou_t = s->eou_t;
             e->st.lanes++;
             continue;
         }
@@ -298,6 +306,7 @@ static int cpu_step(cpu_engine *e, const asr_step_req *reqs, int n, asr_step_out
             outs[i].text = s->delta ? s->delta : "";
             outs[i].t0 = s->t0; outs[i].t1 = s->t1;
             if (s->n_cb == 0) outs[i].t0 = outs[i].t1 = mynah_asr_stream_audio_seconds(s->stream);
+            outs[i].eou = s->eou; outs[i].eou_t = s->eou_t;
             e->st.lanes++;
         }
         e->st.rows += (unsigned long)B;

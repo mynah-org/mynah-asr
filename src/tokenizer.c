@@ -360,3 +360,12 @@ int mynah_asr_tok_find(const mynah_asr_tokenizer *tk, const char *piece) {
         if (strcmp(tk->pieces[i], piece) == 0) return i;
     return -1;
 }
+
+void mynah_asr_eou_ids(const mynah_asr_tokenizer *tk, int vocab, int blank, int *eou, int *eob) {
+    const char *name[2] = {"<EOU>", "<EOB>"};
+    int *out[2] = {eou, eob};
+    for (int k = 0; k < 2; k++) {
+        const int id = mynah_asr_tok_find(tk, name[k]);
+        *out[k] = id >= 0 && id < vocab && id != blank ? id : -1;
+    }
+}

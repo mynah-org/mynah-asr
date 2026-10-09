@@ -434,6 +434,12 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
     if (res->is_eou) {
         cJSON_AddStringToObject(j, "type", "eou");
         cJSON_AddNumberToObject(j, "t", res->t1);
+        /* the model's own <EOU>/<EOB> (a pack trained for it): the stream goes
+         * on and the next utterance follows; a VAD eou frame is unchanged */
+        if (res->eou_source != MYNAH_ASR_EOU_VAD) {
+            cJSON_AddStringToObject(j, "source", "model");
+            cJSON_AddBoolToObject(j, "backchannel", res->eou_source == MYNAH_ASR_EOU_MODEL_BACKCHANNEL);
+        }
         s->eous++;
         atomic_fetch_add_explicit(&g.eous, 1, memory_order_relaxed);
     } else {

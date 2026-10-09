@@ -18,6 +18,11 @@ void mynah_asr_tokenizer_free(mynah_asr_tokenizer *tk);
  * each sub-vocab: the specials live in the first one). -1 when absent. */
 int mynah_asr_tok_find(const mynah_asr_tokenizer *tk, const char *piece);
 
+/* The end-of-utterance / end-of-backchannel tokens of a pack trained for them
+ * (pieces "<EOU>" / "<EOB>", NeMo's ASR-EOU recipe), as ids the RNNT head can
+ * emit: inside [0, vocab) and not the blank. -1 each when absent. */
+void mynah_asr_eou_ids(const mynah_asr_tokenizer *tk, int vocab, int blank, int *eou, int *eob);
+
 /* Encode text -> piece ids, for FORCED ALIGNMENT: the aligner needs the text in
  * ITS own vocabulary, which is not the one that produced the text (canary emits
  * with its vocab, the CTC aligner has a different 16k one).

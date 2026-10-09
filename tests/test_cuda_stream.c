@@ -33,7 +33,7 @@
  *        option on top of the chosen precision / GEMM / pass-lanes arm.
  *        [--kv-dtype f32|bf16|int8] [--weights f32|int8]
  *        [--list clips.txt] [--alone N] [--no-cpu] [--json out.json --key-root DIR]
- *        [--bench C --steps S]
+ *        [--bench C --steps S] [--lookahead N]
  *   --list      one clip path per line (up to MAXC), added to the clips
  *   --alone N   gate A compares only the first N clips alone vs in the cohort
  *               (every clip is still checked on a shifted slot)
@@ -42,6 +42,10 @@
  *   --bench C   no gates: C lanes (the clips cycled) stepped together with the
  *               stage profile on; prints device ms per full pass (passes where
  *               all C lanes stepped, after 2 warm steps) and the VRAM facts
+ *   --lookahead the streaming preset (default 3, Nemotron's); a pack must
+ *               serve it, e.g. 1 for parakeet-realtime-eou-120m, whose only
+ *               preset is [70, 1] and which has no language prompt (the
+ *               engine runs the encoder projector alone, as src/encoder.c)
  * exit 0 = the gates pass; 1 = gate A or C failed or a device error; 3 = A and C
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -55,12 +59,25 @@
 
 #define MAXC 256
 
-typedef struct { char *text; char *log; } utt;
+typedef struct { char *text; char *log; char *eous; } utt;
+
+/* the model's own ends of utterance (a pack with <EOU>/<EOB>): "kind@t;" each,
+ * compared between alone, cohort, the serving-loop arms and the CPU library */
+static void add_eou(utt *u, int kind, double t) {
+    char rec[48];
+    snprintf(rec, sizeof(rec), "%d@%.4f;", kind, t);
+    const size_t a = u->eous ? strlen(u->eous) : 0, b = strlen(rec);
+    char *n = realloc(u->eous, a + b + 1);
+    if (!n) return;
+    memcpy(n + a, rec, b + 1);
+    u->eous = n;
+}
 
 /* the per-step record gate C compares: text, window, tokens, finish */
 static void log_step(utt *u, const asr_step_out *o) {
     char rec[64];
-    snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d:", o->t0, o->t1, o->n_tokens, o->finished);
+    if (o->eou) snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d,eou%d@%.4f:", o->t0, o->t1, o->n_tokens, o->finished, o->eou, o->eou_t);
+    else snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d:", o->t0, o->t1, o->n_tokens, o->finished);
     const char *parts[2] = {rec, o->text ? o->text : ""};
     for (int k = 0; k < 2; k++) {
         const size_t a = u->log ? strlen(u->log) : 0, b = strlen(parts[k]);
@@ -83,6 +100,7 @@ static void cat_text(utt *u, const char *s) {
 /* stream `n` clips as one cohort on the cuda engine, in real-time-sized feeds,
  * finalizing each at its end; returns the per-slot concatenated text */
 static int g_split = 0;   /* gate C: submit, feed the next chunks, finish */
+static int g_lookahead = 3;   /* --lookahead: the preset every stream runs at */
 
 static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char **langs, utt *out) {
     asr_step_req reqs[MAXC];
@@ -90,8 +108,8 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
     size_t off[MAXC];
     int done[MAXC];
     for (int i = 0; i < n; i++) {
-        if (asr_engine_slot_reset(e, i, langs[i], 3) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
-        off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL;
+        if (asr_engine_slot_reset(e, i, langs[i], g_lookahead) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
+        off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL; out[i].eous = NULL;
     }
     for (int guard = 0; guard < 100000; guard++) {
         int nreq = 0, alive = 0;
@@ -132,6 +150,7 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
         for (int k = 0; k < nreq; k++) {
             if (outs[k].stepped || outs[k].finished) log_step(&out[reqs[k].slot], &outs[k]);
             cat_text(&out[reqs[k].slot], outs[k].text);
+            if (outs[k].eou) add_eou(&out[reqs[k].slot], outs[k].eou, outs[k].eou_t);
             if (outs[k].finished) done[reqs[k].slot] = 1;
         }
     }
@@ -140,7 +159,10 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
 
 typedef struct { utt *u; } cb_ctx;
 static void on_res(const mynah_asr_result *r, void *ud) {
-    if (r->is_eou) return;
+    if (r->is_eou) {
+        if (r->eou_source != MYNAH_ASR_EOU_VAD) add_eou(((cb_ctx *)ud)->u, r->eou_source, r->t1);
+        return;
+    }
     cat_text(((cb_ctx *)ud)->u, r->text);
 }
 
@@ -162,7 +184,7 @@ static int bench(const char *model, const char *gemm, const char *kv_dtype, cons
     size_t *off = calloc((size_t)C, sizeof(size_t));
     if (!reqs || !outs || !off) return 1;
     for (int i = 0; i < C; i++)
-        if (asr_engine_slot_reset(e, i, "auto", 3) != 0) { printf("FAIL slot reset\n"); return 1; }
+        if (asr_engine_slot_reset(e, i, "auto", g_lookahead) != 0) { printf("FAIL slot reset\n"); return 1; }
     double prof[ASR_PROF_STAGES] = {0}, wall = 0.0;
     unsigned long passes = 0, full = 0;
     for (int st = 0; st < steps; st++) {
@@ -230,6 +252,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) bench_c = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) bench_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
+        else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) g_lookahead = atoi(argv[++i]);
         else if (strcmp(argv[i], "--list") == 0 && i + 1 < argc) {
             FILE *lf = fopen(argv[++i], "r");
             if (!lf) { fprintf(stderr, "cannot open %s\n", argv[i]); return 2; }
@@ -337,7 +360,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         utt cpu = {0};
         cb_ctx c = {&cpu};
-        mynah_asr_stream *s = mynah_asr_stream_open(m, NULL, 3);
+        mynah_asr_stream *s = mynah_asr_stream_open(m, NULL, g_lookahead);
         if (!s) { printf("FAIL: stream open\n"); return 1; }
         size_t off = 0;
         while (off < ns[i]) {
@@ -349,11 +372,13 @@ int main(int argc, char **argv) {
         mynah_asr_stream_finish(s, on_res, &c);
         mynah_asr_stream_close(s);
         const char *a = cpu.text ? cpu.text : "", *b = alone[i].text ? alone[i].text : "";
-        const int same = strcmp(a, b) == 0;
+        const char *ea = cpu.eous ? cpu.eous : "", *eb = alone[i].eous ? alone[i].eous : "";
+        const int same = strcmp(a, b) == 0 && strcmp(ea, eb) == 0;
         if (!same) differs++;
-        printf("%s B cpu-f32 vs gpu %-30s %s\n", same ? "OK  " : "DIFF", clips[i], same ? "identical" : "differs");
-        if (!same) printf("       cpu f32 : %s\n       gpu f32 : %s\n", a, b);
-        free(cpu.text);
+        printf("%s B cpu-f32 vs gpu %-30s %s%s%s\n", same ? "OK  " : "DIFF", clips[i], same ? "identical" : "differs",
+               ea[0] ? "  model eou " : "", ea[0] ? ea : "");
+        if (!same) printf("       cpu f32 : %s [%s]\n       gpu f32 : %s [%s]\n", a, ea, b, eb);
+        free(cpu.text); free(cpu.eous);
     }
     mynah_asr_free(m);
     asr_engine_close(e);

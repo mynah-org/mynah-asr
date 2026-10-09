@@ -243,10 +243,17 @@ static void print_partial(const mynah_asr_result *res, void *ud) {
     (void)ud;
     if (res->is_eou) {
         if (g_deltas_json) {
-            printf("{\"type\":\"eou\",\"t1\":%.4f,\"fed_s\":%.4f}\n", res->t1, g_fed_sec);
+            if (res->eou_source == MYNAH_ASR_EOU_VAD)
+                printf("{\"type\":\"eou\",\"t1\":%.4f,\"fed_s\":%.4f}\n", res->t1, g_fed_sec);
+            else   /* the model's own <EOU>/<EOB>: the VAD line above is unchanged */
+                printf("{\"type\":\"eou\",\"source\":\"model\",\"backchannel\":%s,\"t\":%.4f,\"t1\":%.4f,\"fed_s\":%.4f}\n",
+                       res->eou_source == MYNAH_ASR_EOU_MODEL_BACKCHANNEL ? "true" : "false",
+                       res->t1, res->t1, g_fed_sec);
             fflush(stdout);
         } else {
-            fprintf(stderr, "\n[eou at %.2fs, reported after %.0f ms]\n",
+            fprintf(stderr, "\n[%seou at %.2fs, reported after %.0f ms]\n",
+                    res->eou_source == MYNAH_ASR_EOU_MODEL ? "model " :
+                    res->eou_source == MYNAH_ASR_EOU_MODEL_BACKCHANNEL ? "model backchannel " : "",
                     res->t1, (g_fed_sec - res->t1) * 1000.0);
         }
         return;

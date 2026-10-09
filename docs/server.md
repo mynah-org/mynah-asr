@@ -362,6 +362,22 @@ a token in this delta may have been spoken slightly earlier, because the encoder
 works in chunks and the decoder trails it. Word-level times come from the
 offline path's timestamps.
 
+An `eou` frame comes from the server's VAD (`--vad`) or, on a pack trained to
+emit an end-of-utterance token (`<EOU>`/`<EOB>` in its `tokens.json`, e.g.
+`parakeet-realtime-eou-120m`), from the model itself; the latter carries
+`"source":"model"` and `"backchannel"` (true for `<EOB>`):
+
+```json
+{"type":"eou","t":7.69,"source":"model","backchannel":false,"seq":19,"audio_s":7.69,"lag_ms":4}
+```
+
+`t` is the end of the encoder frame that emitted the token. It follows the
+delta of the same chunk, the token never appears in the text, and the stream
+stays open: the model state is reset (encoder caches, predictor at SOS), as
+NeMo's reference streaming service does, and the next utterance is transcribed
+in the same session. A VAD `eou` frame is unchanged. `mynah-asr-server-cuda`
+sends the same frame.
+
 `text`, `language`, `audio_seconds` and `done:true` are the **v1 fields, kept
 for one release** so existing clients keep working; they go away in S2-5 proper.
 Nemotron deltas are always `final:true` (monotonic greedy, never retracted); the

@@ -20,6 +20,10 @@ the assertions next to the bytes that produced them.
                (SIGTERM -> `error shutting_down`)
   idle         say nothing after the handshake and be cancelled
   ping         read for a while and count the server's pings
+  frames       stream one clip, finalize, and print every delta / eou frame
+               reduced to what must not depend on the server or its load
+               (type, text, t0/t1, t, source, backchannel): the CPU server and
+               mynah-asr-server-cuda can then be diffed line for line
 
 Usage: python3 tests/ws_probe.py <command> [options]
 """
@@ -446,6 +450,37 @@ def cmd_ping(a) -> int:
 
 # ------------------------------------------------------------------ main
 
+def cmd_frames(a) -> int:
+    sess = Session(a.host, a.port, stream_path(a))
+    out, errors, done = [], [], False
+    try:
+        send_clip(sess, load_pcm(a.clip))
+        sess.send_text({"type": "finalize"})
+        deadline = time.monotonic() + a.timeout
+        while time.monotonic() < deadline:
+            msg = sess.next_msg(timeout=max(0.1, deadline - time.monotonic()))
+            if msg is None:
+                break
+            kind = msg.get("type")
+            if kind == "error":
+                errors.append(msg.get("code"))
+            elif kind == "done":
+                done = True
+                break
+            elif kind in ("delta", "eou"):
+                keep = ("type", "text", "t0", "t1") if kind == "delta" else ("type", "t", "source", "backchannel")
+                out.append({k: msg[k] for k in keep if k in msg})
+        sess.send_close()
+    finally:
+        sess.close()
+    for o in out:
+        print(json.dumps(o, sort_keys=True))
+    eous = sum(1 for o in out if o["type"] == "eou" and o.get("source") == "model")
+    ok = done and not errors and (a.expect_model_eou < 0 or eous == a.expect_model_eou)
+    print(f"# {len(out)} frame(s), {eous} model eou(s), done={done}, errors={errors}", file=sys.stderr)
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="localhost")
@@ -496,6 +531,11 @@ def main() -> int:
     p.add_argument("--wait", type=float, default=3.0)
     p.add_argument("--min-pings", type=int, default=2)
     p.set_defaults(fn=cmd_ping)
+
+    p = sub.add_parser("frames")
+    p.add_argument("--clip", required=True)
+    p.add_argument("--expect-model-eou", type=int, default=-1)
+    p.set_defaults(fn=cmd_frames)
 
     a = ap.parse_args()
     try:

@@ -18,7 +18,7 @@
 #       --corpus samples/stress-en/manifest.json --corpus-sample 498 \
 #       [--phase all|reference|ladder|soak] [--ladder "96 128 144 160"] [--ladder-seconds 90]
 #       [--soak-c 128] [--soak-seconds 1800] [--soaks 2] [--seed 42]
-#       [--cohort-ms 40] [--cap 192] [--lang auto] [--lookahead 3] [--ref-c 4] [--gemm own|splitk|own-tc] [--precision f32|bf16]
+#       [--cohort-ms 40] [--cap 192] [--lang auto|''] [--lookahead 3] [--ref-c 4] [--gemm own|splitk|own-tc] [--precision f32|bf16]
 #       [--reference-file <run>/reference.json] [--out ~/asr-evidence/gpu]
 #       [--server-cpus 0-31] [--gen-cpus 64-95]   (taskset; the GPU's NUMA node for the server)
 #       [--server-args "--stage-ahead 1 --graphs buckets ..."]   (extra server options, every server)

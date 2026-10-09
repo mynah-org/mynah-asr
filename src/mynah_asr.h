@@ -25,8 +25,19 @@ typedef struct {
     double      t0, t1;    /* time window in seconds (when available) */
     bool        is_final;  /* false = partial (may still change), true = commit */
     const char *lang;      /* detected language tag, NULL when unavailable   */
-    bool        is_eou;    /* the VAD saw the utterance END at t1 (text is "") */
+    bool        is_eou;    /* an utterance ENDED at t1 (text is ""); who saw it: */
+    int         eou_source;/* MYNAH_ASR_EOU_* when is_eou, else 0             */
 } mynah_asr_result;
+
+/* Who reported an end of utterance (mynah_asr_result.eou_source):
+ *   VAD    the stream's own VAD endpointing (mynah_asr_enable_vad)
+ *   MODEL  the model emitted its end-of-utterance token (<EOU>, packs trained
+ *          for it, e.g. parakeet_realtime_eou_120m); t0 = t1 = the end of the
+ *          encoder frame that emitted it
+ *   MODEL_BACKCHANNEL  the same for the end-of-backchannel token (<EOB>)
+ * A model report also RESETS the stream's model state (see mynah_asr_stream_open):
+ * the stream itself goes on and transcribes the next utterance. */
+enum { MYNAH_ASR_EOU_VAD = 0, MYNAH_ASR_EOU_MODEL = 1, MYNAH_ASR_EOU_MODEL_BACKCHANNEL = 2 };
 
 typedef void (*mynah_asr_result_cb)(const mynah_asr_result *res, void *userdata);
 
@@ -207,7 +218,18 @@ typedef struct mynah_asr_stream mynah_asr_stream;
  * feed per call, so smaller feeds mean lower endpoint latency. Measured on
  * nemotron: 160 ms at 32 ms chunks, 176-212 ms at 100 ms, 312-376 ms at 250 ms.
  * Note the text for the audio just before an endpoint may still arrive AFTER it:
- * the encoder works in chunks and the VAD is ahead of the decoder. */
+ * the encoder works in chunks and the VAD is ahead of the decoder.
+ *
+ * A pack whose vocabulary holds the end-of-utterance tokens <EOU> / <EOB>
+ * (tokens.json; parakeet_realtime_eou_120m) reports them the same way, with
+ * eou_source = MYNAH_ASR_EOU_MODEL(_BACKCHANNEL), after the text delta of the
+ * chunk that emitted them; the token never appears in the text. That chunk
+ * decoded, the stream resets its MODEL state -- encoder caches emptied,
+ * predictor back at SOS -- as NVIDIA's reference streaming service does after
+ * an <EOU>/<EOB> (NeMo nemo/agents/voice_agent/pipecat/services/nemo/
+ * streaming_asr.py, reset_state), while the audio, the mel cadence, the
+ * transcript and the time base go on: the next utterance is transcribed in the
+ * same stream. Packs without those tokens are untouched. */
 mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, int lookahead);
 
 /* Why the cache-aware streaming path cannot serve this model, or NULL when it
