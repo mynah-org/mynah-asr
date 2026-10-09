@@ -176,3 +176,21 @@ Open: endpoint decision slower than the English stock on single clips
 and/or level: no gain augmentation was used tonight); accents (add the
 accented vowels as appended tokens, as NVIDIA appends <EOU>/<EOB>); replicate
 on FR or DE to show it is a method, not a lucky language.
+
+### s2b: FastEmit 0.03 as the only change (`jobs/s2b.sh`)
+
+| | S2 (FastEmit 0) | S2b (FastEmit 0.03) |
+|---|---|---|
+| MLS-it val WER / CER (best) | 40.39 / 12.48 | 41.60 / 12.63 |
+| val EOU rate, empty | 98 %, 0 | 99.5 %, 0 |
+| single clips: speech end -> EOU p50 / p90 / p95 | 2346 / 3770 / 3866 ms (n=54) | 2346 / 3450 / 3962 ms (n=38) |
+| missed 2 s / never | 60 % / 10 % | 62.5 % / 5 % |
+| premature | 0 % | 0 % |
+| A + 1 s + B: EOU in gap, latency p50 / p90 | 58.3 %, 330 / 522 ms | 67.5 %, 298 / 426 ms |
+| A + 1 s + B: B end -> EOU p50, B missed@2s | 2094 ms, 56.7 % | 1742 ms, 37.5 % |
+
+(S2b eou_metrics on 40 clips/pairs vs 60 for S2.) FastEmit 0.03 makes the
+EOU more reliable in pauses and at the second turn, at +1.2 WER and no change
+of the single-clip p50; premature stays 0. Not a clear winner: S2 remains the
+reference for quality, S2b for turn-taking. Next: FastEmit 0.005 / 0.01,
+trailing-silence distribution, gain augmentation in stage 1.

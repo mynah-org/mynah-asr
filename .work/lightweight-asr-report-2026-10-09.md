@@ -81,3 +81,18 @@ tokenizers, metrics/evals/logs per run, `results/survival-final.tgz`
 (13.7 MB, also on the dev machine). Every upload verified by size. Code and
 notes: branch `research/lightweight-asr` of mynah-asr. The HF token was
 removed from the box after the last verified upload.
+
+## Update, same evening: EOU 120M -> Italian WORKS with two stages
+
+Stage 1 plain Italian ASR from the stock model and STOCK tokenizer (de-accented),
+stage 2 text + <EOU>: MLS-it 40.4 WER / 12.5 CER, 0 empty, <EOU> on 98 % of the
+clips (stage 1 alone 41.7 / 12.3). Inside Mynah: FLEURS-it stream 55.1 / 19.0
+(out of domain), CPU/CUDA parity incl. EOU events, CUDA server 1.9 GiB, 0 %
+premature EOU; single-clip endpoint p50 2.35 s (slower than the English stock),
+A + 1 s + B EOU latency p50 0.30-0.33 s. FastEmit 0.03 ablation: better
+turn-taking, +1.2 WER. Training cost: ~13.5 min (stage 1, 40 h) + ~7 min
+(stage 2) on one L40S. So: YES, EOU-120M is a credible base for cheap per-language
+streaming specialists; endpoint latency and accents are the open work. Details:
+`.work/eou-it-ft.md`. Code: `finetune/eou/two_stage.py` (branch lw-finetune-tooling).
+Final HF revision: d836773ad2863d352095898608c45e4bd1e5c950 (230 files, 14 .nemo,
+9 checkpoints, survival-final2.tgz verified); HF token removed from the box.
