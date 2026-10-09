@@ -470,7 +470,7 @@ def preprocessor_info(model):
                       "features", "window_stride")}
 
 
-def make_gain_aug(lo_db=-30.0, hi_db=6.0, prob=0.8, seed=0):
+def make_gain_aug(lo_db=-30.0, hi_db=6.0, prob=0.8, seed=0, audio_attr="audio"):
     """Lightning callback: random per-utterance gain on the training batch.
 
     NeMo v3.0.0's lhotse loader has no plain gain/volume option (it has noise,
@@ -478,7 +478,9 @@ def make_gain_aug(lo_db=-30.0, hi_db=6.0, prob=0.8, seed=0):
     applied to the already-padded batch on the device, just before
     training_step (padding stays zero), then clipped to [-1, 1] and
     re-quantised to the PCM16 grid like a real 16-bit capture. Logged:
-    applied fraction and mean/min/max dB.
+    applied fraction and mean/min/max dB. `audio_attr` names the batch field
+    holding the [B, T] audio ("audio" for the canary2 batch, "audio_signal" for
+    NeMo's AudioToTextEOUBatch).
     """
     import lightning.pytorch as pl
     import torch
@@ -492,7 +494,7 @@ def make_gain_aug(lo_db=-30.0, hi_db=6.0, prob=0.8, seed=0):
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
             if batch is None:
                 return
-            a = batch.audio
+            a = getattr(batch, audio_attr)
             n = a.shape[0]
             db = lo_db + (hi_db - lo_db) * torch.rand(n, generator=self.g)
             on = torch.rand(n, generator=self.g) < prob
