@@ -335,3 +335,23 @@ Reading: a clear slope from empty output in about a minute of training, but
 undertrained (loss ~2.0 at the end): a smoke schedule. VRAM fits an L4.
 Next (ft2): ~260 h of processed audio per subset (5 h x 52, 20 h x 13,
 40 h x 7 epochs), A and B4 at 5 h, B4 at 20/40 h.
+
+### ft2: the data curve at ~constant compute (2026-10-09, L40S, `.work/lightweight-asr/jobs/ft2.sh`)
+
+~260 h of processed audio per run, lr 2e-4, bf16, 300 s batches, no replay
+(Italian-only derivative; English forgetting is information, not a gate):
+
+| run | steps | FLEURS-it WER / CER | MLS-it WER / CER | FLEURS-en WER (base 6.86) | audio-h per GPU-h | peak VRAM alloc | GPU-h incl. evals |
+|---|---|---|---|---|---|---|---|
+| A 5 h x 52 | 3120 | 53.16 / 17.34 | 37.21 / 9.49 | 40.19 | 2854 | 8.05 GB | 0.321 |
+| B4 5 h x 52 | 3120 | 48.77 / 15.28 | 34.40 / 8.66 | 27.75 | 2435 | 8.33 GB | 0.333 |
+| B4 20 h x 13 | 3120 | 43.58 / 13.23 | 30.34 / 7.25 | 52.33 | 2658 | 8.33 GB | 0.326 |
+| B4 40 h x 7 | 3360 | 42.06 / 12.75 | 29.42 / 7.04 | 54.53 | 2865 | 8.33 GB | 0.339 |
+
+Reading: 5 -> 20 h buys ~5 WER points at the same compute (data diversity
+matters); 20 -> 40 h only ~1.5, but 7 epochs at 40 h is probably
+undertrained, so saturation is NOT shown. In-domain CER is 7 %: the acoustic
+side transfers; WER is limited by the decoder still learning Italian
+(lexicon/orthography). Every run costs about a third of an L40S GPU-hour
+including evals (~10 min of actual training). Artifacts: private HF repo
+(final.nemo for -e runs, metrics/evals/logs for all).
