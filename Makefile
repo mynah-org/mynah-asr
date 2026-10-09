@@ -255,6 +255,7 @@ test: $(TESTS) $(SCRIPTED_TESTS) mynah-asr mynah-asr-server examples/minimal
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi
 	@$(MAKE) --no-print-directory test-stream-allocs
 	@o=`python3 tools/bench/streaming_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
+	@o=`python3 tools/eval/eou_metrics.py --self-test` || { echo "$$o"; exit 1; }; echo "$$o" | tail -1
 	@$(MAKE) --no-print-directory test-stream-batch-allocs
 
 # S1-4: the BATCHED step allocates nothing per step either. Same counter, but
@@ -590,6 +591,7 @@ check:
 	@sh tests/test_check_plan.sh
 	@out=$$(python3 tools/bench/streaming_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(python3 tools/bench/stream_load.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
+	@out=$$(python3 tools/eval/eou_metrics.py --self-test) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_partial_quality.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_verdict.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
 	@out=$$(sh tests/test_v2_promote.sh) || { echo "$$out"; exit 1; }; echo "$$out" | tail -1
