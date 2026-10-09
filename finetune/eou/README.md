@@ -56,3 +56,21 @@ Real vs synthetic in the EOU labels: transcripts, utterance boundaries and the
 voiced span are real; every pause (digital zeros + white noise), the gain and
 the absence of incomplete-utterance negatives / backchannels are synthetic or
 missing, as in the public recipe without `align_eou`.
+
+## The working path (2026-10-09 evening): two stages, `two_stage.py`
+
+Validated on one L40S, MLS-it 40 h, accent-insensitive scores:
+stage 1 plain Italian ASR from the STOCK EOU 120M with its STOCK tokenizer
+(de-accented targets), stock decoder/joint, top-4 encoder blocks unfrozen at
+3e-5, decoder/joint 3e-4, FastEmit 0, no padding, 4000 steps -> MLS-it val
+WER 41.7 / CER 12.3; stage 2 from that best with text + <EOU> targets, 50 % of
+the samples with 1-3 s trailing quiet, lr 1e-4, 1500 steps -> 40.4 / 12.5,
+0 empty, <EOU> on 98 % of the val clips. Inside Mynah (CPU stream + CUDA
+server): CPU/CUDA parity incl. EOU events, 1.9 GiB VRAM, 0 % premature EOU;
+the single-clip endpoint is slower than the English stock (p50 2.3 s on
+FLEURS-it). Jobs: `../jobs/chain_it.sh` (40 h + stage 2), `../jobs/m1.sh`
+(Mynah evaluation), `../jobs/s2b.sh` (FastEmit 0.03 ablation),
+`../jobs/close.sh` (end-of-session archival). `plain_asr.py` is the earlier
+port of the same loop; `two_stage.py` is the exact file that produced the
+numbers above (stage 2 options, EOU-aware best selection, per-utterance greedy
+eval because NeMo's batched greedy crashed mid-run).
