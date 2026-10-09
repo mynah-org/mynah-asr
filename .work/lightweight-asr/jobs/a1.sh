@@ -11,11 +11,12 @@
 # Holds the GPU lock.
 #   tmux new -d -s a1 'bash /root/a1.sh 2>&1 | tee /root/res/a1.log'
 set -u
+until grep -q FT2-DONE /root/ft/logs/ft2.log 2>/dev/null; do sleep 30; done   # FT first
 exec 9>/root/gpu.lock; flock 9
 ulimit -n 65536
 cd /root/mynah-eou || exit 2
 O=/root/res/a1; mkdir -p $O
-CL="$(ls samples/stress-en/*/*.wav | head -498 | tr '\n' ' ')"
+CL="$(ls samples/stress-en/*/*.wav | tr '\n' ' ')"   # every class: the soak needs short/medium/long
 knee() {  # tag model lang lookahead levels srv_args
     echo "== a1 $1 [$5] $(date +%T)"
     MODEL=$2 LANG_Q="$3" LOOKAHEAD=$4 LEVELS="$5" GEMM=auto SRV_ARGS="$6" DUR=60 WARM=15 \

@@ -298,3 +298,40 @@ before/after every run and random-gain augmentation is a recorded A/B option
 order, wall-time and disk estimates: `.work/lightweight-asr/ft/README.md`.
 Track E (EOU 120M) is not in the kit yet; its trainer should reuse
 `ftlib.make_gain_aug` with gain ON by default.
+
+## Measurements
+
+### 2026-10-09, L40S (sm_89), NeMo 3.0.0, Canary 180M Flash -> Italian, smoke runs
+
+Kit: `.work/lightweight-asr/ft/` (run_all.sh). Data: MLS-it train, nested
+subsets 4.9988 / 19.996 / 39.998 h, 65 speakers, no speaker overlap with the
+eval; pool peak p50 -7 dBFS. Frozen eval: FLEURS-it test (865) + MLS-it test
+(1262), leaderboard multilingual normaliser (lang it). EN forgetting: 100
+FLEURS-en clips. Rate not set yet (cost fields 0); GPU-hours are measured.
+
+Zero-shot probe (pretrained, after the tokenizer surgery):
+
+| prompt (src=tgt) | FLEURS-it WER / CER | MLS-it WER / CER |
+|---|---|---|
+| it (no Italian text tokens yet) | 100.86 / 100.71 (635 empty) | 99.89 / 99.31 |
+| es | 87.67 / 30.00 | 82.01 / 28.13 |
+| fr | 97.44 / 38.77 | 89.76 / 36.35 |
+| EN sanity, FLEURS-en 100 clips | 6.86 / 3.46 (6.99 at -40 dBFS) | |
+
+The encoder already "hears" Italian phonetically (CER ~28-30 % through the
+Spanish prompt); the missing part is the text side.
+
+Smoke runs: 5 h subset, 600 steps (8.7 equivalent epochs), lr 2e-4, bf16,
+300 s of audio per batch:
+
+| run | trainable | FLEURS-it WER / CER | MLS-it WER / CER | EN WER delta | train wall | audio-h per GPU-h | peak VRAM alloc / reserved | GPU-h incl. evals |
+|---|---|---|---|---|---|---|---|---|
+| A (frozen encoder) | 74.1 M / 183.7 M | 71.32 / 20.72 | 56.70 / 14.05 | +0.70 | 55 s | 2843 | 8.05 / 8.6 GB | 0.131 |
+| B4 (top 4 encoder layers, enc lr x0.3) | 99.4 M | 68.40 / 19.30 | 54.24 / 12.93 | +2.51 | ~65 s | 2404 | 8.33 / 9.72 GB | 0.134 |
+
+Level robustness after A (FLEURS-it): 72.06 / 71.89 / 69.61 WER at peak
+-3 / -20 / -40 dBFS: FT did not narrow it.
+Reading: a clear slope from empty output in about a minute of training, but
+undertrained (loss ~2.0 at the end): a smoke schedule. VRAM fits an L4.
+Next (ft2): ~260 h of processed audio per subset (5 h x 52, 20 h x 13,
+40 h x 7 epochs), A and B4 at 5 h, B4 at 20/40 h.

@@ -3,6 +3,7 @@
 #   A   = frozen encoder, train decoder + new it rows
 #   B<N>= A + top N encoder layers unfrozen (encoder LR x ENC_LR_SCALE)
 # Env: SUBSET (5h|20h|40h, default 5h), ARMS (default "A B"), TOP_N (4),
+#      TAG_SUFFIX (appended to the run tag, e.g. -e50 for a longer schedule),
 #      EPOCHS (10), BATCH_DURATION (300 s of audio per batch; fits a 24 GB L4),
 #      LR (2e-4), RATE_USD_H (box price per GPU-hour, for the cost fields),
 #      T_TRAIN (timeout per run, s), GAIN_AUG (0|1: random gain -30..+6 dB on
@@ -14,7 +15,7 @@
 [ -n "${RATE_USD_H:-}" ] || echo "WARNING: RATE_USD_H unset; cost fields will be 0"
 SUBSET=${SUBSET:-5h}; TOP_N=${TOP_N:-4}
 for arm in ${ARMS:-A B}; do
-    tag="$arm$([ "$arm" = B ] && echo "$TOP_N")-$SUBSET$([ "${GAIN_AUG:-0}" = 1 ] && echo -gain)"
+    tag="$arm$([ "$arm" = B ] && echo "$TOP_N")-$SUBSET$([ "${GAIN_AUG:-0}" = 1 ] && echo -gain)${TAG_SUFFIX:-}"
     if step "train-$tag"; then
         need_gb 3 "a run (.nemo ~0.75 GB + hypotheses)"
         timeout "${T_TRAIN:-14400}" "$PY" "$KIT/train_canary_it.py" --arm "$arm" --top-n "$TOP_N" --subset "$SUBSET" \
