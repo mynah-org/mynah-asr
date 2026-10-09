@@ -100,7 +100,25 @@ level's profile.
   measured window. `gpu_qualify.sh` records the same topology and `[GPU]`
   lines and takes `--server-cpus` / `--gen-cpus`.
 
-## Serving-loop options (all default OFF until screened)
+## Defaults of the CUDA server (2026-10-09)
+
+- `--precision auto --gemm auto`: the fixed-order bf16 tensor-core GEMM
+  (`bf16` + `own-tc`) on sm_80 and newer, the f32 `own` GEMM on older cards,
+  with `--weights int8`, or on the cpu engine. It is a numerical change from
+  f32, batch-invariant byte for byte, with the 498-clip bank inside the WER
+  bound (0.14469 vs 0.14483 corpus WER) and -55% device time per encoder pass;
+  on an L40S it moved the screening knee from below C416 to above C512
+  (`.work/l40s-2026-10-08-asr-cuda.md`). `--precision f32 --gemm own` restores
+  the previous default.
+- The serving-loop options below default ON for the cuda engine
+  (`--stage-ahead 1 --host-threads auto --graphs buckets --warmup 1`): all
+  byte-identical. `--stage-ahead 0 --host-threads 1 --graphs off --warmup 0`
+  restores the eager loop. `--graphs` stays off with `--gemm cublas` or
+  `--profile-stages`.
+- Off: `--kv-dtype`, `--weights int8` (capacity levers, see below) and
+  `--profile-host` (diagnostic).
+
+## Serving-loop options
 
 | flag | what it does | identity |
 |---|---|---|
@@ -117,6 +135,12 @@ warm-up times and the VRAM in use at ready; `[DUMP] ... loop` reports the
 window, the submit/finish split and graph vs eager passes.
 
 ## Quantised arms (default off)
+
+To improve before they can be defaults: `--weights int8` runs on the v1 f32
+kernel, so it competes with the bf16 tensor-core GEMM instead of adding to it;
+the lasting form decodes int8 codes inside the tensor-core tile load (and fuses
+dequant, bias and activation). `--kv-dtype int8` cuts per-stream VRAM by 69%
+but does not speed a pass up; it pays once the cap is VRAM-bound.
 
 Two independent switches, both numerical changes (not bit-identical to f32),
 both batch-invariant by construction (a lane's bytes never depend on its

@@ -1415,13 +1415,13 @@ static void usage(void) {
         "usage: mynah-asr-server-cuda -m <model_dir> [-p PORT] [--host H] [--engine cuda|cpu]\n"
         "       [--device N] [--cap N] [--cohort-ms MS] [--http-threads N] [--idle-ms MS]\n"
         "       [--ping-ms MS] [--max-frame-bytes N] [--max-audio-seconds S] [--metrics-port P]\n"
-        "       [--ring-seconds 30] [--gemm own|own-v2|splitk|own-tc|cublas] [--precision f32|bf16 (bf16 = own-tc only)] [--engine-threads N (cpu engine pool)]\n"
+        "       [--ring-seconds 30] [--gemm auto|own|own-v2|splitk|own-tc|cublas] [--precision auto|f32|bf16 (bf16 = own-tc only; auto = bf16 own-tc on sm_80+, else f32 own)] [--engine-threads N (cpu engine pool)]\n"
         "       [--kv-dtype f32|bf16|int8 (K/V ring storage; default f32)] [--weights f32|int8]\n"
         "       [--profile-stages (DIAGNOSTIC: per-stage CUDA-event timing)] [--dispatch-map] [--version]\n"
         "       [--profile-host (DIAGNOSTIC: the engine thread's wall per phase, [HOSTP] lines)]\n"
         "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
         "       [--stage-ahead 0|1] [--host-threads N|auto] [--graphs off|buckets] [--graph-buckets 8,16,32,64,128]\n"
-        "       [--warmup 0|1]  (all default off: 0, 1 thread, off, -, 0)\n"
+        "       [--warmup 0|1]  (cuda engine defaults: 1, auto, buckets, 8,16,32,64,128, 1; cpu engine: off)\n"
         "  --stage-ahead 1: stage and feed the next chunks while the encoder pass runs (byte-identical)\n"
         "  --host-threads: threads (engine thread included) for the host mel of a staged batch; auto =\n"
         "  1 up to 8 usable CPUs, 2 up to 16, 4 above (affinity and cgroup quota)\n"
@@ -1435,11 +1435,15 @@ int main(int argc, char **argv) {
     g.host = "0.0.0.0"; g.port = 8291; g.metrics_port = 0; g.device = 0; g.cap = 128;
     g.cohort_ms = 40; g.http_threads = 0; g.idle_ms = 30000; g.ping_ms = 15000;
     g.max_frame_bytes = 1 << 20; g.max_audio_seconds = 0.0; g.engine_name = "cuda";
-    g.precision = "f32"; g.gemm = "own"; g.threads = 0; g.ring_seconds = 30;
+    /* precision and GEMM resolve below ("auto"); the serving-loop options
+     * default on for the cuda engine (S14-13/S14-14: byte-identical to the
+     * eager loop, gate C and the C=64 server wave) */
+    g.precision = NULL; g.gemm = NULL; g.threads = 0; g.ring_seconds = 30;
+    int stage_ahead_set = 0, graphs_set = 0, warmup_set = 0;
     int dispatch_map = 0;
     const double t_start = now_s();
     g.host_threads = 1;
-    const char *host_threads_arg = "1";
+    const char *host_threads_arg = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1464,15 +1468,16 @@ int main(int argc, char **argv) {
         else if (ARG("--metrics-port")) g.metrics_port = atoi(v);
         else if (ARG("--gemm")) g.gemm = v;
         else if (ARG("--precision")) g.precision = v;
-        else if (ARG("--stage-ahead")) g.stage_ahead = atoi(v);
+        else if (ARG("--stage-ahead")) { g.stage_ahead = atoi(v); stage_ahead_set = 1; }
         else if (ARG("--host-threads")) host_threads_arg = v;
         else if (ARG("--graphs")) {
+            graphs_set = 1;
             if (strcmp(v, "off") == 0) g.graphs = 0;
             else if (strcmp(v, "buckets") == 0) g.graphs = 1;
             else { fprintf(stderr, "--graphs must be off or buckets\n"); return 2; }
         }
         else if (ARG("--graph-buckets")) g.graph_buckets = v;
-        else if (ARG("--warmup")) g.warmup = atoi(v);
+        else if (ARG("--warmup")) { g.warmup = atoi(v); warmup_set = 1; }
         else if (ARG("--kv-dtype")) g.kv_dtype = v;
         else if (ARG("--weights")) g.weights = v;
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
@@ -1487,6 +1492,31 @@ int main(int argc, char **argv) {
     if (g.ring_seconds < 1) g.ring_seconds = 1;
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
     if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
+    const int cuda_engine = strcmp(g.engine_name, "cuda") == 0;
+    /* --precision/--gemm auto (the default): the fixed-order bf16 tensor-core
+     * GEMM on sm_80+ (S14-8c: batch-invariant, 498-clip bank WER 0.14469 vs
+     * 0.14483 for f32, device time per pass -55%), the f32 own GEMM elsewhere,
+     * with --weights int8 (an f32-activation arm), or on the cpu engine.
+     * An explicit --precision or --gemm is honoured as given. */
+    {
+        const int auto_prec = g.precision == NULL || strcmp(g.precision, "auto") == 0;
+        const int auto_gemm = g.gemm == NULL || strcmp(g.gemm, "auto") == 0;
+        const int w8 = g.weights != NULL && strcmp(g.weights, "int8") == 0;
+        const int tc = cuda_engine && !w8 && asr_engine_cuda_cc_major(g.device) >= 8 &&
+                       (auto_prec || strcmp(g.precision, "bf16") == 0) &&
+                       (auto_gemm || strcmp(g.gemm, "own-tc") == 0);
+        if (auto_prec) g.precision = tc ? "bf16" : "f32";
+        if (auto_gemm) g.gemm = (tc && strcmp(g.precision, "bf16") == 0) ? "own-tc" : "own";
+    }
+    if (cuda_engine) {
+        if (!stage_ahead_set) g.stage_ahead = 1;
+        if (!warmup_set) g.warmup = 1;
+        /* graphs serve the own GEMMs only, and not under the event profile */
+        if (!graphs_set) g.graphs = (strcmp(g.gemm, "cublas") != 0 && !g.profile) ? 1 : 0;
+        if (host_threads_arg == NULL) host_threads_arg = "auto";
+    } else if (host_threads_arg == NULL) {
+        host_threads_arg = "1";
+    }
     const int cpus = usable_cpus();
     if (strcmp(host_threads_arg, "auto") == 0) g.host_threads = host_threads_auto(cpus);
     else g.host_threads = atoi(host_threads_arg);

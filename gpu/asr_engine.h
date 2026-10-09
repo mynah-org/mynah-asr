@@ -190,6 +190,10 @@ struct asr_engine { const asr_engine_ops *ops; };
  * slots. NULL on failure with the reason in `err`. */
 asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err, size_t errcap);
 asr_engine *asr_engine_open_cpu(const asr_engine_cfg *cfg, char *err, size_t errcap);
+/* Compute-capability major of CUDA device `device`, or -1 when there is no
+ * CUDA device or the binary has no cuda engine. The server uses it to resolve
+ * --precision/--gemm auto: bf16 own-tc needs sm_80+. */
+int asr_engine_cuda_cc_major(int device);
 
 static inline void asr_engine_close(asr_engine *e) { if (e) e->ops->close(e); }
 static inline void asr_engine_get_facts(const asr_engine *e, asr_engine_facts *f) { e->ops->facts(e, f); }

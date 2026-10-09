@@ -621,6 +621,12 @@ static int warmup_run(cuda_engine *e);
 static feed_team *team_open(cuda_engine *e, int helpers);
 static void team_close(feed_team *t);
 
+extern "C" int asr_engine_cuda_cc_major(int device) {
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) return -1;
+    return major;
+}
+
 extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err, size_t errcap) {
     cuda_engine *e = new cuda_engine();
     e->base.ops = cuda_ops();
