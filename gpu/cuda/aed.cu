@@ -306,7 +306,7 @@ __global__ void dwconv_kernel(const float *__restrict__ g, const int *__restrict
 
 /* ----------------------------------------------------------- decoder kernels */
 
-__device__ double block_sum_d(double v, double *red) {
+static __device__ double block_sum_d(double v, double *red) {
     red[threadIdx.x] = v;
     __syncthreads();
     for (int s = AED_THREADS / 2; s > 0; s >>= 1) {
