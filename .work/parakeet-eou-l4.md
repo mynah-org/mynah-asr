@@ -430,5 +430,8 @@ server and ~C generator processes, so the C1024 rungs of both models may be
 partly generator-limited: a multiplexed generator (lw-async-load) and an A/B
 against the old one come before any C >= 1024 claim.
 Reading: at C1024 the EOU's lag is 3.7x lower than Nemotron's at ~0.56x the
-busy SM and -36 W; the GPU cost ratio (~1.8x) is far below the parameter
-ratio, which is what the 3b perf audit is for. Screens, not soaks.
+busy SM and -36 W. SM utilisation is NOT GPU compute cost (kernel mix,
+occupancy and shapes differ between the models), so the 31/56 ratio is a
+HINT that motivates the 3b audit, not evidence; no optimisation is decided
+on it. Idle VRAM (1.9 vs 6.9 GiB) is the comparable memory number; the
+loaded VRAM is dominated by the cap-sized arena. Screens, not soaks.
