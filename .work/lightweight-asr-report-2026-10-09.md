@@ -71,3 +71,13 @@ recipe failed for a reason isolated to the training loop, not to the model;
 the acoustic side is not the limit (Canary's encoder of the same family
 transferred to Italian at 7 % in-domain CER). The answer needs the ablation
 ladder (one evening of GPU at most, given ~0.1 GPU-h per 5 h run).
+
+## Artifacts at shutdown
+
+Private HF repo `gabrione/mynah-asr-canary-it-experiments`, revision
+f6d4a3076a7884fef62465ecc10c9ba22aea0f95: 201 files, 8 `.nemo`, 4 `last.ckpt`
+(Canary replay, three EOU-IT arms), recipes (`recipe/ft-kit`, `recipe/eou-kit`),
+tokenizers, metrics/evals/logs per run, `results/survival-final.tgz`
+(13.7 MB, also on the dev machine). Every upload verified by size. Code and
+notes: branch `research/lightweight-asr` of mynah-asr. The HF token was
+removed from the box after the last verified upload.
