@@ -22,6 +22,8 @@
 #       [--reference-file <run>/reference.json] [--out ~/asr-evidence/gpu]
 #       [--server-cpus 0-31] [--gen-cpus 64-95]   (taskset; the GPU's NUMA node for the server)
 #       [--server-args "--stage-ahead 1 --graphs buckets ..."]   (extra server options, every server)
+#       [--load-mux N]   (load generator: N event-loop workers instead of one process per
+#                         stream, stream_load.py --mux; also env LOAD_MUX=N; default 0 = off)
 #
 # Every run records a [TOPOLOGY] line (gpu/tools/topology.sh: GPU, driver, the
 # GPU's NUMA node, CPU, usable CPUs incl. the cgroup quota, the pinning) and,
@@ -37,7 +39,7 @@ MODEL=""; PHASE=all; LADDER="96 128 144 160"; LADDER_S=90; SOAK_C=128; SOAK_S=18
 SEED=42; COHORT=40; CAP=192; LANG_Q=auto; LOOKAHEAD=3; REF_C=4; REF_IN=""
 CORPUS=""; CORPUS_SAMPLE=0; CORPUS_SEED=42; MIN_PEAK_DBFS=-30
 WARMUP=30; WINDOW=60; DUMP_EVERY=30; OUT="$HOME/asr-evidence/gpu"; PORT=8291; BIN=./mynah-asr-server-cuda; GEMM=auto; PREC=auto
-SRV_CPUS=""; GEN_CPUS=""; SRV_ARGS=""
+SRV_CPUS=""; GEN_CPUS=""; SRV_ARGS=""; LOAD_MUX="${LOAD_MUX:-0}"
 while [ $# -gt 0 ]; do
     case "$1" in
         -m) MODEL="$2"; shift 2 ;;
@@ -67,12 +69,14 @@ while [ $# -gt 0 ]; do
         --gen-cpus) GEN_CPUS="$2"; shift 2 ;;
         --precision) PREC="$2"; shift 2 ;;
         --server-args) SRV_ARGS="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --load-mux) LOAD_MUX="$2"; shift 2 ;;
+        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "gpu_qualify: unknown option: $1" >&2; exit 2 ;;
     esac
 done
 [ -n "$MODEL" ] && [ -f "$MODEL/mynah.json" ] || { echo "gpu_qualify: -m <converted model dir> is required" >&2; exit 2; }
 [ -x "$BIN" ] || { echo "gpu_qualify: build first (make -C gpu)" >&2; exit 2; }
+case "$LOAD_MUX" in ''|*[!0-9]*) echo "gpu_qualify: --load-mux / LOAD_MUX wants a worker count (0 = off)" >&2; exit 2 ;; esac
 
 RUN="$OUT/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RUN" || exit 2
@@ -195,7 +199,7 @@ print(",".join(k for k in ("short", "medium", "long") if k in have))
 CLSPY
 )
 load() { $GP python3 tools/bench/stream_load.py --port "$PORT" --lookahead "$LOOKAHEAD" --lang "$LANG_Q" \
-             --bank "$CLASSES" --class-bounds 8,20 ${ONSETS:+--onsets "$ONSETS"} "$@"; }
+             --bank "$CLASSES" --class-bounds 8,20 ${ONSETS:+--onsets "$ONSETS"} --mux "$LOAD_MUX" "$@"; }
 
 # ------------------------------------------------------------ 2. reference
 REFJSON="$RUN/reference.json"
@@ -275,7 +279,7 @@ cat > "$RUN/manifest.json" <<JSON
   "connection_ceiling": $(( CAP + 32 )), "server_cpus": "${SRV_CPUS:-container}", "gen_cpus": "${GEN_CPUS:-container}",
   "corpus_clips": $NCLIP, "bank_sha256": "$BANK_SHA", "corpus": "$CORPUS", "corpus_sample": $CORPUS_SAMPLE,
   "corpus_seed": $CORPUS_SEED, "min_peak_dbfs": $MIN_PEAK_DBFS, "reference_concurrency": $REF_C,
-  "lang": "$LANG_Q", "configuration": "gpu-s14", "server_args": "$SRV_ARGS",
+  "lang": "$LANG_Q", "configuration": "gpu-s14", "server_args": "$SRV_ARGS", "load_mux": $LOAD_MUX,
   "ladder": "$LADDER", "ladder_seconds": $LADDER_S,
   "soak_concurrency": $SOAK_C, "soak_seconds": $SOAK_S, "soaks": $SOAKS,
   "warmup_s": $WARMUP, "window_s": $WINDOW, "dump_every_s": $DUMP_EVERY,
