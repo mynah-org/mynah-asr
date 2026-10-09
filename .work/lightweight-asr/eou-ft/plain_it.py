@@ -213,8 +213,11 @@ while step < a.steps:
             rec.update({"val_wer": round(vw, 2), "val_cer": round(vc, 2), "val_empty": sum(1 for h in vh if not h.strip()),
                         "val_eou_rate": round(veo / len(val), 3), "val_nonblank": round(float(np.mean(vnb)), 4)})
             print(f"  VAL {json.dumps({k: rec[k] for k in rec if k.startswith('val')})}", flush=True)
-            if best is None or vw < best:
-                best = vw
+            # stage 2 keeps EOU: best = lowest WER among evals with EOU on >= 80 % of the
+            # val clips; until one qualifies, the eval with the most EOU wins
+            score = vw if not a.eou_append else (vw if rec["val_eou_rate"] >= 0.8 else 1000 - 100 * rec["val_eou_rate"])
+            if best is None or score < best:
+                best = score
                 m.save_to(str(out / "final.nemo"))
                 torch.save({"model": m.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
                             "args": vars(a)}, out / "last.ckpt")
