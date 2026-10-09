@@ -120,11 +120,12 @@ def batch(rs, train=False):
     for i, x in enumerate(xs):
         X[i, : len(x)] = torch.from_numpy(x)
     lens = torch.tensor([len(x) for x in xs])
-    U = max(len(r["ids"]) for r in rs)
+    ids = [r.get("ids") or [0] for r in rs]   # validation rows carry no ids (targets unused there)
+    U = max(len(t) for t in ids)
     Y = torch.zeros(len(rs), U, dtype=torch.long)
-    for i, r in enumerate(rs):
-        Y[i, : len(r["ids"])] = torch.tensor(r["ids"])
-    ylens = torch.tensor([len(r["ids"]) for r in rs])
+    for i, t in enumerate(ids):
+        Y[i, : len(t)] = torch.tensor(t)
+    ylens = torch.tensor([len(t) for t in ids])
     return X.to(dev), lens.to(dev), Y.to(dev), ylens.to(dev)
 
 
