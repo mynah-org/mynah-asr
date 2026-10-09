@@ -333,3 +333,26 @@ nvcc: the .cu was syntax-checked with clang's CUDA front end only). Box order:
 - bf16 own-tc: a WER gate on `samples/eval-bank` (en, fr) against f32 before it
   could become a default.
 - canary-1b-flash / 1b-v2: same code path; VRAM and T_max to check.
+
+### c1: Canary 180M in the CUDA server, first GPU run (2026-10-09, L40S, lw-canary-cuda 96ae1ec)
+
+`.work/lightweight-asr/jobs/c1.sh`. First nvcc build failed at link
+(`block_sum_d` defined in both aed.cu and kernels.cu; fixed in 96ae1ec, made
+file-local). Then, on 7 clips (samples/en, samples/fr, FLEURS):
+- dispatch map: 0 UNKNOWN; encoder (full-context rel-pos attention, 'same'
+  depthwise conv with folded batch_norm) and AED decoder on the GPU,
+  subsampling + mel + prompt + detok in the library on the host;
+- A parity with the CPU library: 7/7 byte-identical transcripts, with the
+  host decoder (stage 2), the GPU decoder f32 (stage 3) and the bf16 arm;
+- B batch identity: 7/7 identical batched vs one by one; C word path identical;
+- server: /v1/models streaming false; WS 400 model_not_streaming before the
+  upgrade; REST identical to the CLI on 3 EN + 2 FR clips; two concurrent
+  rounds 5/5 identical to one by one (no cross-request contamination on this
+  set); translation en>de identical; unknown language 400; books balanced;
+  SIGTERM clean.
+- first cost picture (7 clips, batched, f32): enc 542 ms, dec 9858 ms, host
+  subsampling 1787 ms; batched wall 2.7 s vs 27.9 s for the CPU library
+  reference. The decoder dominates (one GEMM wave per token step), as the
+  design note predicted.
+Still owed before "supported": bf16 parity on a BANK (not 7 clips), EN+FR
+bank WER on the CUDA path, REST concurrency ladder.
