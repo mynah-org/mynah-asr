@@ -161,6 +161,14 @@ is never presented as true streaming. A pseudo-streaming / chunked mode for UX
 recompute it costs measured. Not started before the EOU 120M passes its
 end-to-end gate.
 
+### Gate before Canary counts as supported in the CUDA server (decided 2026-10-09)
+
+In order: CPU library == CUDA f32 (transcripts) -> batch=1 == batch=N ->
+bf16 quality parity on a bank (not 4 clips) -> EN and FR -> REST under
+concurrency -> no cross-request state contamination (a request's transcript
+independent of what shares its wave). Only then a separate throughput ladder.
+First compile + gates: `.work/lightweight-asr/jobs/c1.sh`.
+
 ## 4. Measurements
 
 ### 2026-10-09, L40S box, q1: FLEURS test 200 clips per language, f32, CPU CLI offline (build 4378448)

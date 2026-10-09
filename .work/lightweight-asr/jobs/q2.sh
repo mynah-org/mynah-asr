@@ -5,6 +5,8 @@
 #     (bf16 parity on THIS model; EOU vs Nemotron on the same 498 clips).
 #  A. FLEURS EN 200 (q1 bank) with the new CLI: WER after the reset.
 #  B. eou_metrics: speech-end -> EOU latency, premature/missed, A+gap+B.
+# Reference at C=48: unloaded transcripts are batch/slot-invariant (gate A of
+# test_cuda_stream), so C only shortens the wall time (C=4 paces ~25 min/arm).
 # C first and alone (gpu_qualify refuses a busy container), then A || B on CPU.
 #   tmux new -d -s q2 'bash /root/q2.sh 2>&1 | tee /root/res/q2.log'
 set -u
@@ -12,9 +14,18 @@ cd /root/mynah-eou || exit 2
 O=/root/res/q2; mkdir -p $O
 E=models/parakeet-realtime-eou-120m; M=models/nemotron-3.5-asr-streaming-0.6b
 CORP="--corpus samples/stress-en/manifest.json --corpus-sample 498 --corpus-seed 42"
+# the second checkout tracks only the bank's manifest: hard-link the audio in
+cp -a -l -n /root/mynah-asr/samples/stress-en/. samples/stress-en/ 2>/dev/null
+ls samples/stress-en | head -3
+# the VAD ground truth of eou_metrics needs the converted Silero pack
+if [ ! -f models/silero-vad/mynah.json ]; then
+    make -s fetch-vad && (cd tools && timeout 900 uv run --extra vad python convert_silero.py \
+        ../models/silero-vad/silero_vad.onnx ../models/silero-vad) >$O/vad-convert.log 2>&1 || tail -5 $O/vad-convert.log
+fi
+ls models/silero-vad
 ref() {  # tag model lang lookahead extra-qualify-args
     echo "== q2 ref $1 $(date +%T)"
-    timeout 2400 gpu/tools/gpu_qualify.sh -m $2 $CORP --phase reference --lang "$3" --lookahead $4 \
+    timeout 2400 gpu/tools/gpu_qualify.sh -m $2 $CORP --phase reference --ref-c 48 --lang "$3" --lookahead $4 \
         --out $O/$1 ${@:5} >$O/$1.log 2>&1; echo "rc=$?"; ls $O/$1/*/reference.json 2>/dev/null | head -1
 }
 ref eou-f32  $E "" 1 --precision f32 --gemm own
@@ -26,7 +37,6 @@ python3 gpu/tools/transcript_ab.py $(R eou-f32) $(R eou-auto) --manifest samples
 echo "== q2 AB nemotron(auto) -> eou(auto) $(date +%T)"
 python3 gpu/tools/transcript_ab.py $(R nemo-auto) $(R eou-auto) --manifest samples/stress-en/manifest.json --lang en 2>&1 | grep -v -E "^\s*(A|B|REF)\s*:" | tail -14
 echo "== q2 A+B start $(date +%T)"
-make -s fetch-vad >/dev/null 2>&1
 ( timeout 3600 python3 tools/eval/lang_gate.py -m $E --quant f32 --mode stream --langs en --label eou-reset \
     --manifest samples/eval-bank/manifest.json --root samples/eval-bank --json $O/eou-reset-en.json >$O/eou-reset-en.txt 2>&1
   echo "== q2 lang_gate rc=$? $(date +%T)" ) &
