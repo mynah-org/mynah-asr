@@ -80,3 +80,52 @@ v3.0.0 only in two links (NFA and voice-agent now point at NVIDIA-NeMo/Speech).
   were not re-read for this kit (not used). Whether `align_eou.py` accepts the
   Italian hybrid `stt_it_fastconformer_hybrid_large_pc` stays UNKNOWN.
 - The exact label pipeline/data mix of the released checkpoint is unpublished.
+
+## Measurements, 2026-10-09 (L40S, NeMo 3.0.0, MLS-it 5 h, eou kit)
+
+Fixes needed before the first step ran: tokenizer paths in the model cfg
+(register_artifact on a None model_path), and the numba RNNT loss
+(numba 0.68 needs the `numba-cuda` package; numba-cuda 0.30.4 needs numpy < 2.4).
+
+| run | encoder | decoder/joint | lr (dec/joint, enc) | steps | train loss | FLEURS-it / MLS-it WER | EOU emitted |
+|---|---|---|---|---|---|---|---|
+| eou-it-5h-e52 (cold) | trainable | reinitialised | 1e-3, 3e-4 | 2987 | 404 -> ~10 | 100 / 100 (all empty) | 0 |
+| eou-it-5h-e52-warm | trainable | stock | 1e-3, 3e-4 | stopped at ~1600 | | in-loop VAL 100 / 100 at 1000 and 1500 | 0 |
+| eou-it-5h-e26-frz (cold) | FROZEN | reinitialised | 1e-3, - | 1494 | ~119 at 1200 | 99.57 / 99.69 (VAL 98 at 500 -> 99 at 1000) | 0 |
+| eou-it-5h-e26-frz-warm | FROZEN | stock | 1e-3, - | 1494 | (see below) | | |
+
+Diagnostics on the cold checkpoint (`blankdiag.py`, `batchprobe.py`, CPU):
+- greedy empty on TRAIN and eval clips; max(non-blank) - blank < 0 on every
+  frame of 10 clips (max -0.26 .. -0.65);
+- beam-4 returns the SAME sentence ("che ero un uomo di cartapesta senza
+  sangue nelle vene ...") for every input: the RNNT became an audio-independent
+  text prior;
+- RNNT loss on a train clip: text+<EOU> 44.9, text only 192.9, <EOU> only
+  38.6: the objective converges toward the targets, but NOT to a decodable,
+  audio-conditioned distribution;
+- encoder weights barely moved (median 0.9 %, max 9.3 %), encoder output cosine
+  to stock 0.911, but per-channel temporal std 0.169 -> 0.040; the FROZEN arm
+  collapses as well, so encoder drift is not the primary cause;
+- a real training batch is sane: levels (rms 0.03-0.10, peak 0.3-0.7),
+  durations 12-27 s after padding, Italian text with <EOU> (1024) last;
+- ~1 % of the cuts raise a suppressed lhotse AudioLoadingError (offset
+  ignored, declared vs loaded samples differ): to fix, not the cause.
+- at step 500 there is still some output; continued training converges to
+  blank: the objective/optimisation REWARDS the degenerate solution.
+Suspects, in order: decoder/joint lr 1e-3; 90 % of the samples padded with
+3-6 s of silence (most frames are blank targets); FastEmit 0.03 with that
+padding distribution vs the NVIDIA recipe's actual settings.
+
+## Next session: ablation ladder before any 5 h run
+
+1. Micro-overfit: 16-32 Italian utterances, no artificial padding, no gain,
+   FastEmit 0, encoder frozen, stock decoder/joint, low lr (1e-4). A healthy
+   RNNT must memorise them and greedy must return sensible text.
+2. Then add ONE variable at a time: plain -> +<EOU> -> +padding ->
+   +FastEmit -> +gain -> unfreeze encoder top blocks (discriminative lr,
+   encoder 1e-5..3e-5).
+3. Checkpoints/metrics at steps 0, 100, 250, 500, 750, 1000: train loss,
+   WER, non-blank frame %, blank margin, EOU rate, and an audio-dependence
+   check (different audio -> different hypotheses).
+4. Only then 5 h -> 20 h, and EOU-aware second stage (incomplete-utterance
+   negatives, backchannels) per the NVIDIA recipe.
