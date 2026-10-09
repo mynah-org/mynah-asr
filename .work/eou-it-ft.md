@@ -194,3 +194,29 @@ EOU more reliable in pauses and at the second turn, at +1.2 WER and no change
 of the single-clip p50; premature stays 0. Not a clear winner: S2 remains the
 reference for quality, S2b for turn-taking. Next: FastEmit 0.005 / 0.01,
 trailing-silence distribution, gain augmentation in stage 1.
+
+## French replica, no tuning (2026-10-09 late, `ft/data_fr.py`, `jobs/chain_fr.sh`, `jobs/lvlfr.sh`)
+
+Same stage 1 / stage 2 recipe, steps, lr, freeze policy, curriculum and best
+selection as Italian; de-accented targets (French loses more: é è à ç ê ...).
+Data: MLS-fr, first 6 of 34 train shards; the 60 min/speaker cap gave only
+22.3 h, so the cap was raised to 120 min: "40 h" = 38.58 h from 37 speakers
+(Italian: 39.998 h, 65 speakers). Pool peak p50 -9 dBFS.
+
+| run | MLS-fr val WER / CER | empty | EOU | wall |
+|---|---|---|---|---|
+| plain-FR 38.6 h, 4000 steps | 54.2 (1500) -> 51.5 (3000) -> **50.99 / 26.91** | 2/200 | 0 | 836 s |
+| stage 2 EOU, 1500 steps | 52.4 (250) -> **49.18 / 25.87** | 3/200 | **97 %** | 447 s |
+
+Inside Mynah (CLI stream f32, FLEURS-fr test 200, accent-insensitive):
+WER 78.70 / CER 54.29, 47 empty, model EOU on 139 clips; peak-normalised to
+-3 dBFS: 73.39 / 46.62, 28 empty, EOU on 152 (bank peak p10/p50/p90
+-24.5/-12.2/-8.5 dBFS, so level explains only part). eou_metrics (40 clips,
+gap 1 s): speech end -> EOU p50 2154 / p90 3588 / p95 3680 ms; never 27.5 %;
+premature 0 %; A + 1 s + B: EOU in the gap 70 %, latency p50 378 ms.
+Reading: the two-stage method REPLICATES on a second language in ~21 GPU
+minutes (stage 2 restores <EOU> without a WER cost; 0 % premature), but the
+French model generalises poorly out of domain (37 audiobook speakers): MLS
+49.2 vs FLEURS 73-79. Next for FR: more speakers (more shards / FLEURS train /
+Common Voice), random gain in stage 1, accent tokens.
+Artifacts: HF runs/plain-fr-p40, runs/plain-fr-s2-eou (final.nemo + last.ckpt).

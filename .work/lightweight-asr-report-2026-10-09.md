@@ -96,3 +96,11 @@ streaming specialists; endpoint latency and accents are the open work. Details:
 `.work/eou-it-ft.md`. Code: `finetune/eou/two_stage.py` (branch lw-finetune-tooling).
 Final HF revision: d836773ad2863d352095898608c45e4bd1e5c950 (230 files, 14 .nemo,
 9 checkpoints, survival-final2.tgz verified); HF token removed from the box.
+
+## French replica (same night, no tuning)
+
+MLS-fr 38.6 h (37 speakers): plain 51.0 / 26.9 -> stage 2 EOU 49.2 / 25.9,
+EOU 97 %, ~21 GPU minutes. In Mynah on FLEURS-fr: 78.7 WER (73.4 after level
+normalisation), EOU p50 2.15 s, 0 % premature, A + 1 s + B EOU in gap 70 %.
+The method replicates; out-of-domain generalisation needs more speaker
+diversity than 6 MLS shards give.
