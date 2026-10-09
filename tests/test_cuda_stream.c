@@ -33,7 +33,7 @@
  *        option on top of the chosen precision / GEMM / pass-lanes arm.
  *        [--kv-dtype f32|bf16|int8] [--weights f32|int8]
  *        [--list clips.txt] [--alone N] [--no-cpu] [--json out.json --key-root DIR]
- *        [--bench C --steps S]
+ *        [--bench C --steps S] [--lookahead N]
  *   --list      one clip path per line (up to MAXC), added to the clips
  *   --alone N   gate A compares only the first N clips alone vs in the cohort
  *               (every clip is still checked on a shifted slot)
@@ -42,6 +42,10 @@
  *   --bench C   no gates: C lanes (the clips cycled) stepped together with the
  *               stage profile on; prints device ms per full pass (passes where
  *               all C lanes stepped, after 2 warm steps) and the VRAM facts
+ *   --lookahead the streaming preset (default 3, Nemotron's); a pack must
+ *               serve it, e.g. 1 for parakeet-realtime-eou-120m, whose only
+ *               preset is [70, 1] and which has no language prompt (the
+ *               engine runs the encoder projector alone, as src/encoder.c)
  * exit 0 = the gates pass; 1 = gate A or C failed or a device error; 3 = A and C
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -83,6 +87,7 @@ static void cat_text(utt *u, const char *s) {
 /* stream `n` clips as one cohort on the cuda engine, in real-time-sized feeds,
  * finalizing each at its end; returns the per-slot concatenated text */
 static int g_split = 0;   /* gate C: submit, feed the next chunks, finish */
+static int g_lookahead = 3;   /* --lookahead: the preset every stream runs at */
 
 static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char **langs, utt *out) {
     asr_step_req reqs[MAXC];
@@ -90,7 +95,7 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
     size_t off[MAXC];
     int done[MAXC];
     for (int i = 0; i < n; i++) {
-        if (asr_engine_slot_reset(e, i, langs[i], 3) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
+        if (asr_engine_slot_reset(e, i, langs[i], g_lookahead) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
         off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL;
     }
     for (int guard = 0; guard < 100000; guard++) {
@@ -162,7 +167,7 @@ static int bench(const char *model, const char *gemm, const char *kv_dtype, cons
     size_t *off = calloc((size_t)C, sizeof(size_t));
     if (!reqs || !outs || !off) return 1;
     for (int i = 0; i < C; i++)
-        if (asr_engine_slot_reset(e, i, "auto", 3) != 0) { printf("FAIL slot reset\n"); return 1; }
+        if (asr_engine_slot_reset(e, i, "auto", g_lookahead) != 0) { printf("FAIL slot reset\n"); return 1; }
     double prof[ASR_PROF_STAGES] = {0}, wall = 0.0;
     unsigned long passes = 0, full = 0;
     for (int st = 0; st < steps; st++) {
@@ -230,6 +235,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) bench_c = atoi(argv[++i]);
         else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) bench_steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
+        else if (strcmp(argv[i], "--lookahead") == 0 && i + 1 < argc) g_lookahead = atoi(argv[++i]);
         else if (strcmp(argv[i], "--list") == 0 && i + 1 < argc) {
             FILE *lf = fopen(argv[++i], "r");
             if (!lf) { fprintf(stderr, "cannot open %s\n", argv[i]); return 2; }
@@ -337,7 +343,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         utt cpu = {0};
         cb_ctx c = {&cpu};
-        mynah_asr_stream *s = mynah_asr_stream_open(m, NULL, 3);
+        mynah_asr_stream *s = mynah_asr_stream_open(m, NULL, g_lookahead);
         if (!s) { printf("FAIL: stream open\n"); return 1; }
         size_t off = 0;
         while (off < ns[i]) {
