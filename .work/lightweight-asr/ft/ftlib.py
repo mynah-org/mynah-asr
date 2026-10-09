@@ -98,6 +98,44 @@ def canary_row(audio_filepath, duration, text, lang, pnc, **extra):
     return row
 
 
+def mix_replay(it_rows, replay_rows, ratio, seed):
+    """Training rows where ~`ratio` of the audio seconds are replay rows.
+
+    Replay seconds target = ratio / (1 - ratio) x IT seconds; replay rows are
+    taken in whole shuffled passes over the pool (repeating it if the target
+    exceeds the pool) and the last pass is cut at the target. The result is
+    shuffled as a whole (deterministic `seed`): lhotse's shuffle buffer is far
+    smaller than an epoch, so an IT-then-replay file would arrive in blocks.
+    Returns (rows, info)."""
+    import random
+
+    assert 0.0 < ratio < 1.0, ratio
+    it_s = sum(float(r["duration"]) for r in it_rows)
+    pool_s = sum(float(r["duration"]) for r in replay_rows)
+    assert pool_s > 0, "empty replay pool"
+    target = ratio / (1.0 - ratio) * it_s
+    rng = random.Random(seed)
+    picked, acc, passes = [], 0.0, 0
+    while acc < target:
+        order = list(replay_rows)
+        rng.shuffle(order)
+        passes += 1
+        for r in order:
+            if acc >= target:
+                break
+            picked.append(r)
+            acc += float(r["duration"])
+    rows = list(it_rows) + picked
+    rng.shuffle(rows)
+    per_lang = {}
+    for r in picked:
+        per_lang[r["target_lang"]] = per_lang.get(r["target_lang"], 0.0) + float(r["duration"])
+    info = {"ratio": ratio, "it_s": round(it_s, 1), "replay_s": round(acc, 1), "replay_pool_s": round(pool_s, 1),
+            "replay_share": round(acc / (acc + it_s), 4), "replay_rows": len(picked), "pool_passes": passes,
+            "replay_s_per_lang": {k: round(v, 1) for k, v in sorted(per_lang.items())}}
+    return rows, info
+
+
 # --------------------------------------------------------------------------
 # normalisation
 # --------------------------------------------------------------------------

@@ -99,6 +99,13 @@ def main():
     ap.add_argument("--gain-prob", type=float, default=0.8)
     ap.add_argument("--levels", default=os.environ.get("LEVELS", "-3,-20,-40"),
                     help="peak dBFS levels for the before/after level sweep ('' = skip)")
+    ap.add_argument("--replay-ratio", type=float, default=float(os.environ.get("REPLAY_RATIO", "0") or 0),
+                    help="share of training audio hours drawn from manifests/replay_train.json (data_replay.py); "
+                         "0 = Italian only (original behaviour). Steps scale so the IT epochs stay --epochs")
+    ap.add_argument("--forget-eval", type=int, default=int(os.environ.get("FORGET_EVAL", "0") or 0), choices=[0, 1],
+                    help="score de/es/fr FLEURS forgetting probes before/after (always on when --replay-ratio > 0)")
+    ap.add_argument("--save-ckpt", type=int, default=int(os.environ.get("SAVE_CKPT", "0") or 0), choices=[0, 1],
+                    help="also write <run>/last.ckpt (full Lightning state: optimizer, scheduler, AMP, step)")
     a = ap.parse_args()
 
     tag = a.tag or f"{a.arm}{a.top_n if a.arm == 'B' else ''}-{a.subset}{'-gain' if a.gain_aug else ''}"
@@ -119,7 +126,17 @@ def main():
     train_man = man / f"train_{a.subset}.json"
     hours = json.loads((FT / "hours.json").read_text())
     subset_s = hours[f"train_{a.subset}"]["seconds"]
-    max_steps = a.max_steps or max(50, math.ceil(a.epochs * subset_s / a.batch_duration))
+    train_s, replay_info = subset_s, None
+    if a.replay_ratio > 0:
+        it_rows = ftlib.read_manifest(train_man)
+        rows, replay_info = ftlib.mix_replay(it_rows, ftlib.read_manifest(man / "replay_train.json"), a.replay_ratio, a.seed)
+        train_man = out / "train_mix.json"
+        ftlib.write_manifest(train_man, rows)
+        train_s = replay_info["it_s"] + replay_info["replay_s"]
+        print(f"  replay mix: {replay_info}", flush=True)
+    # epochs are counted on the training manifest, so with replay the IT data is
+    # still seen --epochs times and the step count grows by 1 / (1 - ratio)
+    max_steps = a.max_steps or max(50, math.ceil(a.epochs * train_s / a.batch_duration))
     warmup = max(10, int(a.warmup_frac * max_steps))
 
     model = EncDecMultiTaskModel.restore_from(a.init, map_location="cpu")
@@ -217,6 +234,11 @@ def main():
     val_before = ftlib.eval_sets(model, val_sets, "it", pnc="no", batch_size=32)
     state["val"].append({"step": 0, "audio_h": 0.0, **{k: v["wer"] for k, v in val_before.items() if isinstance(v, dict)}})
     levels = ftlib.parse_levels(a.levels)
+    forget_sets = {lg: man / f"eval_fleurs_{lg}.json" for lg in ("de", "es", "fr")
+                   if (man / f"eval_fleurs_{lg}.json").exists()} if (a.replay_ratio > 0 or a.forget_eval) else {}
+    forget = {"en": {"before": en_before["fleurs_en"]}}
+    for lg, p in forget_sets.items():
+        forget[lg] = {"before": ftlib.eval_sets(model, {f"fleurs_{lg}": p}, lg, pnc="no", batch_size=32)[f"fleurs_{lg}"]}
     lv_before = {"it_val": ftlib.level_sweep(model, val_sets, "it", levels),
                  "en": ftlib.level_sweep(model, {"fleurs_en": man / "en_sanity.json"}, "en", levels)} if levels else None
 
@@ -228,6 +250,18 @@ def main():
     train_wall = t_end - state["t_start"] - state["eval_s"]
     steady_wall = (t_end - state["t_steady"] - (state["eval_s"] - state["eval_steady"])) if state["t_steady"] else None
 
+    ckpt = None
+    if a.save_ckpt:
+        try:  # never lose final.nemo + the evals over the optional checkpoint
+            trainer.save_checkpoint(str(out / "last.ckpt"))
+            ckpt = {"path": str(out / "last.ckpt"), "size_gb": round((out / "last.ckpt").stat().st_size / 2**30, 3),
+                    "global_step": trainer.global_step,
+                    "resume": "same run: trainer.fit(model, ckpt_path=<last.ckpt>) with the same max_steps/schedule "
+                              "(restores optimizer, scheduler, AMP scaler, step); a NEW stage only needs --init final.nemo"}
+            print(f"  saved {ckpt['path']} ({ckpt['size_gb']} GB, step {ckpt['global_step']})", flush=True)
+        except Exception as e:
+            ckpt = {"error": repr(e)}
+            print(f"  WARNING last.ckpt not saved: {e!r}", flush=True)
     model.save_to(str(out / "final.nemo"))
     model = model.cuda().eval()
     final = None
@@ -238,11 +272,18 @@ def main():
         final = ftlib.eval_sets(model, sets, "it", pnc="no", batch_size=32, dump_dir=out / "final_eval")
     en_after = ftlib.eval_sets(model, {"fleurs_en": man / "en_sanity.json"}, "en", pnc="no", batch_size=32,
                                dump_dir=out / "final_eval")
+    forget["en"]["after"] = en_after["fleurs_en"]
+    for lg, p in forget_sets.items():
+        forget[lg]["after"] = ftlib.eval_sets(model, {f"fleurs_{lg}": p}, lg, pnc="no", batch_size=32,
+                                              dump_dir=out / "final_eval")[f"fleurs_{lg}"]
+    for lg, v in forget.items():
+        v["wer_delta"] = round(v["after"]["wer"] - v["before"]["wer"], 3)
+        v["cer_delta"] = round(v["after"]["cer"] - v["before"]["cer"], 3)
     lv_after = {"it_val": ftlib.level_sweep(model, val_sets, "it", levels, dump_dir=out / "final_eval"),
                 "en": ftlib.level_sweep(model, {"fleurs_en": man / "en_sanity.json"}, "en", levels)} if levels else None
 
     total_s = time.time() - T_PROC
-    epochs_done = state["audio_s"] / subset_s
+    epochs_done = state["audio_s"] / train_s
     rate = a.rate_usd_h
     m = {
         "tag": tag, "arm": a.arm, "top_n": a.top_n if a.arm == "B" else None, "subset": a.subset,
@@ -267,6 +308,8 @@ def main():
         "preprocessor": pre, "gain_aug": gain_cb.summary() if gain_cb else None,
         "level_sweep": {"levels_peak_dbfs": levels, "before": lv_before, "after": lv_after,
                         "note": "val subsets (it) and EN clips re-levelled to a fixed peak and re-quantised to PCM16"},
+        "replay": replay_info, "train_hours_exact": round(train_s / 3600, 4), "checkpoint": ckpt,
+        "forget": forget, "forget_wer_delta": {lg: v["wer_delta"] for lg, v in forget.items()},
         "en_wer_delta": round(en_after["fleurs_en"]["wer"] - en_before["fleurs_en"]["wer"], 3),
         "note": "validation subsets are drawn from the frozen eval (smoke test, no checkpoint selection: "
                 "final = last step). GPU-hours = wall time on 1 GPU.",

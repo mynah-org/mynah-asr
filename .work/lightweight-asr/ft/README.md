@@ -18,6 +18,7 @@ checkpoint are public.
 | `common.sh` | - | paths (`FT_ROOT`, default `/root/ft`; `VENV`, default `/root/nemo-venv`), `step`/`ok` marker helpers, disk guard |
 | `setup.sh` | 1 | replaces torch in the venv with the same version built for **cu128** (fallback cu126), adds `num2words regex soundfile pyarrow sentencepiece protobuf`, fetches the Open ASR Leaderboard normaliser (pinned commit) and checks our copy against it, downloads `canary-180m-flash.nemo`, verifies CUDA + bf16 + `import nemo` |
 | `data_it.sh` / `data_it.py` | 2 | MLS it + FLEURS it/en -> 16 kHz mono PCM16 wav + NeMo/lhotse manifests, frozen eval, nested 5/20/40 h cuts, exact hours |
+| `data_replay.py` | 2b | optional replay pool against forgetting: FLEURS train en_us/de_de/es_419/fr_fr capped at `REPLAY_H` (2) h each -> `manifests/replay_train.json` (source_lang = target_lang = the row's language, pnc=yes), plus 100-clip FLEURS test probes `eval_fleurs_{de,es,fr}.json`; ~1 GB of wav |
 | `tokenizer_it.sh` / `tokenizer_it.py` | 3 | `it` SentencePiece on the training-pool text, appended after `fr`, row copy-back, verification |
 | `probe.sh` / `probe_zeroshot.py` | 4 | C0: untouched model with `<|it|>` (and `es`/`fr` floors) on the frozen IT eval + EN sanity |
 | `train_canary_it.sh` / `train_canary_it.py` | 5 | smoke fine-tunes, arm A then B, with per-run accounting JSON |
@@ -58,6 +59,19 @@ killed download resumes. A killed training run restarts from step 0 (runs are
 short; no mid-run checkpoint), a finished run is skipped because its
 `runs/<tag>/metrics.json` exists. To change the plan (seed, hours, FLEURS
 train), delete `done/data*`, `plan.json` and `manifests/`.
+
+Replay (`REPLAY_RATIO=0.2`, needs `data_replay.py` first): the IT manifest is
+mixed with replay rows so ~20 % of the training audio hours are en/de/es/fr
+(rows sampled from the pool with the run seed, whole file shuffled), steps grow
+so the IT data is still seen `EPOCHS` times, and `metrics.json` gets a
+`forget` dict (en/de/es/fr WER/CER before/after, per-language normaliser).
+`REPLAY_RATIO=0` (default) trains exactly as before.
+
+Checkpoints: `SAVE_CKPT=1` also writes `runs/<tag>/last.ckpt` (full Lightning
+state: optimizer, scheduler, AMP scaler, global step; size in
+`metrics.json:checkpoint`). A NEW stage only needs `--init runs/<tag>/final.nemo`;
+`last.ckpt` is for resuming the SAME run (`trainer.fit(model, ckpt_path=...)`
+with the same schedule).
 
 ## Expected wall time (L40S estimates; L4 roughly 2-3x for the GPU parts)
 
