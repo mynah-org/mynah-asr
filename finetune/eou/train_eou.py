@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""Italian-specialist fine-tune of parakeet_realtime_eou_120m-v1 (streaming RNNT + <EOU>).
+"""EOU 120M, combined language + <EOU> fine-tune (stage 2 machinery). EXPERIMENTAL.
 
-    $PY train_eou_it.py --stock /root/ft/models/parakeet_realtime_eou_120m-v1.nemo \
-        --tokenizer /root/ft/models/tok-eou-it --subset 5h --epochs 52 --save-ckpt 1
+KNOWN-BAD CONFIGURATION, kept to reproduce and ablate it: new Italian SPE
+(tokenizer_eou.py) + fresh or stock decoder/joint + --lr 1e-3 + --eou-weight
+0.9 (90 % padded with 3-6 s of zeros, 10 % plain) + FastEmit 0.03 COLLAPSES
+TO BLANK (all four 2026-10-09 arms: WER ~100, empty greedy output, beam returns
+one sentence for every input). There are therefore no defaults for --lr and
+--eou-weight: every run states them. Do not use this as an Italian recipe; the
+plan is plain_asr.py (stage 1, stock tokenizer) first, then a gentle EOU
+curriculum (finetune/README.md).
 
-Recipe (see .work/eou-it-ft.md for the NeMo v3.0.0 file:line of every fact):
+    FT_ROOT=/root/ft $PY train_eou.py --stock /root/ft/models/parakeet_realtime_eou_120m-v1.nemo \
+        --tokenizer /root/ft/models/tok-eou-it --subset 5h --epochs 52 --lr 1e-3 --eou-weight 0.9 --save-ckpt 1
+    # ^ the exact collapsed "cold" arm of 2026-10-09 (eou-it-5h-e52)
+
+Recipe (NeMo v3.0.0 facts with file:line: finetune/eou/README.md):
 - model: stock config, `tokenizer.dir` -> the Italian SPE (+<EOU>,<EOB>), built as
   NeMo's EncDecRNNTBPEEOUModel (the EOU recipe's class: its lhotse dataset appends
   <EOU> to the text and pads the audio). Encoder + preprocessor weights copied from
@@ -21,8 +31,9 @@ Recipe (see .work/eou-it-ft.md for the NeMo v3.0.0 file:line of every fact):
   with the Canary-kit economics fields, IT WER/CER/empty/EOU-rate at native and
   -3/-20/-40 dBFS peak, EN (FLEURS en 100) for information, and a cache-aware
   streaming check (conformer_stream_step) against offline on a few clips.
-`--dry-run`: build the manifests + print the plan, no NeMo/torch (laptop check with
-FT_ROOT pointing at a synthetic tree is not provided; run on the box).
+`--dry-run`: build the manifests + print the plan and the resolved config, no
+NeMo/torch (needs FT_ROOT/manifests/train_<subset>.json and the audio for the trim).
+Provenance: <run>/run.json (finetune/common/runmeta.py).
 """
 from __future__ import annotations
 
@@ -37,12 +48,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-for p in (HERE, HERE.parent / "ft", Path("/root/ft-kit")):
-    if (p / "ftlib.py").exists():
-        sys.path.insert(0, str(p))
-        break
+sys.path[:0] = [str(HERE), str(HERE.parent / "common")]
 import ftlib  # noqa: E402
-from tokenizer_eou_it import norm_text  # noqa: E402
+import runmeta  # noqa: E402
+from tokenizer_eou import check_special_ids, norm_text  # noqa: E402
+from trim import voiced_span  # noqa: E402
 
 FT = ftlib.FT
 T_PROC = time.time()
@@ -53,24 +63,7 @@ EOU_RE = re.compile(r"<EO[UB]>")
 
 
 # --------------------------------------------------------------------------- data
-def voiced_span(path, thr_db=35.0, margin_s=0.10):
-    """(offset, duration) of the voiced part: 25 ms frames whose RMS is within
-    thr_db of the loudest frame, +- margin. Energy stand-in for a forced aligner."""
-    import numpy as np
-    import soundfile as sf
-
-    a, sr = sf.read(path, dtype="float32", always_2d=True)
-    a = a.mean(axis=1)
-    hop = int(0.025 * sr)
-    n = len(a) // hop
-    if n < 4:
-        return 0.0, len(a) / sr
-    fr = a[: n * hop].reshape(n, hop)
-    db = 10 * np.log10(np.maximum((fr ** 2).mean(axis=1), 1e-12))
-    on = np.nonzero(db > db.max() - thr_db)[0]
-    s = max(0.0, on[0] * hop / sr - margin_s)
-    e = min(len(a) / sr, (on[-1] + 1) * hop / sr + margin_s)
-    return round(s, 3), round(e - s, 3)
+# voiced_span: finetune/common/trim.py
 
 
 def build_train_manifest(subset, out_dir, trim=True):
@@ -131,9 +124,8 @@ def build_model(stock_path, tok_dir, trainer=None, warm_dec_joint=False):
     assert stream_after == stream_before, (stream_before, stream_after)
     tk = model.tokenizer
     V = tk.vocab_size
-    ids = {"vocab": V, "eou": tk.token_to_id("<EOU>"), "eob": tk.token_to_id("<EOB>"),
-           "blank": model.joint.num_classes_with_blank - 1}
-    assert ids["eou"] == V - 2 and ids["eob"] == V - 1 and ids["blank"] == V, ids
+    ids = check_special_ids(V, tk.token_to_id("<EOU>"), tk.token_to_id("<EOB>"),
+                            blank_id=model.joint.num_classes_with_blank - 1)
     info = {"stock_class": type(stock).__name__, "streaming_cfg": stream_after, "ids": ids,
             "loss_cfg": OmegaConf.to_container(model.cfg.loss, resolve=True),
             "preprocessor": ftlib.preprocessor_info(model),
@@ -267,16 +259,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stock", default=str(FT / "models" / "parakeet_realtime_eou_120m-v1.nemo"))
     ap.add_argument("--tokenizer", default=str(FT / "models" / "tok-eou-it"))
-    ap.add_argument("--subset", default="5h", choices=["5h", "20h", "40h"])
+    ap.add_argument("--subset", required=True, choices=["5h", "20h", "40h"])
     ap.add_argument("--epochs", type=float, default=52.0, help="sets max_steps (on the subset's trimmed hours)")
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--batch-duration", type=float, default=300.0, help="s of (unpadded) audio per batch")
     ap.add_argument("--num-buckets", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-3, help="decoder + joint (fresh) peak LR")
+    ap.add_argument("--lr", type=float, required=True,
+                    help="decoder + joint peak LR (no default: 1e-3 is part of the KNOWN-BAD 2026-10-09 config)")
     ap.add_argument("--enc-lr-scale", type=float, default=0.3)
     ap.add_argument("--freeze-encoder-layers", type=int, default=0, help="freeze subsampling + bottom N layers")
     ap.add_argument("--warmup-frac", type=float, default=0.08)
-    ap.add_argument("--eou-weight", type=float, default=0.9, help="lhotse weight of the padded EOU group")
+    ap.add_argument("--eou-weight", type=float, required=True,
+                    help="share of padded EOU samples (no default: 0.9 is part of the KNOWN-BAD 2026-10-09 config)")
     ap.add_argument("--trim", type=int, default=1, choices=[0, 1])
     ap.add_argument("--gain-aug", type=int, default=1, choices=[0, 1])
     ap.add_argument("--levels", default="-3,-20,-40")
@@ -289,8 +283,13 @@ def main():
     ap.add_argument("--rate-usd-h", type=float, default=float(os.environ.get("RATE_USD_H", "0") or 0))
     ap.add_argument("--stream-n", type=int, default=6)
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--base-model-id", default="nvidia/parakeet_realtime_eou_120m-v1")
+    ap.add_argument("--base-model-revision", default=None)
     ap.add_argument("--dry-run", action="store_true", help="manifests + plan only (no torch/NeMo)")
     a = ap.parse_args()
+    runmeta.require_root()
+    print("== EXPERIMENTAL: combined language+EOU fine-tune; the 2026-10-09 config (new SPE, lr 1e-3, "
+          "eou-weight 0.9, FastEmit 0.03) collapses to blank. See finetune/README.md.", flush=True)
 
     tag = a.tag or f"eou-it-{a.subset}-e{a.epochs:g}"
     out = FT / "runs" / tag
@@ -305,8 +304,34 @@ def main():
     warmup = max(10, int(a.warmup_frac * max_steps))
     print(f"== {tag}: data {data_info}; max_steps {max_steps} warmup {warmup} "
           f"(~{a.epochs * train_s / 3600:.0f} audio-h before padding)", flush=True)
+    run = runmeta.build(
+        "finetune/eou/train_eou.py", vars(a), probe_env=not a.dry_run,
+        base_model={"id": a.base_model_id, "revision": a.base_model_revision, "path": a.stock,
+                    "sha256": None if a.dry_run else runmeta.sha256_path(a.stock)},
+        tokenizer={"path": a.tokenizer, "sha256": runmeta.sha256_path(Path(a.tokenizer) / "tokenizer.model"),
+                   "note": "new SPE + <EOU>/<EOB> (tokenizer_eou.py)"},
+        data={"dataset": "MLS-it train (canary/prepare_it.py), energy-trimmed", "subset": a.subset,
+              "manifest": str(train_man), "hours": data_info["hours_after_trim"], "utterances": data_info["rows"],
+              **data_info},
+        seed=a.seed,
+        optimizer={"name": "adamw", "betas": [0.9, 0.98], "weight_decay": 1e-3, "grad_clip": 1.0,
+                   "precision": "bf16-mixed", "batch_duration_s": a.batch_duration, "num_buckets": a.num_buckets},
+        lr_groups={"decoder+joint": a.lr, "encoder": a.lr * a.enc_lr_scale},
+        scheduler={"name": "CosineAnnealing", "warmup_steps": warmup, "min_lr": a.lr * 0.01},
+        fastemit_lambda="from the stock loss cfg (0.03 for parakeet_realtime_eou_120m-v1)",
+        augmentation={"gain": {"lo_db": -30.0, "hi_db": 6.0, "prob": 0.8} if a.gain_aug else None,
+                      "white_noise": {"prob": 0.9, "min_level": -90, "max_level": -46},
+                      "padding": {"prob": a.eou_weight, "post_pad_s": [3.0, 6.0], "max_total_s": 40.0}},
+        eou_plain_mix={"eou_share": a.eou_weight, "plain_share": round(1 - a.eou_weight, 4),
+                       "note": "plain group still carries <EOU> (the dataset always appends it)"},
+        freeze_policy={"freeze_encoder_layers": a.freeze_encoder_layers, "warm_dec_joint": bool(a.warm_dec_joint),
+                       "enc_lr_scale": a.enc_lr_scale},
+        max_steps=max_steps, epochs=a.epochs,
+        notes="EXPERIMENTAL; the 2026-10-09 combination (lr 1e-3, eou_weight 0.9, new SPE) collapses to blank")
+    runmeta.print_resolved(run)
     if a.dry_run:
         return 0
+    runmeta.write(out / "run.json", run, status="started")
 
     import lightning.pytorch as pl
     import torch
@@ -463,6 +488,10 @@ def main():
                 "final = last step, no checkpoint selection.",
     }
     ftlib.write_json(out / "metrics.json", m)
+    runmeta.write(out / "run.json", run, status="done", outputs={
+        "final_nemo": str(out / "final.nemo"), "metrics": str(out / "metrics.json"), "checkpoint": ckpt,
+        "fleurs_it_wer": final["fleurs_it"]["wer"], "mls_it_wer": final["mls_it"]["wer"],
+        "eou_rate_fleurs": final["fleurs_it"]["eou_emitted_rate"], "stream_eou_rate": stream["eou_rate"]})
     with open(FT / "runs" / "summary.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"tag": tag, "fleurs_it_wer": final["fleurs_it"]["wer"], "mls_it_wer": final["mls_it"]["wer"],
                             "eou_rate_fleurs": final["fleurs_it"]["eou_emitted_rate"],

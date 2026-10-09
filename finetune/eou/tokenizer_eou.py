@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Italian SentencePiece for parakeet_realtime_eou_120m-v1, with <EOU>/<EOB> appended.
 
-    $PY tokenizer_eou_it.py --stock /root/ft/models/parakeet_realtime_eou_120m-v1.nemo \
+EXPERIMENTAL: this new-vocabulary path is the one used by the 2026-10-09 EOU
+runs that collapsed to blank (finetune/README.md). The stage-1 plan
+(plain_asr.py) uses the STOCK tokenizer instead; this tool stays for the
+ablation ladder and for future languages the stock pieces cannot spell.
+
+    $PY tokenizer_eou.py --stock /root/ft/models/parakeet_realtime_eou_120m-v1.nemo \
         --text /root/ft/text/it_pool.txt --out /root/ft/models/tok-eou-it
 
 1. Read the stock tokenizer.model out of the .nemo: model type, vocab size,
@@ -32,6 +37,19 @@ from pathlib import Path
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 SPECIAL = ["<EOU>", "<EOB>"]
+
+
+def check_special_ids(n_pieces, eou_id, eob_id, base_vocab=None, blank_id=None):
+    """The id contract every EOU artefact relies on (NeMo's EOU dataset, the
+    Mynah pack, export_to_mynah.sh): <EOU> and <EOB> are the LAST two pieces,
+    <EOU> first, and the RNNT blank comes right after them (= n_pieces).
+    Returns the resolved {vocab, eou, eob, blank}; raises AssertionError."""
+    ids = {"vocab": n_pieces, "eou": eou_id, "eob": eob_id, "blank": n_pieces if blank_id is None else blank_id}
+    assert (eou_id, eob_id) == (n_pieces - 2, n_pieces - 1), f"<EOU>/<EOB> must be the last two ids: {ids}"
+    assert ids["blank"] == n_pieces, f"RNNT blank must follow <EOB>: {ids}"
+    if base_vocab is not None:
+        assert n_pieces == base_vocab + 2, f"vocab must be base {base_vocab} + 2: {ids}"
+    return ids
 _KEEP = re.compile(r"[^a-zàáèéìíîòóùú' ]")
 
 
@@ -127,8 +145,7 @@ def verify(out_dir: Path, base_vocab: int, nemo_check: bool) -> dict:
     ids = sp.encode("ciao come stai<EOU>")
     res = {"vocab": n, "eou_id": eou, "eob_id": eob, "blank_id_in_model": n,
            "probe_ids": ids, "probe_pieces": [sp.id_to_piece(i) for i in ids]}
-    assert n == base_vocab + 2, res
-    assert (eou, eob) == (base_vocab, base_vocab + 1), res
+    check_special_ids(n, eou, eob, base_vocab=base_vocab)
     assert ids[-1] == eou and ids.count(eou) == 1, f"<EOU> not a single piece: {res}"
     if nemo_check:
         from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
@@ -183,7 +200,7 @@ def main():
     base = train_spm(norm, out, spec, base_vocab)
     add_special(base, out)
     res = verify(out, base_vocab, nemo_check=not a.dry_run)
-    res.update({"stock_spec": spec, "text_lines": n_out, "normaliser": "eou-ft/tokenizer_eou_it.py::norm_text"})
+    res.update({"stock_spec": spec, "text_lines": n_out, "normaliser": "finetune/eou/tokenizer_eou.py::norm_text"})
     (out / "tokenizer_info.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))
     print(f"== tokenizer OK: {json.dumps({k: res[k] for k in ('vocab', 'eou_id', 'eob_id', 'blank_id_in_model', 'probe_pieces')}, ensure_ascii=False)}")
     return 0

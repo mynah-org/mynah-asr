@@ -1,6 +1,6 @@
 #!/bin/bash
 # FT'd .nemo -> Mynah pack + Mynah-side streaming sanity (3 Italian clips).
-#   bash export_to_mynah.sh <final.nemo> [pack_dir]
+#   bash finetune/eou/export_to_mynah.sh <final.nemo> [pack_dir]
 # Env: MYNAH (repo with a built ./mynah-asr, default /root/mynah-asr),
 #      PY (python with torch, yaml, numpy, safetensors: default /root/nemo-venv/bin/python,
 #      since tools/.venv is gone on the box), CLIPS (wav list; default: the padded
