@@ -435,3 +435,40 @@ occupancy and shapes differ between the models), so the 31/56 ratio is a
 HINT that motivates the 3b audit, not evidence; no optimisation is decided
 on it. Idle VRAM (1.9 vs 6.9 GiB) is the comparable memory number; the
 loaded VRAM is dominated by the cap-sized arena. Screens, not soaks.
+
+### lvl: level robustness, DIAGNOSTIC (2026-10-09, `.work/lightweight-asr/jobs/lvl.sh`, `lvl_small.sh`)
+
+Same 200 FLEURS EN test clips, same f32 weights, CLI stream, same scorer;
+three deterministic offline transforms (not a runtime change):
+
+| arm | pooled WER | WER mean | CER mean | S / D / I | empty |
+|---|---|---|---|---|---|
+| EOU, original audio (q1) | 0.3014 | 0.1607 (non-empty only) | 0.1194 (non-empty) | 291 / 1001 / 85 | 20.0 % |
+| EOU, peak -3 dBFS | **0.1224** | 0.1223 | 0.0718 | 394 / 56 / 109 | 0 % |
+| EOU, RMS -23 dBFS | 0.1252 | 0.1245 | 0.0730 | 402 / 55 / 115 | 0 % |
+| EOU, causal AGC (300 ms window -> -23 dBFS, <= +40 dB) | 0.1257 | 0.1255 | 0.0735 | 403 / 59 / 112 | 0 % |
+| Nemotron, original (q1, lang en) | 0.1160 | 0.1155 | 0.0685 | 373 / 60 / 97 | 0 % |
+| Nemotron, peak -3 dBFS (control) | 0.1119 | 0.1100 | 0.0640 | 359 / 52 / 100 | 0 % |
+
+The FLEURS collapse is a LEVEL sensitivity of the checkpoint (normalize: NA),
+removed by any of the three, including a causal streamable AGC; Nemotron
+barely moves. At sane levels the EOU is ~1 point of WER behind Nemotron on
+this bank, as on the 498-clip bank (0.1545 vs 0.1447).
+
+EOU behaviour on the peak bank (40 clips, gap 1 s; the full 100-clip pass was
+replaced by this short one to save time):
+
+| | original (q2, 200 clips) | peak -3 dBFS (40 clips) |
+|---|---|---|
+| speech end -> EOU p50 / p90 / p95 (single) | 1738 / 3466 / 3946 ms | 1706 / 2986 / 3274 ms |
+| missed 1 s / 2 s / never | 85.5 / 55.0 / 27.5 % | 82.5 / 37.5 / 2.5 % |
+| premature | 0 % | 0 % |
+| A + 1 s + B: EOU in gap, latency p50 | 35 %, 394 ms | 67.5 %, 586 ms |
+| WER A / B (split at the EOU) | 0.160 / 0.198 | 0.113 / 0.130 |
+
+Level explains the "never" EOUs and part of the misses, NOT the ~1.7 s
+median decision latency on single read-speech clips: that is the checkpoint
+on this audio (the card's 160 ms p50 is on TTS dialogue audio). Levers for it:
+endpointing data in FT, or an external VAD/silence policy; not kernels.
+Implication for FT: random gain augmentation (the MLS-it pool sits at peak
+p50 -7 dBFS, clean levels).
