@@ -42,6 +42,14 @@ struct enc_lw {
     const float *ln_out_w, *ln_out_b;
 };
 
+struct dec_lw {
+    const float *ln_self_w, *ln_self_b, *sq, *sq_b, *sk, *sk_b, *sv, *sv_b, *so, *so_b;
+    const float *ln_cross_w, *ln_cross_b, *cq, *cq_b, *ck, *ck_b, *cv, *cv_b, *co, *co_b;
+    const float *ln_ffn_w, *ln_ffn_b, *ff1, *ff1_b, *ff2, *ff2_b;
+};
+
+#define AED_PROMPT_MAX 16    /* src/mynah_asr.c MYNAH_ASR_AED_PROMPT_MAX */
+
 struct asr_aed_gpu {
     asr_aed_gpu_cfg cfg;
     int device = 0;
@@ -67,6 +75,21 @@ struct asr_aed_gpu {
           *ks = nullptr, *vs = nullptr, *ctx = nullptr, *enc_out = nullptr;
     int *d_ints = nullptr, *h_ints = nullptr;   /* row_seq [r_max] | seq_off | seq_T */
     float *h_x = nullptr, *h_out = nullptr;     /* pinned staging */
+    /* the AED decoder (stage 3) */
+    mynah_asr_aed aed;
+    int aed_ok = 0, dec_gpu = 0;
+    int dL = 0, D = 0, dH = 0, ddk = 0, dF = 0, V = 0, max_seq = 0, d_enc = 0;
+    int l_max = 0, s_max = 0, kv_max = 0;
+    std::vector<dec_lw> dw;
+    const float *d_proj_w = nullptr, *d_proj_b = nullptr, *d_emb = nullptr, *d_pos = nullptr,
+                *d_embln_w = nullptr, *d_embln_b = nullptr, *d_fin_w = nullptr, *d_fin_b = nullptr,
+                *d_head_w = nullptr, *d_head_b = nullptr;
+    float *encp = nullptr;                        /* [r_max, D] projected encoder rows */
+    std::vector<float *> CK, CV, SK, SV;          /* per layer: cross [r_max, D], self [s_max, D] */
+    float *dx = nullptr, *dxn = nullptr, *dq = nullptr, *dkn = nullptr, *dvn = nullptr,
+          *datt = nullptr, *dff = nullptr, *dlogits = nullptr;
+    int *d_step = nullptr, *h_step = nullptr;     /* [cur | soff | eoff | eT] x max_items */
+    int *d_am = nullptr, *h_am = nullptr;
     /* the last encode: what aed_decode may find resident */
     int last_n = 0;
     std::vector<int> last_T, last_off;
@@ -281,6 +304,105 @@ __global__ void dwconv_kernel(const float *__restrict__ g, const int *__restrict
     }
 }
 
+/* ----------------------------------------------------------- decoder kernels */
+
+__device__ double block_sum_d(double v, double *red) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = AED_THREADS / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const double r = red[0];
+    __syncthreads();
+    return r;
+}
+
+/* The decoder's LayerNorm, src/decoder_aed.c ln(): mean and variance in
+ * double, the normalised value in double before the cast, eps 1e-5. out may
+ * alias x (every read of a row happens before its writes, per thread). */
+__global__ void __launch_bounds__(AED_THREADS)
+dec_ln_kernel(const float *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b,
+              float *out, int d) {
+    __shared__ double red[AED_THREADS];
+    const float *row = x + (size_t)blockIdx.x * d;
+    float *o = out + (size_t)blockIdx.x * d;
+    double mu = 0.0;
+    for (int i = threadIdx.x; i < d; i += AED_THREADS) mu += (double)row[i];
+    mu = block_sum_d(mu, red) / (double)d;
+    double var = 0.0;
+    for (int i = threadIdx.x; i < d; i += AED_THREADS) {
+        const double c = (double)row[i] - mu;
+        var += c * c;
+    }
+    var = block_sum_d(var, red);
+    const float inv = (float)(1.0 / sqrt(var / (double)d + 1e-5));
+    for (int i = threadIdx.x; i < d; i += AED_THREADS)
+        o[i] = (float)(((double)row[i] - mu) * (double)inv) * w[i] + b[i];
+}
+
+/* x[a] = emb[cur[a]] + pos[p] (the checkpoint's positional buffer, already scaled) */
+__global__ void dec_embed_kernel(const float *__restrict__ emb, const float *__restrict__ pos,
+                                 const int *__restrict__ cur, int p, int D, float *__restrict__ x) {
+    const int a = blockIdx.x;
+    const float *er = emb + (size_t)cur[a] * D, *pr = pos + (size_t)p * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) x[(size_t)a * D + i] = er[i] + pr[i];
+}
+
+/* the new self K/V row of every live segment into its cache at position p */
+__global__ void dec_kv_store_kernel(const float *__restrict__ kn, const float *__restrict__ vn,
+                                    const int *__restrict__ soff, int p, int D, float *__restrict__ SK,
+                                    float *__restrict__ SV) {
+    const int a = blockIdx.x;
+    const size_t dst = ((size_t)soff[a] + (size_t)p) * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        SK[dst + i] = kn[(size_t)a * D + i];
+        SV[dst + i] = vn[(size_t)a * D + i];
+    }
+}
+
+/* Attention of ONE query row per segment over its n keys/values (rows
+ * kv_off[a] .. kv_off[a] + n of K/V, ld D), one block per (row, head):
+ * s = scale * q.k, softmax, out = sum p v -- src/decoder_aed.c attend(). n is
+ * kv_n[a], or kv_n_all for every row when kv_n is NULL. n == 0 gives zeros,
+ * as the CPU's empty product does. Shared: q[dk] red[AED_THREADS] s[n]. */
+__global__ void __launch_bounds__(AED_THREADS)
+dec_attend_kernel(const float *__restrict__ q, const float *__restrict__ Kb, const float *__restrict__ Vb,
+                  const int *__restrict__ kv_off, const int *__restrict__ kv_n, int kv_n_all, int D, int dk,
+                  float scale, float *__restrict__ out) {
+    extern __shared__ float sm[];
+    float *qh = sm, *red = sm + dk, *sc = red + AED_THREADS;
+    const int a = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, ho = h * dk;
+    const int off = kv_off[a], n = kv_n ? kv_n[a] : kv_n_all;
+    for (int c = tid; c < dk; c += AED_THREADS) qh[c] = q[(size_t)a * D + ho + c];
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (int j = tid; j < n; j += AED_THREADS) {
+        const float *kr = Kb + (size_t)(off + j) * D + ho;
+        float acc = 0.0f;
+        for (int c = 0; c < dk; c++) acc = fmaf(qh[c], kr[c], acc);
+        const float s = scale * acc;
+        sc[j] = s;
+        mx = fmaxf(mx, s);
+    }
+    mx = block_max(mx, red);
+    float sum = 0.0f;
+    for (int j = tid; j < n; j += AED_THREADS) {
+        const float ex = expf(sc[j] - mx);
+        sc[j] = ex;
+        sum += ex;
+    }
+    sum = block_sum(sum, red);
+    const float inv = n > 0 ? 1.0f / sum : 0.0f;
+    for (int j = tid; j < n; j += AED_THREADS) sc[j] *= inv;
+    __syncthreads();
+    for (int c = tid; c < dk; c += AED_THREADS) {
+        float acc = 0.0f;
+        for (int j = 0; j < n; j++) acc = fmaf(sc[j], Vb[(size_t)(off + j) * D + ho + c], acc);
+        out[(size_t)a * D + ho + c] = acc;
+    }
+}
+
 /* ------------------------------------------------------------ the encoder */
 
 /* xs [R, d] (packed, uploaded) -> enc_out [R, d_out]; tables on the device */
@@ -407,6 +529,165 @@ static int hook_encode(void *ud, const float *const *feats, const int *t_mel, in
     return 0;
 }
 
+/* ------------------------------------------------------------ the decoder */
+
+static int dec_ln(aed_gpu *e, const float *x, const float *w, const float *b, float *out, int rows, int d) {
+    if (rows <= 0) return 0;
+    dec_ln_kernel<<<(unsigned)rows, AED_THREADS, 0, e->stream>>>(x, w, b, out, d);
+    CK(e, "dec ln", cudaGetLastError());
+    return 0;
+}
+
+static int dec_attend(aed_gpu *e, const float *q, const float *Kb, const float *Vb, const int *kv_off,
+                      const int *kv_n, int kv_n_all, int nA, float *out) {
+    const size_t smem = (size_t)(e->ddk + AED_THREADS + e->kv_max) * sizeof(float);
+    dec_attend_kernel<<<dim3((unsigned)nA, (unsigned)e->dH), AED_THREADS, smem, e->stream>>>(
+        q, Kb, Vb, kv_off, kv_n, kv_n_all, e->D, e->ddk, 1.0f / sqrtf((float)e->ddk), out);
+    CK(e, "dec attention", cudaGetLastError());
+    return 0;
+}
+
+/* the offload's aed_decode hook: greedy, every segment of the wave stepped
+ * together, the library's stopping rule applied on the host per segment */
+static int hook_decode(void *ud, int from_encode, const float *const *enc, const int *t_enc, int n,
+                       const int *const *prompts, const int *n_prompts, int eos, const int *caps,
+                       int *const *tokens, int *n_out) {
+    aed_gpu *e = (aed_gpu *)ud;
+    for (int i = 0; i < n; i++) n_out[i] = 0;
+    if (e->dead) return -1;
+    if (n <= 0) return 0;
+    if (n > e->max_items) {
+        snprintf(e->err, sizeof(e->err), "a wave of %d segments exceeds --batch %d", n, e->max_items);
+        return -1;
+    }
+    for (int i = 0; i < n; i++)
+        if (n_prompts[i] <= 0 || t_enc[i] < 0 || t_enc[i] > e->t_max) {
+            snprintf(e->err, sizeof(e->err), "segment %d: prompt %d tokens, %d frames (T_max %d)", i,
+                     n_prompts[i], t_enc[i], e->t_max);
+            return -1;
+        }
+    cudaSetDevice(e->device);
+    const double t0 = now_ms();
+    const int D = e->D, mi = e->max_items;
+    int *cur = e->h_step, *soff = e->h_step + mi, *eoff = e->h_step + 2 * mi, *eT = e->h_step + 3 * mi;
+    const int *d_cur = e->d_step, *d_soff = e->d_step + mi, *d_eoff = e->d_step + 2 * mi, *d_eT = e->d_step + 3 * mi;
+
+    /* 1. the encoder rows: resident from the encode just before, else uploaded */
+    std::vector<int> off((size_t)n);
+    int R = 0;
+    int resident = from_encode && e->last_n == n;
+    for (int i = 0; i < n && resident; i++) resident = e->last_T[(size_t)i] == t_enc[i];
+    for (int i = 0; i < n; i++) {
+        off[(size_t)i] = resident ? e->last_off[(size_t)i] : R;
+        R += t_enc[i];
+    }
+    if (!resident) {
+        for (int i = 0; i < n; i++)
+            memcpy(e->h_out + (size_t)off[(size_t)i] * e->d_enc, enc[i], (size_t)t_enc[i] * e->d_enc * sizeof(float));
+        if (R > 0)
+            CK(e, "dec h2d", cudaMemcpyAsync(e->enc_out, e->h_out, (size_t)R * e->d_enc * sizeof(float),
+                                             cudaMemcpyHostToDevice, e->stream));
+        e->last_n = 0;               /* enc_out no longer holds the last encode */
+        e->st_.dec_uploads++;
+    }
+    /* 2. enc_dec_proj and the cross K/V of every layer, once per wave */
+    const float *encp = e->enc_out;
+    if (e->d_proj_w) {
+        if (gemm(e, e->enc_out, e->d_enc, e->d_proj_w, e->d_proj_b, e->encp, D, R, D, e->d_enc, 0, 0) != 0) return -1;
+        encp = e->encp;
+    }
+    for (int l = 0; l < e->dL; l++) {
+        const dec_lw &W = e->dw[(size_t)l];
+        if (gemm(e, encp, D, W.ck, W.ck_b, e->CK[(size_t)l], D, R, D, D, 0, 0) != 0) return -1;
+        if (gemm(e, encp, D, W.cv, W.cv_b, e->CV[(size_t)l], D, R, D, D, 0, 0) != 0) return -1;
+    }
+    /* 3. the per-segment self K/V cache: max_len = min(n_prompt + cap, max_seq) */
+    std::vector<int> max_len((size_t)n), done((size_t)n, 0), so((size_t)n), tok((size_t)n);
+    int S = 0, maxP = 0;
+    for (int i = 0; i < n; i++) {
+        int ml = n_prompts[i] + caps[i];
+        if (ml > e->max_seq) ml = e->max_seq;
+        max_len[(size_t)i] = ml;
+        so[(size_t)i] = S;
+        S += ml;
+        if (ml > maxP) maxP = ml;
+        tok[(size_t)i] = prompts[i][0];
+    }
+    if (S > e->s_max) {
+        snprintf(e->err, sizeof(e->err), "the wave's decoder cache needs %d rows, the engine holds %d", S, e->s_max);
+        return -1;
+    }
+    /* 4. the steps */
+    std::vector<int> act((size_t)n);
+    unsigned long steps = 0, emitted = 0;
+    for (int p = 0; p < maxP; p++) {
+        int nA = 0, head = 0;
+        for (int i = 0; i < n; i++) {
+            if (done[(size_t)i] || p >= max_len[(size_t)i]) continue;
+            act[(size_t)nA] = i;
+            cur[nA] = tok[(size_t)i];
+            soff[nA] = so[(size_t)i];
+            eoff[nA] = off[(size_t)i];
+            eT[nA] = t_enc[i];
+            if (p + 1 >= n_prompts[i]) head = 1;
+            nA++;
+        }
+        if (nA == 0) break;
+        CK(e, "dec step h2d", cudaMemcpyAsync(e->d_step, e->h_step, (size_t)4 * mi * sizeof(int),
+                                              cudaMemcpyHostToDevice, e->stream));
+        dec_embed_kernel<<<(unsigned)nA, 256, 0, e->stream>>>(e->d_emb, e->d_pos, d_cur, p, D, e->dx);
+        CK(e, "dec embed", cudaGetLastError());
+        if (dec_ln(e, e->dx, e->d_embln_w, e->d_embln_b, e->dx, nA, D) != 0) return -1;
+        for (int l = 0; l < e->dL; l++) {
+            const dec_lw &W = e->dw[(size_t)l];
+            /* causal self-attention over [0..p] of each segment's cache */
+            if (dec_ln(e, e->dx, W.ln_self_w, W.ln_self_b, e->dxn, nA, D) != 0) return -1;
+            if (gemm(e, e->dxn, D, W.sq, W.sq_b, e->dq, D, nA, D, D, 0, 0) != 0) return -1;
+            if (gemm(e, e->dxn, D, W.sk, W.sk_b, e->dkn, D, nA, D, D, 0, 0) != 0) return -1;
+            if (gemm(e, e->dxn, D, W.sv, W.sv_b, e->dvn, D, nA, D, D, 0, 0) != 0) return -1;
+            dec_kv_store_kernel<<<(unsigned)nA, 256, 0, e->stream>>>(e->dkn, e->dvn, d_soff, p, D,
+                                                                    e->SK[(size_t)l], e->SV[(size_t)l]);
+            CK(e, "dec kv store", cudaGetLastError());
+            if (dec_attend(e, e->dq, e->SK[(size_t)l], e->SV[(size_t)l], d_soff, nullptr, p + 1, nA, e->datt) != 0) return -1;
+            if (gemm(e, e->datt, D, W.so, W.so_b, e->dx, D, nA, D, D, 1, 0) != 0) return -1;
+            /* cross-attention over the segment's encoder rows */
+            if (dec_ln(e, e->dx, W.ln_cross_w, W.ln_cross_b, e->dxn, nA, D) != 0) return -1;
+            if (gemm(e, e->dxn, D, W.cq, W.cq_b, e->dq, D, nA, D, D, 0, 0) != 0) return -1;
+            if (dec_attend(e, e->dq, e->CK[(size_t)l], e->CV[(size_t)l], d_eoff, d_eT, 0, nA, e->datt) != 0) return -1;
+            if (gemm(e, e->datt, D, W.co, W.co_b, e->dx, D, nA, D, D, 1, 0) != 0) return -1;
+            /* ReLU FFN */
+            if (dec_ln(e, e->dx, W.ln_ffn_w, W.ln_ffn_b, e->dxn, nA, D) != 0) return -1;
+            if (gemm(e, e->dxn, D, W.ff1, W.ff1_b, e->dff, e->dF, nA, e->dF, D, 0, 1) != 0) return -1;
+            if (gemm(e, e->dff, e->dF, W.ff2, W.ff2_b, e->dx, D, nA, D, e->dF, 1, 0) != 0) return -1;
+        }
+        if (head) {
+            if (dec_ln(e, e->dx, e->d_fin_w, e->d_fin_b, e->dxn, nA, D) != 0) return -1;
+            if (gemm(e, e->dxn, D, e->d_head_w, e->d_head_b, e->dlogits, e->V, nA, e->V, D, 0, 0) != 0) return -1;
+            CK(e, "dec argmax", k_dec_argmax(e->dlogits, e->V, nA, e->d_am, e->stream));
+            CK(e, "dec d2h", cudaMemcpyAsync(e->h_am, e->d_am, (size_t)nA * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
+        }
+        /* the step tables are reused next step: wait for this one */
+        CK(e, "dec sync", cudaStreamSynchronize(e->stream));
+        steps++;
+        /* the library's rule, per segment (src/decoder_aed.c mynah_asr_aed_decode) */
+        for (int a = 0; a < nA; a++) {
+            const int i = act[(size_t)a];
+            if (p + 1 < n_prompts[i]) { tok[(size_t)i] = prompts[i][p + 1]; continue; }
+            const int best = e->h_am[a];
+            if (best == eos || n_out[i] >= caps[i]) { done[(size_t)i] = 1; continue; }
+            tokens[i][n_out[i]++] = best;
+            tok[(size_t)i] = best;
+            emitted++;
+        }
+    }
+    e->st_.dec_calls++;
+    e->st_.dec_segments += (unsigned long)n;
+    e->st_.dec_steps += steps;
+    e->st_.dec_tokens += emitted;
+    e->st_.dec_ms += now_ms() - t0;
+    return 0;
+}
+
 /* --------------------------------------------------------------------- open */
 
 static cJSON *load_json(const char *dir, const char *file) {
@@ -523,6 +804,76 @@ static int alloc_encoder_scratch(aed_gpu *e) {
     return 0;
 }
 
+static int upload_decoder(aed_gpu *e) {
+    const mynah_asr_aed &a = e->aed;
+    const size_t D = (size_t)e->D, F = (size_t)e->dF, V = (size_t)e->V;
+    e->dw.resize((size_t)e->dL);
+    for (int l = 0; l < e->dL; l++) {
+        const mynah_asr_aed_layer *S = &a.layers[l];
+        dec_lw &W = e->dw[(size_t)l];
+        memset(&W, 0, sizeof(W));
+#define REQ(dst, src, n) do { W.dst = up_req(e, (src), (n), "aed." #dst); if (!W.dst) return -1; } while (0)
+        REQ(ln_self_w, S->ln_self_w, D); REQ(ln_self_b, S->ln_self_b, D);
+        REQ(sq, qf32(&S->sq), D * D); REQ(sq_b, S->sq_b, D);
+        REQ(sk, qf32(&S->sk), D * D); REQ(sk_b, S->sk_b, D);
+        REQ(sv, qf32(&S->sv), D * D); REQ(sv_b, S->sv_b, D);
+        REQ(so, qf32(&S->so), D * D); REQ(so_b, S->so_b, D);
+        REQ(ln_cross_w, S->ln_cross_w, D); REQ(ln_cross_b, S->ln_cross_b, D);
+        REQ(cq, qf32(&S->cq), D * D); REQ(cq_b, S->cq_b, D);
+        REQ(ck, qf32(&S->ck), D * D); REQ(ck_b, S->ck_b, D);
+        REQ(cv, qf32(&S->cv), D * D); REQ(cv_b, S->cv_b, D);
+        REQ(co, qf32(&S->co), D * D); REQ(co_b, S->co_b, D);
+        REQ(ln_ffn_w, S->ln_ffn_w, D); REQ(ln_ffn_b, S->ln_ffn_b, D);
+        REQ(ff1, qf32(&S->ff1), F * D); REQ(ff1_b, S->ff1_b, F);
+        REQ(ff2, qf32(&S->ff2), D * F); REQ(ff2_b, S->ff2_b, D);
+#undef REQ
+    }
+    if (a.proj.n) {
+        e->d_proj_w = up_req(e, qf32(&a.proj), D * (size_t)e->d_enc, "aed.enc_dec_proj");
+        e->d_proj_b = up_req(e, a.proj_b, D, "aed.enc_dec_proj.bias");
+        if (!e->d_proj_w || !e->d_proj_b) return -1;
+    }
+    e->d_emb = up_req(e, a.emb, V * D, "aed.embedding");
+    e->d_pos = up_req(e, a.pos, (size_t)e->max_seq * D, "aed.pos_enc");
+    e->d_embln_w = up_req(e, a.embln_w, D, "aed.emb_norm");
+    e->d_embln_b = up_req(e, a.embln_b, D, "aed.emb_norm.bias");
+    e->d_fin_w = up_req(e, a.fin_w, D, "aed.final_norm");
+    e->d_fin_b = up_req(e, a.fin_b, D, "aed.final_norm.bias");
+    e->d_head_w = up_req(e, qf32(&a.head), V * D, "aed.head");
+    e->d_head_b = up_req(e, a.head_b, V, "aed.head.bias");
+    if (!e->d_emb || !e->d_pos || !e->d_embln_w || !e->d_embln_b || !e->d_fin_w || !e->d_fin_b ||
+        !e->d_head_w || !e->d_head_b)
+        return -1;
+    return 0;
+}
+
+static int alloc_decoder_scratch(aed_gpu *e) {
+    const size_t R = (size_t)e->r_max, D = (size_t)e->D, mi = (size_t)e->max_items;
+    if (e->d_proj_w &&
+        dalloc(e, (void **)&e->encp, R * D * sizeof(float), &e->vram_scratch, "decoder enc proj") != 0) return -1;
+    e->CK.assign((size_t)e->dL, nullptr); e->CV.assign((size_t)e->dL, nullptr);
+    e->SK.assign((size_t)e->dL, nullptr); e->SV.assign((size_t)e->dL, nullptr);
+    for (int l = 0; l < e->dL; l++) {
+        if (dalloc(e, (void **)&e->CK[(size_t)l], R * D * sizeof(float), &e->vram_scratch, "cross K") != 0 ||
+            dalloc(e, (void **)&e->CV[(size_t)l], R * D * sizeof(float), &e->vram_scratch, "cross V") != 0 ||
+            dalloc(e, (void **)&e->SK[(size_t)l], (size_t)e->s_max * D * sizeof(float), &e->vram_scratch, "self K") != 0 ||
+            dalloc(e, (void **)&e->SV[(size_t)l], (size_t)e->s_max * D * sizeof(float), &e->vram_scratch, "self V") != 0)
+            return -1;
+    }
+    float **rows[] = {&e->dx, &e->dxn, &e->dq, &e->dkn, &e->dvn, &e->datt};
+    for (float **b : rows)
+        if (dalloc(e, (void **)b, mi * D * sizeof(float), &e->vram_scratch, "decoder rows") != 0) return -1;
+    if (dalloc(e, (void **)&e->dff, mi * (size_t)e->dF * sizeof(float), &e->vram_scratch, "decoder ffn") != 0 ||
+        dalloc(e, (void **)&e->dlogits, mi * (size_t)e->V * sizeof(float), &e->vram_scratch, "decoder logits") != 0 ||
+        dalloc(e, (void **)&e->d_step, 4 * mi * sizeof(int), &e->vram_scratch, "decoder step") != 0 ||
+        dalloc(e, (void **)&e->d_am, mi * sizeof(int), &e->vram_scratch, "decoder argmax") != 0)
+        return -1;
+    CK(e, "pinned", cudaMallocHost((void **)&e->h_step, 4 * mi * sizeof(int)));
+    CK(e, "pinned", cudaMallocHost((void **)&e->h_am, mi * sizeof(int)));
+    memset(e->h_step, 0, 4 * mi * sizeof(int));
+    return 0;
+}
+
 static int prepare_tc(aed_gpu *e) {
     if (!e->tc) return 0;
     const int R = e->r_max, d = e->d, ffn = e->ffn;
@@ -534,6 +885,15 @@ static int prepare_tc(aed_gpu *e) {
             return -1;
     }
     if (tc_prepare(e, e->d_ep_w, e->d_out, d, R)) return -1;
+    if (!e->dec_gpu) return 0;
+    const int D = e->D, mi = e->max_items;
+    if (tc_prepare(e, e->d_proj_w, D, e->d_enc, R) || tc_prepare(e, e->d_head_w, e->V, D, mi)) return -1;
+    for (const dec_lw &W : e->dw)
+        if (tc_prepare(e, W.ck, D, D, R) || tc_prepare(e, W.cv, D, D, R) ||
+            tc_prepare(e, W.sq, D, D, mi) || tc_prepare(e, W.sk, D, D, mi) || tc_prepare(e, W.sv, D, D, mi) ||
+            tc_prepare(e, W.so, D, D, mi) || tc_prepare(e, W.cq, D, D, mi) || tc_prepare(e, W.co, D, D, mi) ||
+            tc_prepare(e, W.ff1, e->dF, D, mi) || tc_prepare(e, W.ff2, D, e->dF, mi))
+            return -1;
     return 0;
 }
 
@@ -554,12 +914,8 @@ extern "C" asr_aed_gpu *asr_aed_gpu_open(const asr_aed_gpu_cfg *cfg, char *err, 
         delete e;
         return nullptr;
     }
-    if (cfg->decode_on_gpu) {
-        snprintf(err, errcap, "the GPU AED decoder is not built yet: run with --aed-decoder host "
-                              "(the GPU encoder, the library's CPU decoder)");
-        delete e;
-        return nullptr;
-    }
+    e->dec_gpu = cfg->decode_on_gpu ? 1 : 0;
+    memset(&e->aed, 0, sizeof(e->aed));
     int ndev = 0;
     cudaError_t c = cudaGetDeviceCount(&ndev);
     if (c != cudaSuccess || ndev <= 0) {
@@ -623,9 +979,38 @@ extern "C" asr_aed_gpu *asr_aed_gpu_open(const asr_aed_gpu_cfg *cfg, char *err, 
     if ((size_t)(2 * e->dk + AED_THREADS + e->t_max) * sizeof(float) > 48u * 1024u)
         FAIL("T_max %d needs more shared memory than a block has (segment limit too long)", e->t_max);
 
+    if (e->dec_gpu) {
+        /* the decoder through the library's loader, with mynah.json's geometry
+         * (exactly the arguments mynah_asr_load_quant passes) */
+        const cJSON *jdec = cJSON_GetObjectItem(e->jcfg, "decoder");
+        const char *dtype = jstr(jdec, "type");
+        if (!dtype || strcmp(dtype, "aed_transformer") != 0) FAIL("decoder type '%s' is not aed_transformer", dtype ? dtype : "?");
+        const int nl = jint(jdec, "n_layers", -1), nh = jint(jdec, "n_heads", -1);
+        const int ms = jint(jdec, "max_seq", -1), dl = jint(jdec, "max_generation_delta", -1);
+        if (nl <= 0 || nh <= 0 || ms <= 0 || dl < 0) FAIL("mynah.json decoder geometry incomplete");
+        if (mynah_asr_aed_init(&e->aed, e->st, nl, nh, ms, dl, 0) != 0) FAIL("AED decoder init failed");
+        e->aed_ok = 1;
+        e->dL = e->aed.n_layers; e->D = e->aed.d; e->dH = e->aed.n_heads; e->ddk = e->D / e->dH;
+        e->dF = e->aed.ffn; e->V = e->aed.vocab; e->max_seq = e->aed.max_seq; e->d_enc = e->aed.d_enc;
+        if (e->dH * e->ddk != e->D) FAIL("decoder heads %d do not divide d %d", e->dH, e->D);
+        if (e->d_enc != e->d_out) FAIL("the decoder reads %d-wide encoder rows, the encoder writes %d", e->d_enc, e->d_out);
+        if (!e->aed.proj.n && e->d_enc != e->D) FAIL("no enc_dec_proj and encoder width %d != decoder %d", e->d_enc, e->D);
+        /* a batch wave never asks for timestamps (src/mynah_asr.c), so its
+         * segments need n_prompt + T + delta; the single path (n = 1) may
+         * reach max_seq */
+        e->l_max = AED_PROMPT_MAX + e->t_max + e->aed.max_gen_delta;
+        if (e->l_max > e->max_seq) e->l_max = e->max_seq;
+        e->s_max = e->max_items * e->l_max;
+        if (e->s_max < e->max_seq) e->s_max = e->max_seq;
+        e->kv_max = e->t_max > e->max_seq ? e->t_max : e->max_seq;
+        if ((size_t)(e->ddk + AED_THREADS + e->kv_max) * sizeof(float) > 48u * 1024u)
+            FAIL("the decoder attention needs more shared memory than a block has (max_seq %d)", e->max_seq);
+    }
+
     size_t freeb = 0;
     cudaMemGetInfo(&freeb, &e->vram_total);
-    if (upload_encoder(e) != 0 || alloc_encoder_scratch(e) != 0 || prepare_tc(e) != 0)
+    if (upload_encoder(e) != 0 || alloc_encoder_scratch(e) != 0 ||
+        (e->dec_gpu && (upload_decoder(e) != 0 || alloc_decoder_scratch(e) != 0)) || prepare_tc(e) != 0)
         FAIL("%s", e->err[0] ? e->err : "device upload/allocation failed");
     if (e->tc && e->tc_ws_floats > 0 &&
         dalloc(e, (void **)&e->tc_ws, e->tc_ws_floats * sizeof(float), &e->vram_scratch, "own-tc workspace") != 0)
@@ -642,6 +1027,9 @@ static void aed_close(aed_gpu *e) {
     if (e->h_ints) cudaFreeHost(e->h_ints);
     if (e->h_x) cudaFreeHost(e->h_x);
     if (e->h_out) cudaFreeHost(e->h_out);
+    if (e->h_step) cudaFreeHost(e->h_step);
+    if (e->h_am) cudaFreeHost(e->h_am);
+    if (e->aed_ok) mynah_asr_aed_free(&e->aed);
     /* device buffers go with the context (the process closes once, on exit;
      * cudaDeviceReset does the bulk free, as the streaming engine) */
     if (e->enc_ok) mynah_asr_encoder_free(&e->enc);
@@ -660,7 +1048,8 @@ extern "C" void asr_aed_gpu_close(asr_aed_gpu *e) {
 extern "C" void asr_aed_gpu_offload(asr_aed_gpu *e, mynah_asr_offload *out) {
     memset(out, 0, sizeof(*out));
     out->encode = hook_encode;
-    out->aed_decode = nullptr;     /* the library's CPU decoder (stage 2) */
+    /* --aed-decoder host: NULL, the library's CPU decoder decodes */
+    out->aed_decode = e->dec_gpu ? hook_decode : nullptr;
     out->ud = e;
 }
 
@@ -669,7 +1058,11 @@ extern "C" void asr_aed_gpu_get_facts(const asr_aed_gpu *e, asr_aed_gpu_facts *f
     f->device = e->devname.c_str();
     f->precision = e->tc ? "bf16" : "f32";
     f->gemm = e->tc ? "own-tc" : "own-rowstable";
-    f->decoder = "host";
+    f->decoder = e->dec_gpu ? "gpu" : "host";
+    f->s_max = e->s_max;
+    f->dec_layers = e->dL;
+    f->d_dec = e->D;
+    f->vocab = e->V;
     f->max_items = e->max_items;
     f->t_max = e->t_max;
     f->enc_layers = e->L;
@@ -678,6 +1071,7 @@ extern "C" void asr_aed_gpu_get_facts(const asr_aed_gpu *e, asr_aed_gpu_facts *f
     f->vram_weights = e->vram_weights;
     f->vram_scratch = e->vram_scratch;
     size_t freeb = 0, totb = 0;
+    cudaSetDevice(e->device);      /* /v1/health asks from an HTTP thread */
     if (cudaMemGetInfo(&freeb, &totb) == cudaSuccess) f->vram_used = totb - freeb;
 }
 
@@ -695,7 +1089,14 @@ extern "C" size_t asr_aed_gpu_dispatch_map(const asr_aed_gpu *e, char *buf, size
         "enc attention full context, rel-pos table                 enc_attn_kernel (one block per row x head)\n"
         "enc conv      glu + 'same' depthwise k%d + %s + silu     glu_kernel, dwconv_kernel\n"
         "enc norms     layer_norm (mean/var in double)             k_layernorm\n"
-        "decoder       aed greedy                                  library on the host (src/decoder_aed.c)\n",
-        e->devname.c_str(), e->max_items, e->t_max, g, e->K, e->bn ? "folded batch_norm" : "layer_norm");
+        "%s",
+        e->devname.c_str(), e->max_items, e->t_max, g, e->K, e->bn ? "folded batch_norm" : "layer_norm",
+        e->dec_gpu
+            ? "dec proj/kv   enc_dec_proj, cross K/V once per wave           same GEMM arm\n"
+              "dec step      one row per live segment: ln, q/k/v, o, ffn  same GEMM arm, dec_ln_kernel\n"
+              "dec attention self over [0..p], cross over the segment     dec_attend_kernel (row x head)\n"
+              "dec head      final ln, head, argmax (lowest index)       same GEMM arm, k_dec_argmax\n"
+              "dec rule      prompt, EOS, cap, max_seq                    host, the library's\n"
+            : "decoder       aed greedy                                  library on the host (src/decoder_aed.c)\n");
     return n < 0 ? 0 : ((size_t)n < cap ? (size_t)n : cap - 1);
 }

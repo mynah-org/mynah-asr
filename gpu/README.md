@@ -2,8 +2,8 @@
 
 A SEPARATE tree: one process on one GPU serves the v2 wire protocol with the
 weights and every stream's state resident in VRAM and one batched step per
-cohort. Nothing under `src/` or `server/` is modified for it; those are used
-read-only as libraries. Design, cost model, decisions and gates:
+cohort. `server/` is used read-only; `src/` is used as a library, plus one
+optional seam the offline AED mode installs (`mynah_asr_offload`, below). Design, cost model, decisions and gates:
 [`.work/cuda-batched-streaming-server.md`](../.work/cuda-batched-streaming-server.md).
 
 ```
@@ -20,6 +20,16 @@ gpu/server/main.c       mynah-asr-server-cuda: ingest, cohort scheduler, books, 
 gpu/server/ws.{c,h}     the RFC 6455 server side (client frames)
 tests/test_cuda_kernels.cu   kernels vs CPU references; the GEMM row-stability BYTE gate
 tests/test_cuda_stream.c     gate A (batch identity on the GPU), gate B (CPU f32 == GPU)
+
+gpu/asr_offline.h       the OFFLINE seam (an AED pack): request in, final transcript out
+gpu/offline_engine.c    the library model + (cuda) the GPU offload installed in it
+gpu/aed_gpu.h           the GPU AED engine: the library's offload hooks on one device
+gpu/cuda/aed.cu         encoder layers (packed rows, full rel-pos attention, 'same'
+                        depthwise + folded batch_norm) and the batched greedy AED decoder
+gpu/cuda/aed_stub.c     "not compiled" when built without nvcc
+gpu/server/rest.{c,h}   the offline mode: REST, admission, the batcher thread, books
+tests/test_cuda_aed.c        parity with the library, batch identity, the word path
+tests/test_cuda_aed_server.sh  the offline mode end to end against the CLI
 ```
 
 ## Build
@@ -30,6 +40,7 @@ make -C gpu                       # mynah-asr-server-cuda            (needs nvcc
 make -C gpu cpu                   # mynah-asr-server-cuda-cpuonly    (no nvcc: cpu engine + stub)
 make -C gpu test-kernels          # tests/test_cuda_kernels          (GPU)
 make -C gpu test-stream           # tests/test_cuda_stream           (GPU + pack)
+make -C gpu test-aed              # tests/test_cuda_aed              (GPU + an AED pack)
 ```
 
 `CUDA_ARCH` defaults to `sm_80 sm_86 sm_89 sm_90`; add `sm_120` with CUDA
@@ -178,6 +189,31 @@ subsampling, prompt projector, LSTM and depthwise weights stay f32. The
 dispatch map's `precision` and `kv ring` lines and the banner's `precision=`
 (`f32`, `f32+kv-int8`, `w8a32`, `w8a32+kv-int8`, ...) say what resolved.
 Evidence: [`.work/cuda-quant.md`](../.work/cuda-quant.md).
+
+## Offline mode: AED packs (Canary)
+
+The mode comes from the pack (`decoder.type` `aed_transformer`), never from a
+flag. Such a pack cannot stream -- its decoder keeps no state between calls --
+so the server takes the CPU server's contract for it: `POST
+/v1/audio/transcriptions` (and `/translations`) answers the final transcript,
+and `GET /v1/audio/stream` is refused before the upgrade with `400
+model_not_streaming`. Nothing is ever sent before the transcript is final.
+
+```
+./mynah-asr-server-cuda -m models/canary-180m-flash --cap 64 --batch 16 --cohort-ms 30 -p 8297
+./mynah-asr-server-cuda -m models/canary-180m-flash --engine cpu          # the library alone
+./mynah-asr-server-cuda -m models/canary-180m-flash --aed-decoder host    # GPU encoder, CPU decoder
+./mynah-asr-server-cuda -m models/canary-180m-flash --precision bf16 --gemm own-tc   # the A/B arm
+```
+
+`--cap` bounds the requests admitted (queued + in flight; past it 503
+`server_at_capacity`), `--batch` the requests per GPU batch, `--cohort-ms` the
+gather window from the oldest queued request. The host half of a request --
+WAV, segmentation, mel, the canary2 prompt, the generation budget,
+detokenisation, stitching -- is the library's own code; the GPU replaces the
+encoder and the AED decode through `mynah_asr_offload` (`src/mynah_asr.h`).
+Defaults to f32 own (bf16 own-tc only when asked: no quality gate yet).
+Design and gates: `.work/canary-180m-l4.md` section 5.
 
 ## Status
 

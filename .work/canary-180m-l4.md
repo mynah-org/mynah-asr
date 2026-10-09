@@ -304,6 +304,24 @@ Decoder (AED, greedy), all segments of the wave stepped together:
 
 1. pack capability, the seam, the offline engine with the cpu reference, the
    server's offline mode (REST + 400 on the WebSocket), the GPU engine refusing
-   clearly. 
+   clearly.
 2. GPU encoder, library CPU decoder (`--aed-decoder host`).
 3. GPU decoder, batched across the wave (`--aed-decoder gpu`, the default).
+
+All three are written; none has run on a GPU yet (written on a machine without
+nvcc: the .cu was syntax-checked with clang's CUDA front end only). Box order:
+`make lib && make && make -C gpu && make -C gpu test-aed`, then
+`tests/test_cuda_aed models/canary-180m-flash` (f32: gates A, B, C),
+`... --aed-decoder host` (stage 2 alone), `... --precision bf16` (CER report),
+`tests/test_cuda_aed_server.sh models/canary-180m-flash 8297 cuda`.
+
+### 5.8 Open after the first box run
+
+- Subsampling on the device (it is per segment on the host today; measure its
+  share with `host_subsampling_ms_total` in /v1/health first).
+- The decoder steps one row per segment through M <= --batch GEMMs and syncs
+  once per step for the argmax: launch-bound at small batch; CUDA graphs per
+  (rows) or a device-side stopping rule are the candidates, after a profile.
+- bf16 own-tc: a WER gate on `samples/eval-bank` (en, fr) against f32 before it
+  could become a default.
+- canary-1b-flash / 1b-v2: same code path; VRAM and T_max to check.
