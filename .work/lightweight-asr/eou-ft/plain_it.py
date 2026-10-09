@@ -214,8 +214,9 @@ while step < a.steps:
                         "val_eou_rate": round(veo / len(val), 3), "val_nonblank": round(float(np.mean(vnb)), 4)})
             print(f"  VAL {json.dumps({k: rec[k] for k in rec if k.startswith('val')})}", flush=True)
             # stage 2 keeps EOU: best = lowest WER among evals with EOU on >= 80 % of the
-            # val clips; until one qualifies, the eval with the most EOU wins
-            score = vw if not a.eou_append else (vw if rec["val_eou_rate"] >= 0.8 else 1000 - 100 * rec["val_eou_rate"])
+            # val clips AND <= 10 % empty; until one qualifies, the most EOU (fewest empties) wins
+            ok = rec["val_eou_rate"] >= 0.8 and rec["val_empty"] <= 0.1 * len(val)
+            score = vw if not a.eou_append else (vw if ok else 1000 - 100 * rec["val_eou_rate"] + rec["val_empty"])
             if best is None or score < best:
                 best = score
                 m.save_to(str(out / "final.nemo"))
