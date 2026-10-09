@@ -52,6 +52,16 @@ from nemo.collections.asr.losses.rnnt import RNNTLoss
 
 m = EncDecRNNTBPEModel.restore_from(a.init or a.stock, map_location=dev)
 m.joint._fuse_loss_wer = False
+# Evaluation decodes with the per-utterance greedy loop: NeMo's batched greedy
+# (CUDA-graph label loop) hit "illegal memory access" in batched_hyps_to_hypotheses
+# mid-run on this box (b1 after step 1500, b2 at step 500).
+from omegaconf import open_dict
+_dc = m.cfg.decoding
+with open_dict(_dc):
+    _dc.strategy = "greedy"
+    if "greedy" in _dc:
+        _dc.greedy.use_cuda_graph_decoder = False
+m.change_decoding_strategy(_dc)
 tk = m.tokenizer
 V = tk.vocab_size                       # 1026 incl. <EOU>/<EOB>; blank = V
 loss_fn = RNNTLoss(num_classes=V, reduction="mean_batch", loss_name="warprnnt_numba",

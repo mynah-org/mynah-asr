@@ -5,15 +5,11 @@
 set -u
 K=/root/eou-kit; PY=/root/nemo-venv/bin/python; R=/root/ft/runs; L=/root/ft/logs
 VAL="--val /root/ft/manifests/eval_mls_it.json --val-n 200"
-until grep -q "plain-b2-5h-top4 done" $L/plain-b2.log 2>/dev/null; do sleep 20; done
-best() { $PY -c "import json;d=json.load(open('$R/plain-$1/metrics.json'));print(min(x['val_wer'] for x in d['log'] if 'val_wer' in x))"; }
-w1=$(best b1-5h-frz); w2=$(best b2-5h-top4); echo "== chain b1 best val $w1, b2 best val $w2 $(date +%T)"
-if $PY -c "import sys; sys.exit(0 if float('$w2') < float('$w1') else 1)"; then
-    POL="--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5"; W=b2
-else
-    POL="--freeze-enc 1"; W=b1
-fi
-echo "== chain winner $W: $POL"
+# b1/b2 died in NeMo's batched greedy decoding during an eval (fixed in
+# plain_it.py); b1's best (MLS-it val WER 59.12 / CER 26.57, frozen encoder) is
+# archived. The 40 h run takes the top-4 policy (the better arm on Canary).
+POL="--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5"; W=b2pol
+echo "== chain policy $W: $POL"
 exec 9>/root/gpu.lock; flock 9
 cd $K
 $PY plain_it2.py --manifest /root/ft/manifests/train_40h.json --steps 4000 --bs 16 --lr 3e-4 $POL --eval-every 500 $VAL \
