@@ -135,7 +135,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
                 g = gcd(sr, D.SR)
                 arr, sr = resample_poly(arr, D.SR // g, sr // g).astype("float32"), D.SR
             r = meta[i]
-            uid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(r.get(ic) or i)).rsplit(".", 1)[0]
+            uid = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(str(r.get(ic) or i)).name).rsplit(".", 1)[0]
             p = Path(audio_dir) / src / f"{uid}.wav"
             D.write_wav(p, arr, sr)
             rows.append({"audio_filepath": str(p), "duration": round(dur, 3), "text": r[tc].strip(),

@@ -5,7 +5,8 @@
 # The HF token is read from /root/.hf_token (mode 600); KEEP_TOKEN=1 keeps it for the
 # day's archival uploads (the close-out job deletes it), otherwise it is deleted at the end.
 # Also builds the NeMo fine-tuning venv (/root/nemo-venv: nemo_toolkit[asr], torch cu128
-# via ft/setup.sh, numba-cuda + numpy<2.4 for the warprnnt_numba RNNT loss) in the
+# via canary/setup.sh, numba-cuda + numpy<2.4 for the warprnnt_numba RNNT loss, torchaudio
+# of the SAME torch build: nemo_toolkit[asr] does not pull it, prepare_it's resampler needs it) in the
 # background of the build. A fresh 32 GB L40S is ready in ~20-30 min.
 #   tmux new -d -s prov 'KEEP_TOKEN=1 bash /root/prov.sh 2>&1 | tee -a /root/res/prov.log'
 set -u
@@ -32,6 +33,10 @@ if step venv; then
     ( uv venv -q -p 3.12 $V && VIRTUAL_ENV=$V timeout 2400 uv pip install -q "nemo_toolkit[asr]>=2.6" \
       && FT_ROOT=/root/ft VENV=$V timeout 3000 bash finetune/canary/setup.sh \
       && VIRTUAL_ENV=$V uv pip install -q numba-cuda "numpy<2.4" \
+      && VIRTUAL_ENV=$V uv pip install -q --index-url https://download.pytorch.org/whl/cu128 \
+           --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+           "torchaudio==$($V/bin/python -c 'import torch; print(torch.__version__)')" \
+      && $V/bin/python -c "import torch, torchaudio; assert torch.cuda.is_available()" \
       && cp finetune/eou/two_stage.py /root/eou-kit/plain_it2.py \
       && cp finetune/eou/export_to_mynah.sh /root/eou-kit/ && ok venv ) > $R/venv.log 2>&1 &
     VPID=$!
