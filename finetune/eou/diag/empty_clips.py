@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Which val clips decode EMPTY (or near-empty), and what they have in common.
+--pad-lead S re-decodes with S seconds of quiet before the speech (onset hypothesis).
 
     $PY empty_clips.py --nemo run/final.nemo --val vp=eval_vp.json,cv=eval_cv.json [--val-n 200]
 
@@ -14,6 +15,7 @@ from nemo.collections.asr.models import EncDecRNNTBPEModel
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--nemo", required=True); ap.add_argument("--val", required=True); ap.add_argument("--val-n", type=int, default=200)
+ap.add_argument("--pad-lead", type=float, default=0.0, help="prepend this many s of -75 dBFS quiet (onset hypothesis)")
 a = ap.parse_args()
 m = EncDecRNNTBPEModel.restore_from(a.nemo, map_location="cuda").eval()
 dc = m.cfg.decoding
@@ -40,6 +42,8 @@ for spec in a.val.split(","):
     rows = []
     for i in range(0, len(rs), 16):
         xs = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in rs[i:i + 16]]
+        if a.pad_lead:
+            xs = [np.concatenate([(np.random.randn(int(16000 * a.pad_lead)) * 10 ** (-75 / 20)).astype(np.float32), x]) for x in xs]
         X = torch.zeros(len(xs), max(len(x) for x in xs))
         for j, x in enumerate(xs):
             X[j, :len(x)] = torch.from_numpy(x)
