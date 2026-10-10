@@ -127,6 +127,13 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
             dur = len(arr) / sr
             if not 1.0 <= dur <= 20.0:
                 continue
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1)
+            if sr != D.SR:   # CV mp3 is 32/48 kHz; the venv has no torchaudio (prepare_it's resampler)
+                from math import gcd
+                from scipy.signal import resample_poly
+                g = gcd(sr, D.SR)
+                arr, sr = resample_poly(arr, D.SR // g, sr // g).astype("float32"), D.SR
             r = meta[i]
             uid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(r.get(ic) or i)).rsplit(".", 1)[0]
             p = Path(audio_dir) / src / f"{uid}.wav"
