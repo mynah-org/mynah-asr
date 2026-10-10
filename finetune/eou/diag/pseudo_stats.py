@@ -78,6 +78,11 @@ def main():
     if agree:   # a reference text exists (e.g. Granary's Whisper label): teacher-vs-reference agreement
         out["agreement_wer"] = {"p10_p50_p90": pct([r["teacher_wer"] for r in agree]),
                                 "hours_at_or_below": {t: H([r for r in agree if r["teacher_wer"] <= t]) for t in (5, 10, 15, 20, 30, 50)}}
+        d = sorted(r["duration"] for r in agree); q1, q2 = d[len(d) // 3], d[2 * len(d) // 3]
+        out["agreement_by_duration"] = {f"{lo:.1f}-{hi:.1f}s": {"clips": len(x), "p50": (pct([r["teacher_wer"] for r in x]) or [None] * 3)[1],
+                                                               "share_le_15": round(sum(r["teacher_wer"] <= 15 for r in x) / max(1, len(x)), 3)}
+                                        for lo, hi in ((0, q1), (q1, q2), (q2, 1e9))
+                                        for x in [[r for r in agree if lo <= r["duration"] < hi]]}
     out["candidate_gate"] = {"rule": "lang it, non-empty, 1.0 <= words/s <= 4.5, no 3x repeated n-gram", "clips": len(gate), "hours": H(gate)}
     if a.subs:
         subs = {}
