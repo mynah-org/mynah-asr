@@ -9,7 +9,9 @@ annotated per utterance: the label-quality score used to filter a training sourc
 Each clip is streamed unpaced (1 s frames), then closed; the transcript is the
 concatenation of the server's `delta` texts (tools/bench/streaming_metrics.py). The
 output manifest keeps every input field and adds `teacher` (normalised text) and
-`teacher_wer` (accent-insensitive WER of the teacher against the manifest text, %).
+`teacher_wer` (accent-insensitive WER of the teacher against the manifest text, %; None when
+the manifest has no text), `teacher_raw` and `teacher_lang` (the language of the done frame:
+with --lang auto, the teacher's own language ID).
 Filtering is a separate, cheap step on that file (any threshold, no re-run).
 Standard library only; the WebSocket framing is tools/eval/ws_client.py's.
 """
@@ -62,7 +64,7 @@ def transcribe(path, host, port, lang, tries=20):
             for off in range(0, len(pcm), 32000):
                 ws_send(s, 0x2, pcm[off:off + 32000])
             ws_send(s, 0x8, b"")
-            texts = []
+            texts, lang_out = [], ""
             while True:
                 op, payload = ws_recv(s)
                 if op == 0x8:
@@ -73,10 +75,12 @@ def transcribe(path, host, port, lang, tries=20):
                 kind = msg.get("type") or ("done" if msg.get("done") else "delta")
                 if kind == "delta" and msg.get("text"):
                     texts.append(msg["text"])
+                if kind == "done":
+                    lang_out = msg.get("lang") or msg.get("language") or ""
                 if kind in ("done", "error"):
                     break
             s.close()
-            return "".join(texts)
+            return "".join(texts), lang_out
         except (OSError, ConnectionError, ValueError):
             time.sleep(0.5 + 0.2 * k)
     return None
@@ -105,21 +109,25 @@ def main():
         return r, transcribe(r["audio_filepath"], a.host, a.port, a.lang)
 
     with cf.ThreadPoolExecutor(a.conc) as ex, open(a.out + ".tmp", "w") as f:
-        for r, t in ex.map(one, rows):
+        for r, res in ex.map(one, rows):
             done += 1
-            if t is None:
+            if res is None:
                 fails += 1
                 continue
+            t, lang_out = res
             ref = norm(r["text"])
             r["teacher"] = norm(t)
-            r["teacher_wer"] = round(100 * lev(ref.split(), r["teacher"].split()) / max(1, len(ref.split())), 1)
+            r["teacher_raw"] = t.strip()
+            r["teacher_lang"] = lang_out
+            # no reference (unlabelled audio, e.g. YODAS): no WER, the teacher text is the label
+            r["teacher_wer"] = round(100 * lev(ref.split(), r["teacher"].split()) / max(1, len(ref.split())), 1) if ref else None
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             if done % 1000 == 0:
                 aud = sum(x["duration"] for x in rows[:done])
                 print(f"  {done}/{len(rows)} clips, {aud / (time.time() - t0):.0f}x RT, fails {fails}", flush=True)
     os.replace(a.out + ".tmp", a.out)
     out = [json.loads(l) for l in open(a.out)]
-    w = sorted(x["teacher_wer"] for x in out)
+    w = sorted(x["teacher_wer"] for x in out if x["teacher_wer"] is not None)
     pct = lambda q: w[min(len(w) - 1, int(q * len(w)))] if w else None  # noqa: E731
     print(f"== {a.manifest}: {len(out)} annotated, {fails} failed, {time.time() - t0:.0f}s; teacher WER p50 {pct(.5)} "
           f"p75 {pct(.75)} p90 {pct(.9)}; <=30 %: {sum(v <= 30 for v in w)}  <=50 %: {sum(v <= 50 for v in w)}  "

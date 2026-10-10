@@ -32,7 +32,7 @@ V=/root/nemo-venv
 if step venv; then
     ( uv venv -q -p 3.12 $V && VIRTUAL_ENV=$V timeout 2400 uv pip install -q "nemo_toolkit[asr]>=2.6" \
       && FT_ROOT=/root/ft VENV=$V timeout 3000 bash finetune/canary/setup.sh \
-      && VIRTUAL_ENV=$V uv pip install -q numba-cuda "numpy<2.4" \
+      && VIRTUAL_ENV=$V uv pip install -q numba-cuda "numpy<2.4" silero-vad \
       && VIRTUAL_ENV=$V uv pip install -q --index-url https://download.pytorch.org/whl/cu128 \
            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
            "torchaudio==$($V/bin/python -c 'import torch; print(torch.__version__)')" \
