@@ -6,6 +6,8 @@
 Per clip (teacher_ws.py output): detected language (teacher_lang), empty teacher text,
 words per second, characters per word, longest repeated n-gram run (degenerate loops),
 duration; printed as counts and percentiles, with the hours each candidate gate would keep.
+With a reference text in the manifest (e.g. Granary's Whisper label) the teacher_wer
+distribution is the two-teacher AGREEMENT, with the hours each threshold keeps.
 With --subs (YODAS2 video-level subtitles): per video, the WER between the concatenated
 teacher text (clips in time order) and the subtitle text -- a video-level check only
 (music / other language / auto-captions), never a clip filter.
@@ -72,6 +74,10 @@ def main():
     out["repeat_run_ge3"] = sum(r["_rep"] >= 3 for r in nonempty)
     it = [r for r in nonempty if r.get("teacher_lang") == "it"]
     gate = [r for r in it if 1.0 <= r["_wps"] <= 4.5 and r["_rep"] < 3]
+    agree = [r for r in rs if r.get("teacher_wer") is not None]
+    if agree:   # a reference text exists (e.g. Granary's Whisper label): teacher-vs-reference agreement
+        out["agreement_wer"] = {"p10_p50_p90": pct([r["teacher_wer"] for r in agree]),
+                                "hours_at_or_below": {t: H([r for r in agree if r["teacher_wer"] <= t]) for t in (5, 10, 15, 20, 30, 50)}}
     out["candidate_gate"] = {"rule": "lang it, non-empty, 1.0 <= words/s <= 4.5, no 3x repeated n-gram", "clips": len(gate), "hours": H(gate)}
     if a.subs:
         subs = {}

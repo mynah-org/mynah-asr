@@ -43,10 +43,11 @@ import prepare_it as D  # noqa: E402  (curl, decode_bytes, write_wav, fleurs tsv
 HF = "https://huggingface.co"
 CV_REPO = "fixie-ai/common_voice_17_0"
 VP_REPO = "facebook/voxpopuli"
+YG_REPO = "espnet/yodas-granary"   # Granary's YODAS: pre-segmented clips + Whisper-v3 labels (CC-BY-3.0)
 FLEURS_CFG = {"it": "it_it", "fr": "fr_fr"}
 TEXT_COLS = ("sentence", "raw_text", "normalized_text", "transcription", "text")
-SPK_COLS = ("client_id", "speaker_id")
-ID_COLS = ("path", "audio_id", "id")
+SPK_COLS = ("client_id", "speaker_id", "original_audio_id")
+ID_COLS = ("utt_id", "path", "audio_id", "id")
 
 
 def hf_token():
@@ -77,7 +78,7 @@ def pick(cols, names):
     return None
 
 
-def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0):
+def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False):
     """Download one parquet shard, keep a speaker-capped random subset up to budget_s
     (or eval_n clips), write wavs, delete the shard. Returns manifest rows."""
     import pyarrow.parquet as pq
@@ -96,7 +97,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
         spk_n, want = {}, []
         for i in order:
             r = meta[i]
-            if not text_ok(r[tc]):
+            if not (r[tc] or "").strip() or (not keep_all and not text_ok(r[tc])):
                 continue
             s = r.get(sc) or f"anon{i}"
             if spk_n.get(s, 0) >= spk_cap:
@@ -209,6 +210,9 @@ def main():
     ap.add_argument("--cv-spk", type=int, default=20)
     ap.add_argument("--vp-spk", type=int, default=60)
     ap.add_argument("--no-fleurs", action="store_true")
+    ap.add_argument("--yg-shards", default="", help="yodas-granary <lang>000/ast shard indices (e.g. 0,40,80): "
+                    "every 1-20 s clip, speaker = video -> train_yg.json (Granary Whisper text kept as `text`)")
+    ap.add_argument("--yg-keep-all", action="store_true", help="audit: keep rows with digits / non-latin text")
     ap.add_argument("--eval-n", type=int, default=200)
     ap.add_argument("--audio", default="")
     ap.add_argument("--out", default="")
@@ -231,6 +235,18 @@ def main():
         te = [f for f in files if Path(f).name.startswith("test-") and f.endswith(".parquet")]
         print(f"== {src}: {len(tr)} train shards, {len(te)} test shards, budget {hours} h, cap {cap}/speaker", flush=True)
         jobs.append((src, repo, tr, te, hours * 3600 / len(tr), cap))
+    if a.yg_shards and not (out / "train_yg.json").exists():
+        files = list_files(YG_REPO, f"data/{a.lang}000/ast")
+        pick = [files[int(i)] for i in a.yg_shards.split(",")]
+        rows = []
+        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            futs = [ex.submit(shard_job, "yg", YG_REPO, f, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0, a.yg_keep_all) for f in pick]
+            for fu in futs:
+                rel, r = fu.result()
+                rows += r
+                print(f"  yg {rel}: {len(r)} utts {sum(x['duration'] for x in r) / 3600:.2f} h", flush=True)
+        D.ftlib.write_manifest(out / "train_yg.json", rows)
+        print(f"== yg: {len(rows)} utts {sum(x['duration'] for x in rows) / 3600:.2f} h, {len({x['speaker'] for x in rows})} videos", flush=True)
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         for src, repo, tr, te, per, cap in jobs:
             futs = [ex.submit(shard_job, src, repo, rel, per, cap, str(audio), str(tmp), a.seed) for rel in tr]
