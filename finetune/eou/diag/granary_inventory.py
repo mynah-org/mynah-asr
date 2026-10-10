@@ -49,12 +49,16 @@ def main():
                 if kind == "ast" and first is None and fl:
                     first = fl[0]
         cal = None
-        if first:
+        try:   # calibrate on the first ast shard; a language may have asr_only shards only (e.g. en)
+            if first is None:
+                raise ValueError("no ast shard to calibrate on")
             with fs.open(f"datasets/{REPO}/{first['path']}") as f:
                 t = pq.read_table(f, columns=["duration", "original_audio_id"]).to_pylist()
             h = sum(float(r["duration"]) for r in t) / 3600
             cal = {"shard": first["path"], "MB": round(first["size"] / 1e6), "hours": round(h, 2), "clips": len(t),
                    "videos": len({r["original_audio_id"] for r in t}), "GB_per_h": round(first["size"] / 1e9 / max(h, 1e-9), 3)}
+        except Exception as e:  # noqa: BLE001
+            print(f"   calibration failed for {lang}: {e!r}", flush=True)
         gb = (tot["asr_only"][1] + tot["ast"][1]) / 1e9
         est_h = gb / cal["GB_per_h"] if cal else None
         rows.append({"lang": lang, "dirs": by.get(lang, []), "shards_asr_only": tot["asr_only"][0], "shards_ast": tot["ast"][0],

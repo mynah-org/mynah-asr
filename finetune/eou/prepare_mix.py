@@ -78,7 +78,7 @@ def pick(cols, names):
     return None
 
 
-def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False):
+def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False, max_s=20.0):
     """Download one parquet shard, keep a speaker-capped random subset up to budget_s
     (or eval_n clips), write wavs, delete the shard. Returns manifest rows."""
     import pyarrow.parquet as pq
@@ -127,7 +127,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
                 fails += 1
                 continue
             dur = len(arr) / sr
-            if not 1.0 <= dur <= 20.0:
+            if not 1.0 <= dur <= max_s:
                 continue
             src_sr = sr
             arr, sr = resample16(arr, sr)   # CV mp3 is 32/48 kHz
@@ -213,6 +213,8 @@ def main():
     ap.add_argument("--yg-shards", default="", help="yodas-granary <lang>000/ast shard indices (e.g. 0,40,80): "
                     "every 1-20 s clip, speaker = video -> train_yg.json (Granary Whisper text kept as `text`)")
     ap.add_argument("--yg-keep-all", action="store_true", help="audit: keep rows with digits / non-latin text")
+    ap.add_argument("--yg-max-s", type=float, default=20.0, help="Granary clips average ~19.5 s: 20 keeps < 1/3 of them")
+    ap.add_argument("--yg-spread", type=int, default=0, help="instead of --yg-shards: N shards evenly spread over the language")
     ap.add_argument("--eval-n", type=int, default=200)
     ap.add_argument("--audio", default="")
     ap.add_argument("--out", default="")
@@ -235,12 +237,14 @@ def main():
         te = [f for f in files if Path(f).name.startswith("test-") and f.endswith(".parquet")]
         print(f"== {src}: {len(tr)} train shards, {len(te)} test shards, budget {hours} h, cap {cap}/speaker", flush=True)
         jobs.append((src, repo, tr, te, hours * 3600 / len(tr), cap))
-    if a.yg_shards and not (out / "train_yg.json").exists():
+    if (a.yg_shards or a.yg_spread) and not (out / "train_yg.json").exists():
         files = list_files(YG_REPO, f"data/{a.lang}000/ast")
-        pick = [files[int(i)] for i in a.yg_shards.split(",")]
+        idx = ([round(i * (len(files) - 1) / max(1, a.yg_spread - 1)) for i in range(a.yg_spread)] if a.yg_spread
+               else [int(i) for i in a.yg_shards.split(",")])
+        pick = [files[i] for i in sorted(set(idx))]
         rows = []
         with ProcessPoolExecutor(max_workers=a.workers) as ex:
-            futs = [ex.submit(shard_job, "yg", YG_REPO, f, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0, a.yg_keep_all) for f in pick]
+            futs = [ex.submit(shard_job, "yg", YG_REPO, f, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0, a.yg_keep_all, a.yg_max_s) for f in pick]
             for fu in futs:
                 rel, r = fu.result()
                 rows += r

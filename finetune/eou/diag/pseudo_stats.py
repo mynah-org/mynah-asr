@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--subs", default="")
     ap.add_argument("--json", default="")
+    ap.add_argument("--lang", default="it")
     a = ap.parse_args()
     rs = [json.loads(l) for l in open(a.manifest)]
     H = lambda xs: round(sum(r["duration"] for r in xs) / 3600, 2)  # noqa: E731
@@ -72,7 +73,8 @@ def main():
     out["words_per_s"] = pct([r["_wps"] for r in nonempty])
     out["chars_per_word"] = pct([r["_cpw"] for r in nonempty])
     out["repeat_run_ge3"] = sum(r["_rep"] >= 3 for r in nonempty)
-    it = [r for r in nonempty if r.get("teacher_lang") == "it"]
+    lang0 = (args_lang := a.lang)
+    it = [r for r in nonempty if (r.get("teacher_lang") or "").split("-")[0] == lang0]   # the server says "it" or "it-IT"
     gate = [r for r in it if 1.0 <= r["_wps"] <= 4.5 and r["_rep"] < 3]
     agree = [r for r in rs if r.get("teacher_wer") is not None]
     if agree:   # a reference text exists (e.g. Granary's Whisper label): teacher-vs-reference agreement
@@ -83,7 +85,7 @@ def main():
                                                                "share_le_15": round(sum(r["teacher_wer"] <= 15 for r in x) / max(1, len(x)), 3)}
                                         for lo, hi in ((0, q1), (q1, q2), (q2, 1e9))
                                         for x in [[r for r in agree if lo <= r["duration"] < hi]]}
-    out["candidate_gate"] = {"rule": "lang it, non-empty, 1.0 <= words/s <= 4.5, no 3x repeated n-gram", "clips": len(gate), "hours": H(gate)}
+    out["candidate_gate"] = {"rule": f"lang {lang0}, non-empty, 1.0 <= words/s <= 4.5, no 3x repeated n-gram", "clips": len(gate), "hours": H(gate)}
     if a.subs:
         subs = {}
         for v in json.load(open(a.subs)):
