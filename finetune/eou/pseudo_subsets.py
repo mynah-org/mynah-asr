@@ -92,7 +92,10 @@ def main():
         mix = f"{a.bs * (a2_mean + m) / 2:.0f} ({(a2_mean + m) / 2 / a2_mean:.2f}x)" if a2_mean else "-"
         cv = Counter(r.get("speaker") for r in xs)
         lost = sum(1 for v, c in base_v.items() if cv.get(v, 0) < 0.5 * c)
-        hv = sorted((sum(r["duration"] for r in xs if r.get("speaker") == v) for v in cv), reverse=True) if len(cv) < 20000 else []
+        hv = Counter()
+        for r in xs:
+            hv[r.get("speaker")] += r["duration"]
+        hv = sorted(hv.values(), reverse=True)
         top = sum(hv[: max(1, len(hv) // 10)]) / max(1e-9, sum(hv)) if hv else float("nan")
         print(f"| {name} | {len(xs)} | {sum(d) / 3600:.1f} | {len(cv)} | {lost} | {100 * top:.0f} % | {pct(d)} | {mix} |")
 
