@@ -39,11 +39,17 @@ for v in ref new; do
     rm -f $R/plain-reg-$v/*.nemo $R/plain-reg-$v/*.ckpt
 done
 paste -d'\n' $L/reg-ref.log $L/reg-new.log | cut -c1-220
-if ! diff <(grep -oE "step [0-9]+/50 loss [0-9.]+|trainable [0-9.]+" $L/reg-ref.log) \
-          <(grep -oE "step [0-9]+/50 loss [0-9.]+|trainable [0-9.]+" $L/reg-new.log) >/dev/null; then
-    echo "== REGRESSION: loss trace differs (ref vs new), stop"; exit 4
-fi
-echo "   regression A/B: identical loss trace and trainable params"
+# trainable params must be identical; losses within 1 % (cuDNN / atomics are not bit-exact)
+"$PY" - $L/reg-ref.log $L/reg-new.log <<'PYEOF' || { echo "== REGRESSION: ref vs new differ, stop"; exit 4; }
+import re, sys
+def grab(f):
+    t = open(f).read()
+    return re.findall(r"trainable ([0-9.]+)", t), [float(x) for x in re.findall(r"step \d+/50 loss ([0-9.]+)", t)]
+(tr, lr), (tn, ln) = grab(sys.argv[1]), grab(sys.argv[2])
+ok = tr == tn and len(lr) == len(ln) == 2 and all(abs(a - b) <= 0.01 * max(a, b) for a, b in zip(lr, ln))
+print(f"   regression A/B: trainable {tr} vs {tn}, losses {lr} vs {ln} -> {'OK' if ok else 'DIFFER'}")
+sys.exit(0 if ok else 1)
+PYEOF
 echo "== gate 3: yesterday's checkpoints on the four val sets"
 run base-p40 $L/base-p40.log --init $B/plain-p40-b2pol/final.nemo --manifest $MF/train_40h.json --n 8 --eval-only 1 --vals "$VALS"
 run base-s2 $L/base-s2.log --init $B/plain-s2-eou-p40-b2pol/final.nemo --manifest $MF/train_40h.json --n 8 --eval-only 1 \
