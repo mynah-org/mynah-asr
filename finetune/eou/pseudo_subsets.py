@@ -82,13 +82,19 @@ def main():
         tw = sum(w for _, w in parts)
         a2_mean = sum(w / tw * mean_dur(p, a.a2_max_s) for p, w in parts)
         print(f"   A2 mix alone: mean clip {a2_mean:.1f} s -> {a.bs * a2_mean:.0f} audio s / step")
-    print("| subset | clips | h | videos | dur p10/p50/p90/max s | 50/50 with A2: audio s / step (x A2) |")
-    print("|---|---|---|---|---|---|")
+    from collections import Counter
+    base_v = Counter(r.get("speaker") for r in keep)
+    print("| subset | clips | h | videos | videos losing > 50 % of their clips | top-10 % videos' share of h | dur p10/p50/p90/max s | 50/50 with A2: audio s / step (x A2) |")
+    print("|---|---|---|---|---|---|---|---|")
     for name, xs in subsets.items():
         d = [r["duration"] for r in xs]
         m = sum(d) / max(1, len(d))
         mix = f"{a.bs * (a2_mean + m) / 2:.0f} ({(a2_mean + m) / 2 / a2_mean:.2f}x)" if a2_mean else "-"
-        print(f"| {name} | {len(xs)} | {sum(d) / 3600:.1f} | {len({r.get('speaker') for r in xs})} | {pct(d)} | {mix} |")
+        cv = Counter(r.get("speaker") for r in xs)
+        lost = sum(1 for v, c in base_v.items() if cv.get(v, 0) < 0.5 * c)
+        hv = sorted((sum(r["duration"] for r in xs if r.get("speaker") == v) for v in cv), reverse=True) if len(cv) < 20000 else []
+        top = sum(hv[: max(1, len(hv) // 10)]) / max(1e-9, sum(hv)) if hv else float("nan")
+        print(f"| {name} | {len(xs)} | {sum(d) / 3600:.1f} | {len(cv)} | {lost} | {100 * top:.0f} % | {pct(d)} | {mix} |")
 
 
 if __name__ == "__main__":
