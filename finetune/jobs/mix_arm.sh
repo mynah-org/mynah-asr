@@ -7,14 +7,15 @@
 TAG=$1; shift
 L=$FT_ROOT/logs; MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs
 # VP=<manifest> swaps the VoxPopuli source (e.g. a teacher-filtered one) at the SAME weight
-MIX="$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.20,$MX/train_fleurs.json:0.15"
+MIX=${MIX:-"$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides the whole mix
 VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"
 POL=${POL:-"--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 3e-4 --bs 16"}
 gpu_lock
 if [ -n "${SMOKE:-}" ]; then   # 20 steps of the same policy first: a new code path fails in seconds, not at 20 %
-    timeout 900 "$PY" "$FINETUNE/eou/two_stage.py" --tag smoke-$TAG --out $R --manifest $MF/train_40h.json --n 200 $POL \
-        --steps 20 --eval-every 20 --val $MF/eval_mls_it.json --val-n 16 "$@" 2>&1 \
-        | grep -E "trainable|unfreeze|top-K|step 20/|VAL|done|Traceback|Error" > $L/smoke-$TAG.log
+    # the REAL mix (its longest clips set the memory peak), the same policy and extra flags
+    timeout 900 "$PY" "$FINETUNE/eou/two_stage.py" --tag smoke-$TAG --out $R --mix "$MIX" $POL \
+        --steps ${SMOKE_STEPS:-40} --eval-every ${SMOKE_STEPS:-40} --val $MF/eval_mls_it.json --val-n 16 "$@" 2>&1 \
+        | grep -E "trainable|unfreeze|top-K|step [0-9]+/|VAL|done|Traceback|Error|nan|out of memory" > $L/smoke-$TAG.log
     cat $L/smoke-$TAG.log; rm -f $R/plain-smoke-$TAG/*.nemo $R/plain-smoke-$TAG/*.ckpt
     grep -q "plain-smoke-$TAG done" $L/smoke-$TAG.log || { echo "== SMOKE FAILED $TAG, stop"; exit 3; }
 fi
