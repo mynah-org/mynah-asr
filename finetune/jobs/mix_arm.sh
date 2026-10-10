@@ -6,7 +6,8 @@
 . "$(dirname "$0")/gpu_lock.sh"
 TAG=$1; shift
 L=$FT_ROOT/logs; MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs
-MIX="$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp.json:0.20,$MX/train_fleurs.json:0.15"
+# VP=<manifest> swaps the VoxPopuli source (e.g. a teacher-filtered one) at the SAME weight
+MIX="$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.20,$MX/train_fleurs.json:0.15"
 VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"
 POL=${POL:-"--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 3e-4 --bs 16"}
 gpu_lock
