@@ -66,7 +66,12 @@ if step model-nemotron; then
       && ok model-nemotron || tail -5 $R/dl-nemotron.log $R/convert-nemotron.log
 fi
 [ -n "${KEEP_TOKEN:-}" ] || { rm -f /root/.hf_token; echo "== token removed"; }
-if step vad; then make fetch-vad >$R/vad.log 2>&1 && ok vad; fi
+# Silero VAD: the ONNX AND its Mynah conversion (eou_metrics.py SKIPs, rc 77, without it)
+if step vad; then make fetch-vad >$R/vad.log 2>&1 \
+    && (cd tools && timeout 900 uv run --extra vad python convert_silero.py ../models/silero-vad/silero_vad.onnx ../models/silero-vad >>$R/vad.log 2>&1) \
+    && ok vad || tail -5 $R/vad.log; fi
+# the CUDA engine parity/serving gate binary used by jobs/m1.sh (not part of `make -C gpu`)
+if step gpu-tests; then timeout 1800 make -C gpu -j32 CUDA_ARCH=sm_89 test-stream >$R/gpu-tests.log 2>&1 && ok gpu-tests || tail -5 $R/gpu-tests.log; fi
 # Banks (FLEURS, CC-BY 4.0, public)
 if step bank-stress; then
     (cd tools && timeout 3600 uv run python fetch_stress_bank.py >$R/bank-stress.log 2>&1) && ok bank-stress || tail -5 $R/bank-stress.log
