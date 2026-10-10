@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--readme", default=None, help="README.md for the archive repo")
     ap.add_argument("--extra", action="append", default=[], help="local=remote file pairs (e.g. a survival tarball)")
     ap.add_argument("--nemo-tags", default=r"-e|^eou|^plain", help="regex of run tags whose final.nemo is uploaded")
+    ap.add_argument("--ckpt-tags", default=".", help="regex of run tags whose last.ckpt (resume state) is uploaded; "
+                    "keep it to the runs one may resume from, the archive must stay light")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval", type=int, default=120)
     a = ap.parse_args()
@@ -98,7 +100,8 @@ def main():
             if nemo_re.search(run.name):
                 put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}-{mt('final.nemo')}")
             # resume state where a run saved one (Lightning last.ckpt or the plain loop's torch state)
-            put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}-{mt('last.ckpt')}")
+            if re.search(a.ckpt_tags, run.name):
+                put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}-{mt('last.ckpt')}")
         for tok in sorted((ft / "models").glob("tok-*/")):
             put_dir(tok, f"tokenizers/{tok.name}", f"tok-{tok.name}")
         put_dir(ft / "logs", "logs", f"logs-{int(time.time() // 3600)}")

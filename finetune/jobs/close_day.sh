@@ -3,6 +3,7 @@
 # lost when it is destroyed): wait for the last job's marker, stop the archiver loop, one final
 # verified archival pass, a survival bundle (logs, manifests, metrics, audits, Mynah evals, teacher
 # scores -- no audio, no weights) uploaded and size-verified, the repo listing, token removed.
+# CKPT_TAGS = regex of runs whose last.ckpt is kept (resume points); SQUASH=1 [PRUNE='--delete glob ...'] at the end.
 #   WAIT_LOG=/root/ft/logs/granary_ab.log WAIT_FOR=GRANARY-AB-DONE BUNDLE=survival-2026-10-10 \
 #     tmux new -d -s close 'bash finetune/jobs/close_day.sh'
 set -u
@@ -13,6 +14,7 @@ echo "== close start $(date +%T), waiting for ${WAIT_FOR:-} in ${WAIT_LOG:-}"
 touch /root/arch/STOP 2>/dev/null; tmux kill-session -t arch 2>/dev/null; sleep 5
 echo "== final archival pass $(date +%T)"
 timeout 7200 $PY $F/common/hf_archive.py --repo $REPO --ft-root $FT --token-file /root/.hf_token ${ARCH_EXTRA:-} \
+    --ckpt-tags "${CKPT_TAGS:-.}" \
     | grep -E "uploaded|VERIFY|pass done|Error" | tail -40
 cd /root
 tar czf /root/$B.tgz --exclude="*.nemo" --exclude="*.ckpt" --exclude="*.wav" --exclude="*.parquet" --exclude="*.safetensors" \
@@ -33,5 +35,7 @@ print("REPO files", len(f), "nemo", sum(x.endswith(".nemo") for x in f), "ckpt",
 print("REPO runs with nemo:", sorted({x.split("/")[1] for x in f if x.endswith("final.nemo")}))
 print("REPO sha", api.repo_info(repo).sha)
 PYEOF
+# keep the archive light: only the current files survive (re-uploaded best checkpoints leave LFS history)
+[ -n "${SQUASH:-}" ] && timeout 1800 $PY $F/common/hf_prune.py --repo $REPO --token-file /root/.hf_token ${PRUNE:-} --squash
 rm -f /root/.hf_token; [ -e /root/.hf_token ] && echo "TOKEN STILL PRESENT" || echo "token removed"
 echo "== CLOSE-DONE $(date +%T)"
