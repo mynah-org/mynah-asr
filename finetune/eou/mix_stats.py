@@ -47,8 +47,8 @@ def stats(name, path, sample, seed):
             x, _ = sf.read(r["audio_filepath"], dtype="float32")
         except Exception:  # noqa: BLE001
             continue
-        pk.append(20 * np.log10(np.abs(x).max() + 1e-9))
-        rms.append(20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-9))
+        pk.append(float(20 * np.log10(np.abs(x).max() + 1e-9)))
+        rms.append(float(20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-9)))
     srs = Counter(r.get("src_sr", "16000 (native)") for r in rows)
     spk = {r.get("speaker") for r in rows if r.get("speaker")}
     ex = rng.sample(rows, min(3, len(rows)))
