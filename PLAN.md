@@ -300,6 +300,29 @@ runs on an L40S, its performance numbers labelled as such.
 - [ ] S15-9 Cheapest Italian FT smoke test (Canary first; EOU feasibility incl. EOU behaviour), GPU-hours and cost; expand only on evidence → [`.work/lightweight-asr-ft.md`](.work/lightweight-asr-ft.md)
 - [ ] S15-10 Decision matrix filled from measurements → [`.work/lightweight-asr-plan.md`](.work/lightweight-asr-plan.md)
 
+**EOU 120M Italian specialist (2026-10-09/10).** Two-stage path works (plain IT ASR with the stock
+tokenizer, then `<EOU>`); EOU-IT v2 in Mynah: FLEURS-it 42.0 WER (v1 55.1), EOU p50 1.5 s, CPU/CUDA
+parity. Nemotron 0.6B on the same clips: 15.75 macro (FLEURS 6.3): a training deficit, not the
+architecture (EN stock gap ~1 WER). Tooling in `finetune/` (branch `lw-finetune-tooling`).
+
+- [x] S15-11 Multi-domain stage 1 (MLS+CV+VP+FLEURS, domain-balanced, 4 val sets, macro selection) + VP teacher filtering + gradual unfreeze to the whole encoder (B2: 49.08 macro) → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [x] S15-12 Teacher ceiling on our harness (Nemotron, same clips, paired per utterance) and Mynah evaluation of EOU-IT v2 / v2-full (VP stage-2 regression is real, not the eval) → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [x] S15-13 Granary-it pool (yodas-granary, 152 h, teacher-scored) and C1/C2 A/B: agreement <= 15 % edges a random control by ~0.5, neither beats B2 at fixed compute → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [ ] S15-14 Error analysis, NO GPU (survival bundle 2026-10-10: per-utterance hyps of P40/A0/A2/Nemotron): S/D/I, top confusions, share of near-miss words (1-2 chars), English-SPE tokens per Italian word; is the WER/CER ~3.1 (vs Nemotron 1.8) output representation, predictor or normalisation? → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [ ] S15-15 Discriminating pair, one variable each, B2 policy: (a) C1 longer, 4k -> 8k -> 12k steps (does the curve keep falling?); (b) Italian tokenizer with warm-start (copy shared embed/joint rows, move blank; NVIDIA-NeMo/Speech#15793) in a clean plain stage 1, accented targets → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [ ] S15-16 Only if S15-15a keeps falling: scale Granary-it (300 -> 600 -> 1000 h, agreement <= 15 %, verbalised numbers instead of dropping 8.6 % of the clips) with steps scaled; measure the curve, stop where it flattens → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [ ] S15-17 Stage 2 v3 ablations, one at a time, on the best plain: pre+post padding at p 0.99, noise, multi-utterance targets A<EOU> B<EOU>, whole-encoder policy, FastEmit 0.005 / 0.03; targets: the VP stage-2 regression and EOU never-rate; NVIDIA recipe diff in the note → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+- [ ] S15-18 French replica of the best recipe (Granary-fr ~12k h available); later a far language (Arabic: YODAS v3 + Nemotron teacher) as the generality test → [`.work/eou-it-multidomain-2026-10-10.md`](.work/eou-it-multidomain-2026-10-10.md)
+
+Resume from an empty box (in order): `finetune/jobs/prov.sh` with `KEEP_TOKEN=1` INSIDE the tmux
+command (~5 min; builds the NeMo venv, torchaudio, silero-vad, the CUDA test binary, the Mynah VAD);
+`finetune/jobs/data_mix.sh it` (MLS + CV + VP + FLEURS, ~20 min, audio in /dev/shm); VP filter from
+the archived teacher scores (`data/it/train_vp.teacher.json` on the private Hub repo, no teacher
+re-run); Granary pool via `finetune/jobs/granary_build.sh` (or the archived pool scores);
+checkpoints from the Hub `runs/plain-it-b2-gradual` (best plain), `runs/plain-it-s2-b2` (EOU-IT v2),
+`runs/plain-it-c1-yg15`; then the arm jobs (`mix_arm.sh`, `granary_ab.sh`, `s2_mix.sh`); archive
+loop with `--ckpt-tags`, `finetune/jobs/close_day.sh` at the end (prune + squash, token removed).
+
 ## Durable contract (changes only when a decision changes)
 
 1. Config-driven: every model number comes from the converted pack's
