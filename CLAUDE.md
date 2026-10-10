@@ -31,6 +31,9 @@ the development machine and its numbers are development signals.
   RESULT / DECISION). Read it before proposing a serving optimisation.
 - `docs/nemotron-arch.md` is THE architecture reference for the v1 target;
   `docs/models.md` the model catalogue; `docs/benchmarks.md` durable numbers.
+- `finetune/` — ALL fine-tuning code (Python + box jobs): `common/`, `canary/`, `eou/`, `jobs/`.
+  `.work/` holds ONLY the work-item notes (`.md`): never put scripts there; extend an existing
+  script in `finetune/` before writing a new one (`finetune/README.md` lists them).
 - `.work/` — one note per board item; see `.work/README.md`.
 - `third_party/ingot` — GGUF/safetensors reader (git subtree); `vendor/cJSON`.
 
@@ -70,3 +73,17 @@ Nemotron); blank_as_pad; causal subsampling with asymmetric padding; conv norm
 traps: `-ffast-math` is load-bearing (never `±INFINITY`, sigmoid
 hand-stabilised, finite sentinels); Apple's make 3.81 has one-second
 timestamps, so a gate gets `make clean` first.
+
+## Fine-tuning on a rented GPU box
+
+- The box is ephemeral (destroyed with its disk). Provision with `finetune/jobs/prov.sh`
+  (`KEEP_TOKEN=1` inside the tmux command when the day archives to the Hub); data, downloads
+  and teacher passes run ON the box, never through the dev machine.
+- One GPU workload at a time (`finetune/jobs/gpu_lock.sh`); every job in tmux with a timeout.
+- Archive to the user's private Hub repo from the box, light by design: weights only for the
+  resume points and the winners (`hf_archive.py --ckpt-tags`), metrics/logs/evals always;
+  superseded weights pruned and the history squashed (`finetune/common/hf_prune.py`); the
+  day ends with `finetune/jobs/close_day.sh` (final verified pass, survival bundle, squash,
+  token removed). Tomorrow resumes from the latest good checkpoint, not from the history.
+- Commit and push every script change the same day: nothing lives only on the box.
+
