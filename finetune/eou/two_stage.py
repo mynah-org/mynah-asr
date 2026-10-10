@@ -333,7 +333,7 @@ set_train_mode()
 # --eval-only: a baseline on exactly the val sets / subsample / decoder of the runs it is
 # compared with: one pass through the eval block at step 0, nothing trained or saved
 order = []
-while step < a.steps or (a.eval_only and not log):
+while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
     if a.eval_only:
         loss = torch.zeros(())
     else:
