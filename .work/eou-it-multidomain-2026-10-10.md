@@ -100,10 +100,53 @@ Community / data:
   (copy shared rows, move blank) in NVIDIA-NeMo/Speech#15793. Not dead for us: the 2026-10-09
   failure confounded it with lr 1e-3, 90 % padding and FastEmit.
 
+## Granary-it pseudo-labels (C1 / C2)
+
+Pool: `espnet/yodas-granary` it000 `ast`, 70 shards spread over the language, clips <= 30 s:
+46,280 clips, 152.2 h, 4,068 videos; Nemotron on every clip (2035 s). Two-teacher agreement
+(Nemotron vs Granary-Whisper) WER p50 9.1, p90 37.5; hours at <= 10/15/30 %: 88/111/139.
+99.8 % Italian by the teacher's LID; 3,970 clips (8.6 %) dropped because the teacher writes
+digits (to verbalise next time). Short clips agree less (p50 12.5 below 6.6 s vs ~8 above).
+Subsets (`eou/pseudo_subsets.py`, nested, label = teacher text): agree<=15 98.1 h / 3,704
+videos; random hours-matched control 98.1 h / 3,832 videos. 50/50 with A2 adds 5-9 % audio/step.
+
+Both on B2's policy, 4000 steps, 50 % A2 (internal proportions kept) / 50 % Granary, --max-dur 30
+(peak 36.6 GB). C1 = hygiene + agreement <= 15 %; C2 = hygiene only, random, hours-matched.
+
+| | MLS | FLEURS | CV | VP | macro |
+|---|---|---|---|---|---|
+| B2 | 43.84 / 11.93 / 0 | 43.86 / 14.10 / 0 | 53.78 / 18.69 / 6 | 54.86 / 28.14 / 3 | 49.08 / 18.22 |
+| C1 | 46.78 / 12.81 / 0 | 42.76 / 13.55 / 0 | 53.83 / 19.10 / 6 | 53.84 / 26.69 / 0 | 49.30 / 18.04 |
+| C2 | 47.26 / 13.21 / 0 | 43.60 / 13.81 / 0 | 55.15 / 19.60 / 7 | 53.28 / 27.09 / 1 | 49.82 / 18.43 |
+
+Readings (one seed): agreement filtering gives a small, consistent edge (C1 ahead of C2 at every
+eval and on 3/4 domains, macro -0.5 WER / -0.4 CER); at fixed compute neither moves the macro
+frontier vs B2: Granary shifts the model toward FLEURS/VP and away from MLS (the MLS gap is
+~2.8 from step 1000 on: reweighting, not progressive forgetting). The student's WER/CER ratio
+(~3.1 on FLEURS vs Nemotron's ~1.8) points at near-miss words (morphology, elision,
+segmentation): an INDICATION toward the output representation (English SPE, de-accented
+targets) or the predictor, not proof -- the error analysis decides.
+
+## Archive (end of day)
+
+Private HF repo pruned + squashed (`common/hf_prune.py`): 28.6 -> 13.8 GB, then the day's runs:
+16.1 GB, 359 files, 15 `.nemo`, 7 `last.ckpt` (resume points: B2, EOU-IT v2 (`plain-it-s2-b2`),
+C1, C2, EOU-FR). Survival bundle `results/survival-2026-10-10.tgz` (40.6 MB, verified; also on
+the dev machine): logs, manifests (no audio), metrics, audits, ceiling per-utterance hypotheses,
+Mynah m1 outputs, teacher scores (`data/it/train_vp.teacher.json`, `granary_yg_pool.teacher.json`).
+
+Resume tomorrow: `finetune/jobs/prov.sh` (KEEP_TOKEN=1 inside the tmux command), data via
+`jobs/data_mix.sh it` + `jobs/a2_vpfilter.sh` (scores on HF: no teacher re-run needed),
+Granary via `jobs/granary_build.sh` (or the archived pool scores + `prepare_mix --yg-spread`),
+then `jobs/mix_arm.sh` / `jobs/granary_ab.sh` / `jobs/s2_mix.sh`; checkpoints from HF `runs/*`.
+
 ## Next (ranked)
 
-1. Granary-it pseudo-label audit (3 shards, no filter) -> gates -> +500 h then +1.5k h, Nemotron
-   labels, plain-ASR group (no <EOU>), B2 policy; agreement-filtered vs unfiltered at fixed hours.
+1. Error analysis, no GPU (bundle: ceiling per-utterance hyps of P40/A0/A2/Nemotron): S/D/I,
+   top confusions, share of words within 1-2 characters of the reference, English-SPE tokens
+   per Italian word. Then the discriminating pair: C1 longer (4k -> 8k -> 12k steps) vs an
+   Italian tokenizer with warm-start (NVIDIA-NeMo/Speech#15793: shared rows copied, blank
+   moved) in a clean plain stage 1. Only if the long curve keeps falling: scale Granary.
 2. Stage 2 v3 ablations, one at a time: pre+post padding at p 0.99, noise, multi-utterance
    targets, whole-encoder policy (running), FastEmit 0.005/0.03.
 3. Whole-model 1e-4 A/B; longer runs once data is larger; checkpoint averaging.
