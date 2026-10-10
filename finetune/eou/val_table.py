@@ -36,7 +36,12 @@ def main():
     a = ap.parse_args()
     cols = {n: load(s) for n, s in (c.split("=", 1) for c in a.col)}
     ds = domains(next(iter(cols.values())))
-    deltas = [d.split("-", 1) for d in a.delta]
+    def split_delta(d):   # names may contain "-": take the split whose both sides are columns
+        for i, ch in enumerate(d):
+            if ch == "-" and d[:i] in cols and d[i + 1:] in cols:
+                return d[:i], d[i + 1:]
+        raise SystemExit(f"--delta {d}: not two column names joined by '-'")
+    deltas = [split_delta(d) for d in a.delta]
     print("| domain | " + " | ".join(cols) + "".join(f" | Δ {x}−{y}" for x, y in deltas) + " |")
     print("|---" * (1 + len(cols) + len(deltas)) + "|")
     for d in ds:
