@@ -14,7 +14,7 @@ names are listed at the end.
 |---|---|---|
 | Canary 180M Flash -> Italian specialist | **validated** (2026-10-09, L40S) | `canary/` |
 | Canary 180M Flash -> EN/DE/ES/FR + IT (20 % replay) | **validated** (2026-10-09, L40S) | `canary/` + `canary/replay.py` |
-| parakeet_realtime_eou_120m-v1 -> Italian (+ `<EOU>`) | **EXPERIMENTAL, not working**: the combined language + EOU recipe collapses toward blank | `eou/` |
+| parakeet_realtime_eou_120m-v1 -> Italian / French (+ `<EOU>`) | **validated two-stage path** (2026-10-09, L40S): IT MLS 40.4 WER / EOU 98 %, FR MLS 49.2 / EOU 97 %; the one-shot combined recipe (`train_eou.py`) still collapses toward blank | `eou/two_stage.py` |
 
 ```
 finetune/

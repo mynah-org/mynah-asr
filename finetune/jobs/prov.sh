@@ -36,7 +36,8 @@ if step venv; then
       && VIRTUAL_ENV=$V uv pip install -q --index-url https://download.pytorch.org/whl/cu128 \
            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
            "torchaudio==$($V/bin/python -c 'import torch; print(torch.__version__)')" \
-      && $V/bin/python -c "import torch, torchaudio; assert torch.cuda.is_available()" \
+      && $V/bin/python -c "import torch, torchaudio, scipy.signal; assert torch.cuda.is_available()" \
+      && FT_ROOT=/root/ft $V/bin/python finetune/eou/prepare_mix.py --selftest \
       && cp finetune/eou/two_stage.py /root/eou-kit/plain_it2.py \
       && cp finetune/eou/export_to_mynah.sh /root/eou-kit/ && ok venv ) > $R/venv.log 2>&1 &
     VPID=$!

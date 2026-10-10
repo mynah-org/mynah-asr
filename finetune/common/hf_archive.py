@@ -91,11 +91,14 @@ def main():
         for run in sorted((ft / "runs").glob("*/")):
             if not (run / "metrics.json").exists():
                 continue
-            put_dir(run, f"runs/{run.name}", f"run-{run.name}")
+            # keys carry the file mtime: a run that rewrites its best checkpoint or its
+            # metrics after an earlier pass is uploaded again (2026-10-09 box fix)
+            mt = lambda f: int((run / f).stat().st_mtime) if (run / f).exists() else 0  # noqa: E731
+            put_dir(run, f"runs/{run.name}", f"run-{run.name}-{mt('metrics.json')}")
             if nemo_re.search(run.name):
-                put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}")
+                put(run / "final.nemo", f"runs/{run.name}/final.nemo", f"nemo-{run.name}-{mt('final.nemo')}")
             # resume state where a run saved one (Lightning last.ckpt or the plain loop's torch state)
-            put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}")
+            put(run / "last.ckpt", f"runs/{run.name}/last.ckpt", f"ckpt-{run.name}-{mt('last.ckpt')}")
         for tok in sorted((ft / "models").glob("tok-*/")):
             put_dir(tok, f"tokenizers/{tok.name}", f"tok-{tok.name}")
         put_dir(ft / "logs", "logs", f"logs-{int(time.time() // 3600)}")

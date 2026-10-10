@@ -1,7 +1,13 @@
-# EOU 120M -> new language (Italian first): EXPERIMENTAL tooling
+# EOU 120M -> new language (Italian, French): two-stage path validated
 
-**Status: no working Italian EOU model exists.** The combined language + EOU
-recipe of 2026-10-09 collapses toward blank (all four arms). Everything here is
+**Status (2026-10-09 night): the TWO-STAGE path works** (`two_stage.py`, section
+"The working path" below): EOU-IT MLS-it 40.4 WER / 12.5 CER, EOU on 98 %, 0 empty;
+EOU-FR (same recipe, no tuning) MLS-fr 49.2 / 25.9, EOU 97 %; inside Mynah:
+FLEURS-it 55.1 WER, FLEURS-fr 78.7 (73.4 after level normalisation), 0 %
+premature EOU. Open problem: the MLS -> FLEURS out-of-domain gap (2026-10-10:
+multi-domain data, `prepare_mix.py`). What stays NOT working: the one-shot
+combined language + EOU recipe of `train_eou.py` collapses toward blank (all
+four arms of 2026-10-09). Everything here is
 research tooling for the ablation ladder in `../README.md`; nothing is a
 validated recipe. Base model: `nvidia/parakeet_realtime_eou_120m-v1` (cache-aware
 FastConformer 17L, att context [70,1], RNNT, `<EOU>`=1024, `<EOB>`=1025,

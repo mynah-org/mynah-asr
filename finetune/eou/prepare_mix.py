@@ -84,7 +84,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
 
     tmp = Path(tmp_dir) / f"{src}-{Path(rel).name}"
     D.curl(f"{HF}/datasets/{repo}/resolve/main/{rel}", tmp)
-    rows = []
+    rows, fails = [], 0
     try:
         pf = pq.ParquetFile(str(tmp))
         cols = pf.schema_arrow.names
@@ -123,28 +123,26 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
                 arr, sr = D.decode_bytes(got.pop(i))
             except Exception as e:  # noqa: BLE001
                 print(f"  FAIL {src} {rel}#{i}: {e!r}", flush=True)
+                fails += 1
                 continue
             dur = len(arr) / sr
             if not 1.0 <= dur <= 20.0:
                 continue
-            if arr.ndim > 1:
-                arr = arr.mean(axis=1)
-            if sr != D.SR:   # CV mp3 is 32/48 kHz; the venv has no torchaudio (prepare_it's resampler)
-                from math import gcd
-                from scipy.signal import resample_poly
-                g = gcd(sr, D.SR)
-                arr, sr = resample_poly(arr, D.SR // g, sr // g).astype("float32"), D.SR
+            src_sr = sr
+            arr, sr = resample16(arr, sr)   # CV mp3 is 32/48 kHz
             r = meta[i]
             uid = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(str(r.get(ic) or i)).name).rsplit(".", 1)[0]
             p = Path(audio_dir) / src / f"{uid}.wav"
             D.write_wav(p, arr, sr)
             rows.append({"audio_filepath": str(p), "duration": round(dur, 3), "text": r[tc].strip(),
-                         "speaker": f"{src}:{r.get(sc) or uid}", "corpus": src})
+                         "speaker": f"{src}:{r.get(sc) or uid}", "corpus": src, "src_sr": src_sr})
             acc += dur
             if (eval_n and len(rows) >= eval_n) or (not eval_n and acc >= budget_s):
                 break
     finally:
         tmp.unlink(missing_ok=True)
+    if fails:
+        print(f"  {src} {rel}: {fails} decode failures", flush=True)
     return rel, rows
 
 
@@ -158,17 +156,52 @@ def fleurs_train(lang, audio_dir):
             base = m.name.rsplit("/", 1)[-1]
             if not m.isfile() or base not in by:
                 continue
-            arr, sr = D.decode_bytes(tar.extractfile(m).read())
-            p = Path(audio_dir) / "fleurs" / base.replace(".wav", "") / ""
-            p = p.with_suffix("").parent / (base.rsplit(".", 1)[0] + ".wav")
+            arr, src_sr = D.decode_bytes(tar.extractfile(m).read())
+            arr, sr = resample16(arr, src_sr)
+            p = Path(audio_dir) / "fleurs" / (base.rsplit(".", 1)[0] + ".wav")
             dur = D.write_wav(p, arr, sr)
             r = by.pop(base)
             rows.append({"audio_filepath": str(p), "duration": round(dur, 3), "text": r["raw"].strip(),
-                         "speaker": f"fleurs:{r['sid']}", "corpus": "fleurs"})
+                         "speaker": f"fleurs:{r['sid']}", "corpus": "fleurs", "src_sr": src_sr})
     return rows
 
 
+def resample16(arr, sr):
+    """-> (float32 mono 16 kHz, 16000). scipy polyphase: no torchaudio dependency."""
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    if sr != D.SR:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(sr, D.SR)
+        arr = resample_poly(arr, D.SR // g, sr // g)
+    return arr.astype("float32"), D.SR
+
+
+def selftest():
+    """Provisioning gate: encode a 48 kHz tone as MP3 (what Common Voice ships), decode it
+    with the kit's decoder, resample to 16 kHz, check length and pitch; write it as wav."""
+    import io
+    import tempfile
+    import numpy as np
+    import soundfile as sf
+    t = np.arange(48000) / 48000.0
+    x = (0.3 * np.sin(2 * np.pi * 440 * t)).astype("float32")
+    buf = io.BytesIO(); sf.write(buf, x, 48000, format="MP3"); b = buf.getvalue()
+    arr, sr = D.decode_bytes(b)
+    assert sr == 48000, sr
+    y, sr2 = resample16(arr, sr)
+    assert sr2 == 16000 and abs(len(y) - 16000) < 1200, len(y)
+    f = np.abs(np.fft.rfft(y[2000:14000])).argmax() * 16000 / 12000
+    assert abs(f - 440) < 5, f
+    with tempfile.TemporaryDirectory() as d:
+        dur = D.write_wav(Path(d) / "t.wav", y, sr2)
+    print(f"prepare_mix selftest OK: mp3 48 kHz -> {len(y)} samples @16 kHz, tone {f:.1f} Hz, wav {dur:.2f} s")
+
+
 def main():
+    if "--selftest" in sys.argv:
+        selftest(); return
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lang", required=True, choices=sorted(FLEURS_CFG))
     ap.add_argument("--cv-hours", type=float, default=40)

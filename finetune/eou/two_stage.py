@@ -49,6 +49,7 @@ ap.add_argument("--enc-lr-low", type=float, default=0.0, help="lr of the lower b
 ap.add_argument("--concat-prob", type=float, default=0.0)
 ap.add_argument("--concat-gap", default="0.15,0.6")
 ap.add_argument("--pad-noise-db", default="-90,-60")
+ap.add_argument("--eval-only", type=int, default=0, help="1 = evaluate --init/--stock on the val sets once, no training")
 ap.add_argument("--n", type=int, default=0, help="first N utterances (0 = all)")
 ap.add_argument("--steps", type=int, default=400)
 ap.add_argument("--bs", type=int, default=16)
@@ -329,30 +330,35 @@ def pick_row():
 
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0
 set_train_mode()
+# --eval-only: a baseline on exactly the val sets / subsample / decoder of the runs it is
+# compared with: one pass through the eval block at step 0, nothing trained or saved
 order = []
-while step < a.steps:
-    if a.unfreeze_sched and any(s_ == step for s_, _ in unfreeze):
-        cur_k = apply_unfreeze(step); set_train_mode()
-        print(f"  step {step}: encoder top-K = {cur_k}", flush=True)
-    if a.mix:
-        rs = [pick_row() for _ in range(a.bs)]
-    else:   # the 2026-10-09 sampler, bit for bit
-        if not order:
-            order = list(range(len(rows))); random.shuffle(order)
-        rs = [rows[i] for i in order[: a.bs]]; order = order[a.bs:]
-    X, lens, Y, ylens = batch(rs, train=True)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        e, el = encode(X, lens)
-        d, _, _ = m.decoder(targets=Y, target_length=ylens)
-        j = m.joint(encoder_outputs=e, decoder_outputs=d)
-    loss = loss_fn(log_probs=j.float(), targets=Y, input_lengths=el, target_lengths=ylens)
-    opt.zero_grad(set_to_none=True); loss.backward()
-    torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
-    opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
-    if step % 25 == 0:
-        print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
-              f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
-    if step % a.eval_every == 0 or step == a.steps:
+while step < a.steps or (a.eval_only and not log):
+    if a.eval_only:
+        loss = torch.zeros(())
+    else:
+        if a.unfreeze_sched and any(s_ == step for s_, _ in unfreeze):
+            cur_k = apply_unfreeze(step); set_train_mode()
+            print(f"  step {step}: encoder top-K = {cur_k}", flush=True)
+        if a.mix:
+            rs = [pick_row() for _ in range(a.bs)]
+        else:   # the 2026-10-09 sampler, bit for bit
+            if not order:
+                order = list(range(len(rows))); random.shuffle(order)
+            rs = [rows[i] for i in order[: a.bs]]; order = order[a.bs:]
+        X, lens, Y, ylens = batch(rs, train=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            e, el = encode(X, lens)
+            d, _, _ = m.decoder(targets=Y, target_length=ylens)
+            j = m.joint(encoder_outputs=e, decoder_outputs=d)
+        loss = loss_fn(log_probs=j.float(), targets=Y, input_lengths=el, target_lengths=ylens)
+        opt.zero_grad(set_to_none=True); loss.backward()
+        torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
+        opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
+        if step % 25 == 0:
+            print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
+                  f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
+    if a.eval_only or step % a.eval_every == 0 or step == a.steps:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
         tw, tc = wer_cer([norm(r["text"]) for r in tr], hy)
@@ -382,7 +388,7 @@ while step < a.steps:
             # val clips AND <= 10 % empty; until one qualifies, the most EOU (fewest empties) wins
             ok = rec["val_eou_rate"] >= 0.8 and rec["val_empty"] <= 0.1 * len(val)
             score = vw if not a.eou_append else (vw if ok else 1000 - 100 * rec["val_eou_rate"] + rec["val_empty"])
-            if best is None or score < best:
+            if (best is None or score < best) and not a.eval_only:
                 best = score
                 m.save_to(str(out / "final.nemo"))
                 torch.save({"model": m.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
@@ -393,6 +399,6 @@ while step < a.steps:
                    "audio_h_per_gpu_h": round(seen_s / (time.time() - t0), 1),
                    "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2)},
                   open(out / "metrics.json", "w"), indent=1)
-if not val:
+if not val and not a.eval_only:
     m.save_to(str(out / "final.nemo"))
 print(f"== plain-{a.tag} done {time.time() - t0:.0f}s", flush=True)
