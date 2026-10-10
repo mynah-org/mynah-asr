@@ -1,7 +1,8 @@
 #!/bin/bash
+# (negative ranges need the = form: --gain-db=-10,10)
 # One arm of the multi-domain EOU-IT ablation: experiment A0's data, sampler, seed, val sets,
 # 4000 steps and top-4 policy, plus ONLY the extra flags given (the variable under test).
-#   FT_ROOT=/root/ft tmux new -d -s arm 'FT_ROOT=/root/ft bash finetune/jobs/mix_arm.sh it-a1-gain10 --aug-gain 0.5 --gain-db -10,10 2>&1 | tee -a /root/ft/logs/arm.log'
+#   FT_ROOT=/root/ft tmux new -d -s arm 'FT_ROOT=/root/ft bash finetune/jobs/mix_arm.sh it-a1-gain10 --aug-gain 0.5 --gain-db=-10,10 2>&1 | tee -a /root/ft/logs/arm.log'
 . "$(dirname "$0")/gpu_lock.sh"
 TAG=$1; shift
 L=$FT_ROOT/logs; MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs
