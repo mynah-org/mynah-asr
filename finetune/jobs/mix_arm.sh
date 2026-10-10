@@ -1,5 +1,5 @@
 #!/bin/bash
-# (negative ranges need the = form: --gain-db=-10,10)
+# (negative ranges need the = form: --gain-db=-10,10; SMOKE=1 runs 20 steps of the policy first)
 # One arm of the multi-domain EOU-IT ablation: experiment A0's data, sampler, seed, val sets,
 # 4000 steps and top-4 policy, plus ONLY the extra flags given (the variable under test).
 #   FT_ROOT=/root/ft tmux new -d -s arm 'FT_ROOT=/root/ft bash finetune/jobs/mix_arm.sh it-a1-gain10 --aug-gain 0.5 --gain-db=-10,10 2>&1 | tee -a /root/ft/logs/arm.log'
@@ -11,6 +11,13 @@ MIX="$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.2
 VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"
 POL=${POL:-"--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 3e-4 --bs 16"}
 gpu_lock
+if [ -n "${SMOKE:-}" ]; then   # 20 steps of the same policy first: a new code path fails in seconds, not at 20 %
+    timeout 900 "$PY" "$FINETUNE/eou/two_stage.py" --tag smoke-$TAG --out $R --manifest $MF/train_40h.json --n 200 $POL \
+        --steps 20 --eval-every 20 --val $MF/eval_mls_it.json --val-n 16 "$@" 2>&1 \
+        | grep -E "trainable|unfreeze|top-K|step 20/|VAL|done|Traceback|Error" > $L/smoke-$TAG.log
+    cat $L/smoke-$TAG.log; rm -f $R/plain-smoke-$TAG/*.nemo $R/plain-smoke-$TAG/*.ckpt
+    grep -q "plain-smoke-$TAG done" $L/smoke-$TAG.log || { echo "== SMOKE FAILED $TAG, stop"; exit 3; }
+fi
 echo "== $TAG $(date +%T): extra flags: $*"; ln -sf $L/$TAG.log $L/train_cur.log
 timeout 7200 "$PY" "$FINETUNE/eou/two_stage.py" --tag "$TAG" --out $R --mix "$MIX" $POL --steps 4000 --eval-every 500 \
     --vals "$VALS" "$@" 2>&1 | grep --line-buffered -v -E "NeMo W|warn|Warning" > $L/$TAG.log
