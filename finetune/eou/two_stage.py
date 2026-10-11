@@ -67,6 +67,9 @@ ap.add_argument("--enc-lr", type=float, default=0.0, help="lr for unfrozen encod
 ap.add_argument("--freeze-enc", type=int, default=1, help="1 = whole encoder frozen")
 ap.add_argument("--unfreeze-top", type=int, default=0, help="unfreeze the top K encoder layers")
 ap.add_argument("--eval-every", type=int, default=100)
+ap.add_argument("--eval-steps", default="", help="extra eval steps, e.g. 100,250 (curve shape; stage 1 training is unchanged:"
+                " evals use no torch RNG and stage 1 no numpy RNG)")
+ap.add_argument("--abort-wer", default="", help="STEP:WER -- stop (rc 5) if the macro val WER at STEP is above WER (collapse gate)")
 ap.add_argument("--val", default="")
 ap.add_argument("--val-n", type=int, default=200)
 ap.add_argument("--max-dur", type=float, default=20.0)
@@ -377,6 +380,7 @@ def pick_row():
 
 
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0
+extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
 set_train_mode()
 # --eval-only: a baseline on exactly the val sets / subsample / decoder of the runs it is
 # compared with: one pass through the eval block at step 0, nothing trained or saved
@@ -406,7 +410,7 @@ while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
         if step % 25 == 0:
             print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
                   f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
-    if a.eval_only or step % a.eval_every == 0 or step == a.steps:
+    if a.eval_only or step % a.eval_every == 0 or step == a.steps or step in extra_evals:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
         tw, tc = wer_cer([norm(r["text"]) for r in tr], hy)
@@ -443,10 +447,15 @@ while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
                             "args": vars(a)}, out / "last.ckpt")
                 rec["saved"] = True
         log.append(rec)
+        if a.abort_wer and val and step == int(a.abort_wer.split(":")[0]) and rec["val_wer"] > float(a.abort_wer.split(":")[1]):
+            rec["aborted"] = True
         json.dump({"args": vars(a), "log": log, "wall_s": round(time.time() - t0, 1), "audio_h_seen": round(seen_s / 3600, 3),
                    "audio_h_per_gpu_h": round(seen_s / (time.time() - t0), 1),
                    "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2)},
                   open(out / "metrics.json", "w"), indent=1)
+        if rec.get("aborted"):
+            print(f"== plain-{a.tag} ABORTED at step {step}: macro val WER {rec['val_wer']} > gate {a.abort_wer}", flush=True)
+            raise SystemExit(5)
 if not val and not a.eval_only:
     m.save_to(str(out / "final.nemo"))
 print(f"== plain-{a.tag} done {time.time() - t0:.0f}s", flush=True)

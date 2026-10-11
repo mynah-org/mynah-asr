@@ -7,6 +7,8 @@
 #    accented; text only, no Granary audio in this arm) -> tokenizer_eou.py (CPU);
 # 2. step-0 eval of the warm-started model (how much of the stock decoder survives the remap);
 # 3. mix_arm.sh it-tok-b2 with SMOKE=1, the B2 policy and --tokenizer.
+# Extra evals at 100/250 (curve shape) and a collapse gate: macro WER > 80 at step 1000 stops the
+# arm (B2 was 56.9 there).
 # DEACCENT=1: the vocabulary-only arm (SPE trained on de-accented text, de-accented targets as
 # B2): separates the SPE vocabulary from accent preservation (tag it-tokna-b2).
 #   FT_ROOT=/root/ft tmux new -d -s tok 'FT_ROOT=/root/ft bash finetune/jobs/tok_it.sh 2>&1 | tee -a /root/ft/logs/tok_it.log'
@@ -49,7 +51,7 @@ for arm in stock "$TAG"; do   # step 0: the stock model, then the same weights a
         --manifest $MF/train_40h.json --n 8 --vals "$VALS" 2>&1 | grep -E "^== tokenizer|warm-start|VAL|Traceback|Error"
 done
 flock -u 9
-MIX="$A2" POL="$POL" SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" $TAG $TOKARGS
+MIX="$A2" POL="$POL" SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" $TAG $TOKARGS --eval-steps 100,250 --abort-wer 1000:80
 cd $FT_ROOT && python3 "$FINETUNE/eou/val_table.py" --col B2=runs/plain-it-b2-gradual/metrics.json:4000 \
     --col TOK=runs/plain-$TAG/metrics.json:$(python3 -c "import json; print([r for r in json.load(open('runs/plain-$TAG/metrics.json'))['log'] if r.get('saved')][-1]['step'])") \
     --delta TOK-B2 --trajectory runs/plain-$TAG/metrics.json
