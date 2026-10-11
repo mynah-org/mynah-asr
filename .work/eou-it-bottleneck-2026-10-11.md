@@ -196,3 +196,35 @@ every domain, with a wobble at 500 (CER +0.8, VP +2.3, 15 empty) gone by 1000. I
 and empty curves are monotone 100 -> 1000. Decision: ONE full 4000-step run of 2e-4
 (`it-e2-enc2e-4-s4000`, launched 14:05) with extra evals at 750/1250/1750/2250 to see LR-peak
 instabilities; no other arms.
+
+## E3 = E2 recipe with encoder LR 2e-4, full 4000 steps (`it-e2-enc2e-4-s4000`) — NEW BEST
+
+`FT_ROOT=/root/ft STOP=4000 LRS=2e-4 KEEP_CKPT=1 EVALS=100,250,750,1250,1750,2250 bash finetune/jobs/lr_sweep.sh`
+(first launch died of ENOSPC at start; disk gate + optimizer-state cleanup added). 30 min GPU.
+
+| step | macro WER / CER | mls | fleurs | cv | vp | empty | E2 |
+|---|---|---|---|---|---|---|---|
+| 1000 | 43.90 / 15.16 | 40.64 | 38.24 | 47.11 | 49.62 | 4 | 46.80 |
+| 1250 | 43.14 / 15.78 | 39.28 | 36.27 | 46.06 | 50.97 | 14 | - |
+| 1500 | 41.99 / 15.90 | 37.44 | 34.07 | 45.48 | 50.97 | 12 | 45.52 |
+| 1750 | 39.81 / 14.15 | 36.00 | 33.94 | 43.33 | 45.96 | 5 | - |
+| 2000 | 39.15 / 13.79 | 35.02 | 33.19 | 42.12 | 46.26 | 7 | 42.12 |
+| 3000 | 36.80 / 13.47 | 32.38 | 30.69 | 38.76 | 45.37 | 8 | 40.10 |
+| 4000 | **36.52 / 13.53** | 32.32 | 29.64 | 39.34 | 44.78 | 8 | 39.65 |
+
+CPU probe at 4000: greedy 36.52 / beam-8 **33.09** (mls 30.14, fleurs 27.25, cv 35.08, vp 39.87) /
+8-best oracle 28.52. Same data and batches as B2 (49.08): -12.56 greedy. The LR-peak wobble
+(1250-1500: VP 51, 12-14 empty) recovers by 1750; the tail flattens with the cosine (-0.28 from
+3000 to 4000), as every run.
+
+## Mynah RNNT beam search (branch `feat/rnnt-beam`, e217c2d, local, not pushed)
+
+Port of NeMo 3.0 malsd (no fusion, score_norm), prefix trie with shared LSTM states, streaming
+with a commit lag (default 640 ms), width 1 = the unchanged greedy code. Gates (re-run by the main
+session: `make test` rc 0, test_beam OK; parity file on the box `/root/ft/analysis/beam/`):
+greedy identity 0/60 differences; beam-1 == greedy 240/240; beam-8 tokens == NeMo 240/240 and
+8-best sets equal 240/240 (B2 and E1b, same encoder outputs). Real Mynah streaming beam-8 (640 ms
+lag): E1b 45.23 -> 38.07, B2 49.84 -> 42.91 (streaming with lag beats offline beam, mostly on VP:
+interpretation, not proven). Cost: 4.3 -> ~21 ms CPU per audio second (~2 % of a core per
+real-time stream), ~355 KiB per stream, +640 ms text latency without partials. Not wired: CUDA
+engine, server option, partial results; <EOU> path only checked on the stock English model.
