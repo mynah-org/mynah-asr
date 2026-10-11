@@ -306,3 +306,19 @@ encoder 2e-6, decoder/joint 3e-6). `--init` loads weights only: fresh AdamW stat
 50, cosine over 1000 to 1 %). Whole model trainable, encoder/decoder/joint 1e-4 (the only measured restart:
 E1b, B2 -> all 1e-4, -4.1 in 1000 steps). A2 mix identical to E3, plain ASR, evals 250/500/750/1000, then
 the CPU beam/oracle probe. Script `/root/res/e3r1.sh`; tag `it-e3r1-lr1e4`; launched 17:27 box time.
+
+E3-R1 result (8.4 GPU-min, 46.9 h processed, peak 20.4 GB allocated / 22.2 reserved):
+
+| step | macro WER / CER | mls | fleurs | cv | vp WER / CER / empty | all empty |
+|---|---|---|---|---|---|---|
+| 250 | 37.09 / 14.37 | 33.17 | 30.46 | 39.44 | 45.30 / 27.68 / 9 | 11 |
+| 500 | 36.51 / 13.45 | 32.72 | 29.53 | 39.65 | 44.12 / 25.67 / 8 | 9 |
+| 750 | 36.06 / 12.98 | 32.32 | 29.94 | 38.97 | 43.00 / 23.81 / 7 | 8 |
+| 1000 | **35.92 / 13.03** | 31.90 | 29.51 | 38.76 | 43.53 / 24.38 / 7 | 8 |
+| E3 (same harness) | 36.52 / 13.53 | 32.32 | 29.64 | 39.34 | 44.78 / 25.73 / 8 | 8 |
+
+CPU probe @1000: greedy 35.91 / beam-8 **32.42** / oracle 27.70 (E3: 36.52 / 33.09 / 28.52).
+OBSERVED: -0.60 macro (just above the ~0.5 noise floor), small gains on every domain. Reading per the
+pre-registered bands: "~36-37, flat-ish" -> a short local restart from E3 buys little; tomorrow's P0 weight
+moves from "continue E3" to the fresh long cosine (C1-12k was still falling at 9k) and to P1/P2
+(additive data, distillation). R1 is the best plain checkpoint so far and is kept in the archive.
