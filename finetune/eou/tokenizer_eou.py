@@ -165,6 +165,8 @@ def main():
     ap.add_argument("--text", help="training-pool transcripts, one per line")
     ap.add_argument("--out", required=True)
     ap.add_argument("--dry-run", action="store_true", help="tiny synthetic text, no .nemo, no NeMo import")
+    ap.add_argument("--deaccent", action="store_true",
+                    help="train on de-accented text (a-z + apostrophe): the vocabulary changes, the targets do not")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -193,6 +195,8 @@ def main():
         for line in fi:
             n_in += 1
             t = norm_text(line)
+            if a.deaccent:
+                t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
             if t:
                 fo.write(t + "\n")
                 n_out += 1

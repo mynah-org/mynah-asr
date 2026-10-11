@@ -31,8 +31,9 @@ Multi-domain extensions (2026-10-10; every default reproduces the 2026-10-09 run
                                       the stock SPE splits their text into; blank/<EOU>/<EOB> keep
                                       their ids and rows. Targets keep accents (norm_text); WER/CER
                                       stay accent-insensitive (hypotheses normalised like refs)
-  --accented 1                        accented targets on a model that already carries such an SPE
-                                      (stage 2 from a --tokenizer run)
+  --accented 1|0                      accented targets (default: 1 with --tokenizer, else 0); 1 on a
+                                      model that already carries such an SPE (stage 2 from a
+                                      --tokenizer run), 0 with a --deaccent SPE (vocabulary-only arm)
 """
 import argparse, json, math, os, random, re, time, unicodedata
 from pathlib import Path
@@ -79,9 +80,9 @@ ap.add_argument("--pad-min", type=float, default=1.0)
 ap.add_argument("--pad-max", type=float, default=3.0)
 ap.add_argument("--fastemit", type=float, default=0.0)
 ap.add_argument("--tokenizer", default="", help="warm-started language SPE dir (tokenizer_eou.py output)")
-ap.add_argument("--accented", type=int, default=0, help="accented targets (implied by --tokenizer)")
+ap.add_argument("--accented", type=int, default=-1, help="accented targets (default: 1 with --tokenizer, else 0)")
 a = ap.parse_args()
-a.accented = a.accented or bool(a.tokenizer)
+a.accented = bool(a.tokenizer) if a.accented < 0 else bool(a.accented)
 random.seed(a.seed); torch.manual_seed(a.seed)
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
 dev = "cuda"
@@ -340,7 +341,7 @@ def decode(rs, bs=16):
             ys = h.y_sequence.tolist() if hasattr(h.y_sequence, "tolist") else list(h.y_sequence)
             eous += int(1024 in ys)
             h_ = tk.ids_to_text([t for t in ys if t < 1024])
-            hyps.append(norm(h_) if a.accented else h_)   # stock path unchanged (bit-identical)
+            hyps.append(norm(h_) if (a.accented or a.tokenizer) else h_)   # stock path unchanged (bit-identical)
         d, _ = m.decoder.predict(None, state=None, add_sos=False, batch_size=e.shape[0])[:2]
         j = m.joint.joint(e.transpose(1, 2), d)[:, :, 0, :]
         mg = j[..., :V].max(-1).values - j[..., V]
