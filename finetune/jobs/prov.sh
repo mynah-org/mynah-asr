@@ -12,7 +12,10 @@
 set -u
 command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; }
 export PATH=$HOME/.local/bin:$PATH
-mkdir -p /root/ft/models /root/ft/logs /root/ft/runs /root/eou-kit
+mkdir -p /root/ft/models /root/ft/logs /root/ft/runs /root/eou-kit /dev/shm/ft-audio
+# MLS audio (canary/prepare_it.sh writes $FT/audio) lives in RAM: the 32 GB root disk holds the venvs,
+# models and checkpoints and cannot also take the 40 h + eval audio (need_gb 12 failed on 2026-10-11)
+[ -e /root/ft/audio ] || ln -s /dev/shm/ft-audio /root/ft/audio
 R=/root/res; mkdir -p $R/done
 REPO=/root/mynah-asr; BRANCH=${BRANCH:-lw-finetune-tooling}
 step() { [ -e "$R/done/$1" ] && { echo "== skip $1"; return 1; }; echo "== $1 $(date +%T)"; return 0; }
@@ -50,8 +53,9 @@ if step pyenv; then
     (cd tools && timeout 1800 uv sync --extra oracle -q) && ok pyenv
 fi
 # .nemo models (converted in place by tools/convert_nemo.py)
+# Canary 180M (1.4 GB) only with CANARY=1: the EOU fine-tuning days do not use it
 for m in "parakeet-realtime-eou-120m|nvidia/parakeet_realtime_eou_120m-v1|parakeet_realtime_eou_120m-v1.nemo" \
-         "canary-180m-flash|nvidia/canary-180m-flash|canary-180m-flash.nemo"; do
+         ${CANARY:+"canary-180m-flash|nvidia/canary-180m-flash|canary-180m-flash.nemo"}; do
     d=${m%%|*}; rest=${m#*|}; repo=${rest%%|*}; f=${rest#*|}
     if step "model-$d"; then
         mkdir -p models/$d
@@ -73,7 +77,7 @@ if step vad; then make fetch-vad >$R/vad.log 2>&1 \
 # the CUDA engine parity/serving gate binary used by jobs/m1.sh (not part of `make -C gpu`)
 if step gpu-tests; then timeout 1800 make -C gpu -j32 CUDA_ARCH=sm_89 test-stream >$R/gpu-tests.log 2>&1 && ok gpu-tests || tail -5 $R/gpu-tests.log; fi
 # Banks (FLEURS, CC-BY 4.0, public)
-if step bank-stress; then
+if [ -n "${STRESS:-}" ] && step bank-stress; then   # 641 MB, serving benches only (STRESS=1)
     (cd tools && timeout 3600 uv run python fetch_stress_bank.py >$R/bank-stress.log 2>&1) && ok bank-stress || tail -5 $R/bank-stress.log
 fi
 if step bank-eval; then
