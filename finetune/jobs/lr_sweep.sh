@@ -3,7 +3,8 @@
 # A2 mix, seed 0): every arm keeps E2's schedule (cosine over 4000 steps) and therefore E2's
 # exact batches, and stops at STOP (default 1000) with evals at 100/250/500/1000, so each arm's
 # early curve is directly comparable with E2's own first 1000 steps (E2 itself is the 1e-4 arm).
-# Only the encoder LR changes. A CPU greedy/beam-8/oracle probe follows each arm.
+# Only the encoder LR changes. A CPU greedy/beam-8/oracle probe follows each arm. EVALS= adds eval
+# steps (e.g. denser around the LR peak to see instabilities; training is unchanged).
 #   FT_ROOT=/root/ft LRS="3e-5 2e-4" tmux new -d -s lrs 'FT_ROOT=/root/ft bash finetune/jobs/lr_sweep.sh 2>&1 | tee -a /root/ft/logs/lr_sweep.log'
 . "$(dirname "$0")/gpu_lock.sh"
 MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs; STOP=${STOP:-1000}
@@ -12,7 +13,7 @@ LM=${LM:-$FT_ROOT/analysis/D/lm4_trainmix.arpa}
 for lr in ${LRS:-3e-5 2e-4}; do
     tag=it-e2-enc$lr-s$STOP
     MIX="$A2" POL="--freeze-enc 0 --enc-lr $lr --lr 3e-4 --bs 16" bash "$FINETUNE/jobs/mix_arm.sh" $tag \
-        --stop-at $STOP --eval-steps 100,250 --abort-wer 1000:85
+        --stop-at $STOP --eval-steps ${EVALS:-100,250} --abort-wer 1000:85
     [ -s $R/plain-$tag/final.nemo ] && CUDA_VISIBLE_DEVICES= timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" \
         --nemo $R/plain-$tag/final.nemo --lm $LM --per-set 200 --alphas 0 --beam 8 --beam-alphas 0 \
         --out $R/plain-$tag/beam_probe.json 2>&1 | grep -E "Traceback|Error" | tail -2
