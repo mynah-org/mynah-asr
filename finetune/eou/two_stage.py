@@ -387,7 +387,7 @@ def pick_row():
     return next_row(random.choices(range(len(sources)), weights=[w for _, _, w in sources])[0])
 
 
-log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0
+log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
 extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
 set_train_mode()
 # --eval-only: a baseline on exactly the val sets / subsample / decoder of the runs it is
@@ -415,9 +415,11 @@ while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
         opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
+        max_clip_s = max(max_clip_s, float(lens.max()) / 16000)
         if step % 25 == 0:
             print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
-                  f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
+                  f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB "
+                  f"reserved {torch.cuda.max_memory_reserved() / 1e9:.1f} GB max-clip {max_clip_s:.1f} s", flush=True)
     if a.eval_only or step % a.eval_every == 0 or step == a.steps or step in extra_evals:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
@@ -459,7 +461,8 @@ while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
             rec["aborted"] = True
         json.dump({"args": vars(a), "log": log, "wall_s": round(time.time() - t0, 1), "audio_h_seen": round(seen_s / 3600, 3),
                    "audio_h_per_gpu_h": round(seen_s / (time.time() - t0), 1),
-                   "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2)},
+                   "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+                   "peak_reserved_gb": round(torch.cuda.max_memory_reserved() / 1e9, 2), "max_clip_s": round(max_clip_s, 2)},
                   open(out / "metrics.json", "w"), indent=1)
         if rec.get("aborted"):
             print(f"== plain-{a.tag} ABORTED at step {step}: macro val WER {rec['val_wer']} > gate {a.abort_wer}", flush=True)
