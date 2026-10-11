@@ -117,3 +117,24 @@ it-e1b-all1e4 (from B2, 1000 steps each), E2 it-e2-full1e4 (stock, whole encoder
 steps, batch-paired with B2), each with a CPU greedy/beam-8/oracle probe.
 Deployment note (not training): beam-8 alone is worth ~4.4 macro on B2 — a Mynah beam decoder is
 a candidate engine item.
+
+## S15-15a result: C1 with the cosine over 12k steps — CENSORED at 9k (CUDA OOM)
+
+`it-c1-12k` (C1 mix and policy, STEPS=12000) died of CUDA OOM after step 9000 (5.3 GiB RNNT
+gradient for a batch of long Granary clips, 11.4 GiB reserved but unallocated: fragmentation).
+No 12k endpoint is claimed. Fix for every later job: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`
+(gpu_lock.sh); two_stage.py now logs peak reserved memory and the longest clip.
+
+| step | macro WER / CER | mls | fleurs | cv | vp | train8 |
+|---|---|---|---|---|---|---|
+| 2000 | 52.73 / 20.33 | 49.48 | 46.55 | 58.82 | 56.08 | 54.4 |
+| 4000 | 46.60 / 17.73 | 43.20 | 40.63 | 52.10 | 50.44 | 50.9 |
+| 6000 | 43.40 / 16.42 | 41.15 | 36.14 | 48.74 | 47.58 | 48.8 |
+| 8000 | 41.64 / 15.59 | 39.74 | 34.48 | 46.69 | 45.67 | 45.6 |
+| 9000 | **41.15 / 15.31** | 39.12 | 33.75 | 45.90 | 45.83 | 45.3 |
+
+OBSERVED: C1-12k@4k 46.60 vs C1 (cosine over 4k)@4k 49.30 on the same first 4000 batches: the
+shorter schedule throttled learning (LR available, not just more steps); 4k -> 9k adds another
+-5.45. Every domain falls; train8 ~ val (still underfitting). This is strong evidence of an
+undertraining / LR-budget bottleneck; it does not by itself say which module needs the budget
+(E1a/E1b decide that).
