@@ -228,3 +228,27 @@ lag): E1b 45.23 -> 38.07, B2 49.84 -> 42.91 (streaming with lag beats offline be
 interpretation, not proven). Cost: 4.3 -> ~21 ms CPU per audio second (~2 % of a core per
 real-time stream), ~355 KiB per stream, +640 ms text latency without partials. Not wired: CUDA
 engine, server option, partial results; <EOU> path only checked on the stock English model.
+
+## E3G: E3 recipe on the C1 mix (A2 at half weights + Granary agree<=15, max-dur 30), 4000 steps
+
+Command: `/root/res/e3g.sh` = `MIX="<A2 x0.5>,yg_agree<=15.json:0.5" POL="--freeze-enc 0 --enc-lr 2e-4 --lr 3e-4 --bs 16"
+SMOKE=1 mix_arm.sh it-e3g-yg15 --max-dur 30 --eval-steps 100,250,750,1250,1750,2250`. 36.7 min, peak 36.5 GB
+allocated / 41.9 reserved (E3: 21.6 / 22.7), longest clip 30 s.
+
+| @4000 | E3 | E3G | E3G - E3 |
+|---|---|---|---|
+| mls | 32.32 / 7.9 | 34.95 / 8.9 | +2.63 |
+| fleurs | 29.64 / 8.9 | 29.08 / 8.8 | -0.56 |
+| cv | 39.34 / 11.6 | 38.76 / 11.1 | -0.58 |
+| vp | 44.78 / 25.7 | 43.39 / 23.7 | -1.39 |
+| empty | 8 | 3 | -5 |
+| macro | 36.52 / 13.53 | 36.55 / 13.38 | +0.03 |
+
+Probe (best checkpoint; E3G best = step 3500 36.49): greedy / beam-8 / oracle — E3 36.52 / 33.09 /
+28.52; E3G 36.49 / 33.05 / 28.84.
+
+OBSERVED: with the encoder adapted, Granary (replacing half of A2's draws) does not move the macro;
+it trades MLS (-50 % exposure, +2.6) for VP/CV/FLEURS (-0.6..-1.4, the CV/FLEURS part within the
+~0.8 per-domain noise) and fewer empties — the C1 pattern again. Decision: E3 is the parent of
+EOU-v3 (same accuracy, 30 vs 37 min, 22.7 vs 41.9 GB). Granary, if used later, should ADD
+exposure (more steps / extra weight), not replace A2.
