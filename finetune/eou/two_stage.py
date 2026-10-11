@@ -81,6 +81,9 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--init", default="", help="start from this .nemo instead of --stock (stage 2 from the plain-IT best)")
 ap.add_argument("--eou-append", type=int, default=0, help="stage 2: target = text + <EOU> (NVIDIA EOU dataset semantics)")
 ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of trailing silence after the speech")
+ap.add_argument("--pre-pad-prob", type=float, default=0.0, help="stage 2: prob of LEADING quiet U(0, --pre-pad-max) s "
+                "(NVIDIA's EOU dataset pads before the speech too; VP clips start at frame 0)")
+ap.add_argument("--pre-pad-max", type=float, default=4.0)
 ap.add_argument("--pad-min", type=float, default=1.0)
 ap.add_argument("--pad-max", type=float, default=3.0)
 ap.add_argument("--fastemit", type=float, default=0.0)
@@ -298,6 +301,9 @@ def batch(rs, train=False):
                     continue
                 xs[i] = np.concatenate([xs[i], quiet(rng2(a.concat_gap)), audio(r2)])
                 ids[i] = r["ids_t"] + r2["ids"]
+    if train and a.pre_pad_prob > 0:   # leading silence, same noise floor (stage 2 v3)
+        xs = [np.concatenate([quiet(random.uniform(0.0, a.pre_pad_max)), x])
+              if random.random() < a.pre_pad_prob else x for x in xs]
     if train and a.pad_prob > 0:   # trailing silence with a faint noise floor (stage 2)
         xs = [np.concatenate([x, quiet(random.uniform(a.pad_min, a.pad_max))])
               if random.random() < a.pad_prob else x for x in xs]
