@@ -10,6 +10,10 @@ L=$FT_ROOT/logs; MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs
 MIX=${MIX:-"$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides the whole mix
 VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"
 POL=${POL:-"--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 3e-4 --bs 16"}
+# disk gate: a run writes final.nemo (0.46 GB) + last.ckpt (1.38 GB); it-e2-enc2e-4-s4000 died of
+# ENOSPC on the 32 GB root disk on 2026-10-11
+FREE=$(df -BG --output=avail "$R" | tail -1 | tr -dc 0-9)
+[ "${FREE:-0}" -ge 4 ] || { echo "== DISK GATE $TAG: ${FREE} GB free on $R, need 4"; exit 4; }
 gpu_lock
 if [ -n "${SMOKE:-}" ]; then   # 20 steps of the same policy first: a new code path fails in seconds, not at 20 %
     # the REAL mix (its longest clips set the memory peak), the same policy and extra flags

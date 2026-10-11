@@ -17,6 +17,7 @@ for lr in ${LRS:-3e-5 2e-4}; do
     [ -s $R/plain-$tag/final.nemo ] && CUDA_VISIBLE_DEVICES= timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" \
         --nemo $R/plain-$tag/final.nemo --lm $LM --per-set 200 --alphas 0 --beam 8 --beam-alphas 0 \
         --out $R/plain-$tag/beam_probe.json 2>&1 | grep -E "Traceback|Error" | tail -2
+    [ -n "${KEEP_CKPT:-}" ] || rm -f $R/plain-$tag/last.ckpt   # optimizer state: only for resume points
 done
 cd $FT_ROOT && python3 - $R $STOP ${LRS:-3e-5 2e-4} <<'PY'
 import json, sys
