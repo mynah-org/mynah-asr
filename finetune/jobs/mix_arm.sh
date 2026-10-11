@@ -20,7 +20,8 @@ if [ -n "${SMOKE:-}" ]; then   # 20 steps of the same policy first: a new code p
     grep -q "plain-smoke-$TAG done" $L/smoke-$TAG.log || { echo "== SMOKE FAILED $TAG, stop"; exit 3; }
 fi
 echo "== $TAG $(date +%T): extra flags: $*"; ln -sf $L/$TAG.log $L/train_cur.log
-timeout 7200 "$PY" "$FINETUNE/eou/two_stage.py" --tag "$TAG" --out $R --mix "$MIX" $POL --steps 4000 --eval-every 500 \
+STEPS=${STEPS:-4000}   # STEPS= lengthens the arm (cosine over the whole run, same eval cadence)
+timeout $((STEPS * 2 + 1800)) "$PY" "$FINETUNE/eou/two_stage.py" --tag "$TAG" --out $R --mix "$MIX" $POL --steps $STEPS --eval-every 500 \
     --vals "$VALS" "$@" 2>&1 | grep --line-buffered -v -E "NeMo W|warn|Warning" > $L/$TAG.log
 echo "   rc=${PIPESTATUS[0]}"; grep -E "done|Traceback|Error" $L/$TAG.log | tail -2
 python3 "$FINETUNE/eou/val_table.py" --col P40=$L/base-p40.log --col A0@3000=$R/plain-it-a0-mix/metrics.json:3000 \

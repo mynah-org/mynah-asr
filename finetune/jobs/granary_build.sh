@@ -10,11 +10,13 @@ cd "$FINETUNE/.." || exit 2; ulimit -n 65536
 echo "== granary build: $SPREAD spread shards, clips <= $MAXS s $(date +%T)"
 timeout 10800 "$PY" "$FINETUNE/eou/prepare_mix.py" --lang it --out $O --audio /dev/shm/mix/it-yg --cv-hours 0 --vp-hours 0 \
     --no-fleurs --yg-spread $SPREAD --yg-max-s $MAXS --yg-keep-all --workers 6 2>&1 | grep -E "^== yg|DATA-MIX|Traceback|Error"
+if [ ! -s $O/train_yg.teacher.json ]; then   # resume_it.sh puts the archived pool scores there
 gpu_lock
 ./mynah-asr-server-cuda -m models/nemotron-3.5-asr-streaming-0.6b -p 8295 > $L/teacher_srv4.log 2>&1 & SP=$!
 for i in $(seq 120); do curl -sf localhost:8295/v1/health >/dev/null && break; sleep 1; done
 timeout 7200 python3 finetune/eou/diag/teacher_ws.py --manifest $O/train_yg.json --out $O/train_yg.teacher.json --lang it --conc 128 | tail -1 | cut -c1-220
 kill $SP; wait $SP 2>/dev/null; flock -u 9
+fi
 python3 finetune/eou/diag/pseudo_stats.py --manifest $O/train_yg.teacher.json --json $O/stats_yg.json | head -60
 df -h / /dev/shm | tail -2
 echo "== GRANARY-BUILD-DONE $(date +%T)"
