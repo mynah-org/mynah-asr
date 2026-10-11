@@ -63,6 +63,9 @@ for m in "parakeet-realtime-eou-120m|nvidia/parakeet_realtime_eou_120m-v1|parake
           && ok "model-$d" || tail -5 $R/convert-$d.log
     fi
 done
+# two_stage.py's default --stock and the jobs' STOCK path
+[ -e models/parakeet-realtime-eou-120m/parakeet_realtime_eou_120m-v1.nemo ] && \
+    ln -sfn $REPO/models/parakeet-realtime-eou-120m/parakeet_realtime_eou_120m-v1.nemo /root/ft/models/parakeet_realtime_eou_120m-v1.nemo
 # Nemotron: HF-native port
 if step model-nemotron; then
     timeout 3600 scripts/download_model.sh --model nemotron >$R/dl-nemotron.log 2>&1 \

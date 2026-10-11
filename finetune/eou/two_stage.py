@@ -25,6 +25,14 @@ Multi-domain extensions (2026-10-10; every default reproduces the 2026-10-09 run
   --concat-prob P --concat-gap LO,HI  stage 2 negatives: A + short pause + B as ONE turn,
                                       target text(A) text(B) <EOU> (no EOU inside)
   --pad-noise-db LO,HI                level of the trailing quiet (default -90,-60 dB)
+  --tokenizer DIR                     Italian SPE (tokenizer_eou.py: same size, <EOU>/<EOB> last),
+                                      WARM-STARTED: decoder/joint rows of pieces the stock SPE also
+                                      has are copied, new pieces start from the mean of the rows
+                                      the stock SPE splits their text into; blank/<EOU>/<EOB> keep
+                                      their ids and rows. Targets keep accents (norm_text); WER/CER
+                                      stay accent-insensitive (hypotheses normalised like refs)
+  --accented 1                        accented targets on a model that already carries such an SPE
+                                      (stage 2 from a --tokenizer run)
 """
 import argparse, json, math, os, random, re, time, unicodedata
 from pathlib import Path
@@ -70,7 +78,10 @@ ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of tr
 ap.add_argument("--pad-min", type=float, default=1.0)
 ap.add_argument("--pad-max", type=float, default=3.0)
 ap.add_argument("--fastemit", type=float, default=0.0)
+ap.add_argument("--tokenizer", default="", help="warm-started language SPE dir (tokenizer_eou.py output)")
+ap.add_argument("--accented", type=int, default=0, help="accented targets (implied by --tokenizer)")
 a = ap.parse_args()
+a.accented = a.accented or bool(a.tokenizer)
 random.seed(a.seed); torch.manual_seed(a.seed)
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
 dev = "cuda"
@@ -79,6 +90,36 @@ from nemo.collections.asr.models import EncDecRNNTBPEModel
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 
 m = EncDecRNNTBPEModel.restore_from(a.init or a.stock, map_location=dev)
+if a.tokenizer:
+    # change_vocabulary rebuilds decoder + joint from the config (random init): keep the trained
+    # tensors, then remap only the vocabulary rows (dim 0 == V + 1, blank last)
+    old_sp = m.tokenizer.tokenizer
+    old_ids = {old_sp.id_to_piece(i): i for i in range(old_sp.get_piece_size())}
+    keep_sd = {k: v.detach().clone() for k, v in m.state_dict().items() if k.startswith(("decoder.", "joint."))}
+    m.change_vocabulary(new_tokenizer_dir=a.tokenizer, new_tokenizer_type="bpe")
+    new_sp = m.tokenizer.tokenizer
+    Vn = m.tokenizer.vocab_size
+    assert Vn == old_sp.get_piece_size(), (Vn, old_sp.get_piece_size())
+    src, n_exact = [], 0
+    for i in range(Vn):
+        pc = new_sp.id_to_piece(i)
+        if pc in old_ids:
+            src.append([old_ids[pc]]); n_exact += 1; continue
+        t = "".join(c for c in unicodedata.normalize("NFKD", pc.replace("\u2581", " ")) if not unicodedata.combining(c))
+        ids = [j for j in old_sp.encode(t.strip()) if j != old_sp.unk_id()]
+        if not pc.startswith("\u2581") and len(ids) > 1 and old_sp.id_to_piece(ids[0]) == "\u2581":
+            ids = ids[1:]
+        src.append(ids or [old_sp.unk_id()])
+    src.append([Vn])                      # blank
+    for k, v in keep_sd.items():
+        if v.shape[0] == Vn + 1:
+            keep_sd[k] = torch.stack([v[ids].mean(0) for ids in src])
+            print(f"   warm-start rows {k} {tuple(v.shape)}", flush=True)
+    missing, unexpected = m.load_state_dict(keep_sd, strict=False)
+    assert not unexpected and not [k for k in missing if k.startswith(("decoder.", "joint."))], (missing, unexpected)
+    m.to(dev)
+    print(f"== tokenizer {a.tokenizer}: {Vn} pieces, {n_exact} copied from the stock SPE, "
+          f"{Vn - n_exact} from the mean of their stock split", flush=True)
 m.joint._fuse_loss_wer = False
 # Evaluation decodes with the per-utterance greedy loop: NeMo's batched greedy
 # (CUDA-graph label loop) hit "illegal memory access" in batched_hyps_to_hypotheses
@@ -103,6 +144,11 @@ def norm(t):
     return " ".join(t.split())
 
 
+if a.accented:
+    from tokenizer_eou import norm_text    # lower case, accents and apostrophes kept
+tnorm = norm_text if a.accented else norm   # training targets; refs/hyps are always scored with norm
+
+
 def load(path):
     return [json.loads(l) for l in open(path)]
 
@@ -111,9 +157,9 @@ EOU_ID = tk.token_to_id("<EOU>")
 
 
 def train_rows(path):
-    rs = [r for r in load(path) if r.get("duration", 0) <= a.max_dur and norm(r["text"])]
+    rs = [r for r in load(path) if r.get("duration", 0) <= a.max_dur and tnorm(r["text"])]
     for r in rs:
-        r["ids_t"] = tk.text_to_ids(norm(r["text"]))
+        r["ids_t"] = tk.text_to_ids(tnorm(r["text"]))
         r["ids"] = r["ids_t"] + ([EOU_ID] if a.eou_append else [])
     return rs
 
@@ -293,7 +339,8 @@ def decode(rs, bs=16):
             h = h[0] if isinstance(h, list) else h
             ys = h.y_sequence.tolist() if hasattr(h.y_sequence, "tolist") else list(h.y_sequence)
             eous += int(1024 in ys)
-            hyps.append(tk.ids_to_text([t for t in ys if t < 1024]))
+            h_ = tk.ids_to_text([t for t in ys if t < 1024])
+            hyps.append(norm(h_) if a.accented else h_)   # stock path unchanged (bit-identical)
         d, _ = m.decoder.predict(None, state=None, add_sos=False, batch_size=e.shape[0])[:2]
         j = m.joint.joint(e.transpose(1, 2), d)[:, :, 0, :]
         mg = j[..., :V].max(-1).values - j[..., V]
