@@ -182,3 +182,17 @@ domain (mls -7.6, fleurs -10.6, cv -11.3, vp -8.3). Better than C1-12k@9k (41.15
 fewer steps and no Granary. E2@1000 (46.80) already beats B2@4000. The freeze curriculum was the
 bottleneck; adapting the whole 120M from step 0 is the recipe. Step 1500 shows a transient (VP
 54.4, 20 empty) that recovers by 2000 — watch stability at higher LR.
+
+## Encoder-LR sweep on E2's schedule and batches (`finetune/jobs/lr_sweep.sh`, stop at 1000)
+
+| enc lr | @100 | @250 | @500 | @1000 | vp @500 / @1000 | empty @500 / @1000 | beam-8 / oracle @1000 |
+|---|---|---|---|---|---|---|---|
+| 3e-5 | 79.88 / 36.50 | 65.87 / 25.74 | 58.52 / 20.95 | 51.89 / 17.77 | 64.35 / 57.33 | 9 / 4 | 47.49 / 43.53 |
+| 1e-4 (E2) | 76.24 / 30.79 | 62.79 / 24.08 | 54.19 / 18.72 | 46.80 / 15.69 | 61.02 / 51.89 | 8 / 3 | - |
+| 2e-4 | 73.82 / 30.13 | 61.13 / 22.73 | 52.92 / 19.50 | 43.90 / 15.16 | 63.36 / 49.62 | 15 / 4 | 40.18 / 36.40 |
+
+OBSERVED: more encoder LR = faster curve at every eval; 2e-4 leads E2 by 2.9 WER at 1000 on
+every domain, with a wobble at 500 (CER +0.8, VP +2.3, 15 empty) gone by 1000. Its WER, CER, VP
+and empty curves are monotone 100 -> 1000. Decision: ONE full 4000-step run of 2e-4
+(`it-e2-enc2e-4-s4000`, launched 14:05) with extra evals at 750/1250/1750/2250 to see LR-peak
+instabilities; no other arms.
