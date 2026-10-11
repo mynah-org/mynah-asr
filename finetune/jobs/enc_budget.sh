@@ -6,7 +6,7 @@
 #        both flat => data/targets. (B2's lower encoder moved 0.01-0.04 % in 4000 steps.)
 #   E2  it-e2-full1e4    from STOCK, whole encoder 1e-4 from step 0, decoder+joint 3e-4, 4000
 #        steps: the recipe candidate, batch-paired with B2 (seeded sampler = same batches);
-#        evals at 100/250 + every 500; collapse gate macro > 65 at 1000 (B2 56.9).
+#        evals at 100/250 + every 500; collapse gate only (macro > 85 at 1000; stock 92.4, B2 56.9): a different but healthy curve must not be killed.
 # After each arm: greedy vs beam-8 vs 8-best oracle on CPU (diag/lm_fusion_probe.py, alpha 0),
 # so acoustic headroom (oracle) and the free beam gain are tracked per checkpoint.
 #   FT_ROOT=/root/ft tmux new -d -s enc 'FT_ROOT=/root/ft bash finetune/jobs/enc_budget.sh 2>&1 | tee -a /root/ft/logs/enc_budget.log'
@@ -25,7 +25,7 @@ for arm in "it-e1a-decjoint|--freeze-enc 1 --lr 1e-4" "it-e1b-all1e4|--freeze-en
     probe $tag
 done
 MIX="$A2" POL="--freeze-enc 0 --enc-lr 1e-4 --lr 3e-4 --bs 16" SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" it-e2-full1e4 \
-    --eval-steps 100,250 --abort-wer 1000:65
+    --eval-steps 100,250 --abort-wer 1000:85
 probe it-e2-full1e4
 cd $FT_ROOT && python3 "$FINETUNE/eou/val_table.py" --col B2=runs/plain-it-b2-gradual/metrics.json:4000 \
     --col E1a=runs/plain-it-e1a-decjoint/metrics.json:1000 --col E1b=runs/plain-it-e1b-all1e4/metrics.json:1000 \
