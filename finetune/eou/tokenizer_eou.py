@@ -51,6 +51,8 @@ def check_special_ids(n_pieces, eou_id, eob_id, base_vocab=None, blank_id=None):
         assert n_pieces == base_vocab + 2, f"vocab must be base {base_vocab} + 2: {ids}"
     return ids
 _KEEP = re.compile(r"[^a-zàáèéìíîòóùú' ]")
+_ELISION = ("l|un|dell|nell|all|dall|sull|coll|pell|quest|quell|bell|sant|tutt|c|d|s|m|t|v|n|gl|ci|ch|com|dov|cos|"
+            "anch|nessun|ciascun|qualcun|buon|grand|mezz|tant|quant|senz|fin|perch|dev")
 
 
 def norm_text(s: str) -> str:
@@ -59,7 +61,11 @@ def norm_text(s: str) -> str:
     apostrophes to ', drops everything else (digits included: MLS has none)."""
     s = unicodedata.normalize("NFC", s.lower()).replace("’", "'").replace("`", "'")
     s = _KEEP.sub(" ", s)
-    s = re.sub(r"\s*'\s*", "'", s)
+    # an elision written with a space ("l' acqua", "dell' anno") is glued; any other apostrophe
+    # keeps its spaces ("po' confuso"), and a quote-like one (no letter before it) becomes a space
+    s = re.sub(r"\b(" + _ELISION + r")\s*'\s*(?=[a-zàáèéìíîòóùú])", r"\1'", s)
+    s = re.sub(r"(^|\s)'+", " ", s)
+    s = re.sub(r"\s+'", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 

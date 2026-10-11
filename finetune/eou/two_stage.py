@@ -104,15 +104,23 @@ if a.tokenizer:
     new_sp = m.tokenizer.tokenizer
     Vn = m.tokenizer.vocab_size
     assert Vn == old_sp.get_piece_size(), (Vn, old_sp.get_piece_size())
+    from sentencepiece import sentencepiece_model_pb2 as _pb
+    _mp = _pb.ModelProto(); _mp.ParseFromString(old_sp.serialized_model_proto())
+    dummy0 = _mp.normalizer_spec.add_dummy_prefix   # restored after each word-internal split
     src, n_exact = [], 0
     for i in range(Vn):
         pc = new_sp.id_to_piece(i)
         if pc in old_ids:
             src.append([old_ids[pc]]); n_exact += 1; continue
         t = "".join(c for c in unicodedata.normalize("NFKD", pc.replace("\u2581", " ")) if not unicodedata.combining(c))
+        # a word-internal piece ("zione") is split WITHOUT the dummy "\u2581" prefix, else BPE merges
+        # it into the first stock piece and the row starts as a word-initial one ("\u2581z")
+        internal = not pc.startswith("\u2581")
+        if internal:
+            old_sp.override_normalizer_spec(add_dummy_prefix=False)
         ids = [j for j in old_sp.encode(t.strip()) if j != old_sp.unk_id()]
-        if not pc.startswith("\u2581") and len(ids) > 1 and old_sp.id_to_piece(ids[0]) == "\u2581":
-            ids = ids[1:]
+        if internal:
+            old_sp.override_normalizer_spec(add_dummy_prefix=dummy0)
         src.append(ids or [old_sp.unk_id()])
     src.append([Vn])                      # blank
     for k, v in keep_sd.items():
