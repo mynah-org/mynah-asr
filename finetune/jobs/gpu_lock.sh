@@ -10,7 +10,10 @@
 GPU_LOCK=${GPU_LOCK:-/root/gpu.lock}
 FINETUNE=${FINETUNE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 : "${FT_ROOT:?set FT_ROOT explicitly (data, models and runs root, e.g. /root/ft)}"
-export FT_ROOT PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1
+# expandable_segments: it-c1-12k (30 s clips) died of fragmentation after step 9000 (5.3 GiB RNNT
+# grads requested, 11.4 GiB reserved but unallocated)
+export FT_ROOT PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1 \
+    PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 PY=${VENV:-/root/nemo-venv}/bin/python
 gpu_lock() {
     exec 9>"$GPU_LOCK"
