@@ -157,3 +157,28 @@ is flat within noise (CER slightly worse); unfreezing the encoder gives -4.1 WER
 1000 steps on every domain and moves the N-best oracle down 5.4 (new acoustic evidence, not
 search). The encoder is causally implicated. Caveat: E1b is a re-warm of B2 (5000 steps total);
 E2 (stock -> whole encoder 1e-4 from step 0) is the recipe test.
+
+## E2: stock -> whole encoder 1e-4 from step 0 (decoder+joint 3e-4), A2 mix, 4000 steps — NEW BASELINE
+
+Batch-paired with B2 (same seed, same sampler draws, same val sets); 25.1 min, peak 22.4 GB
+allocated / 24.3 reserved, longest clip 20 s.
+
+| step | E2 macro WER / CER | mls | fleurs | cv | vp | empty | B2 macro |
+|---|---|---|---|---|---|---|---|
+| 100 | 76.24 / 30.79 | 71.93 | 72.79 | 77.42 | 82.80 | 24 | - |
+| 250 | 62.79 / 24.08 | 58.20 | 56.85 | 67.54 | 68.57 | 18 | - |
+| 500 | 54.19 / 18.72 | 50.16 | 49.32 | 56.25 | 61.02 | 8 | 64.97 |
+| 1000 | 46.80 / 15.69 | 43.27 | 42.14 | 49.89 | 51.89 | 3 | 56.90 |
+| 1500 | 45.52 / 17.63 | 40.33 | 37.53 | 49.84 | 54.37 | 20 | 54.48 |
+| 2000 | 42.12 / 15.54 | 38.05 | 34.63 | 45.22 | 50.58 | 6 | 52.43 |
+| 3000 | 40.10 / 14.93 | 35.92 | 33.71 | 42.23 | 48.53 | 9 | 49.81 |
+| 4000 | **39.65 / 14.53** | 36.28 | 33.28 | 42.49 | 46.56 | 8 | 49.08 |
+
+CPU probe at 4000: greedy 39.66 / beam-8 **35.09** / 8-best oracle 31.02
+(beam per set: mls 32.52, fleurs 29.10, cv 37.03, vp 41.71).
+
+OBSERVED: same data, same batches, same 4000 steps as B2: -9.43 macro WER, -3.69 CER, every
+domain (mls -7.6, fleurs -10.6, cv -11.3, vp -8.3). Better than C1-12k@9k (41.15) with 2.25x
+fewer steps and no Granary. E2@1000 (46.80) already beats B2@4000. The freeze curriculum was the
+bottleneck; adapting the whole 120M from step 0 is the recipe. Step 1500 shows a transient (VP
+54.4, 20 empty) that recovers by 2000 — watch stability at higher LR.
