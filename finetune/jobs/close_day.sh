@@ -18,8 +18,8 @@ timeout 7200 $PY $F/common/hf_archive.py --repo $REPO --ft-root $FT --token-file
     | grep -E "uploaded|VERIFY|pass done|Error" | tail -40
 cd /root
 tar czf /root/$B.tgz --exclude="*.nemo" --exclude="*.ckpt" --exclude="*.wav" --exclude="*.parquet" --exclude="*.safetensors" \
-    --exclude="eouw*" --exclude="stream_wavs" \
-    ft/runs ft/logs ft/manifests ft/mix ft/ceiling ft/audit-a0 ft/m1* res 2>/dev/null
+    --exclude="eouw*" --exclude="stream_wavs" --exclude="ft/analysis/src" --exclude="*.arpa" \
+    ft/runs ft/logs ft/manifests ft/mix ft/ceiling ft/audit-a0 ft/m1* ft/analysis res 2>/dev/null
 ls -la /root/$B.tgz
 $PY - "$REPO" "/root/$B.tgz" <<'PYEOF'
 import sys
