@@ -262,7 +262,7 @@ All: v2 stage-2 recipe (text+<EOU>, 50 % 1-3 s trailing quiet, top-4 encoder 3e-
 |---|---|---|---|
 | it-s2-e3 (control) | none | 37.10 (1250) | 37.41 / 96.5 % / 48.34 / 16 / 18 |
 | it-s2-e3-pre | + leading quiet p 0.9, U(0,4) s | - | 37.98 / 95.3 % / 49.72 / 23 / 26 |
-| it-s2-e3-djlr | decoder+joint lr 1e-4 -> 2e-5 | (running) | |
+| it-s2-e3-djlr | decoder+joint lr 1e-4 -> 2e-5 | **36.57 (250)**: EOU 99.3 %, vp 43.0 / 3 empty, all empty 4 | 36.99 / 97.5 % / 46.23 / 11 / 14 |
 
 Mynah (m1.sh; FLEURS-it bank 200 clips, greedy): control it-s2-e3 WER **30.11** / CER 10.38 (v2: 42.00 /
 15.07), EOU on 200/200 clips (v2 188), speech end -> EOU p50 714 / p95 2218 ms (v2 1546 / 3370), never
@@ -272,3 +272,37 @@ Mynah (m1.sh; FLEURS-it bank 200 clips, greedy): control it-s2-e3 WER **30.11** 
 OBSERVED: the VP stage-2 blanking reproduces on E3 (vp empty 8 -> 16). This particular leading-quiet
 intervention (p 0.9, U(0,4) s on top of the current recipe) does not fix it (23 empty, EOU 95.3 %);
 other doses/distributions are not tested and not worth GPU now.
+
+djlr per eval (macro / EOU / vp WER / vp empty; control in brackets): 250 36.57 / 99.3 % / 43.0 / 3
+(37.54 / 98.7 % / 46.52 / 7); 500 37.64 / 99.0 % / 46.59 / 5 (38.95 / 96.5 % / 50.38 / 17); 750 36.94 /
+98.3 % / 45.21 / 7 (37.92 / 96.9 % / 48.17 / 15); 1000 37.08 / 97.6 % / 46.39 / 10 (37.45 / 96.4 % / 48.83 / 16).
+Wins 4/4 evals; the vp blanking still drifts up (3 -> 10) but more slowly. Strong causal evidence that
+excessive stage-2 decoder/joint updating is a major contributor to the VP regression (component swap ->
+damage localised in decoder/joint -> targeted LR cut largely removes it); `--lr` moves decoder and joint
+together, so neither the component nor the mechanism is isolated. The selected checkpoint (step 250)
+comes from the fixed 2026-10-09 selection rule (min WER among evals with EOU >= 80 % and <= 10 % empty).
+
+| Mynah (m1.sh, FLEURS-it bank 200, greedy) | control | pre | djlr@250 |
+|---|---|---|---|
+| WER / CER | 30.11 / 10.38 | 30.53 / 10.46 | 30.91 / 10.27 |
+| clips with model EOU | 200 | 200 | 200 |
+| speech end -> EOU p50 / p95 | 714 / 2218 ms | 618 / 1290 ms | 810 / 2570 ms |
+| missed @2 s / never | 11.7 % / 0 % | 0 % / 0 % | 13.3 % / 0 % |
+| premature (any) | 3.3 % | 1.7 % | 1.7 % |
+| A+1s+B EOU in gap, p50 | 95.0 %, 330 ms | 98.3 %, 490 ms | 95.0 %, 394 ms |
+| CPU/CUDA parity | PASS | PASS | PASS |
+
+**Decision: EOU-v3 = `plain-it-s2-e3-djlr` (step 250)**: passes every gate (macro <= 37.5, vp <= 46, vp
+empty ~3, EOU >= 95 %); Mynah endpointing equivalent to the control except +96 ms p50; FLEURS-bank WER
+differences are within noise (the gain is on VP, absent from that bank). Notes for later (not run):
+leading quiet gave the best Mynah endpointing but the worst NeMo VP -> `djlr + leading quiet` is the
+natural next stage-2 arm; a "light EOU adaptation" (~250 steps at low decoder/joint LR) is a hypothesis
+for a cheap per-language stage 2, untested.
+
+## E3-R1: short LR restart from E3 weights (opportunistic end-of-day probe, S15-21 P0)
+
+NOT "E3 trained for 5k steps". Parent `plain-it-e2-enc2e-4-s4000/final.nemo` (E3 ended at 1 % of peak:
+encoder 2e-6, decoder/joint 3e-6). `--init` loads weights only: fresh AdamW state, fresh schedule (warmup
+50, cosine over 1000 to 1 %). Whole model trainable, encoder/decoder/joint 1e-4 (the only measured restart:
+E1b, B2 -> all 1e-4, -4.1 in 1000 steps). A2 mix identical to E3, plain ASR, evals 250/500/750/1000, then
+the CPU beam/oracle probe. Script `/root/res/e3r1.sh`; tag `it-e3r1-lr1e4`; launched 17:27 box time.
