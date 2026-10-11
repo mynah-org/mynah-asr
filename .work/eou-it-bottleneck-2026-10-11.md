@@ -138,3 +138,22 @@ shorter schedule throttled learning (LR available, not just more steps); 4k -> 9
 -5.45. Every domain falls; train8 ~ val (still underfitting). This is strong evidence of an
 undertraining / LR-budget bottleneck; it does not by itself say which module needs the budget
 (E1a/E1b decide that).
+
+## E1a vs E1b (from B2, A2 mix, 1000 steps each, `finetune/jobs/enc_budget.sh`)
+
+| step | E1a: encoder frozen, dec+joint 1e-4 | E1b: whole model 1e-4 |
+|---|---|---|
+| 0 (= B2) | 49.08 / 18.22 | 49.08 / 18.22 |
+| 250 | 49.39 / 19.76 | 48.07 / 18.54 |
+| 500 | 49.55 / 19.74 | 45.95 / 17.57 |
+| 750 | 49.41 / 19.64 | 44.99 / 16.82 |
+| 1000 | 49.27 / 19.56 (mls 43.36, fleurs 42.85, cv 54.52, vp 56.38; 20 empty) | 44.97 / 16.87 (mls 40.27, fleurs 38.57, cv 49.26, vp 51.76; 12 empty) |
+
+CPU probe (`diag/lm_fusion_probe.py`, 200 clips/set, alpha 0): greedy / beam-8 / 8-best oracle
+— B2 49.25 / 44.84 / 41.32; E1a 49.33 / 44.71 / 40.29; E1b 44.89 / 40.25 / 35.95.
+
+OBSERVED: with the same LR, the same batches and the same start, training only the output side
+is flat within noise (CER slightly worse); unfreezing the encoder gives -4.1 WER / -1.4 CER in
+1000 steps on every domain and moves the N-best oracle down 5.4 (new acoustic evidence, not
+search). The encoder is causally implicated. Caveat: E1b is a re-warm of B2 (5000 steps total);
+E2 (stock -> whole encoder 1e-4 from step 0) is the recipe test.
