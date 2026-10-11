@@ -69,6 +69,8 @@ ap.add_argument("--unfreeze-top", type=int, default=0, help="unfreeze the top K 
 ap.add_argument("--eval-every", type=int, default=100)
 ap.add_argument("--eval-steps", default="", help="extra eval steps, e.g. 100,250 (curve shape; stage 1 training is unchanged:"
                 " evals use no torch RNG and stage 1 no numpy RNG)")
+ap.add_argument("--stop-at", type=int, default=0, help="stop after this step, LR schedule still over --steps "
+                "(early-curve sweeps that share a longer run's schedule and batches)")
 ap.add_argument("--abort-wer", default="", help="STEP:WER -- stop (rc 5) if the macro val WER at STEP is above WER (collapse gate)")
 ap.add_argument("--val", default="")
 ap.add_argument("--val-n", type=int, default=200)
@@ -393,7 +395,7 @@ set_train_mode()
 # --eval-only: a baseline on exactly the val sets / subsample / decoder of the runs it is
 # compared with: one pass through the eval block at step 0, nothing trained or saved
 order = []
-while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
+while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and not log):
     if a.eval_only:
         loss = torch.zeros(())
     else:
@@ -420,7 +422,7 @@ while (not a.eval_only and step < a.steps) or (a.eval_only and not log):
             print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
                   f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB "
                   f"reserved {torch.cuda.max_memory_reserved() / 1e9:.1f} GB max-clip {max_clip_s:.1f} s", flush=True)
-    if a.eval_only or step % a.eval_every == 0 or step == a.steps or step in extra_evals:
+    if a.eval_only or step % a.eval_every == 0 or step == a.steps or step == a.stop_at or step in extra_evals:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
         tw, tc = wer_cer([norm(r["text"]) for r in tr], hy)
