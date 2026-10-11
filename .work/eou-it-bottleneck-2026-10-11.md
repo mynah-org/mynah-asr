@@ -252,3 +252,23 @@ it trades MLS (-50 % exposure, +2.6) for VP/CV/FLEURS (-0.6..-1.4, the CV/FLEURS
 ~0.8 per-domain noise) and fewer empties — the C1 pattern again. Decision: E3 is the parent of
 EOU-v3 (same accuracy, 30 vs 37 min, 22.7 vs 41.9 GB). Granary, if used later, should ADD
 exposure (more steps / extra weight), not replace A2.
+
+## Stage 2 on E3 (EOU-v3 candidates; `/root/res/s2e3.sh`, `/root/res/s2djlr.sh` -> `finetune/jobs/s2_mix.sh`)
+
+All: v2 stage-2 recipe (text+<EOU>, 50 % 1-3 s trailing quiet, top-4 encoder 3e-5, 1500 steps, FastEmit
+0), init `plain-it-e2-enc2e-4-s4000/final.nemo` (E3 plain: 36.52, vp 44.78 / 8 empty).
+
+| arm | change | best macro (step) | @1500 macro / EOU / vp WER / vp empty / all empty |
+|---|---|---|---|
+| it-s2-e3 (control) | none | 37.10 (1250) | 37.41 / 96.5 % / 48.34 / 16 / 18 |
+| it-s2-e3-pre | + leading quiet p 0.9, U(0,4) s | - | 37.98 / 95.3 % / 49.72 / 23 / 26 |
+| it-s2-e3-djlr | decoder+joint lr 1e-4 -> 2e-5 | (running) | |
+
+Mynah (m1.sh; FLEURS-it bank 200 clips, greedy): control it-s2-e3 WER **30.11** / CER 10.38 (v2: 42.00 /
+15.07), EOU on 200/200 clips (v2 188), speech end -> EOU p50 714 / p95 2218 ms (v2 1546 / 3370), never
+0 % (v2 5 %), premature 3.3 % (all in 0.5-1.2 s pauses, none in speech; v2 0 %), A+1s+B: EOU in gap 95 %
+(v2 75 %), p50 330 ms; CPU/CUDA parity PASS.
+
+OBSERVED: the VP stage-2 blanking reproduces on E3 (vp empty 8 -> 16). This particular leading-quiet
+intervention (p 0.9, U(0,4) s on top of the current recipe) does not fix it (23 empty, EOU 95.3 %);
+other doses/distributions are not tested and not worth GPU now.
