@@ -8,7 +8,8 @@ TAG=$1; shift
 L=$FT_ROOT/logs; MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs
 # VP=<manifest> swaps the VoxPopuli source (e.g. a teacher-filtered one) at the SAME weight
 MIX=${MIX:-"$MF/train_40h.json:0.35,$MX/train_cv.json:0.30,${VP:-$MX/train_vp.json}:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides the whole mix
-VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"
+# VALS= adds val sets (e.g. clean-it): two_stage.py val_wer is then the mean over ALL of them; compare per domain
+VALS=${VALS:-"mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"}
 POL=${POL:-"--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 3e-4 --bs 16"}
 # disk gate: a run writes final.nemo (0.46 GB) + last.ckpt (1.38 GB); it-e2-enc2e-4-s4000 died of
 # ENOSPC on the 32 GB root disk on 2026-10-11

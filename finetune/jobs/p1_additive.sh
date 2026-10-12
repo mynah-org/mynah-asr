@@ -7,6 +7,12 @@
 # and vs E3-8k it is +external audio (plus the extra steps; unavoidable in an additive design).
 # Default W=0.25 -> 10667 steps, ~1.5 passes over the pool. Read in processed hours (exposure_audit.py), not steps.
 # Report: harness greedy/beam-8/oracle-8 AND clean-it (tedx, italic) greedy/beam-8/oracle-8; decisions at K=8.
+# Pre-registered (2026-10-12; primary = clean oracle@8, TEDx weighs more than ITALIC; baselines E3-8k: harness
+# 31.36/28.27/23.60, clean macro 36.40/33.03/25.46, tedx 34.64/30.44/25.67, italic 38.16/35.62/25.25):
+#   strong win  clean oracle@8 -2 or better, no serious harness regression;  promising  -1..-2 (esp. TEDx);
+#   null        < 1 on clean and harness oracle;  tradeoff  only ITALIC/read improves, TEDx worse -> do not scale;
+#   very strong oracle AND beam/greedy improve.  A win supports "additive external exposure under a longer mixed
+#   schedule", not a pure effect of the 98 h. In-run: compare at A2-equivalent steps = steps x (1 - W).
 #   FT_ROOT=/root/ft tmux new -d -s p1 'FT_ROOT=/root/ft bash finetune/jobs/p1_additive.sh 2>&1 | tee -a /root/ft/logs/p1_additive.log'
 . "$(dirname "$0")/gpu_lock.sh"
 MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; YG=$FT_ROOT/mix/it-yg; R=$FT_ROOT/runs; K=$FT_ROOT/analysis/K
@@ -15,6 +21,9 @@ MIX=$(python3 -c "
 w = $W; a2 = [('$MF/train_40h.json', .35), ('$MX/train_cv.json', .30), ('$MX/train_vp_t50.json', .20), ('$MX/train_fleurs.json', .15)]
 print(','.join(f'{p}:{x * (1 - w):.4f}' for p, x in a2) + f',$YG/subsets/yg_agree<=15.json:{w:.4f}')")
 echo "== p1_additive W=$W STEPS=$STEPS TAG=$TAG $(date +%T)"; echo "   MIX=$MIX"
+# in-run evals also on clean-it (200 clips per sub-bank): the printed val_wer is then a 6-set mean; the harness
+# macro is recomputed from the four harness domains
+VALS="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json,tedx=$MF/eval_tedx_it.json,italic=$MF/eval_italic_it.json" \
 MIX="$MIX" POL="--freeze-enc 0 --enc-lr 2e-4 --lr 3e-4 --bs 16" STEPS=$STEPS SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" $TAG \
     --max-dur 30 --eval-steps 100,250 --abort-wer 1000:85
 rm -f $R/plain-$TAG/last.ckpt
