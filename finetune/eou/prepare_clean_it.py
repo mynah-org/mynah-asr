@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""clean-it: a small Italian HOLDOUT bank, source/speaker/video-disjoint from every training mix and not named
-in the teacher's training data (MLS, CommonVoice, FLEURS, VoxPopuli/Europarl, Granary are; these are not).
+"""clean-it: a small Italian HOLDOUT bank, source/speaker/video-disjoint from every training mix of ours (verified
+on our side) and not explicitly listed among the known Nemotron training datasets (MLS, CommonVoice, FLEURS,
+VoxPopuli/Europarl, Granary are listed; an undocumented proprietary set is not checkable, so absence from the
+teacher's pretraining is NOT proven).
 
     python3 prepare_clean_it.py --out /root/ft/manifests --audio /dev/shm/clean-it [--tedx-per-talk 60]
         [--italic-per-speaker 70]
