@@ -22,12 +22,43 @@ the box disk is 32 GB) and NeMo manifests under --out (default /root/ft/mix/<lan
 train_<src>.json, eval_<src>.json (--eval-n clips from the test split), hours.json.
 
   /root/nemo-venv/bin/python finetune/eou/prepare_mix.py --lang it --cv-hours 40 --vp-hours 40
+
+Granary (yg) at scale, incremental mode: any of --yg-dirs / --yg-split-long / --audio-ext /
+--yg-hours / --yg-min-free-gb switches it on (without them the yg path is unchanged):
+
+  prepare_mix.py --lang it --cv-hours 0 --vp-hours 0 --no-fleurs --yg-keep-all \
+      --yg-dirs it000,it100,it101 --yg-spread 70,250,250 --yg-split-long 20 --audio-ext flac --yg-hours 450
+
+  - --yg-spread takes one N per --yg-dirs entry (today's evenly-spread formula per dir, so
+    `--yg-dirs it000 --yg-spread 70` is the same 70 shards as the legacy pool); one N alone spreads
+    over the concatenated listing. Shards are pinned to the dataset revision (HF sha) of the run.
+  - Each shard's rows go to <out>/yg_shards/<dir>-<shard>.json when the shard is done; the raw
+    parquet is deleted right after extraction (as before). A rerun skips cached shards, so
+    re-running with a larger --yg-hours (or more dirs) grows the pool as a superset: cached
+    shards are admitted first, then new ones in spread-first order, round-robin over the dirs.
+  - --yg-hours H: no new shard is started once the admitted hours (+ the in-flight estimate)
+    reach H; granularity = whole shards. --yg-min-free-gb G: same stop when the --audio
+    filesystem has < G GB free.
+  - --yg-split-long S: clips <= S s are kept whole (>= 1 s; --yg-max-s is ignored), longer ones
+    are cut at speech pauses (prepare_yodas.speech_spans / pack_spans: Silero VAD, or the energy
+    detector with --yg-vad energy) into pieces of --yg-piece-min-s..S s; a span longer than S
+    with no pause is dropped (never cut mid-speech). A piece's `text` is EMPTY: the parent's
+    Granary text does not align to it, so the teacher label is the only label (teacher_wer =
+    None; pseudo_subsets.py --no-ref-keep decides). It keeps `ref_parent` (parent text),
+    `parent_id`, `piece`, `n_pieces`.
+  - Every yg row also carries utt_id, shard (repo path), row (index in the parquet), offset
+    and duration within the parent (s), parent_dur, revision, and orig_offset / lang_orig when
+    the parquet has them. --audio-ext flac writes FLAC PCM_16 16 kHz (soundfile) and deletes a
+    stale <utt_id>.wav of the same clip.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import random
+import shutil
 import re
 import sys
 import tarfile
@@ -48,6 +79,7 @@ FLEURS_CFG = {"it": "it_it", "fr": "fr_fr"}
 TEXT_COLS = ("sentence", "raw_text", "normalized_text", "transcription", "text")
 SPK_COLS = ("client_id", "speaker_id", "original_audio_id")
 ID_COLS = ("utt_id", "path", "audio_id", "id")
+YG_EXTRA_COLS = {"original_audio_offset": "orig_offset", "lang": "lang_orig"}   # kept when present
 
 
 def hf_token():
@@ -64,6 +96,28 @@ def list_files(repo, path):
     return sorted(x["path"] for x in json.load(urllib.request.urlopen(req, timeout=60)) if x["type"] == "file")
 
 
+def hf_revision(repo):
+    """Current commit sha of a dataset repo (None when the API is unreachable)."""
+    req = urllib.request.Request(f"{HF}/api/datasets/{repo}/revision/main")
+    if hf_token():
+        req.add_header("Authorization", f"Bearer {hf_token()}")
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=60)).get("sha")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def write_audio(dst, audio, sr):
+    """16 kHz mono PCM16, container from the suffix (.wav / .flac); atomic like D.write_wav."""
+    import soundfile as sf
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp" + dst.suffix)
+    sf.write(str(tmp), audio, sr, subtype="PCM_16")
+    os.replace(tmp, dst)
+    return len(audio) / sr
+
+
 def text_ok(t):
     if not t or re.search(r"\d", t):
         return False
@@ -78,20 +132,26 @@ def pick(cols, names):
     return None
 
 
-def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False, max_s=20.0):
+def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False, max_s=20.0,
+              yg=None):
     """Download one parquet shard, keep a speaker-capped random subset up to budget_s
-    (or eval_n clips), write wavs, delete the shard. Returns manifest rows."""
+    (or eval_n clips), write wavs, delete the shard. Returns manifest rows.
+    yg: incremental-mode options (dict: split_s, piece_min_s, vad, ext, rev, threads) or None (legacy)."""
     import pyarrow.parquet as pq
 
-    tmp = Path(tmp_dir) / f"{src}-{Path(rel).name}"
-    D.curl(f"{HF}/datasets/{repo}/resolve/main/{rel}", tmp)
+    tmp = Path(tmp_dir) / f"{src}-{Path(rel).parent.parent.name}-{Path(rel).name}" if yg else Path(tmp_dir) / f"{src}-{Path(rel).name}"
+    D.curl(f"{HF}/datasets/{repo}/resolve/{(yg or {}).get('rev') or 'main'}/{rel}", tmp)
+    split_s = (yg or {}).get("split_s") or 0
+    n_long = n_pieces = n_drop = 0
+    lost_s = 0.0
     rows, fails = [], 0
     try:
         pf = pq.ParquetFile(str(tmp))
         cols = pf.schema_arrow.names
         tc = pick(cols, ("normalized_text", "sentence") if src == "vp" else TEXT_COLS)
         sc, ic = pick(cols, SPK_COLS), pick(cols, ID_COLS)
-        meta = pf.read(columns=[c for c in (tc, sc, ic) if c]).to_pylist()
+        xc = [c for c in YG_EXTRA_COLS if c in cols] if yg else []
+        meta = pf.read(columns=[c for c in (tc, sc, ic) if c] + xc).to_pylist()
         order = list(range(len(meta)))
         random.Random(f"{seed}-{rel}").shuffle(order)
         spk_n, want = {}, []
@@ -127,12 +187,37 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
                 fails += 1
                 continue
             dur = len(arr) / sr
-            if not 1.0 <= dur <= max_s:
+            if not (1.0 <= dur if split_s else 1.0 <= dur <= max_s):
                 continue
             src_sr = sr
             arr, sr = resample16(arr, sr)   # CV mp3 is 32/48 kHz
             r = meta[i]
             uid = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(str(r.get(ic) or i)).name).rsplit(".", 1)[0]
+            if yg:
+                segs = [(0, len(arr))]
+                if split_s and dur > split_s:   # cut at speech pauses; the teacher labels the pieces
+                    sys.path.insert(0, str(Path(__file__).resolve().parent))
+                    import prepare_yodas as Y
+                    segs, dl = Y.pack_spans(Y.speech_spans(arr, sr, yg["vad"], yg["threads"]), sr,
+                                            yg["piece_min_s"], split_s)
+                    n_long += 1; n_pieces += len(segs); n_drop += dl
+                    lost_s += dur - sum(b - a for a, b in segs) / sr
+                for k, (c0, c1) in enumerate(segs):
+                    piece = bool(split_s) and dur > split_s
+                    p = Path(audio_dir) / src / f"{uid}_p{k:02d}.{yg['ext']}" if piece else Path(audio_dir) / src / f"{uid}.{yg['ext']}"
+                    d = write_audio(p, arr[c0:c1], sr)
+                    if yg["ext"] != "wav":
+                        p.with_suffix(".wav").unlink(missing_ok=True)   # stale legacy copy of the same clip
+                    row = {"audio_filepath": str(p), "duration": round(d, 3), "text": "" if piece else r[tc].strip(),
+                           "speaker": f"{src}:{r.get(sc) or uid}", "corpus": src, "src_sr": src_sr,
+                           "utt_id": str(r.get(ic) or uid), "shard": rel, "row": i, "offset": round(c0 / sr, 3),
+                           "parent_dur": round(dur, 3), "revision": yg["rev"]}
+                    row.update({YG_EXTRA_COLS[c]: r[c] for c in xc})
+                    if piece:
+                        row.update(parent_id=row["utt_id"], ref_parent=r[tc].strip(), piece=k, n_pieces=len(segs))
+                    rows.append(row)
+                    acc += d
+                continue
             p = Path(audio_dir) / src / f"{uid}.wav"
             D.write_wav(p, arr, sr)
             rows.append({"audio_filepath": str(p), "duration": round(dur, 3), "text": r[tc].strip(),
@@ -141,7 +226,10 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
             if (eval_n and len(rows) >= eval_n) or (not eval_n and acc >= budget_s):
                 break
     finally:
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)   # raw shard deleted as soon as it is extracted
+    if split_s:
+        print(f"  {src} {rel}: {n_long} clips > {split_s:g} s -> {n_pieces} pieces, {n_drop} pause-less spans "
+              f"dropped, {lost_s / 3600:.2f} h not kept (silence + dropped spans)", flush=True)
     if fails:
         print(f"  {src} {rel}: {fails} decode failures", flush=True)
     return rel, rows
@@ -179,6 +267,86 @@ def resample16(arr, sr):
     return arr.astype("float32"), D.SR
 
 
+def spread_first(n):
+    """0..n-1 ordered so that every prefix is spread over the range (bit-reversal order)."""
+    b = max(1, math.ceil(math.log2(max(2, n))))
+    return sorted(range(n), key=lambda i: int(f"{i:0{b}b}"[::-1], 2))
+
+
+def yg_incremental(a, spread, audio, tmp, out):
+    """Granary pool built shard by shard into <out>/yg_shards (restartable, growable); see the docstring."""
+    dirs = [d for d in (a.yg_dirs or f"{a.lang}000").split(",") if d]
+    rev = hf_revision(YG_REPO)
+    lists = {d: list_files(YG_REPO, f"data/{d}/ast") for d in dirs}
+    per = {d: [] for d in dirs}
+    if spread and len(spread) == len(dirs):
+        for d, n in zip(dirs, spread):
+            fs = lists[d]
+            per[d] = [fs[i] for i in sorted({round(i * (len(fs) - 1) / max(1, n - 1)) for i in range(min(n, len(fs)))})]
+    elif spread:   # one N over the concatenated listing
+        fs = [f for d in dirs for f in lists[d]]
+        for i in sorted({round(i * (len(fs) - 1) / max(1, spread[0] - 1)) for i in range(spread[0])}):
+            per[fs[i].split("/")[1]].append(fs[i])
+    else:          # --yg-shards: i (first dir) or dir:i
+        for x in a.yg_shards.split(","):
+            d, i = x.split(":") if ":" in x else (dirs[0], x)
+            per[d].append(lists[d][int(i)])
+    cache = out / "yg_shards"
+    cache.mkdir(parents=True, exist_ok=True)
+    cpath = lambda rel: cache / f"{rel.split('/')[1]}-{Path(rel).stem}.json"  # noqa: E731
+    rr = [[fs[j] for j in spread_first(len(fs))] for fs in per.values()]
+    order = [rr[k][j] for j in range(max(map(len, rr), default=0)) for k in range(len(rr)) if j < len(rr[k])]
+    budget = a.yg_hours * 3600 if a.yg_hours else float("inf")
+    got, acc = {}, 0.0
+    for rel in [r for r in order if cpath(r).exists()]:   # cached shards first: the pool grows as a superset
+        if acc >= budget:
+            break
+        got[rel] = D.ftlib.read_manifest(cpath(rel)); acc += sum(x["duration"] for x in got[rel])
+    print(f"== yg: dirs {','.join(dirs)}, revision {rev}, {sum(map(len, rr))} shards selected, {len(got)} cached "
+          f"({acc / 3600:.1f} h), budget {a.yg_hours or '-'} h", flush=True)
+    todo = iter([r for r in order if not cpath(r).exists()])
+    opts = {"split_s": a.yg_split_long, "piece_min_s": a.yg_piece_min_s, "ext": a.audio_ext, "rev": rev,
+            "vad": a.yg_vad, "threads": a.yg_vad_threads}
+    if opts["vad"] == "auto":
+        try:
+            import silero_vad  # noqa: F401
+            opts["vad"] = "silero"
+        except ImportError:
+            opts["vad"] = "energy"
+    from concurrent.futures import FIRST_COMPLETED, wait
+    live, t0, stop = {}, time.time(), ""
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        while True:
+            while len(live) < a.workers and not stop:
+                est = acc / max(1, len(got)) * len(live) if got else 0.0   # hours already in flight
+                if acc + est >= budget:
+                    stop = f"budget {a.yg_hours} h"; break
+                if a.yg_min_free_gb and shutil.disk_usage(audio).free < a.yg_min_free_gb * 1e9:
+                    stop = f"< {a.yg_min_free_gb} GB free on {audio}"; break
+                rel = next(todo, None)
+                if rel is None:
+                    break
+                live[ex.submit(shard_job, "yg", YG_REPO, rel, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0,
+                               a.yg_keep_all, a.yg_max_s, opts)] = rel
+            if not live:
+                break
+            done, _ = wait(live, return_when=FIRST_COMPLETED)
+            for fu in done:
+                rel, r = fu.result()
+                del live[fu]
+                D.ftlib.write_manifest(cpath(rel), r)
+                got[rel] = r; acc += sum(x["duration"] for x in r)
+                print(f"  yg {rel}: {len(r)} utts {sum(x['duration'] for x in r) / 3600:.2f} h, pool {acc / 3600:.1f} h "
+                      f"({time.time() - t0:.0f}s)", flush=True)
+    if stop:
+        print(f"== yg: stopped admitting shards: {stop}", flush=True)
+    rows = [x for rel in order if rel in got for x in got[rel]]
+    D.ftlib.write_manifest(out / "train_yg.json", rows)
+    np_ = sum(1 for x in rows if "parent_id" in x)
+    print(f"== yg: {len(rows)} utts ({np_} pieces) {sum(x['duration'] for x in rows) / 3600:.2f} h from {len(got)} shards, "
+          f"{len({x['speaker'] for x in rows})} videos", flush=True)
+
+
 def selftest():
     """Provisioning gate: encode a 48 kHz tone as MP3 (what Common Voice ships), decode it
     with the kit's decoder, resample to 16 kHz, check length and pitch; write it as wav."""
@@ -214,7 +382,17 @@ def main():
                     "every 1-20 s clip, speaker = video -> train_yg.json (Granary Whisper text kept as `text`)")
     ap.add_argument("--yg-keep-all", action="store_true", help="audit: keep rows with digits / non-latin text")
     ap.add_argument("--yg-max-s", type=float, default=20.0, help="Granary clips average ~19.5 s: 20 keeps < 1/3 of them")
-    ap.add_argument("--yg-spread", type=int, default=0, help="instead of --yg-shards: N shards evenly spread over the language")
+    ap.add_argument("--yg-spread", default="", help="instead of --yg-shards: N shards evenly spread over the language "
+                    "(incremental mode: one N per --yg-dirs entry, or one N over all of them)")
+    ap.add_argument("--yg-dirs", default="", help="incremental mode: Granary dirs, e.g. it000,it100,it101 (default <lang>000)")
+    ap.add_argument("--yg-split-long", type=float, default=0, help="incremental mode: clips > S s cut at pauses into pieces <= S s")
+    ap.add_argument("--yg-piece-min-s", type=float, default=2.0, help="shortest piece kept by --yg-split-long")
+    ap.add_argument("--yg-vad", default="auto", choices=("auto", "silero", "energy"), help="pause detector of --yg-split-long "
+                    "(auto: silero if installed)")
+    ap.add_argument("--yg-vad-threads", type=int, default=1, help="torch threads per worker for silero")
+    ap.add_argument("--yg-hours", type=float, default=0, help="incremental mode: stop starting shards once the pool has H h")
+    ap.add_argument("--yg-min-free-gb", type=float, default=0, help="incremental mode: stop starting shards below G GB free on --audio")
+    ap.add_argument("--audio-ext", default="wav", choices=("wav", "flac"), help="yg audio container (flac: incremental mode)")
     ap.add_argument("--eval-n", type=int, default=200)
     ap.add_argument("--audio", default="")
     ap.add_argument("--out", default="")
@@ -237,9 +415,14 @@ def main():
         te = [f for f in files if Path(f).name.startswith("test-") and f.endswith(".parquet")]
         print(f"== {src}: {len(tr)} train shards, {len(te)} test shards, budget {hours} h, cap {cap}/speaker", flush=True)
         jobs.append((src, repo, tr, te, hours * 3600 / len(tr), cap))
-    if (a.yg_shards or a.yg_spread) and not (out / "train_yg.json").exists():
+    spread = [int(x) for x in a.yg_spread.split(",") if x.strip()]
+    yg_new = bool(a.yg_dirs or a.yg_split_long or a.audio_ext != "wav" or a.yg_hours or a.yg_min_free_gb)
+    if (a.yg_shards or any(spread)) and yg_new:
+        yg_incremental(a, spread, audio, tmp, out)
+    elif (a.yg_shards or any(spread)) and not (out / "train_yg.json").exists():
         files = list_files(YG_REPO, f"data/{a.lang}000/ast")
-        idx = ([round(i * (len(files) - 1) / max(1, a.yg_spread - 1)) for i in range(a.yg_spread)] if a.yg_spread
+        yg_spread = spread[0] if spread else 0
+        idx = ([round(i * (len(files) - 1) / max(1, yg_spread - 1)) for i in range(yg_spread)] if yg_spread
                else [int(i) for i in a.yg_shards.split(",")])
         pick = [files[i] for i in sorted(set(idx))]
         rows = []
