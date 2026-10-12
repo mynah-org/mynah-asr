@@ -37,10 +37,17 @@ TEDX = "https://huggingface.co/datasets/deepdml/mtedx/resolve/main/it/{split}-00
 ITALIC = "https://zenodo.org/records/8040649/files/italic.zip"
 
 
-def fetch(url, dst):
-    if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-        subprocess.run(["curl", "-fsSL", "--retry", "5", "-C", "-", "-o", dst, url], check=True)
-    return dst
+def fetch(url, dst, tries=20):
+    """resumable download until the local size equals the server's Content-Length (Zenodo drops long transfers)."""
+    head = subprocess.run(["curl", "-sIL", url], capture_output=True, text=True).stdout
+    size = [int(x) for x in re.findall(r"(?im)^content-length:\s*(\d+)", head)]
+    want = size[-1] if size else None
+    for _ in range(tries):
+        have = os.path.getsize(dst) if os.path.exists(dst) else 0
+        if have and (want is None or have >= want):
+            return dst
+        subprocess.run(["curl", "-fsSL", "--retry", "5", "-C", "-", "-o", dst, url])
+    raise RuntimeError(f"download incomplete: {url}")
 
 
 def sha(x):
