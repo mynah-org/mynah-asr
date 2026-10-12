@@ -62,6 +62,7 @@ PY
 TLMIX="$TL/mls.json:0.35,$TL/cv.json:0.30,$TL/vp.json:0.20,$TL/fleurs.json:0.15"
 MIX="$TLMIX" POL="--freeze-enc 0 --enc-lr 2e-4 --lr 3e-4 --bs 16" SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" it-p2-tl \
     --eval-steps 100,250 --abort-wer 1000:85
+rm -f $R/plain-it-p2-tl/last.ckpt   # 1.38 GB on the 32 GB root; a fixed-budget arm is not a resume point
 [ -s $R/plain-it-p2-tl/final.nemo ] && CUDA_VISIBLE_DEVICES= timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" \
     --nemo $R/plain-it-p2-tl/final.nemo --per-set 200 --alphas 0 --beam 8 --beam-alphas 0 \
     --out $R/plain-it-p2-tl/beam_probe.json 2>&1 | grep -E "macro|Traceback|Error" | tail -4
