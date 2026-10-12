@@ -7,7 +7,7 @@
 # Scale mode (prepare_mix.py incremental mode), on when any of YG_DIRS / YG_SPLIT / YG_EXT / YG_HOURS is set:
 #   YG_DIRS=it000,it100,it101 YG_SPREAD=70,250,250 (one N per dir) YG_SPLIT=20 (clips > 20 s cut at
 #   pauses) YG_EXT=flac YG_HOURS=450 (no new shard once the pool has 450 h)
-#   [YG_MIN_FREE_GB=4 YG_WORKERS=6 YG_TIMEOUT=10800 TEACHER_TIMEOUT=7200 SHM_MIN_GB=2]
+#   YG_NO_TEACHER=1 (download/cut only, no GPU lock) [YG_MIN_FREE_GB=4 YG_WORKERS=6 YG_TIMEOUT=10800 TEACHER_TIMEOUT=7200 SHM_MIN_GB=2]
 # Restartable and growable: done shards are cached in $O/yg_shards; the teacher reuses every score it
 # has ($O/teacher_archive.json = the archived pool scores, copied once; the last output; an interrupted
 # run's .tmp), so a rerun with a larger YG_HOURS only downloads and scores the new shards.
@@ -42,6 +42,7 @@ PY
     FREE=$(df -Pk /dev/shm | awk 'NR==2 {print int($4 / 1048576)}')
     [ -n "$RUN" ] && [ "$FREE" -lt "${SHM_MIN_GB:-2}" ] && { echo "== /dev/shm: ${FREE} GB free < ${SHM_MIN_GB:-2} GB, stop before the teacher"; exit 4; }
 fi
+[ -n "${YG_NO_TEACHER:-}" ] && { echo "== YG_NO_TEACHER: download/cut only, teacher skipped"; exit 0; }   # never jumps the GPU queue
 if [ -n "$RUN" ]; then
 gpu_lock
 ./mynah-asr-server-cuda -m models/nemotron-3.5-asr-streaming-0.6b -p 8295 > $L/teacher_srv4.log 2>&1 & SP=$!

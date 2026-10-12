@@ -4,9 +4,13 @@
 #   it-e3-s8000   E3 recipe, A2 only                         (twin of E3  = plain-it-e2-enc2e-4-s4000, 36.52)
 #   it-e3g-s8000  E3G mix: A2 x0.5 + Granary-it teacher labels (twin of E3G = plain-it-e3g-yg15, 36.55)
 #                 agree<=15, max-dur 30
-# -> a 2x2 {4k, 8k} x {A2, A2 + teacher-labelled YODAS}: E3G-8k sees E3's A2 exposure PLUS the Granary
-# draws, at matched optimizer steps with E3-8k. Pre-registered: E3G-8k - E3-8k <= -1.0 macro (2x the
-# noise floor) = the extra audio helps; |diff| < 1.0 = inconclusive at this pool size (~one seed).
+# -> a 2x2 {4k, 8k} x {A2, A2 + 50 % teacher-labelled YODAS draws}. Readings (each changes something else too):
+#   E3-4k -> E3-8k    optimisation budget / A2 re-exposure scaling;
+#   E3G-4k -> E3G-8k  scaling of the mixed regime;
+#   E3-4k <-> E3G-8k  approximately E3's integrated A2 exposure PLUS Granary, but steps/schedule change too;
+#   E3-8k <-> E3G-8k  the mix choice at equal optimizer budget (E3G has HALF the A2 exposure): not a pure
+#                     "add data" test. Pre-registered for it: <= -1.0 macro (2x the noise floor) = the mixed
+#                     regime wins; |diff| < 1.0 = inconclusive (one seed).
 # After each arm: CPU greedy / beam-8 / 8-best oracle probe (alpha 0, no LM).
 #   FT_ROOT=/root/ft tmux new -d -s s8k 'FT_ROOT=/root/ft bash finetune/jobs/scale_8k.sh 2>&1 | tee -a /root/ft/logs/scale_8k.log'
 . "$(dirname "$0")/gpu_lock.sh"
