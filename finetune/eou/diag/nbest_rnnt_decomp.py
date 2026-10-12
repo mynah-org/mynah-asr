@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--dumps", required=True, help="comma-separated nbest_b<K>.jsonl files (same K)")
     ap.add_argument("--tune", default="mls_tune,fleurs_tune")
     ap.add_argument("--out", default="decomp.json")
+    ap.add_argument("--dump-scores", default="", help="JSONL with every hypothesis' beam score, full, ilm, errors (offline curves)")
     a = ap.parse_args()
     from nemo.collections.asr.models import EncDecRNNTBPEModel
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,6 +97,11 @@ def main():
                 h["full"], h["ilm"], h["ac"] = fv, iv, fv - iv
             if i % 500 == 0:
                 print(f"   {i}/{len(clips)}", flush=True)
+    if a.dump_scores:
+        with open(a.dump_scores, "w") as fd:
+            for c in clips:
+                fd.write(json.dumps({"set": c["set"], "nref": c["nref"], "hyps": [{k: h[k] for k in ("score", "full", "ilm", "words", "err")}
+                                                                                    for h in c["hyps"]]}) + "\n")
     sets = sorted({c["set"] for c in clips})
     tun = [s for s in a.tune.split(",") if s in sets]
     rep = [s for s in sets if s not in tun]
@@ -107,7 +113,7 @@ def main():
         w = c["hyps"][0]
         if o["err"] >= w["err"]:
             continue
-        g = "read" if c["set"] in READ else "spont"
+        g = ("read" if c["set"] in READ else "spont") + ("_tune" if c["set"] in a.tune.split(",") else "")
         k = cls.setdefault(c["set"], {"n": 0, "search": 0, "ilm_pref_w": 0, "ac_pref_w": 0, "both_pref_w": 0})
         k2 = cls.setdefault(g, {"n": 0, "search": 0, "ilm_pref_w": 0, "ac_pref_w": 0, "both_pref_w": 0})
         for d in (k, k2):
