@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--adapt-steps", type=int, default=600)
     ap.add_argument("--report", default="mls,fleurs,cv,vp")
     ap.add_argument("--tune", default="mls_tune,fleurs_tune")
+    ap.add_argument("--fixed", default="", help="name:alpha:beta,... apply weights chosen elsewhere (e.g. on the tune "
+                    "split of another dump) instead of tuning: for a holdout bank with no tune split")
     ap.add_argument("--out", default="lm_rescore.json")
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -139,7 +141,16 @@ def main():
         res[K] = {"beam": {**{s: round(beam[s], 2) for s in rep}, "macro": round(bm, 2)},
                   "oracle": {**{s: round(orc[s], 2) for s in rep}, "macro": round(om, 2)}}
         print(f"== K={K}: beam {res[K]['beam']}\n   oracle {res[K]['oracle']}")
+        fixed = {f.split(":")[0]: tuple(float(x) for x in f.split(":")[1:]) for f in a.fixed.split(",") if f}
         for name, lm in lms.items():
+            if name in fixed:
+                al, be = fixed[name]
+                rr = wer(R, lambda c: max(c["hyps"], key=lambda h: h["score"] + al * lm[h["text"]] + be * h["words"]))
+                lmm = macro(rr, rep)
+                res[K][name] = {"alpha": al, "beta": be, "fixed": True, **{s: round(rr[s], 2) for s in rep},
+                                "macro": round(lmm, 2), "recovery": round((bm - lmm) / (bm - om), 3) if bm > om else None}
+                print(f"   {name} (fixed): " + json.dumps(res[K][name]))
+                continue
             best, curve = evaluate(clips, rep, tun, lm, alphas, betas)
             _, al, be, rr = best
             lmm = macro(rr, rep)
