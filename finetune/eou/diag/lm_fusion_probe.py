@@ -26,6 +26,12 @@ ap.add_argument("--vals", default="mls=/root/ft/manifests/eval_mls_it.json,fleur
 ap.add_argument("--per-set", type=int, default=60)
 ap.add_argument("--alphas", default="0.3,0.6")
 ap.add_argument("--beam", type=int, default=4)
+ap.add_argument("--beams", default="", help="several beam sizes, e.g. 4,8,16 (overrides --beam): oracle@K vs K")
+ap.add_argument("--dump-nbest", default="", help="DIR: per beam size, nbest_b<K>.jsonl with every hypothesis "
+                "(text, score, tokens) per clip, for diag/nbest_audit.py (offline rescoring / ranking audit)")
+ap.add_argument("--tune-extra", type=int, default=0, help="1: also decode the MLS/FLEURS val clips OUTSIDE the "
+                "harness subsample (sets mls_tune / fleurs_tune; never in the macro): a disjoint split to tune "
+                "rescoring on, so the harness clips stay report-only")
 ap.add_argument("--beam-alphas", default="", help="LM weights for beam (default: --alphas)")
 ap.add_argument("--blank-mode", default="lm_weighted_full", help="beam blank_lm_score_mode: lm_weighted_full | no_score")
 ap.add_argument("--skip-greedy", type=int, default=0)
@@ -69,17 +75,20 @@ if lm_path.endswith(".arpa"):   # parse the ARPA once, reuse as .nemo for every 
     lm.save_to(lm_path)
     print(f"LM parsed {time.time() - t0:.0f}s -> {lm_path}", flush=True)
 
-sets = []
+sets, tune_sets = [], []
 for spec in a.vals.split(","):
     n, p = spec.split("=", 1)
     rs = [json.loads(l) for l in open(p)]
-    rs = rs[:: max(1, len(rs) // a.per_set)][: a.per_set]
-    sets.append((n, rs))
+    sub = rs[:: max(1, len(rs) // a.per_set)][: a.per_set]
+    sets.append((n, sub))
+    if a.tune_extra and n in ("mls", "fleurs"):
+        used = {r["audio_filepath"] for r in sub}
+        tune_sets.append((f"{n}_tune", [r for r in rs if r["audio_filepath"] not in used]))
 
 enc = []    # (set, ref, enc[T, D], len)
 t0 = time.time()
 with torch.no_grad():
-    for n, rs in sets:
+    for n, rs in sets + tune_sets:
         for i in range(0, len(rs), 8):
             ch = rs[i:i + 8]
             xs = []
@@ -94,7 +103,7 @@ with torch.no_grad():
             f, fl = m.preprocessor(input_signal=X.to(dev), length=lens.to(dev))
             e, el = m.encoder(audio_signal=f, length=fl)
             for b, r in enumerate(ch):
-                enc.append((n, norm(r["text"]), e[b, :, : int(el[b])].cpu(), int(el[b])))
+                enc.append((n, norm(r["text"]), e[b, :, : int(el[b])].cpu(), int(el[b]), r["audio_filepath"]))
 print(f"encoded {len(enc)} clips in {time.time() - t0:.0f}s on {dev}", flush=True)
 
 
@@ -124,9 +133,10 @@ def text_of(h):
     return norm(tk.ids_to_text([t for t in ys if t < 1024]))
 
 
-def run(tag):
+def run(tag, dump=None):
     t0 = time.time()
     per = {}
+    fd = open(dump, "w") if dump else None
     with torch.no_grad():
         for i in range(0, len(enc), 16):
             ch = enc[i:i + 16]
@@ -138,7 +148,7 @@ def run(tag):
             hy = m.decoding.rnnt_decoder_predictions_tensor(encoder_output=E.to(dev), encoded_lengths=el.to(dev),
                                                             return_hypotheses=True)
             hy = hy[0] if isinstance(hy, tuple) else hy
-            for (n, ref, _, _), h in zip(ch, hy):
+            for (n, ref, _, _, path), h in zip(ch, hy):
                 # beam with return_best_hypothesis=False: list[Hypothesis] per clip, best first
                 nb = list(h) if isinstance(h, list) else list(h.n_best_hypotheses) if hasattr(h, "n_best_hypotheses") else [h]
                 texts = [text_of(x) for x in nb]
@@ -148,11 +158,17 @@ def run(tag):
                 s["hw"] += len(texts[0].split())
                 s["we"] += errs[0]; s["wn"] += len(rw); s["ce"] += lev(ref, texts[0]); s["cn"] += len(ref)
                 s["oracle_we"] += min(errs)
+                if fd:
+                    fd.write(json.dumps({"set": n, "path": path, "ref": ref, "hyps": [
+                        {"text": t, "score": float(x.score), "ntok": len([y for y in (x.y_sequence.tolist() if hasattr(x.y_sequence, "tolist") else x.y_sequence) if y < 1024])}
+                        for t, x in zip(texts, nb)]}, ensure_ascii=False) + "\n")
     rec = {"tag": tag, "sec": round(time.time() - t0, 1)}
     for n, s in per.items():
         rec[f"{n}_wer"] = round(100 * s["we"] / s["wn"], 2); rec[f"{n}_cer"] = round(100 * s["ce"] / s["cn"], 2)
         rec[f"{n}_oracle_wer"] = round(100 * s["oracle_we"] / s["wn"], 2)
         rec[f"{n}_len_ratio"] = round(s["hw"] / s["wn"], 3)   # hypothesis words / reference words
+    if fd:
+        fd.close()
     rec["macro_wer"] = round(float(np.mean([rec[f"{n}_wer"] for n, _ in sets])), 2)
     rec["macro_cer"] = round(float(np.mean([rec[f"{n}_cer"] for n, _ in sets])), 2)
     rec["macro_oracle_wer"] = round(float(np.mean([rec[f"{n}_oracle_wer"] for n, _ in sets])), 2)
@@ -163,11 +179,15 @@ def run(tag):
 out = []
 alphas = [float(x) for x in a.alphas.split(",") if x]
 balphas = [float(x) for x in (a.beam_alphas or a.alphas).split(",") if x]
-for al in ([] if a.skip_greedy else [0.0] + alphas):
+for al in ([] if a.skip_greedy else [0.0] + [x for x in alphas if x]):
     set_decoding("greedy_batch", al); out.append(run(f"greedy a={al}"))
     json.dump(out, open(a.out, "w"), indent=1)
-if a.beam > 1:
-    for al in [0.0] + balphas:
-        set_decoding("malsd_batch", al, a.beam); out.append(run(f"malsd beam={a.beam} a={al}"))
+if a.dump_nbest:
+    import os
+    os.makedirs(a.dump_nbest, exist_ok=True)
+for K in ([int(x) for x in a.beams.split(",")] if a.beams else [a.beam] if a.beam > 1 else []):
+    for al in [0.0] + [x for x in balphas if x]:
+        set_decoding("malsd_batch", al, K)
+        out.append(run(f"malsd beam={K} a={al}", f"{a.dump_nbest}/nbest_b{K}.jsonl" if a.dump_nbest and al == 0 else None))
         json.dump(out, open(a.out, "w"), indent=1)
 print("wrote", a.out)
