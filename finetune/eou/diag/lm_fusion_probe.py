@@ -20,7 +20,7 @@ import numpy as np, soundfile as sf, torch
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--nemo", required=True)
-ap.add_argument("--lm", required=True, help="token ARPA (build_token_arpa.py) or NGPU-LM .nemo")
+ap.add_argument("--lm", default="", help="token ARPA (build_token_arpa.py) or NGPU-LM .nemo; not needed when every alpha is 0")
 ap.add_argument("--vals", default="mls=/root/ft/manifests/eval_mls_it.json,fleurs=/root/ft/manifests/eval_fleurs_it.json,"
                 "cv=/root/ft/mix/it/eval_cv.json,vp=/root/ft/mix/it/eval_vp.json")
 ap.add_argument("--per-set", type=int, default=60)
@@ -61,6 +61,7 @@ m = EncDecRNNTBPEModel.restore_from(a.nemo, map_location=dev).eval()
 tk = m.tokenizer
 blank = m.decoding.blank_id if hasattr(m.decoding, "blank_id") else tk.vocab_size
 lm_path = a.lm
+assert lm_path or not any(float(x) for x in (a.alphas + "," + a.beam_alphas).split(",") if x), "--lm needed for alpha > 0"
 if lm_path.endswith(".arpa"):   # parse the ARPA once, reuse as .nemo for every decoding config
     t0 = time.time()
     lm = NGramGPULanguageModel.from_file(lm_path, vocab_size=tk.vocab_size)
