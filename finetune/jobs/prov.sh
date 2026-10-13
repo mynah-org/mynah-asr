@@ -14,6 +14,16 @@
 set -u
 command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; }
 export PATH=$HOME/.local/bin:$PATH
+# A small /dev/shm (some hosts cap it at 31-41 GB and refuse a remount) cannot hold A2 + the Granary pools +
+# clean-it: then every /dev/shm audio dir the jobs use is a symlink to the root disk, so manifest paths (and the
+# archived teacher scores keyed on them) stay identical. SHM_MIN_GB (default 120) is the threshold.
+if [ "$(df -Pk /dev/shm | awk 'NR==2 {print int($2 / 1048576)}')" -lt "${SHM_MIN_GB:-120}" ]; then
+    for d in clean-it ft-audio mix yodas; do
+        mkdir -p /root/disk/$d
+        [ -L /dev/shm/$d ] || { rmdir /dev/shm/$d 2>/dev/null; [ -e /dev/shm/$d ] || ln -s /root/disk/$d /dev/shm/$d; }
+    done
+    echo "== small /dev/shm: audio dirs on the root disk ($(ls -l /dev/shm | grep -c -- '->') symlinks)"
+fi
 mkdir -p /root/ft/models /root/ft/logs /root/ft/runs /root/eou-kit /dev/shm/ft-audio
 # MLS audio (canary/prepare_it.sh writes $FT/audio) lives in RAM: the 32 GB root disk holds the venvs,
 # models and checkpoints and cannot also take the 40 h + eval audio (need_gb 12 failed on 2026-10-11)
