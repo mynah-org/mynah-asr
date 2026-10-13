@@ -5,7 +5,7 @@
         --a2-share 0.75 [--last 1]
 
 Reads the VAL lines of a running two_stage.py log; prints the harness macro (mls/fleurs/cv/vp, recomputed even when
-the run evaluates extra sets), the reference at the same step and at the nearest OBSERVED step to the A2-equivalent
+the run or the reference evaluates extra sets), the reference at the same step and at the nearest OBSERVED step to the A2-equivalent
 step (steps x a2-share; never interpolated), and any extra val sets (e.g. tedx/italic) as they appear.
 """
 import argparse
@@ -23,6 +23,9 @@ def main():
     ap.add_argument("--last", type=int, default=0)
     a = ap.parse_args()
     ref = {r["step"]: r for r in json.load(open(a.ref))["log"] if "val_wer" in r}
+    for r in ref.values():   # the harness macro, also when the reference run evaluated extra sets (C: + tedx/italic)
+        if all(f"val_{k}_wer" in r for k in H):
+            r["val_wer"] = sum(r[f"val_{k}_wer"] for k in H) / 4
     st, rows = None, []
     for l in open(a.log):
         m = re.search(r"step (\d+)/", l)
