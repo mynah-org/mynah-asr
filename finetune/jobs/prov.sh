@@ -7,7 +7,9 @@
 # Also builds the NeMo fine-tuning venv (/root/nemo-venv: nemo_toolkit[asr], torch cu128
 # via canary/setup.sh, numba-cuda + numpy<2.4 for the warprnnt_numba RNNT loss, torchaudio
 # of the SAME torch build: nemo_toolkit[asr] does not pull it, prepare_it's resampler needs it) in the
-# background of the build. A fresh 32 GB L40S is ready in ~20-30 min.
+# background of the build. torch is pinned to 2.11.0+cu128, the build of every 2026-10 run: on a CUDA 13
+# driver setup.sh would keep PyPI's torch 2.14.1+cu130, which has no cu128 torchaudio (and changes the stack).
+# A fresh 32 GB L40S is ready in ~20-30 min.
 #   tmux new -d -s prov 'KEEP_TOKEN=1 bash /root/prov.sh 2>&1 | tee -a /root/res/prov.log'
 set -u
 command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; }
@@ -34,7 +36,8 @@ cd $REPO || exit 2
 V=/root/nemo-venv
 if step venv; then
     ( uv venv -q -p 3.12 $V && VIRTUAL_ENV=$V timeout 2400 uv pip install -q "nemo_toolkit[asr]>=2.6" \
-      && FT_ROOT=/root/ft VENV=$V timeout 3000 bash finetune/canary/setup.sh \
+      && FT_ROOT=/root/ft VENV=$V FORCE_TORCH=${FORCE_TORCH-1} TORCH_VERSION=${TORCH_VERSION-2.11.0} TORCH_CUDA=${TORCH_CUDA-cu128} \
+         timeout 3000 bash finetune/canary/setup.sh \
       && VIRTUAL_ENV=$V uv pip install -q numba-cuda "numpy<2.4" silero-vad \
       && VIRTUAL_ENV=$V uv pip install -q --index-url https://download.pytorch.org/whl/cu128 \
            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
