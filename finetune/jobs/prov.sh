@@ -12,6 +12,15 @@
 # A fresh 32 GB L40S is ready in ~20-30 min.
 #   tmux new -d -s prov 'KEEP_TOKEN=1 bash /root/prov.sh 2>&1 | tee -a /root/res/prov.log'
 set -u
+# TLS gate BEFORE the token is ever sent: on 2026-10-13 a host intercepted HTTPS (HF, PyPI, PyTorch) with its own
+# "Internal Proxy Root CA" injected into the container trust store, so the Bearer token was readable on the host.
+# Every endpoint must chain to a public CA; otherwise the token is deleted and provisioning stops.
+for h in huggingface.co cdn-lfs.hf.co files.pythonhosted.org download.pytorch.org; do
+    iss=$(echo | timeout 15 openssl s_client -connect $h:443 -servername $h 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+    echo "== tls $h: ${iss:-no certificate}"
+    echo "$iss" | grep -qE "O ?= ?(Amazon|Google Trust Services|GlobalSign|DigiCert|Let's Encrypt|Sectigo|Fastly|Cloudflare)" || {
+        rm -f /root/.hf_token; echo "== TLS GATE FAILED on $h (non-public issuer): token deleted, stop"; exit 9; }
+done
 command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; }
 export PATH=$HOME/.local/bin:$PATH
 # A small /dev/shm (some hosts cap it at 31-41 GB and refuse a remount) cannot hold A2 + the Granary pools +
