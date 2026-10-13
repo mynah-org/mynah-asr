@@ -21,18 +21,33 @@ hub() {  # hub <path in repo> <dest>: resumable, authenticated, skipped when pre
 echo "== resume_it $(date +%T)"
 hub data/it/train_vp.teacher.json $MX/train_vp.teacher.json || exit 2
 hub data/it/granary_yg_pool.teacher.json $YG/train_yg.teacher.json || exit 2
-for run in ${RUNS:-plain-it-e3-s8000 plain-it-p1-add25 plain-it-s2-e3-djlr}; do   # 2026-10-12 references: E3-8k, C (best plain), EOU-v3
+# 2026-10-13 references: C250-20k (best plain), C250, C, E3-8k, EOU-v3
+for run in ${RUNS:-plain-it-c250-20k plain-it-c250 plain-it-p1-add25 plain-it-e3-s8000 plain-it-s2-e3-djlr}; do
     hub runs/$run/final.nemo $R/$run/final.nemo && hub runs/$run/metrics.json $R/$run/metrics.json || exit 2
 done
+# the NEW-video pool (it100/it101, C250's second external source): its teacher scores live in the 2026-10-13
+# bundle; with them in place granary_build.sh only re-downloads the audio (no teacher pass). POOL6=0 skips it.
+YG6=$FT_ROOT/mix/it-yg6
+if [ "${POOL6:-1}" = 1 ] && [ ! -s $YG6/train_yg.teacher.json ]; then
+    hub results/survival-2026-10-13.tgz /root/survival-2026-10-13.tgz || exit 2
+    mkdir -p $YG6 && tar xzf /root/survival-2026-10-13.tgz -O ft/mix/it-yg6/train_yg.teacher.json > $YG6/train_yg.teacher.json || exit 2
+fi
 echo "== hub ok $(date +%T)"
 bash "$FINETUNE/jobs/data_mix.sh" it || exit 3
 FILTER_ONLY=1 bash "$FINETUNE/jobs/a2_vpfilter.sh" || exit 4
 bash "$FINETUNE/jobs/granary_build.sh" || exit 5
 "$PY" "$FINETUNE/eou/pseudo_subsets.py" --pool $YG/train_yg.teacher.json --out $YG/subsets | tail -12
+G6=()
+if [ "${POOL6:-1}" = 1 ]; then   # same arguments as c_scale.sh's build (deterministic shard selection)
+    YG_OUT=$YG6 YG_AUDIO=/dev/shm/mix/it-yg6 YG_EXT=flac YG_DIRS=it100,it101 YG_SPREAD=60,55 YG_HOURS=235 YG_WORKERS=8 \
+        YG_MIN_FREE_GB=4 bash "$FINETUNE/jobs/granary_build.sh" || exit 5
+    "$PY" "$FINETUNE/eou/pseudo_subsets.py" --pool $YG6/train_yg.teacher.json --out $YG6/subsets | tail -12
+    G6=($YG6/train_yg.teacher.json "$YG6/subsets/yg_agree<=15.json")
+fi
 # clean-it holdout (mTEDx + ITALIC; deterministic selection, ~1.8 GB of downloads, scored post hoc only)
 [ -s $FT_ROOT/manifests/eval_tedx_it.json ] && [ -s $FT_ROOT/manifests/eval_italic_it.json ] || \
     timeout 5400 "$PY" "$FINETUNE/eou/prepare_clean_it.py" --out $FT_ROOT/manifests --audio /dev/shm/clean-it | tail -3
-"$PY" - $MX/train_vp.teacher.json $YG/train_yg.teacher.json $YG/subsets/yg_agree\<=15.json <<'PY' || exit 6
+"$PY" - $MX/train_vp.teacher.json $YG/train_yg.teacher.json $YG/subsets/yg_agree\<=15.json "${G6[@]}" <<'PY' || exit 6
 import json, os, sys
 bad = 0
 for p in sys.argv[1:]:
