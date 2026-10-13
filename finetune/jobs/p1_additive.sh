@@ -36,6 +36,8 @@ else:
 print(f"{w:.4f}", steps, ",".join(f"{p}:{w * h / H:.4f}" for p, h, _ in hd))
 PY
 )
+# FIX_STEPS: same mix (W), longer/shorter schedule; A2 is then NOT held at 8000 steps' worth (schedule scaling)
+[ -n "${FIX_STEPS:-}" ] && STEPS=$FIX_STEPS
 TAG=${TAG:-it-p1-add$(python3 -c "print(int(round($W * 100)))")}
 MIX=$(python3 -c "
 w = $W; a2 = [('$MF/train_40h.json', .35), ('$MX/train_cv.json', .30), ('$MX/train_vp_t50.json', .20), ('$MX/train_fleurs.json', .15)]
