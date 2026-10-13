@@ -4,6 +4,7 @@
 # verified archival pass, a survival bundle (logs, manifests, metrics, audits, Mynah evals, teacher
 # scores -- no audio, no weights) uploaded and size-verified, the repo listing, token removed.
 # CKPT_TAGS = regex of runs whose last.ckpt is kept (resume points); SQUASH=1 [PRUNE='--delete glob ...'] at the end.
+# TAR_EXCLUDE = extra tar flags, e.g. '--exclude=yg_shards' (the Granary shard caches are rebuilt from the public set).
 #   WAIT_LOG=/root/ft/logs/granary_ab.log WAIT_FOR=GRANARY-AB-DONE BUNDLE=survival-2026-10-10 \
 #     tmux new -d -s close 'bash finetune/jobs/close_day.sh'
 set -u
@@ -18,7 +19,7 @@ timeout 7200 $PY $F/common/hf_archive.py --repo $REPO --ft-root $FT --token-file
     | grep -E "uploaded|VERIFY|pass done|Error" | tail -40
 cd /root
 tar czf /root/$B.tgz --exclude="*.nemo" --exclude="*.ckpt" --exclude="*.wav" --exclude="*.parquet" --exclude="*.safetensors" \
-    --exclude="eouw*" --exclude="stream_wavs" --exclude="ft/analysis/src" --exclude="*.arpa" \
+    --exclude="eouw*" --exclude="stream_wavs" --exclude="ft/analysis/src" --exclude="*.arpa" ${TAR_EXCLUDE:-} \
     ft/runs ft/logs ft/manifests ft/mix ft/ceiling ft/audit-a0 ft/m1* ft/analysis res 2>/dev/null
 ls -la /root/$B.tgz
 $PY - "$REPO" "/root/$B.tgz" <<'PYEOF'
