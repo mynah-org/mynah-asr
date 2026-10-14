@@ -7,6 +7,7 @@
 # Scale mode (prepare_mix.py incremental mode), on when any of YG_DIRS / YG_SPLIT / YG_EXT / YG_HOURS is set:
 #   YG_DIRS=it000,it100,it101 YG_SPREAD=70,250,250 (one N per dir) YG_SPLIT=20 (clips > 20 s cut at
 #   pauses) YG_EXT=flac YG_HOURS=450 (no new shard once the pool has 450 h)
+#   YG_EXCLUDE=it000:70,it100:60,it101:55 (skip the shards of it-yg + it-yg6: a disjoint pool)
 #   YG_NO_TEACHER=1 (download/cut only, no GPU lock) [YG_MIN_FREE_GB=4 YG_WORKERS=6 YG_TIMEOUT=10800 TEACHER_TIMEOUT=7200 SHM_MIN_GB=2]
 # Restartable and growable: done shards are cached in $O/yg_shards; the teacher reuses every score it
 # has ($O/teacher_archive.json = the archived pool scores, copied once; the last output; an interrupted
@@ -21,6 +22,7 @@ NEW=; X=(); TPY=python3
 [ -n "$YG_SPLIT" ] && { NEW=1; X+=(--yg-split-long "$YG_SPLIT"); }
 [ -n "$YG_EXT" ] && { NEW=1; X+=(--audio-ext "$YG_EXT"); }
 [ -n "$YG_HOURS" ] && { NEW=1; X+=(--yg-hours "$YG_HOURS"); }
+[ -n "$YG_EXCLUDE" ] && { NEW=1; X+=(--yg-exclude-spread "$YG_EXCLUDE"); }
 [ -n "$NEW" ] && { X+=(--yg-min-free-gb "${YG_MIN_FREE_GB:-4}"); TPY=$PY; }   # $PY has soundfile (FLAC)
 echo "== granary build: $SPREAD spread shards, clips <= $MAXS s ${X[*]:+${X[*]} }$(date +%T)"
 timeout "${YG_TIMEOUT:-10800}" "$PY" "$FINETUNE/eou/prepare_mix.py" --lang it --out $O --audio $AUD --cv-hours 0 --vp-hours 0 \

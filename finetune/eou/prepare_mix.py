@@ -36,6 +36,8 @@ Granary (yg) at scale, incremental mode: any of --yg-dirs / --yg-split-long / --
     parquet is deleted right after extraction (as before). A rerun skips cached shards, so
     re-running with a larger --yg-hours (or more dirs) grows the pool as a superset: cached
     shards are admitted first, then new ones in spread-first order, round-robin over the dirs.
+  - --yg-exclude-spread it000:70,it100:60,it101:55 drops the shards another pool's spread selected
+    (it-yg + it-yg6), so a larger spread builds a pool of videos no earlier pool has seen.
   - --yg-hours H: no new shard is started once the admitted hours (+ the in-flight estimate)
     reach H; granularity = whole shards. --yg-min-free-gb G: same stop when the --audio
     filesystem has < G GB free.
@@ -291,6 +293,14 @@ def yg_incremental(a, spread, audio, tmp, out):
         for x in a.yg_shards.split(","):
             d, i = x.split(":") if ":" in x else (dirs[0], x)
             per[d].append(lists[d][int(i)])
+    if a.yg_exclude_spread:   # drop the shards other pools already use (same per-dir spread formula)
+        for x in a.yg_exclude_spread.split(","):
+            d, n = x.split(":")
+            fs = lists.get(d) or list_files(YG_REPO, f"data/{d}/ast")
+            used = {fs[i] for i in {round(i * (len(fs) - 1) / max(1, int(n) - 1)) for i in range(min(int(n), len(fs)))}}
+            if d in per:
+                k = len(per[d]); per[d] = [f for f in per[d] if f not in used]
+                print(f"== yg: exclude {d}:{n} -> {k - len(per[d])} of {k} selected shards dropped", flush=True)
     cache = out / "yg_shards"
     cache.mkdir(parents=True, exist_ok=True)
     cpath = lambda rel: cache / f"{rel.split('/')[1]}-{Path(rel).stem}.json"  # noqa: E731
@@ -385,6 +395,8 @@ def main():
     ap.add_argument("--yg-spread", default="", help="instead of --yg-shards: N shards evenly spread over the language "
                     "(incremental mode: one N per --yg-dirs entry, or one N over all of them)")
     ap.add_argument("--yg-dirs", default="", help="incremental mode: Granary dirs, e.g. it000,it100,it101 (default <lang>000)")
+    ap.add_argument("--yg-exclude-spread", default="", help="incremental mode: dir:N,... shards to skip = the spread "
+                    "selection of other pools (e.g. it000:70,it100:60,it101:55 = it-yg + it-yg6): a disjoint new pool")
     ap.add_argument("--yg-split-long", type=float, default=0, help="incremental mode: clips > S s cut at pauses into pieces <= S s")
     ap.add_argument("--yg-piece-min-s", type=float, default=2.0, help="shortest piece kept by --yg-split-long")
     ap.add_argument("--yg-vad", default="auto", choices=("auto", "silero", "energy"), help="pause detector of --yg-split-long "
