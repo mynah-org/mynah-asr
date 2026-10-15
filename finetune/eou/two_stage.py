@@ -275,6 +275,10 @@ def lr_factor(s):
 
 
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
+group_names = (["decoder+joint"] + [f"encoder-{i}" for i in range(1, len(groups) - 1 - (ctc_head is not None))]
+               + (["encoder"] if len(groups) - (ctc_head is not None) == 2 else []))[: len(groups) - (ctc_head is not None)] \
+    + (["ctc_head"] if ctc_head is not None else [])
+lr_auc = [0.0] * len(groups)   # integrated LR per parameter group (sum over optimizer steps)
 print("== trainable", sum(p.numel() for g in groups for p in g["params"]) / 1e6, "M", flush=True)
 
 
@@ -450,6 +454,8 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             eg = [p_.grad.norm() for p_ in m.encoder.parameters() if p_.grad is not None]
             enc_gn = float(torch.norm(torch.stack(eg))) if eg else 0.0
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
+        for gi, g in enumerate(opt.param_groups):
+            lr_auc[gi] += g["lr"] if any(p_.grad is not None for p_ in g["params"]) else 0.0
         opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
         max_clip_s = max(max_clip_s, float(lens.max()) / 16000)
         if step % 25 == 0:
@@ -498,6 +504,7 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             rec["aborted"] = True
         json.dump({"args": vars(a), "log": log, "wall_s": round(time.time() - t0, 1), "audio_h_seen": round(seen_s / 3600, 3),
                    "audio_h_per_gpu_h": round(seen_s / (time.time() - t0), 1),
+                   "lr_auc": {n_: round(v_, 4) for n_, v_ in zip(group_names, lr_auc)},
                    "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                    "peak_reserved_gb": round(torch.cuda.max_memory_reserved() / 1e9, 2), "max_clip_s": round(max_clip_s, 2)},
                   open(out / "metrics.json", "w"), indent=1)

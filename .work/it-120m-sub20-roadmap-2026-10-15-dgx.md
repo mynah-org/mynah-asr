@@ -140,8 +140,8 @@ into far substitutions and insertions (VP S_far 17.0 -> 19.3, I 5.1 -> 6.7; CV +
 Annealed CTC (strong early, -> 0) stays an untested hypothesis, low priority.
 
 Full report: `arm_report.py` output (DGX `~/ft/analysis/arms/r0_r2_1k.md`), copied below in short form only.
-Artifacts (checkpoints @1k, per-clip dumps, logs) live on the DGX under `~/ft/{runs,analysis,logs}` (the DGX token
-is read-only: not on the Hub).
+Artifacts on the private Hub repo: `runs/dgx-r0-ctl-1k`, `runs/dgx-r2-ctc01-1k` (final.nemo + metrics.json),
+`results/dgx-2026-10-15/{analysis,logs}` (lab 1 dumps, N-best dumps, arm dumps and reports, all logs).
 
 ## Why R1 (WSD at an 8k horizon) was NOT run, and the next experiment
 
@@ -152,9 +152,34 @@ tested at budgets where the decay actually happens. Next GPU session (DGX ~25 mi
 - Budget B = 2000, every arm's schedule COMPLETES at B (`--steps 2000`, evals 500/1000/1500/2000), A2 mix, seed 0:
   - S0 `--steps 2000` (cosine to B: the control at that budget);
   - S1 `--steps 2000 --lr-shape wsd --decay-frac 0.2` (flat then short decay);
-  - S2 S0 with peak LRs x2 (`--enc-lr 4e-4 --lr 6e-4`): integrated-LR hypothesis.
+  - S2 S0 with the ENCODER peak LR x2 only (`--enc-lr 4e-4`, decoder+joint stay 3e-4): the E3 lesson was encoder
+    plasticity; doubling both would confound it.
+  Every run now writes `lr_auc` (sum of LR over optimizer steps, per parameter group) in metrics.json: the
+  integrated-LR-starvation hypothesis is read from it, not from nominal peak LRs.
   Compare against each other at 2k AND against R0's 8k-horizon curve at the same steps; report integrated LR per
   group. Reference point: E3-8k reached 39.77 at 2k and 35.53 at 3k on the L40S.
 - Pre-registered bands (vs S0 at 2k, harness macro greedy, flushed): lever <= -2.0; promising -1..-2; null +-1.
 - If schedule is null too: curriculum / bounded hard-example sampling (teacher-good / student-bad band).
 - Untouched holdout needed before any final claim (clean-it is now a research-development bank).
+
+## Result: minimum sufficient trailing flush on C250-36k (OBSERVED; harness = dev, clean = contaminated bank)
+
+| trailing silence | +encoder frames (80 ms) | harness | clean | tedx (D) | italic |
+|---|---|---|---|---|---|
+| 0 | 0 | 22.30 | 23.76 | 23.08 (9.02) | 24.44 |
+| 40 ms | 0.5 | 22.20 | 23.25 | 22.82 (8.82) | 23.67 |
+| 80 ms | 1 | **22.16** | 22.82 | 22.36 (8.67) | 23.29 |
+| 120 ms | 1.5 | 22.20 | 22.84 | 22.13 (8.38) | 23.54 |
+| 160 ms | 2 | 22.22 | 22.66 | 21.88 (8.31) | 23.45 |
+| 240 ms | 3 | 22.21 | 22.16 | 21.32 (8.03) | 23.00 |
+| 320 ms | 4 | 22.22 | 22.02 | 21.04 (7.87) | 23.00 |
+| 500 ms | 6.2 | 22.21 | 21.76 | 20.71 (7.75) | 22.80 |
+| 1000 ms | 12.5 | 22.23 | 21.63 | 20.47 | 22.80 |
+
+- The harness saturates after one encoder frame (its read clips already end in silence) and CANNOT select this knob;
+  clean-it keeps improving to ~0.5-1 s (TEDx segments end on speech, often mid-word). Most of the gain is in the
+  first 1-4 frames (clean -0.9 by 80 ms, -1.7 by 320 ms).
+- Reading: the end-of-input loss is real and grows with how abruptly the clip ends; a production finaliser should
+  feed >= 0.3-0.5 s of silence (or the equivalent zero-input encoder steps) before the final transcript. A fresh
+  holdout with natural end-of-utterance boundaries is needed to fix the number without the contaminated bank.
+- All future evals report raw EOF AND 0.5 s flush; historical numbers are kept as raw EOF.
