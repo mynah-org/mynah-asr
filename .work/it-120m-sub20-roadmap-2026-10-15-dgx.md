@@ -244,3 +244,30 @@ Next if additive: promote the combined recipe to an 8k-horizon run and compare a
 - **S3-4k — horizon**: S3's recipe with `--steps 4000` (WSD decay over the last 800). Question: does the gain hold
   with more budget? Reference: E3-8k harness greedy 31.36 at 8k. **Strong**: <= 31.4 at 4k (E3-8k quality at half
   the steps); **good**: 31.4-33.0; **weak**: > 33.0 (then the 2k advantage is mostly a fast start).
+
+## Result: S4 (encoder 8e-4 @2k) and S3-4k (OBSERVED)
+
+| arm | 500 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | lr_auc enc | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S3 WSD + enc 4e-4, 2k | 49.79 | 42.02 | 39.54 | 35.64 | | | | | 0.70 | 784 |
+| **S4** WSD + enc 8e-4, 2k | 47.51 | 41.15 | 38.35 | **34.46** | | | | | 1.40 | 793 |
+| **S3-4k** WSD + enc 4e-4, 4k | 49.26 | 41.20 | 38.96 | 36.42 | 36.36 | 33.40 | 31.02 | **29.96** | 1.40 | 1583 |
+
+- **S4: frontier still rising** (-1.18 vs S3; band <= -1.0, at the edge). No collapse: empties 4-6 / 730, encoder grad
+  norm lower than S3 (96 vs 126 late). Gains on MLS (S_far 11.6 -> 9.9); VP / TEDx about flat. The optimum
+  encoder LR is >= 8e-4 at this budget; the next step up (1.2e-3 or 1.6e-3) must show where it turns.
+- **S3-4k: STRONG** (pre-registered <= 31.4): harness greedy **29.96** at 4k (flushed 29.97) vs E3-8k's 31.36 at 8k:
+  better than the old 8k recipe with half the steps (4000 x 16 clips = ~187 audio h, 26 min of L40S). Clean-it
+  (contaminated) flushed 33.55. A transient dip at 2500 (36.36, 18 empties) during the flat phase recovers by 3000:
+  watch empties in longer flat phases.
+- Same encoder AUC (1.40) at 2k (S4 34.46) and at 4k-halfway (S3-4k 36.42 at 2k): AUC is not the whole story; the
+  terminal decay matters (most of each run's gain lands in its last 20 %).
+- Data note: these are A2-only (MLS/CV/VP/FLEURS ~120 h). The C250 long runs add ~228 h of Granary; the recipe
+  should be promoted onto the C250 mix and compared with C250-20k (25.90 harness greedy) at <= 8k steps.
+
+### Proposed next (not launched)
+
+1. S5 = S3-4k with encoder 8e-4 (both levers at their current best) at 4k — one arm, 26 min.
+2. Encoder LR frontier at 2k: 1.6e-3 — one arm, 13 min.
+3. Promotion: best recipe on the C250 mix (needs the two Granary pools; ~55 GB, fits this 84 GB box) at 8k,
+   vs C250-20k / C250-36k. Pre-register before launch.
