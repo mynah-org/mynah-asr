@@ -280,3 +280,25 @@ Next if additive: promote the combined recipe to an 8k-horizon run and compare a
 - **S6 boundary probe** = S4 with `--enc-lr 1.6e-3` at 2k. NOT a promotion candidate: it locates the LR boundary.
   vs S4 (34.46): still rising <= -1.0; flat +-1.0; overshoot > +1.0 or empties > 5 % or a NaN/collapse.
 After these two: no more A2 micro-tuning; the next run is the promotion on the C250 mix (pre-registered separately).
+
+## Roadmap toward ~10 % (agreed 2026-10-15; phases gate on ORACLE@8, not only greedy)
+
+Error budget at C250-36k (harness greedy / beam-8 / oracle-8 = 22.3 / 20.5 / 16.25; clean raw 23.7 / 22.0 / 15.1, flushed
+greedy 21.8): candidate generation sets an oracle floor ~15; ranking/search costs ~5; finalisation ~2 (now fixed in
+eval). Rule: oracle does not move -> work on encoder / data / KD; oracle moves but beam does not -> decoder / ranking.
+Wall target: oracle@8 < 10 first, then turn it into 1-best. 1-5 % only as a separate, domain-restricted experiment.
+
+- A. Optimizer (today): S5 / S6 -> freeze the winning recipe. No further A2 micro-tuning.
+- B. Exposure: winner recipe on the C250 mix at 8k (then 16k if still steep) vs C250-20k / 36k (raw + flushed,
+  greedy / beam / oracle). Pre-register before launch.
+- C. Curriculum: bucketed dynamic sampling (easy / near-S / far-S / deletion-heavy / empty / teacher-disagreement),
+  up-weighting "teacher right, student wrong, label credible"; never up-weight alignment garbage (VP offsets).
+- D. it-yg7 500 h: teacher- and student-guided selection (teacher quality, student-teacher disagreement, deletion
+  ratio, duration, source diversity, near-duplicates), not uniform addition (OLDREP: more videos != better).
+- E. True KD: encoder representation distillation from Nemotron (both FastConformer, 80 ms frames: alignment is a
+  projection 512 -> teacher dim + length match; cosine/MSE; lambda annealed to 0), teacher cost reported apart.
+  Then N-best / sequence KD with teacher scores.
+- F. Ranking: only once oracle@8 is low enough; discriminative N-best KD / reranking.
+- G. EOU stage 2 on the best plain checkpoint (EOU-v3 low decoder/joint LR recipe).
+- Holdout: build a FINAL-IT untouched set NOW (sources disjoint from training and from today's analyses), freeze its
+  manifest hash in this file and do not score it until a final claim. clean-it is a development bank from today on.
