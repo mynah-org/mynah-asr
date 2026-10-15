@@ -271,3 +271,12 @@ Next if additive: promote the combined recipe to an 8k-horizon run and compare a
 2. Encoder LR frontier at 2k: 1.6e-3 — one arm, 13 min.
 3. Promotion: best recipe on the C250 mix (needs the two Granary pools; ~55 GB, fits this 84 GB box) at 8k,
    vs C250-20k / C250-36k. Pre-register before launch.
+
+### S5 and S6 pre-registration (2026-10-15 ~12:55 UTC, before results)
+
+- **S5** = S3-4k with `--enc-lr 8e-4` (WSD, decay last 20 %, 4k). Bands vs S3-4k (29.96 at 4k, harness greedy raw):
+  **win** <= -1.0 -> freeze S5 as the recipe and promote it to the C250 mix; **flat** +-1.0 -> keep 4e-4 (lower risk);
+  **worse** > +1.0. Also report the dips/empties in the flat phase (S3-4k had 18 empties at 2500).
+- **S6 boundary probe** = S4 with `--enc-lr 1.6e-3` at 2k. NOT a promotion candidate: it locates the LR boundary.
+  vs S4 (34.46): still rising <= -1.0; flat +-1.0; overshoot > +1.0 or empties > 5 % or a NaN/collapse.
+After these two: no more A2 micro-tuning; the next run is the promotion on the C250 mix (pre-registered separately).
