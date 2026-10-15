@@ -183,3 +183,38 @@ tested at budgets where the decay actually happens. Next GPU session (DGX ~25 mi
   feed >= 0.3-0.5 s of silence (or the equivalent zero-input encoder steps) before the final transcript. A fresh
   holdout with natural end-of-utterance boundaries is needed to fix the number without the contaminated bank.
 - All future evals report raw EOF AND 0.5 s flush; historical numbers are kept as raw EOF.
+
+## Result: schedule tournament @2k (OBSERVED, L40S Vast, same box/seed/data/budget)
+
+Box: fresh L40S (8 cores, 84 GB disk); A2 data rebuilt and gated (all audio present, VP t50 from the archived scores).
+First launch crashed at step 1 (numba NVVM 12.9 vs torch nvJitLink 12.8): fixed by the 12.9 toolchain, now pinned
+and gated in prov.sh. The arm logs lost their step lines (grep treated NeMo output as binary; now `grep -a`), so
+no RNNT-loss / encoder-grad-norm windows for these three arms; metrics.json, lr_auc and the dumps are complete.
+
+In-run harness macro greedy WER (raw EOF), schedules COMPLETING at 2k (warmup 100):
+
+| arm | difference | 500 | 1000 | 1500 | 2000 | lr_auc dec+joint / encoder | wall s |
+|---|---|---|---|---|---|---|---|
+| S0 | cosine 2k (control) | 51.10 | 44.17 | 42.19 | **41.96** | 0.289 / 0.192 | 806 |
+| S1 | WSD, decay last 20 % | 51.39 | 42.36 | 40.14 | **38.13 (-3.83)** | 0.526 / 0.351 | 784 |
+| S2 | encoder peak LR x2 (4e-4) | 48.17 | 40.88 | 39.55 | **38.85 (-3.11)** | 0.289 / 0.385 | 785 |
+
+0.5 s flush, harness: S0 41.98, S1 38.17, S2 38.84. Clean-it (contaminated, post hoc, flushed): S0 44.50, S1 40.94,
+S2 41.66. For scale: L40S E3-8k (cosine 8k) was 39.77 at 2k and 35.53 at 3k.
+
+- Both are LEVERS (pre-registered <= -2.0 vs S0). Curve shapes differ: S2's advantage appears from 500 steps and
+  stays ~3 (-2.9 / -3.3 / -2.6 / -3.1): faster encoder adaptation from the start. S1 equals S0 at 500 (identical
+  LR there), then grows (-1.8 / -2.1 / -3.8): the gain comes from holding the peak and decaying late.
+- Both raise the ENCODER integrated LR to ~0.35-0.39 (S0 0.19): consistent with the integrated-LR-starvation
+  hypothesis (S1 also doubles the decoder+joint AUC, so S1 alone cannot attribute it to the encoder; S2 can).
+- Error composition (harness, raw): the gains are mostly FAR substitutions (MLS S_far 14.3 -> 12.4 / 12.1, VP
+  16.5 -> 13.9 / 13.6, CV 17.2 -> 15.8 / 15.6) with near substitutions and deletions down a little: real lexical /
+  acoustic learning, not a deletion -> substitution trade. Empties rise slightly on VP (0.8 -> 3.1 %).
+
+### S3 pre-registration (launched 11:40 UTC, before its numbers): WSD + encoder 4e-4 @2k
+
+`--steps 2000 --lr-shape wsd --decay-frac 0.2 --enc-lr 4e-4`, everything else as S0. Question: are the two levers
+additive? Bands vs the best single arm S1 (38.13, harness macro greedy raw at 2k): **additive** <= -1.5;
+**partly additive** -0.5..-1.5; **redundant** within +-0.5; **overshoot** > +0.5 (then: longer warmup or enc 3e-4).
+Next if additive: promote the combined recipe to an 8k-horizon run and compare against E3-8k / C250 trajectories
+(target: E3-8k's 8k quality in <= 4k steps).
