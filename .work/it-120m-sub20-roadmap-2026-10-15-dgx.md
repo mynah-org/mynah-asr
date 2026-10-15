@@ -340,3 +340,33 @@ Primary = harness oracle@8 and greedy (raw); the reading:
   only speed; oracle@8 <= 12 on harness AND clean -> switch priorities to teacher/student + ranking (roadmap E/F);
 - **null**: harness greedy > 25.90 (the A2 gain does not survive the larger mix).
 Stop after phase B and report before any further training.
+
+## Result: phase B — W4 on the C250 mix at 8k (OBSERVED, L40S Japan, 2026-10-15)
+
+Same mix as C250-20k/36k (W 0.4388, identical pools 28,573 + 38,140 clips and weights), W4 recipe, 8k steps, 3714 s
+(62 min), 401.6 processed audio hours, lr_auc dec+joint 2.10 / encoder 2.80. Probes (greedy / beam-8 / oracle-8):
+
+| run | steps | harness raw | harness 0.5 s flush | clean raw | clean 0.5 s flush |
+|---|---|---|---|---|---|
+| **W4-C250-8k** | 8k | **26.12 / 23.67 / 19.43** | 26.17 / 23.72 / 19.51 | 27.29 / 25.05 / 17.45 | 25.96 / 23.85 / 16.45 |
+| C250-20k | 20k | 25.90 / 22.96 / 18.98 | — | 26.48 / 23.76 / 17.11 | — |
+| C250-36k (re-probed here) | 36k | 22.27 / 20.54 / 16.26 | 22.21 / 20.56 / 16.25 | 23.73 / 22.00 / 15.12 | **21.73 / 20.23 / 13.71** |
+
+In-run harness val at equal steps (raw): W4 44.16 / 38.02 / 32.17 / 29.51 / 26.11 at 1k / 2k / 4k / 6k / 8k vs the
+C250-36k trajectory 53.89 / 43.08 / 34.41 / 31.54 / 29.07 (then 27.84 @12k, 25.43 @16k, 23.90 @20k, 22.37 @36k).
+
+- **Pre-registered reading: NULL** (harness greedy 26.12 > 25.90, by 0.22): W4 at 8k does NOT beat C250-20k, and
+  oracle@8 (19.43) is worse than C250-36k (16.26): no representation shift.
+- What it is instead: C250-20k quality within 0.2-0.8 in 2.5x fewer steps (62 vs ~150 L40S-min), and ~3 points ahead of
+  the long cosine at the same step; W4@8k sits where the 36k-cosine run was at ~14k steps.
+- The A2 lesson (4k beats the old 8k) does NOT transfer as "8k beats 20k" on a 3x larger pool: at 8k the model sees the
+  357 h pool ~1.1 times; the steep part of the C250 curve is still exposure-limited. W4 compresses the schedule, it does
+  not remove the need for exposure on the bigger mix.
+- Flush (same-box reference): C250-36k clean flushed **21.73 / 20.23 / 13.71** — the current best model with the
+  corrected finalisation; the harness is flat under flush (its clips end in silence).
+- Next candidates (NOT launched; pre-register first): W4 at 16k on C250 (does the faster schedule beat C250-36k at
+  less than half its steps?), or keep 8k and move to curriculum / guided data selection (phase C/D). Clean-it stays a
+  development bank; a FINAL-IT holdout is still to be built.
+
+Artifacts: Hub `runs/l40s-it-w4-c250-8k` (final.nemo, metrics, probes), `results/l40s-jp-2026-10-15/{analysis,logs}`
+(C250-36k raw/flushed reference probes in analysis/phaseB).
