@@ -23,6 +23,8 @@ ap.add_argument("--per-set", type=int, default=200, help="dev sets: two_stage.py
 ap.add_argument("--report-per-set", type=int, default=100000)
 ap.add_argument("--penalties", default="-0.5,0,0.25,0.5,1,1.5,2")
 ap.add_argument("--max-symbols", type=int, default=10)
+ap.add_argument("--pre-pad-s", type=float, default=0.0, help="digital silence prepended to every clip (cold-start test)")
+ap.add_argument("--post-pad-s", type=float, default=0.0, help="digital silence appended to every clip (flush test)")
 ap.add_argument("--out", default="sweep.json")
 ap.add_argument("--dump", default="")
 a = ap.parse_args()
@@ -95,7 +97,9 @@ with torch.no_grad():
             xs = []
             for r in ch:
                 x, _ = sf.read(r["audio_filepath"], dtype="float32")
-                xs.append(x.mean(1) if x.ndim > 1 else x)
+                x = x.mean(1) if x.ndim > 1 else x
+                xs.append(np.concatenate([np.zeros(int(a.pre_pad_s * 16000), np.float32), x,
+                                          np.zeros(int(a.post_pad_s * 16000), np.float32)]))
             X = torch.zeros(len(xs), max(len(x) for x in xs))
             for b, x in enumerate(xs):
                 X[b, :len(x)] = torch.from_numpy(x)
