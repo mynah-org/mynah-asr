@@ -302,3 +302,22 @@ Wall target: oracle@8 < 10 first, then turn it into 1-best. 1-5 % only as a sepa
 - G. EOU stage 2 on the best plain checkpoint (EOU-v3 low decoder/joint LR recipe).
 - Holdout: build a FINAL-IT untouched set NOW (sources disjoint from training and from today's analyses), freeze its
   manifest hash in this file and do not score it until a final claim. clean-it is a development bank from today on.
+
+## Result: S5 and S6 (OBSERVED) — optimizer recipe frozen
+
+| arm | 500 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | lr_auc enc | empties (last) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S3-4k enc 4e-4 | 49.26 | 41.20 | 38.96 | 36.42 | 36.36 | 33.40 | 31.02 | 29.96 | 1.40 | 5 |
+| **S5** enc 8e-4, 4k | 48.39 | 41.01 | 37.11 | 36.17 | 35.39 | 32.64 | 31.03 | **29.35** | 2.80 | 6 |
+| S4 enc 8e-4, 2k | 47.51 | 41.15 | 38.35 | 34.46 | | | | | 1.40 | 6 |
+| **S6** enc 1.6e-3, 2k | 50.26 | 44.90 | 41.37 | **35.91** | | | | | 2.81 | 9 |
+
+- **S5: FLAT** (-0.61 vs S3-4k; band +-1.0). Better on MLS (26.06 vs 27.56, S_far 8.6 -> 7.8), VP deletions / empties
+  slightly up (empties 4.6 % on VP). No dip at 2500 this time (35.39). Per the pre-registration: keep 4e-4.
+- **S6: OVERSHOOT** (+1.45 vs S4): worse from 500 steps on (50.3 vs 47.5), more empties, VP deletions 18.5. The
+  encoder LR boundary at this batch / horizon lies between 8e-4 and 1.6e-3; at 4k, 4e-4 and 8e-4 are equivalent.
+- **Frozen recipe "W4"**: stock init, whole encoder 4e-4 + decoder/joint 3e-4, AdamW (0.9, 0.98) wd 1e-3, bs 16,
+  warmup 5 % then flat peak, cosine decay over the last 20 % (`--lr-shape wsd --decay-frac 0.2 --enc-lr 4e-4`).
+  A2-only, 4k steps: harness greedy 29.96 (E3-8k at 8k: 31.36); 26 min on an L40S.
+- Next = phase B: W4 on the C250 mix at 8k vs C250-20k (harness greedy 25.90, clean 26.48 raw) and C250-36k
+  (22.27 / 23.73 raw), greedy / beam-8 / oracle-8, raw and 0.5 s flush. Pre-register before launch.
