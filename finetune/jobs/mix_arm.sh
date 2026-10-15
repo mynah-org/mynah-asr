@@ -27,7 +27,7 @@ fi
 echo "== $TAG $(date +%T): extra flags: $*"; ln -sf $L/$TAG.log $L/train_cur.log
 STEPS=${STEPS:-4000}   # STEPS= lengthens the arm (cosine over the whole run, same eval cadence)
 timeout $((STEPS * 2 + 1800)) "$PY" "$FINETUNE/eou/two_stage.py" --tag "$TAG" --out $R --mix "$MIX" $POL --steps $STEPS --eval-every 500 \
-    --vals "$VALS" "$@" 2>&1 | grep --line-buffered -v -E "NeMo W|warn|Warning" > $L/$TAG.log
+    --vals "$VALS" "$@" 2>&1 | grep -a --line-buffered -v -E "NeMo W|warn|Warning" > $L/$TAG.log
 echo "   rc=${PIPESTATUS[0]}"; grep -E "done|Traceback|Error" $L/$TAG.log | tail -2
 python3 "$FINETUNE/eou/val_table.py" --col P40=$L/base-p40.log --col A0@3000=$R/plain-it-a0-mix/metrics.json:3000 \
     --col "$TAG@best=$R/plain-$TAG/metrics.json:$(python3 -c "import json; print([r for r in json.load(open('$R/plain-$TAG/metrics.json'))['log'] if r.get('saved')][-1]['step'])")" \

@@ -9,6 +9,9 @@
 # of the SAME torch build: nemo_toolkit[asr] does not pull it, prepare_it's resampler needs it) in the
 # background of the build. torch is pinned to 2.11.0+cu128, the build of every 2026-10 run: on a CUDA 13
 # driver setup.sh would keep PyPI's torch 2.14.1+cu130, which has no cu128 torchaudio (and changes the stack).
+# numba-cuda's RNNT kernels are linked at run time: NVVM and nvJitLink must be ONE CUDA release. Since 2026-10-15
+# numba-cuda pulls an NVVM 12.9 while torch cu128 pins nvJitLink 12.8 -> "nvvmAddNVVMContainerToProgram ... may need
+# newer version of nvJitLink" at the first RNNT loss; the 12.9 toolchain is pinned (also needed for sm_121 / GB10).
 # A fresh 32 GB L40S is ready in ~20-30 min.
 #   tmux new -d -s prov 'KEEP_TOKEN=1 bash /root/prov.sh 2>&1 | tee -a /root/res/prov.log'
 set -u
@@ -58,10 +61,19 @@ if step venv; then
       && FT_ROOT=/root/ft VENV=$V FORCE_TORCH=${FORCE_TORCH-1} TORCH_VERSION=${TORCH_VERSION-2.11.0} TORCH_CUDA=${TORCH_CUDA-cu128} \
          timeout 3000 bash finetune/canary/setup.sh \
       && VIRTUAL_ENV=$V uv pip install -q numba-cuda "numpy<2.4" silero-vad \
+      && VIRTUAL_ENV=$V uv pip install -q "nvidia-cuda-nvcc-cu12==12.9.86" "nvidia-cuda-nvrtc-cu12==12.9.86" \
+           "nvidia-cuda-runtime-cu12==12.9.79" "nvidia-nvjitlink-cu12==12.9.86" \
       && VIRTUAL_ENV=$V uv pip install -q --index-url https://download.pytorch.org/whl/cu128 \
            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
            "torchaudio==$($V/bin/python -c 'import torch; print(torch.__version__)')" \
       && $V/bin/python -c "import torch, torchaudio, scipy.signal; assert torch.cuda.is_available()" \
+      && $V/bin/python -c "
+import torch
+from nemo.collections.asr.losses.rnnt import RNNTLoss
+lp = torch.randn(2, 50, 11, 1027, device='cuda', requires_grad=True)
+out = RNNTLoss(num_classes=1026, loss_name='warprnnt_numba')(log_probs=lp, targets=torch.randint(0, 1026, (2, 10), device='cuda'),
+    input_lengths=torch.full((2,), 50, device='cuda'), target_lengths=torch.full((2,), 10, device='cuda'))
+out.sum().backward(); print('rnnt loss gate ok', float(out))" \
       && FT_ROOT=/root/ft $V/bin/python finetune/eou/prepare_mix.py --selftest \
       && cp finetune/eou/two_stage.py /root/eou-kit/plain_it2.py \
       && cp finetune/eou/export_to_mynah.sh /root/eou-kit/ && ok venv ) > $R/venv.log 2>&1 &
