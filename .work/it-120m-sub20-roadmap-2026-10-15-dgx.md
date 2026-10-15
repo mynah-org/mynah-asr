@@ -119,3 +119,42 @@ in-run val at 1k = 44.51 (R0 should land within ~1 of it).
 - Bands at 1k (harness macro greedy, in-run val and post-hoc flushed; R2 - R0): **lever** <= -2.0 with D not
   converted into S_far (S_far must not rise by more than half the D drop); **promising** -1.0..-2.0;
   **null** within +-1.0; **harmful** > +1.0. Null -> no 8k nursing: move to the schedule axis (R1, WSD).
+
+## Result: R0 vs R2 @1k (OBSERVED, GB10) — CTC 0.1 NULL
+
+Parity gate PASSED: R0 in-run harness val 65.48 / 55.33 / 45.34 at 250 / 500 / 1000 vs L40S E3-8k 64.96 / 53.76 /
+44.51 (+0.8 at 1k: hardware nondeterminism, same recipe/data/seed).
+
+| | R0 control | R2 CTC 0.1 | R2 - R0 |
+|---|---|---|---|
+| harness macro greedy, raw EOF | 45.34 | 46.12 | **+0.78 (NULL band)** |
+| harness macro greedy, 0.5 s flush | 45.41 | 46.20 | +0.79 |
+| harness CER | 16.05 | 15.52 | -0.53 |
+| harness empties (in-run val) | 8 | 3 | |
+| wall s / audio h (1k steps) | 1143 / 46.9 | 1150 / 46.9 | CTC is free |
+| enc grad norm, steps 500-1000 | 160 | 176 | +10 % |
+
+Mechanism: CTC cuts deletions (VP D 19.6 -> 14.5, TEDx 15.4 -> 12.8 per 100 words; fewer empties) but turns them
+into far substitutions and insertions (VP S_far 17.0 -> 19.3, I 5.1 -> 6.7; CV +2.4 overall). The curve crosses
+(R2 -0.8 at 500, +0.8 at 1k): within noise. Per the pre-registration: fixed-weight CTC is NULL; not nursed to 8k.
+Annealed CTC (strong early, -> 0) stays an untested hypothesis, low priority.
+
+Full report: `arm_report.py` output (DGX `~/ft/analysis/arms/r0_r2_1k.md`), copied below in short form only.
+Artifacts (checkpoints @1k, per-clip dumps, logs) live on the DGX under `~/ft/{runs,analysis,logs}` (the DGX token
+is read-only: not on the Hub).
+
+## Why R1 (WSD at an 8k horizon) was NOT run, and the next experiment
+
+With `--steps 8000`, the cosine is still at 96 % of peak at step 1000 (warmup ends at 400), so a flat-LR arm differs
+from R0 by < 4 % LR up to 1k: an R1 at 500-1000 steps cannot discriminate anything. Schedule hypotheses must be
+tested at budgets where the decay actually happens. Next GPU session (DGX ~25 min per 1k steps on A2):
+
+- Budget B = 2000, every arm's schedule COMPLETES at B (`--steps 2000`, evals 500/1000/1500/2000), A2 mix, seed 0:
+  - S0 `--steps 2000` (cosine to B: the control at that budget);
+  - S1 `--steps 2000 --lr-shape wsd --decay-frac 0.2` (flat then short decay);
+  - S2 S0 with peak LRs x2 (`--enc-lr 4e-4 --lr 6e-4`): integrated-LR hypothesis.
+  Compare against each other at 2k AND against R0's 8k-horizon curve at the same steps; report integrated LR per
+  group. Reference point: E3-8k reached 39.77 at 2k and 35.53 at 3k on the L40S.
+- Pre-registered bands (vs S0 at 2k, harness macro greedy, flushed): lever <= -2.0; promising -1..-2; null +-1.
+- If schedule is null too: curriculum / bounded hard-example sampling (teacher-good / student-bad band).
+- Untouched holdout needed before any final claim (clean-it is now a research-development bank).
