@@ -321,3 +321,22 @@ Wall target: oracle@8 < 10 first, then turn it into 1-best. 1-5 % only as a sepa
   A2-only, 4k steps: harness greedy 29.96 (E3-8k at 8k: 31.36); 26 min on an L40S.
 - Next = phase B: W4 on the C250 mix at 8k vs C250-20k (harness greedy 25.90, clean 26.48 raw) and C250-36k
   (22.27 / 23.73 raw), greedy / beam-8 / oracle-8, raw and 0.5 s flush. Pre-register before launch.
+
+## Phase B pre-registration (2026-10-15 ~13:50 UTC, before launch): W4 on the C250 mix at 8k
+
+Run `it-w4-c250-8k`: `p1_additive.sh` with the C250 external pools (it-yg + it-yg6 agree<=15, PASSES 1.5 -> W 0.4388,
+the C250-20k/36k mix unchanged), `FIX_STEPS=8000`, `P1_EXTRA="--lr-shape wsd --decay-frac 0.2 --enc-lr 4e-4"`
+(W4, frozen: NOT changed on intermediate results), seed 0, same box family (L40S). Probes: greedy / beam-8 / oracle-8
+on the harness and clean-it, raw EOF AND 0.5 s trailing flush; C250-36k is re-probed with the flush on the same box
+so both protocols have a same-box reference. Clean-it is a contaminated development bank: secondary.
+
+Baselines (raw EOF, greedy / beam-8 / oracle-8): C250-20k harness 25.90 / 22.96 / 18.98, clean 26.48 / 23.76 / 17.11;
+C250-36k harness 22.27 / 20.53 / 16.25, clean 23.73 / 22.00 / 15.11.
+
+Primary = harness oracle@8 and greedy (raw); the reading:
+- **compute compression**: W4-8k harness greedy <= 25.90 (C250-20k quality in 2.5x fewer steps);
+- **strong compression**: harness greedy <= 22.27 (C250-36k quality in 4.5x fewer steps);
+- **representation shift**: harness oracle@8 <= 15.25 (1.0 below C250-36k) — W4 changes candidate generation, not
+  only speed; oracle@8 <= 12 on harness AND clean -> switch priorities to teacher/student + ranking (roadmap E/F);
+- **null**: harness greedy > 25.90 (the A2 gain does not survive the larger mix).
+Stop after phase B and report before any further training.

@@ -36,6 +36,8 @@ ap.add_argument("--beam-alphas", default="", help="LM weights for beam (default:
 ap.add_argument("--blank-mode", default="lm_weighted_full", help="beam blank_lm_score_mode: lm_weighted_full | no_score")
 ap.add_argument("--skip-greedy", type=int, default=0)
 ap.add_argument("--threads", type=int, default=16)
+ap.add_argument("--post-pad-s", type=float, default=0.0, help="digital silence appended to every clip: lets the streaming "
+                "encoder emit the last tokens (0 = raw end of file, the historical protocol)")
 ap.add_argument("--out", default="fusion.json")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -94,7 +96,8 @@ with torch.no_grad():
             xs = []
             for r in ch:
                 x, sr = sf.read(r["audio_filepath"], dtype="float32")
-                xs.append(x.mean(1) if x.ndim > 1 else x)
+                x = x.mean(1) if x.ndim > 1 else x
+                xs.append(np.concatenate([x, np.zeros(int(a.post_pad_s * 16000), np.float32)]) if a.post_pad_s else x)
             L = max(len(x) for x in xs)
             X = torch.zeros(len(xs), L)
             for b, x in enumerate(xs):

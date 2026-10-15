@@ -36,6 +36,8 @@ else:
 print(f"{w:.4f}", steps, ",".join(f"{p}:{w * h / H:.4f}" for p, h, _ in hd))
 PY
 )
+# P1_EXTRA: extra two_stage.py flags appended last (they override POL), e.g. the W4 recipe
+#   P1_EXTRA="--lr-shape wsd --decay-frac 0.2 --enc-lr 4e-4"; PROBE_POST=0.5 also probes with that trailing silence.
 # FIX_STEPS: same mix (W), longer/shorter schedule; A2 is then NOT held at 8000 steps' worth (schedule scaling)
 [ -n "${FIX_STEPS:-}" ] && STEPS=$FIX_STEPS
 TAG=${TAG:-it-p1-add$(python3 -c "print(int(round($W * 100)))")}
@@ -46,16 +48,20 @@ echo "== p1_additive W=$W STEPS=$STEPS TAG=$TAG EXT=$EXT PASSES=${PASSES:-} $(da
 # clean-it is NEVER in the in-run evals (they pick final.nemo): it is scored post hoc only. (C itself had clean-200
 # in its 6-set selection mean; flat curve, identical clean-200 values at the chosen and the last step.)
 MIX="$MIX" POL="--freeze-enc 0 --enc-lr 2e-4 --lr 3e-4 --bs 16" STEPS=$STEPS SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" $TAG \
-    --max-dur 30 --eval-steps 100,250 --abort-wer 1000:85
+    --max-dur 30 --eval-steps 100,250 --abort-wer 1000:85 ${P1_EXTRA:-}
 rm -f $R/plain-$TAG/last.ckpt
 [ -s $R/plain-$TAG/final.nemo ] || exit 3
 gpu_lock
+for post in 0 ${PROBE_POST:-}; do
+sfx=$([ "$post" = 0 ] || echo "_post$post")
 for bank in harness clean; do
     case $bank in
         harness) V="mls=$MF/eval_mls_it.json,fleurs=$MF/eval_fleurs_it.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"; N=200 ;;
         clean) V="tedx=$MF/eval_tedx_it.json,italic=$MF/eval_italic_it.json"; N=100000 ;;
     esac
     timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" --nemo $R/plain-$TAG/final.nemo --vals "$V" --per-set $N \
-        --alphas 0 --beam-alphas 0 --beams 8 --threads 32 --out $R/plain-$TAG/probe_$bank.json 2>&1 | grep -E "^\{|Traceback|Error" | cut -c1-400
+        --alphas 0 --beam-alphas 0 --beams 8 --threads 32 --post-pad-s $post --out $R/plain-$TAG/probe_$bank$sfx.json 2>&1 \
+        | grep -E "^\{|Traceback|Error" | sed "s/^/post=$post /" | cut -c1-400
+done
 done
 echo "== P1-ADD-DONE $TAG $(date +%T)"
