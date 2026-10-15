@@ -87,6 +87,11 @@ ap.add_argument("--pre-pad-max", type=float, default=4.0)
 ap.add_argument("--pad-min", type=float, default=1.0)
 ap.add_argument("--pad-max", type=float, default=3.0)
 ap.add_argument("--fastemit", type=float, default=0.0)
+ap.add_argument("--ctc-weight", type=float, default=0.0, help="auxiliary CTC loss on the encoder output (training-only "
+                "linear head, not saved in final.nemo): loss = rnnt + w * ctc, both summed per utterance, batch mean")
+ap.add_argument("--lr-shape", default="cosine", choices=("cosine", "wsd"), help="wsd: warmup, flat peak LR, then a "
+                "cosine decay over the last --decay-frac of --steps (warmup-stable-decay)")
+ap.add_argument("--decay-frac", type=float, default=0.2)
 ap.add_argument("--tokenizer", default="", help="warm-started language SPE dir (tokenizer_eou.py output)")
 ap.add_argument("--accented", type=int, default=-1, help="accented targets (default: 1 with --tokenizer, else 0)")
 a = ap.parse_args()
@@ -252,9 +257,24 @@ else:
     groups.append({"params": list(m.encoder.parameters()), "lr": a.enc_lr or a.lr * 0.1})
 for p in m.preprocessor.parameters():
     p.requires_grad = False
+ctc_head = None
+if a.ctc_weight:
+    ctc_head = torch.nn.Linear(int(m.cfg.encoder.d_model), V + 1).to(dev)   # V pieces incl. <EOU>/<EOB>, blank = V
+    groups.append({"params": list(ctc_head.parameters()), "lr": a.lr})
 opt = torch.optim.AdamW(groups, betas=(0.9, 0.98), weight_decay=1e-3)
 warm = max(10, a.steps // 20)
-sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / a.steps))) * 0.99 + 0.01)
+
+
+def lr_factor(s):
+    if a.lr_shape == "wsd":
+        d0 = a.steps * (1 - a.decay_frac)
+        f = 1.0 if s < d0 else 0.5 * (1 + math.cos(math.pi * min(1.0, (s - d0) / max(1.0, a.steps - d0))))
+    else:
+        f = 0.5 * (1 + math.cos(math.pi * min(1.0, s / a.steps)))
+    return min(1.0, (s + 1) / warm) * f * 0.99 + 0.01
+
+
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
 print("== trainable", sum(p.numel() for g in groups for p in g["params"]) / 1e6, "M", flush=True)
 
 
@@ -420,12 +440,21 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             d, _, _ = m.decoder(targets=Y, target_length=ylens)
             j = m.joint(encoder_outputs=e, decoder_outputs=d)
         loss = loss_fn(log_probs=j.float(), targets=Y, input_lengths=el, target_lengths=ylens)
+        if ctc_head is not None:
+            lp = torch.log_softmax(ctc_head(e.transpose(1, 2).float()), -1).transpose(0, 1)   # [T, B, V + 1]
+            ctc = torch.nn.functional.ctc_loss(lp, Y, el, ylens, blank=V, reduction="sum", zero_infinity=True) / len(rs)
+            loss_rnnt = loss.detach()
+            loss = loss + a.ctc_weight * ctc
         opt.zero_grad(set_to_none=True); loss.backward()
+        if (step + 1) % 25 == 0:   # encoder gradient norm before clipping (does the auxiliary loss reach the encoder?)
+            eg = [p_.grad.norm() for p_ in m.encoder.parameters() if p_.grad is not None]
+            enc_gn = float(torch.norm(torch.stack(eg))) if eg else 0.0
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
         opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
         max_clip_s = max(max_clip_s, float(lens.max()) / 16000)
         if step % 25 == 0:
-            print(f"  step {step}/{a.steps} loss {loss.item():.3f} audio {seen_s / 3600:.2f} h "
+            print(f"  step {step}/{a.steps} loss {loss.item():.3f}"
+                  + (f" (rnnt {loss_rnnt.item():.3f} ctc {ctc.item():.3f})" if ctc_head is not None else "") + f" enc-gn {enc_gn:.2f} audio {seen_s / 3600:.2f} h "
                   f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB "
                   f"reserved {torch.cuda.max_memory_reserved() / 1e9:.1f} GB max-clip {max_clip_s:.1f} s", flush=True)
     if a.eval_only or step % a.eval_every == 0 or step == a.steps or step == a.stop_at or step in extra_evals:

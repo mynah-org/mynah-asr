@@ -92,3 +92,30 @@ diagnostic, not a selection):
 - Next (re-baseline): every model is re-scored with the dev-chosen trailing flush (0.5 s) before comparing; the
   micro-FT tournament (R0 control / R1 WSD schedule / R2-R3 CTC 0.1-0.25, then pre-roll) reports S_near / S_far / D / I
   per set, not only WER.
+
+## Method tournament: objective and R0 vs R2 pre-registration (2026-10-15, before results)
+
+Objective (reframed): a cheap, reproducible adaptation recipe English EOU120M -> language specialist that reaches
+most of a long run's accuracy in a fraction of the steps / processed audio / GPU time. The 36k is a reference,
+not the recipe. Arms are judged against the CONTROL AT THE SAME BUDGET (learning curve), one variable per arm.
+Every arm reports WER / CER / S_near / S_far / D / I / empty, audio hours, wall time and encoder grad norm
+(`diag/arm_report.py`), raw EOF and 0.5 s trailing flush. Dev = harness (in-run val + post-hoc); clean-it is
+post hoc only and now CONTAMINATED as a research-development bank (read many times today): a fresh untouched
+holdout is needed before any final claim.
+
+Common: E3 recipe (stock init, A2 mix MLS 40h .35 / CV .30 / VP-t50 .20 / FLEURS .15 — identical manifests to the
+L40S, VP t50 rebuilt from the archived scores and byte-checked), whole encoder 2e-4, decoder+joint 3e-4, bs 16,
+max-dur 20, seed 0, `--steps 8000` cosine, `--stop-at 1000`, evals at 250/500/1000. Cross-box anchor: L40S E3-8k
+in-run val at 1k = 44.51 (R0 should land within ~1 of it).
+
+- R0 control: no extra flag. Gate passed before launch: with `--ctc-weight 0` the patched trainer reproduces the
+  original losses bit for bit (317.981 / 236.349 at steps 25 / 50).
+- R2: `--ctc-weight 0.1` only. Hypothesis: a direct monotonic alignment signal on the encoder speeds Italian
+  acoustic adaptation. Mechanism checks (smoke, OBSERVED): CTC uses the encoder lengths and the RNNT targets /
+  lengths, blank = V (1026, same as RNNT), sum per utterance / batch (= RNNT `mean_batch`), training-only head
+  (the saved .nemo has the stock's 467 keys, none CTC); losses finite; per-utterance CTC ~2.5-3.5x RNNT early,
+  so w 0.1 is ~20-25 % of the total. Caveat: 80 ms frames vs ~9 Italian pieces/s: fast speech can make CTC
+  infeasible for a clip (zero_infinity drops it).
+- Bands at 1k (harness macro greedy, in-run val and post-hoc flushed; R2 - R0): **lever** <= -2.0 with D not
+  converted into S_far (S_far must not rise by more than half the D drop); **promising** -1.0..-2.0;
+  **null** within +-1.0; **harmful** > +1.0. Null -> no 8k nursing: move to the schedule axis (R1, WSD).
