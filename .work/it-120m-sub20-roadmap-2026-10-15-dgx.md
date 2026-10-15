@@ -218,3 +218,29 @@ additive? Bands vs the best single arm S1 (38.13, harness macro greedy raw at 2k
 **partly additive** -0.5..-1.5; **redundant** within +-0.5; **overshoot** > +0.5 (then: longer warmup or enc 3e-4).
 Next if additive: promote the combined recipe to an 8k-horizon run and compare against E3-8k / C250 trajectories
 (target: E3-8k's 8k quality in <= 4k steps).
+
+## Result: S3 = WSD + encoder 4e-4 @2k — ADDITIVE (OBSERVED)
+
+| arm | 500 | 1000 | 1500 | 2000 | lr_auc dec+joint / encoder |
+|---|---|---|---|---|---|
+| S0 cosine 2k | 51.10 | 44.17 | 42.19 | 41.96 | 0.289 / 0.192 |
+| S1 WSD | 51.39 | 42.36 | 40.14 | 38.13 | 0.526 / 0.351 |
+| S2 enc x2 | 48.17 | 40.88 | 39.55 | 38.85 | 0.289 / 0.385 |
+| **S3 WSD + enc x2** | 49.79 | 42.02 | 39.54 | **35.64** | 0.526 / 0.701 |
+
+- vs S1 -2.49 (pre-registered additive band <= -1.5); vs S0 -6.32. Flushed harness 35.75; clean-it (contaminated)
+  flushed 38.20 (S0 44.50). E3-8k (cosine 8k) needed ~3k steps for 35.53: S3 gets there in 2k.
+- Gains again mostly far substitutions (MLS S_far 14.3 -> 11.6, VP 16.5 -> 11.6, CV 17.2 -> 14.3) plus near ones.
+- Shape: S3 trails S2 at 500 (49.8 vs 48.2: flat peak vs cosine) and gains most in the final decay (-3.9 from 1500
+  to 2000). Encoder grad norm (logs now intact) 206 -> 126 over the run: no instability at 4e-4 flat.
+- The encoder's integrated LR keeps paying (0.19 -> 0.35/0.38 -> 0.70, WER 42.0 -> 38.1/38.9 -> 35.6): the
+  frontier is not found yet.
+
+### Next two arms, pre-registered (2026-10-15 ~12:00 UTC, before results)
+
+- **S4 — encoder LR frontier @2k**: S3 with `--enc-lr 8e-4` (encoder AUC ~1.4). Bands vs S3 (35.64): frontier still
+  rising <= -1.0; flat within +-1.0 (S3's 4e-4 is near the optimum); overshoot > +1.0 (or any collapse / empties
+  > 5 %) -> the optimum is below 8e-4.
+- **S3-4k — horizon**: S3's recipe with `--steps 4000` (WSD decay over the last 800). Question: does the gain hold
+  with more budget? Reference: E3-8k harness greedy 31.36 at 8k. **Strong**: <= 31.4 at 4k (E3-8k quality at half
+  the steps); **good**: 31.4-33.0; **weak**: > 33.0 (then the 2k advantage is mostly a fast start).
