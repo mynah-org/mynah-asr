@@ -370,3 +370,20 @@ C250-36k trajectory 53.89 / 43.08 / 34.41 / 31.54 / 29.07 (then 27.84 @12k, 25.4
 
 Artifacts: Hub `runs/l40s-it-w4-c250-8k` (final.nemo, metrics, probes), `results/l40s-jp-2026-10-15/{analysis,logs}`
 (C250-36k raw/flushed reference probes in analysis/phaseB).
+
+## Phase B2 pre-registration (2026-10-16, before launch): W4 on the C250 mix at 16k
+
+Run `it-w4-c250-16k`: identical to phase B (same pools, W 0.4388, W4 frozen, seed 0) except `FIX_STEPS=16000`
+(~2.2 passes over the 357 h pool). Box: RTX 6000 Ada 48 GB (Vast, Estonia; same AD102 family as the L40S); C250-36k
+is re-probed on the same box (raw + 0.5 s flush) as the reference. Question: does the faster schedule reach C250-36k
+quality at less than half its steps once exposure is no longer the limit?
+
+Primary = harness greedy and oracle@8 (raw EOF); reading:
+- **strong compression**: harness greedy <= 22.27 (C250-36k quality in 2.25x fewer steps) -> W4 becomes the default
+  schedule for every next phase (C/D/E run at 16k instead of 36k);
+- **partial**: 22.27 < greedy <= 23.90 (ahead of the 36k-cosine trajectory at 20k steps) -> W4 is a cheaper screening
+  schedule, final runs keep the long horizon;
+- **null**: greedy > 23.90 (the W4 advantage at 8k is a phase effect, not a better endpoint);
+- **representation shift**: harness oracle@8 <= 15.25 (1.0 below C250-36k), independent of the greedy reading.
+Secondary: clean-it (contaminated development bank) greedy/beam/oracle raw and flushed vs C250-36k flushed
+21.73 / 20.23 / 13.71. W4 is NOT changed on intermediate in-run numbers. Stop and report after B2.
