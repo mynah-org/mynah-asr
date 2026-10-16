@@ -7,6 +7,8 @@
 #    and the nested subsets (pseudo_subsets.py);
 # 5. the clean-it holdout bank (prepare_clean_it.py);
 # 6. gate: every scored clip's audio exists (the scores are only valid on the same clips).
+# SNAPSHOT=<name> (e.g. it-c250): steps 2-5 come from the data snapshot on the Hub (data_snapshot.sh) instead of
+# the public sources; the gate then covers the snapshot's manifests (the full teacher pools are not in it).
 #   FT_ROOT=/root/ft tmux new -d -s resume 'FT_ROOT=/root/ft bash finetune/jobs/resume_it.sh 2>&1 | tee -a /root/ft/logs/resume.log'
 . "$(dirname "$0")/gpu_lock.sh"
 HUB=${HUB:-gabrione/mynah-asr-canary-it-experiments}
@@ -33,6 +35,13 @@ if [ "${POOL6:-1}" = 1 ] && [ ! -s $YG6/train_yg.teacher.json ]; then
     mkdir -p $YG6 && tar xzf /root/survival-2026-10-13.tgz -O ft/mix/it-yg6/train_yg.teacher.json > $YG6/train_yg.teacher.json || exit 2
 fi
 echo "== hub ok $(date +%T)"
+if [ -n "${SNAPSHOT:-}" ]; then
+    timeout 5400 "$PY" "$FINETUNE/common/data_snapshot.py" restore --repo $HUB --name $SNAPSHOT --token-file /root/.hf_token \
+        --workers ${SNAP_WORKERS:-16} --tmp /root || { echo "== snapshot restore FAILED"; exit 7; }
+    df -h / /dev/shm | tail -2
+    echo "== RESUME-IT-DONE (snapshot $SNAPSHOT) $(date +%T)"
+    exit 0
+fi
 bash "$FINETUNE/jobs/data_mix.sh" it || exit 3
 FILTER_ONLY=1 bash "$FINETUNE/jobs/a2_vpfilter.sh" || exit 4
 bash "$FINETUNE/jobs/granary_build.sh" || exit 5
