@@ -69,6 +69,9 @@ ap.add_argument("--unfreeze-top", type=int, default=0, help="unfreeze the top K 
 ap.add_argument("--eval-every", type=int, default=100)
 ap.add_argument("--eval-steps", default="", help="extra eval steps, e.g. 100,250 (curve shape; stage 1 training is unchanged:"
                 " evals use no torch RNG and stage 1 no numpy RNG)")
+ap.add_argument("--profile-steps", type=int, default=0,
+                help="throughput profile only: run this many training steps (+20 skipped as warm-up), print where the step "
+                     "time goes (host batch build vs GPU spans from CUDA events, no extra syncs) and exit; nothing saved")
 ap.add_argument("--stop-at", type=int, default=0, help="stop after this step, LR schedule still over --steps "
                 "(early-curve sweeps that share a longer run's schedule and batches)")
 ap.add_argument("--abort-wer", default="", help="STEP:WER -- stop (rc 5) if the macro val WER at STEP is above WER (collapse gate)")
@@ -419,6 +422,27 @@ def pick_row():
     return next_row(random.choices(range(len(sources)), weights=[w for _, _, w in sources])[0])
 
 
+def profile_report(host, evs, wall, skip=20):
+    """Where a training step's wall time goes. GPU spans come from CUDA events (read after one final sync), so no
+    sync is added inside the loop; 'gpu idle' = GPU time between one step's last event and the next step's first,
+    i.e. the GPU waiting for the host (batch build, launches): the upper bound of what a batch prefetch recovers."""
+    torch.cuda.synchronize()
+    h, E = host[skip:], evs[skip:]
+    fwd = [e[0].elapsed_time(e[1]) for e in E]; bwd = [e[1].elapsed_time(e[2]) for e in E]
+    optm = [e[2].elapsed_time(e[3]) for e in E]
+    idle = [evs[i - 1][3].elapsed_time(evs[i][0]) for i in range(skip + 1, len(evs))]
+    step_ms = (wall[-1] - wall[skip]) / (len(wall) - 1 - skip) * 1000
+    r = {"steps": len(E), "step_ms": round(step_ms, 1), "steps_per_min": round(60000 / step_ms, 1),
+         "host_batch_ms": round(1000 * float(np.mean(h)), 1), "gpu_fwd_loss_ms": round(float(np.mean(fwd)), 1),
+         "gpu_bwd_ms": round(float(np.mean(bwd)), 1), "gpu_clip_opt_ms": round(float(np.mean(optm)), 1),
+         "gpu_idle_between_steps_ms": round(float(np.mean(idle)), 1)}
+    r["gpu_idle_frac"] = round(r["gpu_idle_between_steps_ms"] / step_ms, 3)
+    r["host_batch_frac"] = round(r["host_batch_ms"] / step_ms, 3)
+    print(f"== PROFILE {json.dumps(r)}", flush=True)
+    raise SystemExit(0)
+
+
+prof_host, prof_ev, prof_wall = [], [], []
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
 extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
 set_train_mode()
@@ -432,6 +456,7 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
         if a.unfreeze_sched and any(s_ == step for s_, _ in unfreeze):
             cur_k = apply_unfreeze(step); set_train_mode()
             print(f"  step {step}: encoder top-K = {cur_k}", flush=True)
+        t_h0 = time.perf_counter()
         if a.mix:
             rs = [pick_row() for _ in range(a.bs)]
         else:   # the 2026-10-09 sampler, bit for bit
@@ -439,6 +464,9 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
                 order = list(range(len(rows))); random.shuffle(order)
             rs = [rows[i] for i in order[: a.bs]]; order = order[a.bs:]
         X, lens, Y, ylens = batch(rs, train=True)
+        if a.profile_steps:
+            prof_host.append(time.perf_counter() - t_h0); ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            ev[0].record()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             e, el = encode(X, lens)
             d, _, _ = m.decoder(targets=Y, target_length=ylens)
@@ -449,7 +477,11 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             ctc = torch.nn.functional.ctc_loss(lp, Y, el, ylens, blank=V, reduction="sum", zero_infinity=True) / len(rs)
             loss_rnnt = loss.detach()
             loss = loss + a.ctc_weight * ctc
+        if a.profile_steps:
+            ev[1].record()
         opt.zero_grad(set_to_none=True); loss.backward()
+        if a.profile_steps:
+            ev[2].record()
         if (step + 1) % 25 == 0:   # encoder gradient norm before clipping (does the auxiliary loss reach the encoder?)
             eg = [p_.grad.norm() for p_ in m.encoder.parameters() if p_.grad is not None]
             enc_gn = float(torch.norm(torch.stack(eg))) if eg else 0.0
@@ -457,6 +489,10 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
         for gi, g in enumerate(opt.param_groups):
             lr_auc[gi] += g["lr"] if any(p_.grad is not None for p_ in g["params"]) else 0.0
         opt.step(); sched.step(); step += 1; seen_s += float(lens.sum()) / 16000
+        if a.profile_steps:
+            ev[3].record(); prof_ev.append(ev); prof_wall.append(time.perf_counter())
+            if step == a.profile_steps + 20:
+                profile_report(prof_host, prof_ev, prof_wall)
         max_clip_s = max(max_clip_s, float(lens.max()) / 16000)
         if step % 25 == 0:
             print(f"  step {step}/{a.steps} loss {loss.item():.3f}"
