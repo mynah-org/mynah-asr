@@ -63,12 +63,20 @@ def main():
     ap.add_argument("--student", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--mult", default="", help="bucket multipliers, e.g. hard=2,solved=0.5 (others 1): shown as weight after")
+    ap.add_argument("--teacher", default="", help="comma list of teacher_ws.py outputs: teacher / teacher_wer joined by "
+                    "audio_filepath where a mix manifest lacks them (e.g. train_vp_t50.json <- train_vp.teacher.json)")
     ap.add_argument("--write", type=int, default=0, help="1 = write the bucket manifests and mix.txt (needs --mult)")
     ap.add_argument("--max-dur", type=float, default=30.0)
     a = ap.parse_args()
     st = {}
     for l in open(a.student):
         r = json.loads(l); st[r["audio_filepath"]] = r
+    tj = {}
+    for tp in (x for x in a.teacher.split(",") if x):
+        for l in open(tp):
+            r = json.loads(l)
+            if r.get("teacher_wer") is not None:
+                tj[r["audio_filepath"]] = (r.get("teacher"), r["teacher_wer"])
     mix = [(p, float(w)) for p, w in (x.rsplit(":", 1) for x in a.mix.split(","))]
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     table, buckets_of = [], {}
@@ -76,6 +84,9 @@ def main():
         kind = src_kind(p)
         rows = [json.loads(l) for l in open(p)]
         rows = [r for r in rows if r.get("duration", 0) <= a.max_dur]
+        for r in rows:
+            if "teacher_wer" not in r and r["audio_filepath"] in tj:
+                r["teacher"], r["teacher_wer"] = tj[r["audio_filepath"]]
         miss = sum(1 for r in rows if r["audio_filepath"] not in st)
         if miss:
             sys.exit(f"== {p}: {miss} clips without a student score")
