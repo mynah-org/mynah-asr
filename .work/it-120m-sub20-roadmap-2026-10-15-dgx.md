@@ -415,3 +415,17 @@ at 1k / 2k / 4k / 6k / 8k / 10k / 12k / 14k / 15.5k; the 20 % decay (12.8k-16k) 
 
 Artifacts: Hub `runs/ada-it-w4-c250-16k` (final.nemo, metrics, probes), `results/ada-ee-2026-10-16/{analysis,logs}`;
 data snapshot `data/snapshots/it-c250` (22 shards, 22.2 GiB; `resume_it.sh SNAPSHOT=it-c250`).
+
+## Throughput profile (OBSERVED, RTX 6000 Ada, 2026-10-16; `two_stage.py --profile-steps 300`, B2 mix/policy, 2 seeds)
+
+| step | host batch build | GPU fwd+loss | GPU bwd | GPU clip+opt | GPU idle between steps | steps/min |
+|---|---|---|---|---|---|---|
+| 273-276 ms | 25.2-25.6 ms (9.2 %) | 112-114 ms | 120-121 ms | 15 ms | 25.3-25.7 ms (9.2-9.4 %) | 218-220 |
+
+- The synchronous batch build costs ~9 % of a step (GPU idle ~= host time): BELOW the 10-15 % gate, so no prefetch
+  thread for now (at most ~10 % on the training part).
+- The real overhead is the in-run evaluation: pure training runs at ~219 steps/min, the B2 run averaged ~126 over
+  16k steps (7621 s vs ~4400 s of training): ~50 min (~40 %) went to 34 evals (4 harness sets x 200 clips, decoded,
+  plus a final.nemo + 1.4 GB last.ckpt save on every new best). For screening runs, an eval every 2000 steps in the
+  flat phase and every 500 in the decay (where WSD's best always lands) would cut a 16k run from ~127 to ~80 min;
+  pre-register it before use (it changes which checkpoint is final.nemo only if a flat-phase step were the best).
