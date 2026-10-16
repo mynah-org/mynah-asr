@@ -447,3 +447,27 @@ Declared confounds (not corrected, to avoid designing on the distribution): `har
 WER >= 30 threshold is easier to cross on short clips; CV hard goes 24 % -> 44 % of CV draws); VP hard (232 clips) is
 deletion-heavy (hyp/ref 0.70, 8.6 % empty, teacher 5.3). If C1 passes, the first read is per-set delta oracle
 (MLS / FLEURS / CV / VP) and VP deletions / empties, not only the macro.
+
+## Result: phase C1 — within-source difficulty curriculum, W4 8k (OBSERVED, RTX 6000 Ada, 2026-10-16) — NULL
+
+final.nemo = step 8000 (EOF), 3164 s (53 min with the sparse evals). Probes (greedy / beam-8 / oracle-8):
+
+| run | harness raw | harness 0.5 s flush | clean raw | clean 0.5 s flush |
+|---|---|---|---|---|
+| **C1** (hard x2, solved x0.5) | **26.27 / 23.64 / 19.45** | 26.29 / 23.68 / 19.50 | 27.04 / 24.47 / 17.53 | 26.08 / 23.56 / 16.78 |
+| W4-C250-8k (reference) | 26.12 / 23.67 / 19.43 | 26.17 / 23.72 / 19.51 | 27.29 / 25.05 / 17.45 | 25.96 / 23.85 / 16.45 |
+
+C1 per set, harness raw greedy (oracle-8): MLS 24.97 (19.90), FLEURS 19.42 (14.13), CV 27.89 (18.12), VP 32.82 (25.63).
+In-run harness val: 43.42 / 38.52 / 32.58 / 29.76 / 27.40 / 26.47 / 26.28 at 1k / 2k / 4k / 6k / 7k / 7.5k / 8k.
+
+- **Pre-registered reading: NULL** (oracle@8 19.45 vs gate 18.4; reference 19.43). Every number is within +-0.6 of
+  the reference on both banks; doubling the draws of credible clips a strong model still gets wrong and halving the
+  solved ones, at fixed source marginals and budget, does not change candidate generation at 8k.
+- Reading: at this budget the 120M is not limited by WHICH of the C250 clips it sees more often. Together with the
+  schedule result (B/B2), the C250 pool itself sets the ceiling: more information has to come from outside it
+  (new audio chosen for what the model lacks: phase D) or from a richer target (encoder KD: phase E), not from
+  re-weighting it. Phase C is closed at this granularity (a stronger multiplier would be a new pre-registration).
+- Reusable: the per-clip student scores of the whole C250 pool (W4-C250-16k, 116,526 clips) and the bucket tables.
+
+Artifacts (no Hub token on the box at close): local copy of probes, metrics, logs, bucket stats and the student
+scores (`student_w4_16k.jsonl.gz`, 11.8 MB); to be uploaded to the Hub under results/ada-ee-2026-10-16/c1.
