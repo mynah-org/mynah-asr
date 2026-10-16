@@ -62,7 +62,8 @@ def main():
     ap.add_argument("--mix", required=True)
     ap.add_argument("--student", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--mult", default="")
+    ap.add_argument("--mult", default="", help="bucket multipliers, e.g. hard=2,solved=0.5 (others 1): shown as weight after")
+    ap.add_argument("--write", type=int, default=0, help="1 = write the bucket manifests and mix.txt (needs --mult)")
     ap.add_argument("--max-dur", type=float, default=30.0)
     a = ap.parse_args()
     st = {}
@@ -107,23 +108,40 @@ def main():
             if not xs:
                 continue
             tws = [t for _, _, t in xs if t is not None]
+            sts = [st[r["audio_filepath"]] for r, _, _ in xs]
+            rw = sum(x["ref_words"] for x in sts)
             table.append({"source": src_name(p), "bucket": b, "clips": len(xs),
+                          "median_s": round(float(np.median([r["duration"] for r, _, _ in xs])), 1),
+                          "hyp_ref_word_ratio": round(sum(len(x["student"].split()) for x in sts) / max(1, rw), 3),
+                          "empty_pct": round(100 * sum(1 for x in sts if not x["student"].strip()) / len(xs), 1),
                           "hours": round(sum(r["duration"] for r, _, _ in xs) / 3600, 2),
                           "student_wer": round(float(np.mean([s for _, s, _ in xs])), 1),
                           "teacher_wer": round(float(np.mean(tws)), 1) if tws else None,
                           "share_clips": round(100 * len(xs) / n, 1)})
         buckets_of[p] = (w, bk)
-    hdr = "| source | bucket | clips | hours | student WER | teacher WER | % source clips |"
-    lines = [hdr, "|---|---|---|---|---|---|---|"] + [
-        f"| {t['source']} | {t['bucket']} | {t['clips']} | {t['hours']} | {t['student_wer']} | {t['teacher_wer'] if t['teacher_wer'] is not None else '-'} | {t['share_clips']} |"
-        for t in table]
+        mult = {k: float(v) for k, v in (x.split("=") for x in a.mult.split(","))} if a.mult else {}
+        Z = sum(len(bk[b]) * mult.get(b, 1.0) for b in bk)
+        for t in table:
+            if t["source"] == src_name(p):
+                t["w_before"] = round(w * t["clips"] / n, 4)
+                t["w_after"] = round(w * t["clips"] * mult.get(t["bucket"], 1.0) / Z, 4)
+    hdr = ("| source | bucket | clips | hours | median s | student WER | teacher/label WER | hyp/ref words | empty % "
+           "| % source clips | weight before | weight after |")
+    lines = [hdr, "|" + "---|" * 12] + [
+        f"| {t['source']} | {t['bucket']} | {t['clips']} | {t['hours']} | {t['median_s']} | {t['student_wer']} | "
+        f"{t['teacher_wer'] if t['teacher_wer'] is not None else '-'} | {t['hyp_ref_word_ratio']} | {t['empty_pct']} | "
+        f"{t['share_clips']} | {t['w_before']} | {t['w_after']} |" for t in table]
     tot = defaultdict(lambda: [0, 0.0])
     for t in table:
         tot[t["bucket"]][0] += t["clips"]; tot[t["bucket"]][1] += t["hours"]
-    lines += ["", "| bucket | clips | hours |", "|---|---|---|"] + [f"| {b} | {tot[b][0]} | {tot[b][1]:.1f} |" for b in BUCKETS if b in tot]
+    wb = defaultdict(lambda: [0.0, 0.0])
+    for t in table:
+        wb[t["bucket"]][0] += t["w_before"]; wb[t["bucket"]][1] += t["w_after"]
+    lines += ["", "| bucket | clips | hours | draw share before | draw share after |", "|---|---|---|---|---|"] + [
+        f"| {b} | {tot[b][0]} | {tot[b][1]:.1f} | {100 * wb[b][0]:.1f} % | {100 * wb[b][1]:.1f} % |" for b in BUCKETS if b in tot]
     (out / "stats.md").write_text("\n".join(lines) + "\n"); json.dump(table, open(out / "stats.json", "w"), indent=1)
     print("\n".join(lines))
-    if not a.mult:
+    if not a.write:
         return
     mult = {k: float(v) for k, v in (x.split("=") for x in a.mult.split(","))}
     parts, eff = [], []
