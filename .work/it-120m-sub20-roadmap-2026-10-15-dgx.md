@@ -387,3 +387,31 @@ Primary = harness greedy and oracle@8 (raw EOF); reading:
 - **representation shift**: harness oracle@8 <= 15.25 (1.0 below C250-36k), independent of the greedy reading.
 Secondary: clean-it (contaminated development bank) greedy/beam/oracle raw and flushed vs C250-36k flushed
 21.73 / 20.23 / 13.71. W4 is NOT changed on intermediate in-run numbers. Stop and report after B2.
+
+## Result: phase B2 — W4 on the C250 mix at 16k (OBSERVED, RTX 6000 Ada, Vast EE, 2026-10-16)
+
+Same mix/pools/recipe as phase B, 16k steps, 7621 s (127 min, 803.6 processed audio hours, lr_auc dec+joint 4.21 /
+encoder 5.61); final.nemo = best in-run harness val (step 15500, as for every run). Probes (greedy / beam-8 / oracle-8),
+C250-36k re-probed on the same box:
+
+| run | steps | harness raw | harness 0.5 s flush | clean raw | clean 0.5 s flush |
+|---|---|---|---|---|---|
+| **W4-C250-16k** | 16k | **22.76 / 21.02 / 16.71** | 22.83 / 21.23 / 16.87 | 23.64 / 21.48 / 15.01 | 22.64 / 20.55 / 14.29 |
+| W4-C250-8k | 8k | 26.12 / 23.67 / 19.43 | 26.17 / 23.72 / 19.51 | 27.29 / 25.05 / 17.45 | 25.96 / 23.85 / 16.45 |
+| C250-36k (same box) | 36k | 22.27 / 20.53 / 16.25 | 22.21 / 20.57 / 16.27 | 23.73 / 22.00 / 15.11 | **21.74 / 20.23 / 13.71** |
+
+In-run harness val: 47.87 / 38.16 / 33.91 / 29.86 / 27.70 / 26.41 / 27.04 (12k, end of the flat peak) / 24.38 / 22.76
+at 1k / 2k / 4k / 6k / 8k / 10k / 12k / 14k / 15.5k; the 20 % decay (12.8k-16k) is worth ~4 points, as at 8k.
+
+- **Pre-registered reading: PARTIAL** (22.27 < 22.76 <= 23.90): W4 reaches C250-36k within 0.5 greedy in 2.25x fewer
+  steps (127 vs ~290 GPU-min), but does not match it. **No representation shift**: harness oracle@8 16.71 vs 16.25
+  (worse by 0.46); clean raw is a tie (23.64 / 21.48 / 15.01 vs 23.73 / 22.00 / 15.11), clean flushed slightly worse.
+- Per the pre-registration: W4 is the screening schedule (cheap probes at 8k-16k); a final run keeps the long horizon.
+- Reading of the schedule axis: the faster schedule converges to the SAME ceiling (oracle ~16 harness, ~14-15 clean)
+  that 36k steps of plain fine-tuning on this mix reach. More steps / a better LR shape no longer move candidate
+  generation: the schedule axis is closed. Next = data and signal (phase C curriculum, D guided selection, E encoder
+  KD), screened with W4 at 8k against W4-C250-8k (26.12 / 23.67 / 19.43), promoted to 16k only on an oracle gain.
+- Throughput: 6000 Ada ~126 steps/min over the whole run including evals, the same as the L40S (129).
+
+Artifacts: Hub `runs/ada-it-w4-c250-16k` (final.nemo, metrics, probes), `results/ada-ee-2026-10-16/{analysis,logs}`;
+data snapshot `data/snapshots/it-c250` (22 shards, 22.2 GiB; `resume_it.sh SNAPSHOT=it-c250`).
