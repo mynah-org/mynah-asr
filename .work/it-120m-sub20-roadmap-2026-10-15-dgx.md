@@ -429,3 +429,21 @@ data snapshot `data/snapshots/it-c250` (22 shards, 22.2 GiB; `resume_it.sh SNAPS
   plus a final.nemo + 1.4 GB last.ckpt save on every new best). For screening runs, an eval every 2000 steps in the
   flat phase and every 500 in the decay (where WSD's best always lands) would cut a 16k run from ~127 to ~80 min;
   pre-register it before use (it changes which checkpoint is final.nemo only if a flat-phase step were the best).
+
+## Phase C1 pre-registration (2026-10-16 ~15:05 UTC, before launch): within-source difficulty curriculum, W4 8k
+
+Scorer (frozen): W4-C250-16k greedy on all 116,526 C250 training clips (`student_score.py`, parity with
+lm_fusion_probe greedy exact on the harness), sha256 of the scores 8d4c9271..., of the mix 0df9a4c1....
+Buckets (`curriculum_mix.py`, credibility estimated without the student: Granary two-teacher agreement, VP teacher
+vs label joined from train_vp.teacher.json, MLS/CV/FLEURS human labels + chars/s within p1..p99): hard 10,794 clips
+18.4 h, mid 80,238 / 270.0 h, solved 22,522 / 51.4 h, lowcred 2,831 / 7.5 h, suspect 141 / 0.4 h.
+C1 = hard x2, solved x0.5, everything else x1, normalised INSIDE each source (C250 source marginals unchanged):
+hard 8.5 % -> 16.5 % of draws, solved 19.5 % -> 9.9 %, mid 68.9 % -> 70.3 %. W4 recipe, 8k steps, seed 0, screening
+harness policy (`--eval-sparse 2000,500 --final-eof 1`: final.nemo = step 8000; W4-C250-8k's final was step 8000 too).
+
+Single gate: harness oracle@8 (raw) <= 18.4 (W4-C250-8k: 19.43) -> promote to 16k; > 18.4 -> C1 has not added enough
+information; next is targeted selection / encoder KD. Greedy / beam / CER / empties are recorded, not decisive.
+Declared confounds (not corrected, to avoid designing on the distribution): `hard` is 60 % CV clips (5 s median: a
+WER >= 30 threshold is easier to cross on short clips; CV hard goes 24 % -> 44 % of CV draws); VP hard (232 clips) is
+deletion-heavy (hyp/ref 0.70, 8.6 % empty, teacher 5.3). If C1 passes, the first read is per-set delta oracle
+(MLS / FLEURS / CV / VP) and VP deletions / empties, not only the macro.
