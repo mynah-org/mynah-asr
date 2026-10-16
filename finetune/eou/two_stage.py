@@ -69,6 +69,10 @@ ap.add_argument("--unfreeze-top", type=int, default=0, help="unfreeze the top K 
 ap.add_argument("--eval-every", type=int, default=100)
 ap.add_argument("--eval-steps", default="", help="extra eval steps, e.g. 100,250 (curve shape; stage 1 training is unchanged:"
                 " evals use no torch RNG and stage 1 no numpy RNG)")
+ap.add_argument("--eval-sparse", default="", help="FLAT,DECAY: eval every FLAT steps before the WSD decay starts and every DECAY "
+                "steps inside it (plus the last step), instead of --eval-every; training is unchanged (evals use no RNG)")
+ap.add_argument("--final-eof", type=int, default=0, help="1 = final.nemo is the LAST step (pre-registered decision point), "
+                "not the best in-run val; evals are diagnostic only and save nothing during the run")
 ap.add_argument("--profile-steps", type=int, default=0,
                 help="throughput profile only: run this many training steps (+20 skipped as warm-up), print where the step "
                      "time goes (host batch build vs GPU spans from CUDA events, no extra syncs) and exit; nothing saved")
@@ -442,6 +446,14 @@ def profile_report(host, evs, wall, skip=20):
     raise SystemExit(0)
 
 
+def is_eval(s):
+    if not a.eval_sparse:
+        return s % a.eval_every == 0
+    flat, dec = (int(x) for x in a.eval_sparse.split(","))
+    d0 = a.steps * (1 - a.decay_frac) if a.lr_shape == "wsd" else a.steps
+    return s > 0 and (s % dec == 0 if s >= d0 else s % flat == 0)
+
+
 prof_host, prof_ev, prof_wall = [], [], []
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
 extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
@@ -499,7 +511,7 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
                   + (f" (rnnt {loss_rnnt.item():.3f} ctc {ctc.item():.3f})" if ctc_head is not None else "") + f" enc-gn {enc_gn:.2f} audio {seen_s / 3600:.2f} h "
                   f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB "
                   f"reserved {torch.cuda.max_memory_reserved() / 1e9:.1f} GB max-clip {max_clip_s:.1f} s", flush=True)
-    if a.eval_only or step % a.eval_every == 0 or step == a.steps or step == a.stop_at or step in extra_evals:
+    if a.eval_only or is_eval(step) or step == a.steps or step == a.stop_at or step in extra_evals:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
         tw, tc = wer_cer([norm(r["text"]) for r in tr], hy)
@@ -529,7 +541,7 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             # val clips AND <= 10 % empty; until one qualifies, the most EOU (fewest empties) wins
             ok = rec["val_eou_rate"] >= 0.8 and rec["val_empty"] <= 0.1 * len(val)
             score = vw if not a.eou_append else (vw if ok else 1000 - 100 * rec["val_eou_rate"] + rec["val_empty"])
-            if (best is None or score < best) and not a.eval_only:
+            if (best is None or score < best) and not a.eval_only and not a.final_eof:
                 best = score
                 m.save_to(str(out / "final.nemo"))
                 torch.save({"model": m.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
@@ -547,6 +559,8 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
         if rec.get("aborted"):
             print(f"== plain-{a.tag} ABORTED at step {step}: macro val WER {rec['val_wer']} > gate {a.abort_wer}", flush=True)
             raise SystemExit(5)
-if not val and not a.eval_only:
-    m.save_to(str(out / "final.nemo"))
+if (not val or a.final_eof) and not a.eval_only:
+    m.save_to(str(out / "final.nemo"))   # --final-eof: the pre-registered decision point is the last step
+    if a.final_eof:
+        print(f"== plain-{a.tag} final.nemo = step {step} (EOF)", flush=True)
 print(f"== plain-{a.tag} done {time.time() - t0:.0f}s", flush=True)
