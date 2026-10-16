@@ -463,11 +463,26 @@ In-run harness val: 43.42 / 38.52 / 32.58 / 29.76 / 27.40 / 26.47 / 26.28 at 1k 
 - **Pre-registered reading: NULL** (oracle@8 19.45 vs gate 18.4; reference 19.43). Every number is within +-0.6 of
   the reference on both banks; doubling the draws of credible clips a strong model still gets wrong and halving the
   solved ones, at fixed source marginals and budget, does not change candidate generation at 8k.
-- Reading: at this budget the 120M is not limited by WHICH of the C250 clips it sees more often. Together with the
-  schedule result (B/B2), the C250 pool itself sets the ceiling: more information has to come from outside it
-  (new audio chosen for what the model lacks: phase D) or from a richer target (encoder KD: phase E), not from
-  re-weighting it. Phase C is closed at this granularity (a stronger multiplier would be a new pre-registration).
+- Reading (scoped): THIS static difficulty function (hard x2 / solved x0.5, defined by the W4-16k scorer and the
+  credibility rules above) does not change candidate generation at 8k. Not excluded: dynamic / loss-aware sampling,
+  competence schedules, domain-specific curricula; not pursued now (low ROI vs D / E). Together with B / B2 (exposure
+  helped up to 28-36k, W4 compresses it to the same ceiling) and the earlier untargeted Granary additions: the next
+  large gain is unlikely to come from the schedule or from statically re-sampling C250; it needs a different learning
+  signal (E) and/or new, selected information (D). Phase C is closed at this granularity.
 - Reusable: the per-clip student scores of the whole C250 pool (W4-C250-16k, 116,526 clips) and the bucket tables.
 
-Artifacts (no Hub token on the box at close): local copy of probes, metrics, logs, bucket stats and the student
+Artifacts (no Hub token on the box at close; deliberately not re-added for a null): local copy of probes, metrics, logs, bucket stats and the student
 scores (`student_w4_16k.jsonl.gz`, 11.8 MB); to be uploaded to the Hub under results/ada-ee-2026-10-16/c1.
+
+## Next session plan (2026-10-17; each arm pre-registered before launch, judged first on harness oracle@8)
+
+- **D: D0 uniform-new vs D1 selected-new.** Score it-yg7 with `student_score.py` (W4-C250-16k) + the teacher, look
+  at the DATA distribution only (teacher-good / student-bad / structurally credible: hours, durations, sources), then
+  pre-register the amount. D1 = selected clips, D0 = random clips from the same it-yg7, duration-matched to D1, same
+  physical hours, same external weight, same W4-8k / draws; so a D1 win is the selection, not yg7 or short clips.
+- **E: encoder KD, audit first.** Same WAVs through teacher (Nemotron 0.6B) and student: T_teacher vs T_student,
+  effective frame rate / stride and their ratio, hidden sizes, available teacher layers (early / mid / late
+  statistics), temporal offset from subsampling / look-ahead; a similarity / alignment check per layer BEFORE choosing
+  layer, projection (512 -> D_teacher) and loss.
+- Target stays candidate generation: clean flushed oracle@8 13.71 -> <10-12 first, ranking (21.74 -> oracle) after.
+- Box: restore with `resume_it.sh SNAPSHOT=it-c250`; upload today's C1 artifacts with the new (rotated) token.
