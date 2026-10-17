@@ -34,7 +34,9 @@ ap.add_argument("--synth", default="0.4,0.7,1,1.5,2,5,10,20", help="durations (s
 ap.add_argument("--t-layers", default="auto")
 ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 ap.add_argument("--bench", type=int, default=0)
-ap.add_argument("--ridge", type=float, default=1.0)
+ap.add_argument("--ridge", type=float, default=1e-2, help="ridge on STANDARDISED features (x lambda * N)")
+ap.add_argument("--t-contexts", default="", help="teacher att_context_size values to audit, e.g. '56,0;56,3;56,13' "
+                "(the alignability and T checks are repeated per value; default = the checkpoint's default only)")
 ap.add_argument("--out", required=True)
 a = ap.parse_args()
 
@@ -89,7 +91,10 @@ def run(m, x, store):
     f, fl = m.preprocessor(input_signal=X, length=L)
     e, el = m.encoder(audio_signal=f, length=fl)
     T = int(el[0])
-    lay = {i: v[0, :T].float().cpu().numpy() if v.shape[1] >= T else v[0].float().cpu().numpy() for i, v in store.items()}
+    mel = f[0, :, :int(fl[0])].float().cpu().numpy().T   # frames x mels
+    pad = np.zeros((T * 8, mel.shape[1]), np.float32); pad[:min(len(mel), T * 8)] = mel[:T * 8]
+    store["_mel8"] = pad.reshape(T, -1)
+    lay = {i: (v if isinstance(v, np.ndarray) else v[0, :T].float().cpu().numpy()) for i, v in store.items()}
     return int(fl[0]), T, int(e.shape[-1]), lay
 
 
@@ -98,18 +103,20 @@ def lstats(h):   # h: T x D
             "frame_l2": float(np.linalg.norm(h, axis=1).mean()), "temporal_var": float(h.var(0).mean())}
 
 
-def ridge_fit(Xs, Ys, lam):
-    X = np.concatenate(Xs); Y = np.concatenate(Ys)
-    mx, my = X.mean(0), Y.mean(0); X = X - mx; Y = Y - my
+def ridge_fit(Xs, Ys, lam):   # features standardised per channel on the TRAIN frames
+    X = np.concatenate(Xs).astype(np.float64); Y = np.concatenate(Ys).astype(np.float64)
+    mx, sx, my, sy = X.mean(0), X.std(0) + 1e-6, Y.mean(0), Y.std(0) + 1e-6
+    X = (X - mx) / sx; Y = (Y - my) / sy
     W = np.linalg.solve(X.T @ X + lam * len(X) * np.eye(X.shape[1]), X.T @ Y)
-    return W, mx, my
+    return W, (mx, sx, my, sy)
 
 
-def score(W, mx, my, Xs, Ys):
-    X = np.concatenate(Xs) - mx; Y = np.concatenate(Ys)
-    P = X @ W + my
+def score(W, st, Xs, Ys):   # held out: R^2 of the standardised target, cosine of the CENTRED frames
+    mx, sx, my, sy = st
+    X = (np.concatenate(Xs) - mx) / sx; Y = (np.concatenate(Ys) - my) / sy
+    P = X @ W
     cos = (P * Y).sum(1) / (np.linalg.norm(P, axis=1) * np.linalg.norm(Y, axis=1) + 1e-9)
-    r2 = 1 - ((Y - P) ** 2).sum() / ((Y - Y.mean(0)) ** 2).sum()
+    r2 = 1 - ((Y - P) ** 2).sum() / (Y ** 2).sum()
     return float(cos.mean()), float(r2)
 
 
@@ -152,40 +159,56 @@ if clips:
         n = int(round(d * sr)); x = np.tile(base, math.ceil(n / len(base)))[:n]
         clips.append((f"synth:{d:g}s", x.astype(np.float32)))
 
-per, pairs = [], []
-for name, x in clips:
-    mt, tt, dt, lt = run(T_m, x, Ts)
-    ms, ts, ds, ls = run(S_m, x, Ss)
-    per.append({"clip": name, "sec": round(len(x) / sr, 3), "samples": len(x), "mel_t": mt, "mel_s": ms,
-                "T_teacher": tt, "T_student": ts, "dT": tt - ts, "ratio": round(tt / max(1, ts), 4),
-                "pred_T_teacher": math.ceil(mt / sub_t), "pred_T_student": math.ceil(ms / sub_s),
-                "teacher_layers": {str(i): lstats(v) for i, v in lt.items()},
-                "student_layers": {str(i): lstats(v) for i, v in ls.items()}})
-    if not name.startswith("synth"):
-        pairs.append((ls, lt))
-    print(f"  {name:>12} {len(x) / sr:6.2f}s mel {mt}/{ms} T {tt}/{ts} dT {tt - ts}", flush=True)
-rep["clips"] = per
-rep["T_equal_all"] = all(p["dT"] == 0 for p in per)
-rep["dT_set"] = sorted({p["dT"] for p in per})
 
-if pairs and rep["T_equal_all"]:
-    tr, te = pairs[::2], pairs[1::2]
-    sfin = s_layers[-1]; al = {}
-    for tl in t_layers:
-        al[str(tl)] = {}
-        for k in range(-3, 4):
-            Xa, Ya = zip(*[shifted(s[sfin], t[tl], k) for s, t in tr])
-            Xb, Yb = zip(*[shifted(s[sfin], t[tl], k) for s, t in te])
-            W, mx, my = ridge_fit(Xa, Ya, a.ridge)
-            c, r2 = score(W, mx, my, Xb, Yb)
-            al[str(tl)][str(k)] = {"cos": round(c, 4), "r2": round(r2, 4)}
-        print(f"  teacher layer {tl}: " + " ".join(f"{k}:{v['cos']:.3f}/{v['r2']:.3f}" for k, v in al[str(tl)].items()),
-              flush=True)
-    rep["alignability_student_final_to_teacher"] = al
-    rep["alignability_note"] = (f"ridge {a.ridge} fitted on {len(tr)} clips, scored on {len(te)}; key = teacher frame "
-                                "shift vs student frame (cos / R^2 held out)")
-else:
-    rep["alignability_student_final_to_teacher"] = "skipped: T differs on some clip (see dT_set) or no real clips"
+def set_ctx(m, ctx):
+    if ctx is not None:
+        m.encoder.set_default_att_context_size(ctx)
+
+
+def audit(ctx):
+    set_ctx(T_m, ctx)
+    per, pairs = [], []
+    for name, x in clips:
+        mt, tt, dt, lt = run(T_m, x, Ts)
+        ms, ts, ds, ls = run(S_m, x, Ss)
+        per.append({"clip": name, "sec": round(len(x) / sr, 3), "samples": len(x), "mel_t": mt, "mel_s": ms,
+                    "T_teacher": tt, "T_student": ts, "dT": tt - ts, "ratio": round(tt / max(1, ts), 4),
+                    "pred_T_teacher": math.ceil(mt / sub_t), "pred_T_student": math.ceil(ms / sub_s),
+                    "teacher_layers": {str(i): lstats(v) for i, v in lt.items() if i != "_mel8"},
+                    "student_layers": {str(i): lstats(v) for i, v in ls.items() if i != "_mel8"}})
+        if not name.startswith("synth"):
+            pairs.append((ls, lt))
+    r = {"att_context_teacher": ctx or rep["teacher"]["encoder_att_context_size_live"], "clips": per,
+         "T_equal_all": all(p["dT"] == 0 for p in per), "dT_set": sorted({p["dT"] for p in per})}
+    print(f"== teacher att_context {r['att_context_teacher']}: T equal on all {len(per)} clips: {r['T_equal_all']} "
+          f"(dT {r['dT_set']}); T at 1/5/10/20 s: " + ", ".join(f"{p['T_teacher']}/{p['T_student']}" for p in per
+                                                           if p["clip"] in ("synth:1s", "synth:5s", "synth:10s", "synth:20s")), flush=True)
+    if pairs and r["T_equal_all"]:
+        tr, te = pairs[::2], pairs[1::2]; al = {}
+        for src in ["_mel8"] + s_layers:   # mel8 = 8 stacked mel frames: the acoustic baseline a student must beat
+            for tl in t_layers:
+                row = {}
+                for k in range(-4, 5):
+                    Xa, Ya = zip(*[shifted(s_[src], t[tl], k) for s_, t in tr])
+                    Xb, Yb = zip(*[shifted(s_[src], t[tl], k) for s_, t in te])
+                    W, st = ridge_fit(Xa, Ya, a.ridge)
+                    c, r2 = score(W, st, Xb, Yb)
+                    row[str(k)] = {"cos": round(c, 4), "r2": round(r2, 4)}
+                al[f"{'mel8' if src == '_mel8' else 'student' + str(src)}->teacher{tl}"] = row
+                best = max(row, key=lambda k: row[k]["r2"])
+                print(f"  {'mel8' if src == '_mel8' else 'student L' + str(src):>11} -> teacher L{tl:<2} R2 by shift "
+                      + " ".join(f"{k}:{v['r2']:.3f}" for k, v in row.items()) + f" | best {best} cos {row[best]['cos']:.3f}", flush=True)
+        r["alignability"] = al
+        r["alignability_note"] = (f"standardised ridge {a.ridge}, fitted on the frames of {len(tr)} clips, scored on {len(te)}; "
+                                  "key = teacher frame shift k (student frame i <-> teacher frame i + k); centred cosine / R^2 held out")
+    return r
+
+
+ctxs = [None] + [[int(v) for v in c.split(",")] for c in a.t_contexts.split(";") if c]
+rep["audits"] = [audit(c) for c in ctxs]
+set_ctx(T_m, ctxs[0] or rep["teacher"]["encoder_att_context_size_live"])
+rep["T_equal_all"] = all(r["T_equal_all"] for r in rep["audits"])
+rep["dT_set"] = sorted({d for r in rep["audits"] for d in r["dT_set"]})
 
 if a.bench and a.device == "cuda":
     for tag, m in (("teacher", T_m), ("student", S_m)):
