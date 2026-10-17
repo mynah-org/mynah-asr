@@ -29,7 +29,11 @@ STEPS=${STEPS:-4000}   # STEPS= lengthens the arm (cosine over the whole run, sa
 timeout $((STEPS * 2 + 1800)) "$PY" "$FINETUNE/eou/two_stage.py" --tag "$TAG" --out $R --mix "$MIX" $POL --steps $STEPS --eval-every 500 \
     --vals "$VALS" "$@" 2>&1 | grep -a --line-buffered -v -E "NeMo W|warn|Warning" > $L/$TAG.log
 echo "   rc=${PIPESTATUS[0]}"; grep -E "done|Traceback|Error" $L/$TAG.log | tail -2
-python3 "$FINETUNE/eou/val_table.py" --col P40=$L/base-p40.log --col A0@3000=$R/plain-it-a0-mix/metrics.json:3000 \
-    --col "$TAG@best=$R/plain-$TAG/metrics.json:$(python3 -c "import json; print([r for r in json.load(open('$R/plain-$TAG/metrics.json'))['log'] if r.get('saved')][-1]['step'])")" \
-    --delta "$TAG@best-A0@3000" --trajectory $R/plain-$TAG/metrics.json
+# summary only: the baseline columns exist on the box that ran them; a --final-eof run saves no "best" row (-> last step)
+C=(); [ -s $L/base-p40.log ] && C+=(--col P40=$L/base-p40.log)
+[ -s $R/plain-it-a0-mix/metrics.json ] && C+=(--col A0@3000=$R/plain-it-a0-mix/metrics.json:3000)
+B=$(python3 -c "import json; l=json.load(open('$R/plain-$TAG/metrics.json'))['log']; s=[r for r in l if r.get('saved')] or [r for r in l if 'step' in r]; print(s[-1]['step'])" 2>/dev/null)
+[ -n "$B" ] && python3 "$FINETUNE/eou/val_table.py" "${C[@]}" --col "$TAG@$B=$R/plain-$TAG/metrics.json:$B" \
+    $([ -s $R/plain-it-a0-mix/metrics.json ] && echo --delta "$TAG@$B-A0@3000") --trajectory $R/plain-$TAG/metrics.json \
+    || echo "== val_table summary skipped (diagnostic only)"
 echo "== ARM-DONE $TAG $(date +%T)"
