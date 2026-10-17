@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--old", default="")
     ap.add_argument("--expect", default="")
     ap.add_argument("--hash", type=int, default=0)
+    ap.add_argument("--xhash", default="", help="name=manifest,...: clips of the pool whose DECODED samples (int16, any "
+                    "container: FLAC vs WAV) equal a clip of these manifests (re-uploaded videos across pools)")
+    ap.add_argument("--dup-out", default="", help="write the duplicate groups (within the pool + cross-pool) as JSON")
     a = ap.parse_args()
     rows = load(a.pool)
     d = np.array([r["duration"] for r in rows])
@@ -66,6 +69,28 @@ def main():
         with ThreadPoolExecutor(16) as ex:
             hs = Counter(ex.map(h, list(paths)))
         rep["dup_audio"] = sum(c - 1 for c in hs.values() if c > 1)
+    groups = {}
+    if a.xhash:
+        import soundfile as sf
+
+        def sh_(p):
+            x, _ = sf.read(p, dtype="int16")
+            return hashlib.sha1(x.tobytes()).hexdigest()
+        with ThreadPoolExecutor(32) as ex:
+            mine = dict(zip(paths, ex.map(sh_, list(paths))))
+            inv = defaultdict(list)
+            for p, h_ in mine.items():
+                inv[h_].append(p)
+            rep["dup_samples_within"] = sum(len(v) - 1 for v in inv.values() if len(v) > 1)
+            groups["within"] = [v for v in inv.values() if len(v) > 1]
+            for spec in (x for x in a.xhash.split(",") if x):
+                n, p = spec.split("=", 1)
+                op = [r["audio_filepath"] for r in load(p)]
+                hit = sorted({q for h_ in ex.map(sh_, op) if h_ in inv for q in inv[h_]})
+                rep[f"cross_dup_{n}"] = {"old_clips": len(op), "pool_clips_matching": len(hit)}
+                groups[f"cross_{n}"] = hit
+    if a.dup_out:
+        json.dump(groups, open(a.dup_out, "w"))
     if a.expect:
         rep["vs_expected_pct"] = {k: round(100 * (rep[k] - float(v)) / float(v), 2)
                                   for k, v in (x.split("=") for x in a.expect.split(","))}
