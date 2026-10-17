@@ -96,6 +96,16 @@ ap.add_argument("--pad-max", type=float, default=3.0)
 ap.add_argument("--fastemit", type=float, default=0.0)
 ap.add_argument("--ctc-weight", type=float, default=0.0, help="auxiliary CTC loss on the encoder output (training-only "
                 "linear head, not saved in final.nemo): loss = rnnt + w * ctc, both summed per utterance, batch mean")
+ap.add_argument("--kd-teacher", default="", help="encoder feature distillation (training only, not in final.nemo): "
+                "teacher .nemo (Nemotron 0.6B); its --kd-t-layer output (eval, no grad, clean features of the SAME "
+                "augmented audio) is matched frame by frame (T_teacher == T_student, kd_audit.py) by the student's "
+                "--kd-s-layer output through a NEW random-init Linear(d_s, d_t): loss = rnnt + lambda(t) * mean over valid "
+                "frames of (1 - cos)")
+ap.add_argument("--kd-s-layer", type=int, default=7)
+ap.add_argument("--kd-t-layer", type=int, default=17)
+ap.add_argument("--kd-weight", type=float, default=0.0, help="lambda at step 0")
+ap.add_argument("--kd-end-frac", type=float, default=0.8, help="lambda decays linearly to 0 at this fraction of --steps")
+ap.add_argument("--kd-t-context", default="", help="teacher att_context_size 'L,R' (default: the checkpoint's)")
 ap.add_argument("--lr-shape", default="cosine", choices=("cosine", "wsd"), help="wsd: warmup, flat peak LR, then a "
                 "cosine decay over the last --decay-frac of --steps (warmup-stable-decay)")
 ap.add_argument("--decay-frac", type=float, default=0.2)
@@ -268,6 +278,34 @@ ctc_head = None
 if a.ctc_weight:
     ctc_head = torch.nn.Linear(int(m.cfg.encoder.d_model), V + 1).to(dev)   # V pieces incl. <EOU>/<EOB>, blank = V
     groups.append({"params": list(ctc_head.parameters()), "lr": a.lr})
+kd_proj = kd_t = None
+if a.kd_teacher:
+    from nemo.collections.asr.models import ASRModel
+    kd_t = ASRModel.restore_from(a.kd_teacher, map_location=dev).eval()
+    for p_ in kd_t.parameters():
+        p_.requires_grad = False
+    if a.kd_t_context:
+        kd_t.encoder.set_default_att_context_size([int(v) for v in a.kd_t_context.split(",")])
+    kd_store = {}
+    kd_t.encoder.layers[a.kd_t_layer].register_forward_hook(
+        lambda mod, inp, o: kd_store.__setitem__("t", (o[0] if isinstance(o, tuple) else o)))
+    enc_layers[a.kd_s_layer].register_forward_hook(
+        lambda mod, inp, o: kd_store.__setitem__("s", (o[0] if isinstance(o, tuple) else o)) if m.training else None)
+    g_ = torch.Generator().manual_seed(a.seed + 1)   # fresh projection: nothing from the kd_audit.py probe
+    kd_proj = torch.nn.Linear(int(m.cfg.encoder.d_model), int(kd_t.cfg.encoder.d_model))
+    with torch.no_grad():
+        torch.nn.init.xavier_uniform_(kd_proj.weight, generator=g_); kd_proj.bias.zero_()
+    kd_proj = kd_proj.to(dev)
+    groups.append({"params": list(kd_proj.parameters()), "lr": a.lr})
+    print(f"== KD: teacher {a.kd_teacher} L{a.kd_t_layer} (att_context {kd_t.encoder.att_context_size}) <- student "
+          f"L{a.kd_s_layer} via Linear({kd_proj.in_features},{kd_proj.out_features}); lambda {a.kd_weight} -> 0 at "
+          f"{a.kd_end_frac:g} of the steps; loss 1 - cos", flush=True)
+
+
+def kd_lambda(s):
+    return a.kd_weight * max(0.0, 1.0 - s / max(1.0, a.kd_end_frac * a.steps))
+
+
 opt = torch.optim.AdamW(groups, betas=(0.9, 0.98), weight_decay=1e-3)
 warm = max(10, a.steps // 20)
 
@@ -282,9 +320,12 @@ def lr_factor(s):
 
 
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
-group_names = (["decoder+joint"] + [f"encoder-{i}" for i in range(1, len(groups) - 1 - (ctc_head is not None))]
-               + (["encoder"] if len(groups) - (ctc_head is not None) == 2 else []))[: len(groups) - (ctc_head is not None)] \
+_ng = len(groups) - (kd_proj is not None)
+group_names = (["decoder+joint"] + [f"encoder-{i}" for i in range(1, _ng - 1 - (ctc_head is not None))]
+               + (["encoder"] if _ng - (ctc_head is not None) == 2 else []))[: _ng - (ctc_head is not None)] \
     + (["ctc_head"] if ctc_head is not None else [])
+if kd_proj is not None:   # the projection group is the last one
+    group_names = group_names[:len(groups) - 1] + ["kd_proj"]
 lr_auc = [0.0] * len(groups)   # integrated LR per parameter group (sum over optimizer steps)
 print("== trainable", sum(p.numel() for g in groups for p in g["params"]) / 1e6, "M", flush=True)
 
@@ -489,6 +530,20 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             ctc = torch.nn.functional.ctc_loss(lp, Y, el, ylens, blank=V, reduction="sum", zero_infinity=True) / len(rs)
             loss_rnnt = loss.detach()
             loss = loss + a.ctc_weight * ctc
+        if kd_proj is not None:
+            t_k0 = time.perf_counter()
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                tf, tfl = kd_t.preprocessor(input_signal=X, length=lens)
+                kd_t.encoder(audio_signal=tf, length=tfl)
+            ht = kd_store.pop("t").float(); hs = kd_store.pop("s")
+            T_ = min(ht.shape[1], hs.shape[1]); ht, hs = ht[:, :T_], hs[:, :T_]
+            vm = (torch.arange(T_, device=dev)[None] < el[:, None]).float()   # valid frames (T equal by construction)
+            cs = torch.nn.functional.cosine_similarity(kd_proj(hs.float()), ht, dim=-1)
+            kd = ((1 - cs) * vm).sum() / vm.sum().clamp(min=1)
+            kd_cos = float(((cs.detach() * vm).sum() / vm.sum().clamp(min=1)))
+            kd_ms = (time.perf_counter() - t_k0) * 1000
+            loss_rnnt = loss.detach()
+            loss = loss + kd_lambda(step) * kd
         if a.profile_steps:
             ev[1].record()
         opt.zero_grad(set_to_none=True); loss.backward()
@@ -497,6 +552,8 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
         if (step + 1) % 25 == 0:   # encoder gradient norm before clipping (does the auxiliary loss reach the encoder?)
             eg = [p_.grad.norm() for p_ in m.encoder.parameters() if p_.grad is not None]
             enc_gn = float(torch.norm(torch.stack(eg))) if eg else 0.0
+            if kd_proj is not None:
+                kd_gn = float(torch.norm(torch.stack([p_.grad.norm() for p_ in kd_proj.parameters()])))
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
         for gi, g in enumerate(opt.param_groups):
             lr_auc[gi] += g["lr"] if any(p_.grad is not None for p_ in g["params"]) else 0.0
@@ -508,14 +565,18 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
         max_clip_s = max(max_clip_s, float(lens.max()) / 16000)
         if step % 25 == 0:
             print(f"  step {step}/{a.steps} loss {loss.item():.3f}"
-                  + (f" (rnnt {loss_rnnt.item():.3f} ctc {ctc.item():.3f})" if ctc_head is not None else "") + f" enc-gn {enc_gn:.2f} audio {seen_s / 3600:.2f} h "
+                  + (f" (rnnt {loss_rnnt.item():.3f} ctc {ctc.item():.3f})" if ctc_head is not None else "")
+                  + (f" (rnnt {loss_rnnt.item():.3f} kd {kd.item():.4f} cos {kd_cos:.4f} lambda {kd_lambda(step):.3f} "
+                     f"proj-gn {kd_gn:.3f} teacher {kd_ms:.0f} ms)" if kd_proj is not None else "") + f" enc-gn {enc_gn:.2f} audio {seen_s / 3600:.2f} h "
                   f"{seen_s / (time.time() - t0):.0f}x RT peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB "
                   f"reserved {torch.cuda.max_memory_reserved() / 1e9:.1f} GB max-clip {max_clip_s:.1f} s", flush=True)
     if a.eval_only or is_eval(step) or step == a.steps or step == a.stop_at or step in extra_evals:
         tr = rows[:8]
         hy, eo, mg, nb = decode(tr)
         tw, tc = wer_cer([norm(r["text"]) for r in tr], hy)
-        rec = {"step": step, "loss": round(loss.item(), 3), "train8_wer": round(tw, 2), "train8_cer": round(tc, 2),
+        rec = {"step": step, "loss": round(loss.item(), 3),
+               **({"rnnt": round(loss_rnnt.item(), 3), "kd": round(kd.item(), 4), "kd_cos": round(kd_cos, 4),
+                   "kd_lambda": round(kd_lambda(step), 4)} if kd_proj is not None and not a.eval_only else {}), "train8_wer": round(tw, 2), "train8_cer": round(tc, 2),
                "train8_empty": sum(1 for h in hy if not h.strip()), "train8_distinct": len(set(hy)),
                "nonblank_frac": round(float(np.mean(nb)), 4), "margin_max_mean": round(float(np.mean(mg)), 3)}
         print(f"  EVAL {json.dumps(rec)}", flush=True)
