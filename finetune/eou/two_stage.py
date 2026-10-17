@@ -512,7 +512,7 @@ def is_eval(s):
 
 
 prof_host, prof_ev, prof_wall = [], [], []
-calib = []
+calib = []; acc_r = acc_k = None
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
 extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
 set_train_mode()
@@ -565,6 +565,7 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
                 gk = torch.autograd.grad(kd, ep, allow_unused=True)
                 vr = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gr, ep)])
                 vk = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gk, ep)])
+                acc_r = vr if acc_r is None else acc_r + vr; acc_k = vk if acc_k is None else acc_k + vk
                 calib.append((float(vr.norm()), float(vk.norm()), float(torch.nn.functional.cosine_similarity(vr, vk, dim=0)),
                               float(loss_rnnt), float(kd)))
                 print(f"  calib batch {len(calib)}: |g_rnnt| {calib[-1][0]:.3f} |g_kd@1| {calib[-1][1]:.4f} "
@@ -575,6 +576,8 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
                           "g_kd_at_lambda1_mean": round(float(c_[:, 1].mean()), 5),
                           "ratio_median": round(float(np.median(c_[:, 1] / c_[:, 0])), 5),
                           "ratio_mean_of_means": round(float(c_[:, 1].mean() / c_[:, 0].mean()), 5),
+                          "ratio_of_summed_grads": round(float(acc_k.norm() / acc_r.norm()), 5),
+                          "grad_cos_summed": round(float(torch.nn.functional.cosine_similarity(acc_r, acc_k, dim=0)), 4),
                           "grad_cos_mean": round(float(c_[:, 2].mean()), 4), "rnnt_mean": round(float(c_[:, 3].mean()), 3),
                           "kd_mean": round(float(c_[:, 4].mean()), 4), "s_layer": a.kd_s_layer, "t_layer": a.kd_t_layer}), flush=True)
                     raise SystemExit(0)

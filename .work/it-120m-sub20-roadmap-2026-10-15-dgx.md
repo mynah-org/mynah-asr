@@ -548,3 +548,5 @@ Teacher Nemotron 3.5 streaming 0.6B (`EncDecRNNTBPEModelWithPrompt`, 638M) vs st
   (intermediate -> intermediate; S4 -> T5 is higher but early-to-early, near-acoustic). The ridge probe is NOT reused:
   E1's projection is a fresh random-init Linear(512, 1024).
 - Precompute estimate: 8.6 GB per 100 h for one teacher layer in bf16; on-the-fly teacher costs ~+40 ms / batch.
+- Fallback (E2, a distinct hypothesis, only if E1 S7 -> T17 is stable but null): early-layer distillation S4 -> T5
+  (highest R^2, .509, but early-to-early and near-acoustic).
