@@ -13,6 +13,7 @@ for p in $PATHS; do
     d=$S/$(echo "${p#/root/}" | tr / _)
     if [ -d "$p" ]; then cp -r "$p" "$d"; else cp "$p" "$d"; fi
 done
+find $S -type f \( -name "*.nemo" -o -name "*.ckpt" -o -name "*.wav" -o -name "*.flac" \) -delete   # never weights / audio
 find $S -type f \( -name "*.json" -o -name "*.jsonl" \) -size +5M -exec gzip -9 {} \;
 du -sh $S; find $S -type f | wc -l
 $PY - "$REPO" "$S" "$DEST" <<'PYEOF'
