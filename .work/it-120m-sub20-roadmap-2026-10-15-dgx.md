@@ -550,3 +550,6 @@ Teacher Nemotron 3.5 streaming 0.6B (`EncDecRNNTBPEModelWithPrompt`, 638M) vs st
 - Precompute estimate: 8.6 GB per 100 h for one teacher layer in bf16; on-the-fly teacher costs ~+40 ms / batch.
 - Fallback (E2, a distinct hypothesis, only if E1 S7 -> T17 is stable but null): early-layer distillation S4 -> T5
   (highest R^2, .509, but early-to-early and near-acoustic).
+- Teacher context check (S7 -> T17, same 248 clips): [56,0] .445, [56,3] .434, [56,6] .422, [56,13] .423, best
+  shift 0 in all four, T equal in all four -> the context does not change the pair or the alignment; the frozen
+  default [56,3] stays. E0 closed.
