@@ -19,7 +19,7 @@ shifts -3..+3: the best shift is the empirical offset, the curve's sharpness say
 This is a DIAGNOSTIC: a high cosine does not prove the layer is a useful target.
 --bench 1: teacher and student encoder forward ms for a batch of 16 x 10 s, and peak memory, on the device.
 """
-import argparse, json, math, time
+import argparse, json, math, re, time
 
 import numpy as np
 import soundfile as sf
@@ -32,6 +32,7 @@ ap.add_argument("--manifests", default="", help="name=manifest:n,... (first n cl
 ap.add_argument("--synth", default="0.4,0.7,1,1.5,2,5,10,20", help="durations (s) of synthetic clips (a real clip "
                 "tiled / cut to that length, so the encoders see speech)")
 ap.add_argument("--t-layers", default="auto")
+ap.add_argument("--s-layers", default="auto", help="student layers (0-based), default ~1/2 and last")
 ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 ap.add_argument("--bench", type=int, default=0)
 ap.add_argument("--ridge", default="0.01,0.1,1,10", help="ridge values on STANDARDISED features (x lambda * N); the best "
@@ -133,7 +134,8 @@ rep = {"teacher": describe(T_m), "student": describe(S_m)}
 nt, ns = len(T_m.encoder.layers), len(S_m.encoder.layers)
 t_layers = sorted({max(0, round(nt * q) - 1) for q in (0.25, 0.5, 0.75, 1.0)}) if a.t_layers == "auto" else \
     [int(x) for x in a.t_layers.split(",")]
-s_layers = sorted({max(0, round(ns * q) - 1) for q in (0.5, 1.0)})
+s_layers = sorted({max(0, round(ns * q) - 1) for q in (0.5, 1.0)}) if a.s_layers == "auto" else \
+    [int(x) for x in a.s_layers.split(",")]
 rep["t_layers"], rep["s_layers"] = t_layers, s_layers
 Ts, Th = hooks(T_m, t_layers)
 Ss, Sh = hooks(S_m, s_layers)
@@ -178,31 +180,40 @@ def audit(ctx):
                     "teacher_layers": {str(i): lstats(v) for i, v in lt.items() if i != "_mel8"},
                     "student_layers": {str(i): lstats(v) for i, v in ls.items() if i != "_mel8"}})
         if not name.startswith("synth"):
-            pairs.append((ls, lt))
+            pairs.append((ls, lt, re.sub(r"\d+$", "", name.split(":")[0])))
     r = {"att_context_teacher": ctx or rep["teacher"]["encoder_att_context_size_live"], "clips": per,
          "T_equal_all": all(p["dT"] == 0 for p in per), "dT_set": sorted({p["dT"] for p in per})}
     print(f"== teacher att_context {r['att_context_teacher']}: T equal on all {len(per)} clips: {r['T_equal_all']} "
           f"(dT {r['dT_set']}); T at 1/5/10/20 s: " + ", ".join(f"{p['T_teacher']}/{p['T_student']}" for p in per
                                                            if p["clip"] in ("synth:1s", "synth:5s", "synth:10s", "synth:20s")), flush=True)
     if pairs and r["T_equal_all"]:
-        tr, te = pairs[::2], pairs[1::2]; al = {}
+        dom = sorted({p[2] for p in pairs}); tr, te = [], []
+        for d_ in dom:   # alternate clips of EACH domain: every domain is in both halves
+            xs = [p for p in pairs if p[2] == d_]; tr += xs[::2]; te += xs[1::2]
+        al = {}
         for src in ["_mel8"] + s_layers:   # mel8 = 8 stacked mel frames: the acoustic baseline a student must beat
             for tl in t_layers:
                 row = {}
                 for k in range(-4, 5):
-                    Xa, Ya = zip(*[shifted(s_[src], t[tl], k) for s_, t in tr])
-                    Xb, Yb = zip(*[shifted(s_[src], t[tl], k) for s_, t in te])
+                    Xa, Ya = zip(*[shifted(s_[src], t[tl], k) for s_, t, _ in tr])
+                    Xb, Yb = zip(*[shifted(s_[src], t[tl], k) for s_, t, _ in te])
                     best = None
                     for lam in (float(v) for v in str(a.ridge).split(",")):
                         W, st = ridge_fit(Xa, Ya, lam)
                         c, r2 = score(W, st, Xb, Yb)
                         if best is None or r2 > best["r2"]:
-                            best = {"cos": round(c, 4), "r2": round(r2, 4), "ridge": lam}
+                            best = {"cos": round(c, 4), "r2": round(r2, 4), "ridge": lam, "_W": (W, st)}
+                    W, st = best.pop("_W")
+                    for d_ in dom:   # the pooled fit, scored on each domain's held-out clips
+                        xb = [shifted(s_[src], t[tl], k) for s_, t, dd in te if dd == d_]
+                        if xb:
+                            cd, rd = score(W, st, [x for x, _ in xb], [y for _, y in xb])
+                            best[f"r2_{d_}"] = round(rd, 4); best[f"cos_{d_}"] = round(cd, 4)
                     row[str(k)] = best
                 al[f"{'mel8' if src == '_mel8' else 'student' + str(src)}->teacher{tl}"] = row
                 best = max(row, key=lambda k: row[k]["r2"])
                 print(f"  {'mel8' if src == '_mel8' else 'student L' + str(src):>11} -> teacher L{tl:<2} R2 by shift "
-                      + " ".join(f"{k}:{v['r2']:.3f}" for k, v in row.items()) + f" | best {best} cos {row[best]['cos']:.3f}", flush=True)
+                      + " ".join(f"{k}:{v['r2']:.3f}" for k, v in row.items()) + f" | best {best} cos {row[best]['cos']:.3f} | " + " ".join(f"{d_} {row[best].get('r2_' + d_, float('nan')):.3f}" for d_ in dom), flush=True)
         r["alignability"] = al
         r["alignability_note"] = (f"standardised ridge {a.ridge}, fitted on the frames of {len(tr)} clips, scored on {len(te)}; "
                                   "key = teacher frame shift k (student frame i <-> teacher frame i + k); centred cosine / R^2 held out")

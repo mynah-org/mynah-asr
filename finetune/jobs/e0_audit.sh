@@ -6,6 +6,6 @@
 OUT=${OUT:-$FT_ROOT/e0/kd_audit.json}; mkdir -p "$(dirname $OUT)"
 T=${TEACHER:-$FT_ROOT/models/nemotron-3.5-asr-streaming-0.6b.nemo}; S=${STUDENT:-$FT_ROOT/models/parakeet_realtime_eou_120m-v1.nemo}
 [ -n "${NOLOCK:-}" ] || gpu_lock
-timeout 1800 "$PY" "$FINETUNE/eou/diag/kd_audit.py" --teacher $T --student $S --manifests "${MF:?}" ${TCTX:+--t-contexts "$TCTX"} --bench 1 --out $OUT 2>&1 \
+timeout 1800 "$PY" "$FINETUNE/eou/diag/kd_audit.py" --teacher $T --student $S --manifests "${MF:?}" ${TCTX:+--t-contexts "$TCTX"} ${SLAYERS:+--s-layers $SLAYERS} ${TLAYERS:+--t-layers $TLAYERS} --bench 1 --out $OUT 2>&1 \
     | grep -a -v -E "NeMo W|warn|Warning"
 echo "== E0-DONE $(date +%T)"
