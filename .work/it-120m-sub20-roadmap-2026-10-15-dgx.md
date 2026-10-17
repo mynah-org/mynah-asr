@@ -512,3 +512,39 @@ clips where a credible teacher succeeds and the 120M fails (D1) move the candida
   per-domain check before promotion; |D1 - D0| < 1.0 -> selection heuristic null (no threshold tuning); both <= 18.4
   vs the reference while D0 ~ D1 -> new yg7 exposure matters, selection less; neither beats the reference by > 0.5
   -> simple extra-data route weak, compute to E. Differences < 0.5 are not read. Clean-it diagnostic only.
+
+### Phase E0 result: teacher / student encoder audit (`kd_audit.py`, OBSERVED; no training)
+
+Teacher Nemotron 3.5 streaming 0.6B (`EncDecRNNTBPEModelWithPrompt`, 638M) vs student EOU 120M stock (115M):
+
+| | EOU 120M | Nemotron 0.6B |
+|---|---:|---:|
+| preprocessor | 16 kHz, 128 mel, 25 / 10 ms, n_fft 512, no norm | identical |
+| encoder layers / d_model | 17 / 512 | 24 / 1024 |
+| subsampling | dw_striding x8, causal | identical |
+| frame | 80 ms | 80 ms |
+| T at 1 / 5 / 10 / 20 s | 14 / 64 / 126 / 251 | 14 / 64 / 126 / 251 |
+| att_context | [70, 1] | [56, 3] default (0 / 3 / 6 / 13 selectable) |
+| encoder fwd 16 x 10 s bf16 (uncontended) | 19.6 ms | 37.5 ms |
+
+- T_teacher == T_student on every clip (412 real + synthetic 0.4-20 s, 4 teacher contexts): no interpolation /
+  DTW; frame-to-frame 1:1. The language prompt enters AFTER the encoder (`prompt_kernel` on the encoder output):
+  the teacher encoder states are prompt-free.
+- Linear alignability (standardised ridge, fitted on half the clips of each domain, scored held out; 248 training
+  clips MLS / CV / VP / YG, 60 each; diagnostic only, not "information content"): held-out R^2 at the best shift
+
+| student \ teacher | L5 | L11 | L17 | L23 |
+|---|---|---|---|---|
+| mel stack (acoustic baseline) | .070 (+1) | .070 (+1) | .053 (+2) | .018 |
+| L4 | .509 (0) | .347 (0) | .333 (0) | .123 |
+| **L7** | .288 (0) | .285 (0) | **.434 (0)** | .158 |
+| L12 | .194 (-1) | .270 (-1) | .349 (-1) | .159 |
+| L16 (final) | .087 (-4) | .153 (-4) | .208 (-4) | .157 (0) |
+
+  S7 -> T17 per domain (held out): MLS .449, CV .462, VP .426, YG .395 (consistent across domains); R^2 at shift
+  -1 / 0 / +1: .381 / .434 / .339 (sharp peak at 0). The teacher's final layer is weakly predictable from anything
+  (task / tokenizer specific); the student's final layer maps poorly and lags (best shift -4).
+- **Frozen for E1: student L7 (0-based) -> teacher L17 (0-based), shift 0, teacher default context [56, 3]**
+  (intermediate -> intermediate; S4 -> T5 is higher but early-to-early, near-acoustic). The ridge probe is NOT reused:
+  E1's projection is a fresh random-init Linear(512, 1024).
+- Precompute estimate: 8.6 GB per 100 h for one teacher layer in bf16; on-the-fly teacher costs ~+40 ms / batch.
