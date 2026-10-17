@@ -96,6 +96,10 @@ def main():
     ap.add_argument("--base", default="", help="A2 part of the mix, unchanged (path:weight,...)")
     ap.add_argument("--ext", default="", help="existing external manifests sharing --ext-w with the D set")
     ap.add_argument("--ext-w", type=float, default=0.4388)
+    ap.add_argument("--d-share", type=float, default=0.0, help="> 0: the D set gets this FIXED draw share (taken from "
+                    "--ext-w; the --ext manifests share the rest in proportion to hours) instead of its hours' share")
+    ap.add_argument("--steps", type=int, default=8000, help="for the expected draws per clip")
+    ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--dups", default="", help="pool_sanity.py --dup-out JSON: within-pool groups keep their first clip, "
                     "clips matching an older pool (cross_*) are dropped (student-free, before bucketing)")
     a = ap.parse_args()
@@ -176,15 +180,22 @@ def main():
     ext = [p for p in a.ext.split(",") if p]
     eh = [hours(p, a.max_s) for p in ext]
     for n in sets:
-        hs = eh + [a.hours]; ps = ext + [str(out / f"{n}.json")]
-        parts = ([a.base] if a.base else []) + [f"{p}:{a.ext_w * h / sum(hs):.4f}" for p, h in zip(ps, hs)]
+        ps = ext + [str(out / f"{n}.json")]
+        if a.d_share > 0:
+            ws = [(a.ext_w - a.d_share) * h / sum(eh) for h in eh] + [a.d_share]
+        else:
+            hs = eh + [a.hours]; ws = [a.ext_w * h / sum(hs) for h in hs]
+        parts = ([a.base] if a.base else []) + [f"{p}:{w:.4f}" for p, w in zip(ps, ws)]
+        summ[n]["draw_share"] = round(ws[-1], 4)
+        summ[n]["expected_draws_per_clip"] = round(a.steps * a.bs * ws[-1] / max(1, len(sets[n])), 2)
         (out / f"mix_{n}.txt").write_text(",".join(parts) + "\n")
         summ[n]["mix"] = ",".join(parts)
     json.dump(summ, open(out / "d_sets.json", "w"), indent=1)
     for n in sets:
         t = summ[n]
         print(f"== {n}: {t['clips']} clips {t['hours']} h, dur {t['dur_p10_p50_p90']}, student {t['student_wer']}, "
-              f"teacher {t['teacher_wer']}, videos {t['videos']}\n   mix {t['mix']}")
+              f"teacher {t['teacher_wer']}, videos {t['videos']} (top-10 % share {t['top10pct_videos_h_share']} %), "
+              f"draw share {t['draw_share']}, expected draws / clip {t['expected_draws_per_clip']}\n   mix {t['mix']}")
     print(f"== overlap D0/D1: {ov} clips ({100 * ov / max(1, len(d1)):.1f} % of D1)")
 
 
