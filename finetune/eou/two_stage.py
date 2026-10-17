@@ -297,6 +297,7 @@ if a.kd_teacher:
     print(f"== KD: preprocessor max |student - teacher| = {dpre:.2e} (eval, same input)", flush=True)
     if dpre > 1e-3:
         raise SystemExit("== KD: preprocessors differ, the shared-feature design does not hold")
+    kd_t = kd_t.to(torch.bfloat16)   # inference only: halves the teacher's resident memory (1.3 GB)
     kd_store = {}
     kd_t.encoder.layers[a.kd_t_layer].register_forward_hook(
         lambda mod, inp, o: kd_store.__setitem__("t", (o[0] if isinstance(o, tuple) else o)))
@@ -412,8 +413,11 @@ kd_feats = {}
 
 def encode(X, lens):
     f, fl = m.preprocessor(input_signal=X, length=lens)
-    if kd_t is not None and m.training:   # the teacher reads THESE features (same dither realisation), before SpecAugment
-        kd_feats["f"], kd_feats["fl"] = f.detach(), fl
+    if kd_t is not None and m.training:   # the teacher reads THESE features (same dither realisation), before SpecAugment;
+        t_k0 = time.perf_counter()        # run BEFORE the student encoder / joint: its no-grad activations are freed first
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):   # preprocessors identical (checked at start)
+            kd_t.encoder(audio_signal=f.detach(), length=fl)
+        kd_feats["ms"] = (time.perf_counter() - t_k0) * 1000
     if m.training and m.spec_augmentation is not None:
         f = m.spec_augmentation(input_spec=f, length=fl)
     return m.encoder(audio_signal=f, length=fl)
@@ -548,21 +552,18 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             loss_rnnt = loss.detach()
             loss = loss + a.ctc_weight * ctc
         if kd_proj is not None:
-            t_k0 = time.perf_counter()
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):   # preprocessors identical (kd_audit.py)
-                kd_t.encoder(audio_signal=kd_feats.pop("f"), length=kd_feats.pop("fl"))
             ht = kd_store.pop("t").float(); hs = kd_store.pop("s")
             T_ = min(ht.shape[1], hs.shape[1]); ht, hs = ht[:, :T_], hs[:, :T_]
             vm = (torch.arange(T_, device=dev)[None] < el[:, None]).float()   # valid frames (T equal by construction)
             cs = torch.nn.functional.cosine_similarity(kd_proj(hs.float()), ht, dim=-1)
             kd = ((1 - cs) * vm).sum() / vm.sum().clamp(min=1)
             kd_cos = float(((cs.detach() * vm).sum() / vm.sum().clamp(min=1)))
-            kd_ms = (time.perf_counter() - t_k0) * 1000
+            kd_ms = kd_feats.pop("ms", 0.0)   # host-side launch time only (async): the real cost is the step time vs the control
             loss_rnnt = loss.detach()
             if a.kd_calib:
                 ep = [p_ for p_ in m.encoder.parameters() if p_.requires_grad]
-                gr = torch.autograd.grad(loss, ep, retain_graph=True, allow_unused=True)
-                gk = torch.autograd.grad(kd, ep, allow_unused=True)
+                gk = torch.autograd.grad(kd, ep, retain_graph=True, allow_unused=True)   # small graph first
+                gr = torch.autograd.grad(loss, ep, allow_unused=True)
                 vr = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gr, ep)])
                 vk = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gk, ep)])
                 acc_r = vr if acc_r is None else acc_r + vr; acc_k = vk if acc_k is None else acc_k + vk
