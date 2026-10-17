@@ -44,8 +44,8 @@ R=/root/res; mkdir -p $R/done
 REPO=/root/mynah-asr; BRANCH=${BRANCH:-lw-finetune-tooling}
 step() { [ -e "$R/done/$1" ] && { echo "== skip $1"; return 1; }; echo "== $1 $(date +%T)"; return 0; }
 ok() { touch "$R/done/$1"; echo "== ok $1 $(date +%T)"; }
-hf() {  # hf <repo> <file> <dest>: resumable, authenticated
-    curl -fL --retry 5 -C - -H "Authorization: Bearer $(cat /root/.hf_token)" \
+hf() {  # hf <repo> <file> <dest>: resumable, authenticated (token via a curl config on a pipe, never in argv)
+    curl -fL --retry 5 -C - -K <(printf 'header = "Authorization: Bearer %s"\n' "$(cat /root/.hf_token)") \
         -o "$3" "https://huggingface.co/$1/resolve/main/$2"
 }
 

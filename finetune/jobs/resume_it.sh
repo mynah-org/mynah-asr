@@ -17,7 +17,7 @@ mkdir -p $MX $YG $FT_ROOT/logs
 hub() {  # hub <path in repo> <dest>: resumable, authenticated, skipped when present
     [ -s "$2" ] && return 0
     mkdir -p "$(dirname "$2")"
-    curl -fsSL --retry 5 -C - -H "Authorization: Bearer $(cat /root/.hf_token)" \
+    curl -fsSL --retry 5 -C - -K <(printf 'header = "Authorization: Bearer %s"\n' "$(cat /root/.hf_token)") \
         -o "$2" "https://huggingface.co/$HUB/resolve/main/$1" || { echo "== hub FAILED $1"; return 1; }
 }
 echo "== resume_it $(date +%T)"
