@@ -566,3 +566,45 @@ parity, serving advantage kept (120M, ~2 GB, true streaming); 15-18 WER = top ba
    plain -> EOU WER delta, not the EOU rate alone; 6. Mynah export + parity; 7. FINAL-IT built before the last
    choice and used once: greedy / beam WER + CER, empties, EOU precision / recall, endpoint latency, streaming lag,
    failures by duration / domain; L4 / L40S serving benchmark.
+
+### Phase D data (OBSERVED, before any D training) and the frozen D0 / D1 (pre-registration, 2026-10-17 ~13:20 UTC)
+
+it-yg7 rebuilt exactly (156,247 clips / 500.7 h / 9,441 videos / 201 shards, 0 video / shard overlap with it-yg and
+it-yg6, max 30 s); teacher pass complete; `yg_all` (digits dropped) 142,080 clips / 445.5 h. Duplicates removed
+before bucketing (`pool_sanity.py --xhash`, decoded samples): 81 within-pool groups (re-uploaded videos, first kept)
++ 12 / 23 clips equal to it-yg / it-yg6 agree<=15 clips -> 107 dropped. Frozen scorer W4-C250-16k.
+
+| bucket | clips | h | dur p10/p50/p90 | student WER | teacher vs Granary | empty % | hyp/ref | videos | top-10 % videos' h |
+|---|---|---|---|---|---|---|---|---|---|
+| A learnable | 4,535 | 7.86 | 1.7 / 4.2 / 13.7 | 43.4 | 0.8 | 0.0 | 0.94 | 2,550 | 33 % |
+| B solved | 10,987 | 27.4 | 2.4 / 7.1 / 18.9 | 1.2 | 2.9 | 0.0 | 1.00 | 4,160 | 40 % |
+| M mid | 66,823 | 247.0 | 3.9 / 11.5 / 26.0 | 19.8 | 6.7 | 0.0 | 0.97 | 8,351 | 45 % |
+| C ambiguous | 53,538 | 147.0 | 2.0 / 7.0 / 23.2 | 43.4 | 33.3 | 0.0 | 0.96 | 7,146 | 49 % |
+| D suspicious | 19 | 0.03 | - | 45.8 | 44.1 | - | - | 19 | - |
+| E excluded | 6,071 | 15.8 | 1.5 / 6.4 / 23.2 | 88.3 | 44.0 | 11.2 | 1.00 | 2,779 | 39 % |
+
+Student-free gate (teacher_wer <= 5, no label flags): 116 h. Only 7.9 of the 116 credible hours are hard for the
+16k scorer (short-clip heavy: A median 4.2 s vs pool 8.9 s); the scorer already handles most unseen-video yg7.
+
+Design amendment (registered now, before any D result; A NOT widened, thresholds unchanged): H = 7.86 h = all of A.
+With the hours-proportional weight the D set would get ~1.5 % of the draws (< 0.5 pass): no power. Instead the D set
+gets a FIXED draw share 0.10, taken from the external weight (yg 0.1455, yg6 0.1933; A2 unchanged).
+Question tested: does a fixed 10 % training budget allocated to a small new-data subset selected by teacher-supported
+student difficulty beat the identical budget on a random, duration-matched subset of the same deduplicated,
+credibility-gated it-yg7 universe?
+
+| | clips | h | dur p10/p50/p90 | videos | top-10 % videos' h | draw share | expected draws / clip | student WER | teacher vs Granary |
+|---|---|---|---|---|---|---|---|---|---|
+| D0 (random, gate, per-bin matched) | 4,395 | 7.86 | 1.7 / 4.3 / 14.0 | 2,561 | 33.8 % | 0.10 | 2.91 | 18.1 | 0.7 |
+| D1 (all of A) | 4,534 | 7.86 | 1.7 / 4.2 / 13.7 | 2,549 | 32.9 % | 0.10 | 2.82 | 43.4 | 0.8 |
+
+Overlap D0 / D1: 849 clips (18.7 % of D1; mostly short bins where A is ~1/3 of the gate). sha256: D0.json f3c9a54f,
+D1.json e6172110, mix_D0 262567a0, mix_D1 a073d0b8, yg_all 9ed5bb09, student scores 6bd9e14b, scorer b13e4e7e,
+dup groups 4281b425. Runs: `c1_curriculum.sh` with MIXFILE = mix_D0 / mix_D1, W4 8k (enc 4e-4, dec/joint 3e-4, WSD
+0.2, bs 16, seed 0, max-dur 30), stock init, sparse evals, final.nemo = EOF; D0 first, D1 not changed after D0.
+Primary = harness oracle@8 (reference W4-C250-8k 19.43):
+- D1 <= D0 - 1.0 -> selection win; additionally <= 18.4 -> strong selection win (16k candidate);
+- |D1 - D0| < 1.0 -> selection null (no threshold tuning afterwards);
+- D0 and D1 both clearly below 19.43 (> 0.5) -> new yg7 exposure useful, selection not needed;
+- D1 better on greedy / beam but not oracle -> not a candidate-generation win;
+- deltas < 0.5 are not read; a -0.3 is never promoted to 16k. Clean-it diagnostic only.
