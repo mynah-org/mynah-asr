@@ -34,7 +34,8 @@ ap.add_argument("--synth", default="0.4,0.7,1,1.5,2,5,10,20", help="durations (s
 ap.add_argument("--t-layers", default="auto")
 ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 ap.add_argument("--bench", type=int, default=0)
-ap.add_argument("--ridge", type=float, default=1e-2, help="ridge on STANDARDISED features (x lambda * N)")
+ap.add_argument("--ridge", default="0.01,0.1,1,10", help="ridge values on STANDARDISED features (x lambda * N); the best "
+                "held-out value per (source, teacher layer, shift) is reported (diagnostic, mildly optimistic)")
 ap.add_argument("--t-contexts", default="", help="teacher att_context_size values to audit, e.g. '56,0;56,3;56,13' "
                 "(the alignability and T checks are repeated per value; default = the checkpoint's default only)")
 ap.add_argument("--out", required=True)
@@ -191,9 +192,13 @@ def audit(ctx):
                 for k in range(-4, 5):
                     Xa, Ya = zip(*[shifted(s_[src], t[tl], k) for s_, t in tr])
                     Xb, Yb = zip(*[shifted(s_[src], t[tl], k) for s_, t in te])
-                    W, st = ridge_fit(Xa, Ya, a.ridge)
-                    c, r2 = score(W, st, Xb, Yb)
-                    row[str(k)] = {"cos": round(c, 4), "r2": round(r2, 4)}
+                    best = None
+                    for lam in (float(v) for v in str(a.ridge).split(",")):
+                        W, st = ridge_fit(Xa, Ya, lam)
+                        c, r2 = score(W, st, Xb, Yb)
+                        if best is None or r2 > best["r2"]:
+                            best = {"cos": round(c, 4), "r2": round(r2, 4), "ridge": lam}
+                    row[str(k)] = best
                 al[f"{'mel8' if src == '_mel8' else 'student' + str(src)}->teacher{tl}"] = row
                 best = max(row, key=lambda k: row[k]["r2"])
                 print(f"  {'mel8' if src == '_mel8' else 'student L' + str(src):>11} -> teacher L{tl:<2} R2 by shift "
