@@ -553,3 +553,16 @@ Teacher Nemotron 3.5 streaming 0.6B (`EncDecRNNTBPEModelWithPrompt`, 638M) vs st
 - Teacher context check (S7 -> T17, same 248 clips): [56,0] .445, [56,3] .434, [56,6] .422, [56,13] .423, best
   shift 0 in all four, T equal in all four -> the context does not change the pair or the alignment; the frozen
   default [56,3] stays. E0 closed.
+
+### Path to EOU-IT v4 (plan, 2026-10-17; after D / E1 read)
+
+Success = FINAL-IT (new, untouched) 1-best < 20 WER, EOU success >= 98-99 %, plain -> EOU delta 0..+1 WER, Mynah
+parity, serving advantage kept (120M, ~2 GB, true streaming); 15-18 WER = top band; ~10-12 = stretch.
+1. Promote the one real D / KD win (if a probe justifies it) to a sufficient budget.
+2. KD + selected data together only if the effects are clearly additive.
+3. If oracle@8 reaches ~10-12 while 1-best stays 17-20: switch axis to ranking / sequence (N-best) distillation,
+   not more encoder steps.
+4. Freeze the best plain; 5. Stage 2 EOU with the conservative v3 recipe (decoder / joint LR / 5), gate on the
+   plain -> EOU WER delta, not the EOU rate alone; 6. Mynah export + parity; 7. FINAL-IT built before the last
+   choice and used once: greedy / beam WER + CER, empties, EOU precision / recall, endpoint latency, streaming lag,
+   failures by duration / domain; L4 / L40S serving benchmark.
