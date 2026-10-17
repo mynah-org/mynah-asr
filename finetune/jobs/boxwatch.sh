@@ -14,7 +14,8 @@ for f in $LOGS; do
     echo "$n" >"$k"
 done
 now=$(date +%s)
-for t in $(tmux ls -F '#S' 2>/dev/null | grep -v ssh_tmux); do
+# sessions whose log is quiet by design (lock holders, long downloads) are listed in /root/.boxwatch/no_stale
+for t in $(tmux ls -F '#S' 2>/dev/null | grep -v ssh_tmux | grep -vxF -f <(cat $S/no_stale 2>/dev/null; echo ssh_tmux)); do
     f=$(ls -t /root/ft/logs/$t*.log /root/res/$t*.log 2>/dev/null | head -1)
     [ -n "$f" ] && [ $(( (now - $(stat -c %Y "$f")) / 60 )) -gt "$STALE_MIN" ] && echo "STALE: tmux $t, $(basename $f) unchanged > $STALE_MIN min"
 done
