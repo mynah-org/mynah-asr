@@ -24,6 +24,7 @@ gpu_lock
 timeout 3600 "$PY" "$FINETUNE/eou/diag/student_score.py" --nemo "$STUDENT" --manifests "yg7=$POOL/subsets/yg_all.json" \
     --out $POOL/student_w4_16k.jsonl --bs 64 | grep -E "^==|Traceback|Error"
 flock -u 9
-python3 "$FINETUNE/eou/d_select.py" --pool $POOL/subsets/yg_all.json --student $POOL/student_w4_16k.jsonl --out $D
+python3 "$FINETUNE/eou/d_select.py" --pool $POOL/subsets/yg_all.json --student $POOL/student_w4_16k.jsonl --out $D \
+    $([ -s $D/dup_groups.json ] && echo --dups $D/dup_groups.json)
 sha256sum $POOL/subsets/yg_all.json $POOL/student_w4_16k.jsonl "$STUDENT" | tee $D/hashes.txt
 echo "== D-PREP-DONE $(date +%T)"

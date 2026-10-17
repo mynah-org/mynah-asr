@@ -16,7 +16,7 @@
   B  solved       student_wer <= 5;
   A  learnable    teacher_wer <= 5 and student_wer >= 30 (teacher credible, student fails);
   M  mid          everything else.
-Credibility (teacher_wer, h_flags) never looks at the student. With --hours H:
+Duplicates (--dups) are removed first. Credibility (teacher_wer, h_flags) never looks at the student. With --hours H:
   D1 = H hours drawn at random (--seed) from A;
   D0 = H hours drawn at random from the GATE = teacher_wer <= 5 and no h_flags (A's student-free conditions),
        independent of the student, matched to D1 per duration bin (hours per bin = D1's), so D0 and D1 differ
@@ -96,11 +96,22 @@ def main():
     ap.add_argument("--base", default="", help="A2 part of the mix, unchanged (path:weight,...)")
     ap.add_argument("--ext", default="", help="existing external manifests sharing --ext-w with the D set")
     ap.add_argument("--ext-w", type=float, default=0.4388)
+    ap.add_argument("--dups", default="", help="pool_sanity.py --dup-out JSON: within-pool groups keep their first clip, "
+                    "clips matching an older pool (cross_*) are dropped (student-free, before bucketing)")
     a = ap.parse_args()
     st = {}
     for l in open(a.student):
         r = json.loads(l); st[r["audio_filepath"]] = r
     rows = [r for r in map(json.loads, open(a.pool)) if r["duration"] <= a.max_s]
+    if a.dups:
+        g = json.load(open(a.dups)); drop = set()
+        for grp in g.get("within") or []:
+            drop |= set(sorted(grp)[1:])
+        for k, v in g.items():
+            if k.startswith("cross_"):
+                drop |= set(v)
+        n0 = len(rows); rows = [r for r in rows if r["audio_filepath"] not in drop]
+        print(f"== dups: {n0 - len(rows)} clips dropped ({len(drop)} listed)")
     miss = sum(1 for r in rows if r["audio_filepath"] not in st)
     if miss:
         sys.exit(f"== {miss} pool clips without a student score")
