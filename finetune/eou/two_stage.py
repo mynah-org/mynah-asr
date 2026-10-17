@@ -104,7 +104,11 @@ ap.add_argument("--kd-teacher", default="", help="encoder feature distillation (
 ap.add_argument("--kd-s-layer", type=int, default=7)
 ap.add_argument("--kd-t-layer", type=int, default=17)
 ap.add_argument("--kd-weight", type=float, default=0.0, help="lambda at step 0")
-ap.add_argument("--kd-end-frac", type=float, default=0.8, help="lambda decays linearly to 0 at this fraction of --steps")
+ap.add_argument("--kd-end-frac", type=float, default=1.0, help="lambda(s) = kd_weight * max(0, 1 - s / (kd_end_frac * steps)): "
+                "linear from step 0, 0 from kd_end_frac * steps on (1.0 = over the whole run)")
+ap.add_argument("--kd-calib", type=int, default=0, help="N > 0: gradient calibration only (no optimizer step, no eval): "
+                "on N training batches, encoder grad norms of the RNNT loss and of the KD loss at lambda 1, their ratio "
+                "and cosine, printed as == KD-CALIB, then exit")
 ap.add_argument("--kd-t-context", default="", help="teacher att_context_size 'L,R' (default: the checkpoint's)")
 ap.add_argument("--lr-shape", default="cosine", choices=("cosine", "wsd"), help="wsd: warmup, flat peak LR, then a "
                 "cosine decay over the last --decay-frac of --steps (warmup-stable-decay)")
@@ -286,6 +290,13 @@ if a.kd_teacher:
         p_.requires_grad = False
     if a.kd_t_context:
         kd_t.encoder.set_default_att_context_size([int(v) for v in a.kd_t_context.split(",")])
+    with torch.no_grad():   # the teacher reads the student's features: the two preprocessors must be the same function
+        m.preprocessor.eval(); x_ = torch.randn(2, 48000, device=dev) * 0.1; l_ = torch.tensor([48000, 30000], device=dev)
+        fs_, _ = m.preprocessor(input_signal=x_, length=l_); ft_, _ = kd_t.preprocessor(input_signal=x_, length=l_)
+        dpre = float((fs_ - ft_).abs().max()); m.preprocessor.train()
+    print(f"== KD: preprocessor max |student - teacher| = {dpre:.2e} (eval, same input)", flush=True)
+    if dpre > 1e-3:
+        raise SystemExit("== KD: preprocessors differ, the shared-feature design does not hold")
     kd_store = {}
     kd_t.encoder.layers[a.kd_t_layer].register_forward_hook(
         lambda mod, inp, o: kd_store.__setitem__("t", (o[0] if isinstance(o, tuple) else o)))
@@ -396,8 +407,13 @@ def batch(rs, train=False):
     return X.to(dev), lens.to(dev), Y.to(dev), ylens.to(dev)
 
 
+kd_feats = {}
+
+
 def encode(X, lens):
     f, fl = m.preprocessor(input_signal=X, length=lens)
+    if kd_t is not None and m.training:   # the teacher reads THESE features (same dither realisation), before SpecAugment
+        kd_feats["f"], kd_feats["fl"] = f.detach(), fl
     if m.training and m.spec_augmentation is not None:
         f = m.spec_augmentation(input_spec=f, length=fl)
     return m.encoder(audio_signal=f, length=fl)
@@ -496,6 +512,7 @@ def is_eval(s):
 
 
 prof_host, prof_ev, prof_wall = [], [], []
+calib = []
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
 extra_evals = {int(x) for x in a.eval_steps.split(",") if x}
 set_train_mode()
@@ -532,9 +549,8 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             loss = loss + a.ctc_weight * ctc
         if kd_proj is not None:
             t_k0 = time.perf_counter()
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                tf, tfl = kd_t.preprocessor(input_signal=X, length=lens)
-                kd_t.encoder(audio_signal=tf, length=tfl)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):   # preprocessors identical (kd_audit.py)
+                kd_t.encoder(audio_signal=kd_feats.pop("f"), length=kd_feats.pop("fl"))
             ht = kd_store.pop("t").float(); hs = kd_store.pop("s")
             T_ = min(ht.shape[1], hs.shape[1]); ht, hs = ht[:, :T_], hs[:, :T_]
             vm = (torch.arange(T_, device=dev)[None] < el[:, None]).float()   # valid frames (T equal by construction)
@@ -543,6 +559,26 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             kd_cos = float(((cs.detach() * vm).sum() / vm.sum().clamp(min=1)))
             kd_ms = (time.perf_counter() - t_k0) * 1000
             loss_rnnt = loss.detach()
+            if a.kd_calib:
+                ep = [p_ for p_ in m.encoder.parameters() if p_.requires_grad]
+                gr = torch.autograd.grad(loss, ep, retain_graph=True, allow_unused=True)
+                gk = torch.autograd.grad(kd, ep, allow_unused=True)
+                vr = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gr, ep)])
+                vk = torch.cat([(g if g is not None else torch.zeros_like(p_)).flatten() for g, p_ in zip(gk, ep)])
+                calib.append((float(vr.norm()), float(vk.norm()), float(torch.nn.functional.cosine_similarity(vr, vk, dim=0)),
+                              float(loss_rnnt), float(kd)))
+                print(f"  calib batch {len(calib)}: |g_rnnt| {calib[-1][0]:.3f} |g_kd@1| {calib[-1][1]:.4f} "
+                      f"ratio {calib[-1][1] / calib[-1][0]:.4f} cos {calib[-1][2]:.4f} rnnt {calib[-1][3]:.2f} kd {calib[-1][4]:.4f}", flush=True)
+                if len(calib) >= a.kd_calib:
+                    c_ = np.array(calib)
+                    print("== KD-CALIB " + json.dumps({"batches": len(c_), "g_rnnt_mean": round(float(c_[:, 0].mean()), 4),
+                          "g_kd_at_lambda1_mean": round(float(c_[:, 1].mean()), 5),
+                          "ratio_median": round(float(np.median(c_[:, 1] / c_[:, 0])), 5),
+                          "ratio_mean_of_means": round(float(c_[:, 1].mean() / c_[:, 0].mean()), 5),
+                          "grad_cos_mean": round(float(c_[:, 2].mean()), 4), "rnnt_mean": round(float(c_[:, 3].mean()), 3),
+                          "kd_mean": round(float(c_[:, 4].mean()), 4), "s_layer": a.kd_s_layer, "t_layer": a.kd_t_layer}), flush=True)
+                    raise SystemExit(0)
+                continue
             loss = loss + kd_lambda(step) * kd
         if a.profile_steps:
             ev[1].record()
