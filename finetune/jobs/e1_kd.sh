@@ -8,9 +8,10 @@
 #   ARM=ctl|kd tmux new -d -s e1 'FT_ROOT=/root/ft ARM=kd bash finetune/jobs/e1_kd.sh 2>&1 | tee -a /root/ft/logs/e1-kd.log'
 set -u
 : "${FT_ROOT:?}"; ARM=${ARM:?ctl or kd}; STEPS=${STEPS:-2000}
-S=${KD_S:-7}; T=${KD_T:-17}; LAM=${KD_LAMBDA:-25}; END=${KD_END:-0.8}
+S=${KD_S:-7}; T=${KD_T:-17}; LAM=${KD_LAMBDA:-}; END=${KD_END:-1.0}
 TEACHER=${TEACHER:-$FT_ROOT/models/nemotron-3.5-asr-streaming-0.6b.nemo}
 W4="--lr-shape wsd --decay-frac 0.2 --enc-lr 4e-4 --eval-sparse 500,250 --final-eof 1"
+[ "$ARM" = kd ] && [ -z "$LAM" ] && { echo "== KD_LAMBDA must be set (pre-registered from ARM=calib)"; exit 2; }
 KD=""; [ "$ARM" = kd ] && KD="--kd-teacher $TEACHER --kd-s-layer $S --kd-t-layer $T --kd-weight $LAM --kd-end-frac $END"
 if [ "$ARM" = calib ]; then   # unit calibration of the KD loss: no optimizer step, no eval, no WER (two_stage.py --kd-calib)
     . "$(dirname "$0")/gpu_lock.sh"; gpu_lock
