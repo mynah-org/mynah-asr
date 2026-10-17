@@ -4,7 +4,8 @@
 # seed 0) at FIX_STEPS=$STEPS, sparse evals, final.nemo = EOF; the KD arm adds ONLY two_stage.py --kd-* (student
 # layer S -> fresh Linear(512, 1024) -> teacher layer T of Nemotron 0.6B, 1 - cos, lambda annealed to 0).
 # Probes (p1_additive.sh): harness + clean-it, greedy / beam-8 / oracle-8, raw and 0.5 s flush.
-#   ARM=calib: --kd-calib on C250 batches (encoder grad norms RNNT vs KD at lambda 1), nothing trained.
+#   ARM=calib: --kd-calib on C250 batches (encoder grad norms RNNT vs KD at lambda 1), nothing trained; CALIB_INIT=<.nemo>
+#   calibrates on an adapted student (the stock step 0 is a transient: RNNT ~500, encoder grad ~5300 vs ~140 in-run).
 #   ARM=ctl|kd tmux new -d -s e1 'FT_ROOT=/root/ft ARM=kd bash finetune/jobs/e1_kd.sh 2>&1 | tee -a /root/ft/logs/e1-kd.log'
 set -u
 : "${FT_ROOT:?}"; ARM=${ARM:?ctl or kd}; STEPS=${STEPS:-2000}
@@ -20,7 +21,7 @@ if [ "$ARM" = calib ]; then   # unit calibration of the KD loss: no optimizer st
     MIX="$MIX,$FT_ROOT/mix/it-yg/subsets/yg_agree<=15.json:0.1885,$FT_ROOT/mix/it-yg6/subsets/yg_agree<=15.json:0.2503"   # = C250
     timeout 1200 "$PY" "$FINETUNE/eou/two_stage.py" --tag e1-calib --out $FT_ROOT/runs --mix "$MIX" --freeze-enc 0 --lr 3e-4 --bs 16 \
         --steps $STEPS --max-dur 30 $W4 --seed 0 --val $MF/eval_mls_it.json --val-n 8 \
-        --kd-teacher $TEACHER --kd-s-layer $S --kd-t-layer $T --kd-weight 1 --kd-calib ${CALIB_N:-16} 2>&1 \
+        ${CALIB_INIT:+--init $CALIB_INIT} --kd-teacher $TEACHER --kd-s-layer $S --kd-t-layer $T --kd-weight 1 --kd-calib ${CALIB_N:-16} 2>&1 \
         | grep -a -E "== KD|calib batch|trainable|Traceback|Error|out of memory"
     exit 0
 fi
