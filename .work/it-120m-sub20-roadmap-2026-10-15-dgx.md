@@ -659,3 +659,26 @@ In-run harness val at 8k: 26.56 vs 26.87.
   inside C250, null) this closes static student-difficulty selection / re-weighting at this scale. Not tested:
   larger selected sets from a bigger pool, dynamic / loss-aware selection.
 - Compute moves to E (encoder KD).
+
+### Phase E1-short result: encoder KD S7 -> T17 vs its exact control, 2k (OBSERVED, one seed, same box; EOF)
+
+| greedy / beam-8 / oracle@8 | harness raw | harness 0.5 s flush | clean raw | clean 0.5 s flush |
+|---|---|---|---|---|
+| ctl 2k | 35.59 / 32.79 / 28.47 | 35.61 / 32.79 / 28.46 | 36.73 / 33.77 / 25.55 | 35.57 / 32.59 / 24.59 |
+| kd 2k (lambda0 270) | 35.70 / 32.62 / **28.32** | 35.79 / 32.69 / 28.45 | 36.80 / 33.75 / 25.87 | 35.82 / 32.76 / 25.12 |
+
+Harness CER greedy 13.07 -> 12.61 (-0.46), beam 11.28 -> 11.21. Per set greedy (oracle@8): ctl MLS 33.20 (27.74),
+FLEURS 29.08 (23.83), CV 38.39 (28.15), VP 41.68 (34.17); kd MLS 33.49 (28.03), FLEURS 30.24 (24.41), CV 38.97
+(28.05), VP 40.10 (32.78). In-run harness greedy at 2k 35.60 vs 35.72.
+
+Mechanism (training logs): cosine S7 -> T17 0.05 (step 25) -> 0.77 (225) -> 0.85 (1k) -> 0.86 (EOF, plateau from
+~1.2k); KD loss 0.95 -> 0.14; projection grad norm 102 -> 0.5 as lambda -> 0; RNNT loss mean of the last 200 steps
+71.6 vs ctl 73.6 (not obstructed); encoder grad norm median 129 vs 133; peak 36.1 / 39.9 GB vs 34.8 / 38.6;
+wall +19 % (1385 vs 1166 s incl. evals; teacher on the fly).
+
+- **Pre-registered reading: healthy; oracle@8 -0.15 vs ctl (<= ctl + 0.5) -> promote to a pre-registered E1-8k;
+  NOT a strong early signal (needs <= ctl - 1.0).** Every task delta is under 0.5 (not read) except CER -0.46.
+- Reading (scoped): at 2k the student L7 can be driven close to the teacher L17 (cos 0.86) without obstructing
+  RNNT, at +19 % wall; that alignment has not (yet) moved the 2k candidate set. Open: whether a full 8k schedule
+  (lambda over 8k) transfers task-level information, or representation matching and task transfer are decoupled
+  for this pair / loss.
