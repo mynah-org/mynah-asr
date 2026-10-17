@@ -688,9 +688,14 @@ wall +19 % (1385 vs 1166 s incl. evals; teacher on the fly).
 - **E1-8k (pre-registered now, before launch):** `e1_kd.sh ARM=kd STEPS=8000 KD_LAMBDA=270 KD_END=1.0`
   (lambda(s) = 270 x (1 - s / 8000); everything else = E1-short), vs the existing W4-C250-8k control 26.12 / 23.67 /
   19.43 -- BUT that control used the old save-best path; for an exact A/B also run `ARM=ctl STEPS=8000` (same
-  code path, sparse evals, EOF), ~65 min. Primary harness oracle@8 kd vs ctl-8k: <= ctl - 1.0 -> KD win, 16k
-  candidate; <= 18.4 -> strong; |delta| < 0.5 -> KD (this pair / loss) null -> E2 (S4 -> T5) or move to ranking /
-  N-best distillation; greedy / beam / CER / per domain alongside; cosine and RNNT logs as in E1-short.
+  code path, sparse evals, EOF), ~65 min. Primary harness oracle@8 kd vs ctl-8k (<= ctl - 1.0 = KD moves the
+  candidate set; <= 18.4 = strong; |delta| < 0.5 = null); greedy / beam / CER / per domain alongside. E1-8k is a
+  BRANCH POINT, decided by which of the three moves:
+  - oracle AND beam / greedy improve together -> plain win: validate / promote (16k), then stage 2 EOU;
+  - oracle improves (>= 1.0) but beam / greedy stay ~flat -> the representation transfer works and the bottleneck is
+    ranking: stop encoder-KD variants, move to ranking / N-best / sequence distillation;
+  - oracle null -> the candidate set did not change, ranking is NOT the answer yet: change the representation
+    objective / layer (E2 = S4 -> T5, the highest-R^2 pair in E0), not the decoder.
 - Teacher cost: on the fly +19 % wall at 2k; precompute only if 8k+ runs multiply (8.6 GB / 100 h one layer bf16).
 - FINAL-IT: inclusion criteria, speaker / source disjointness from every pool and bank, manifest sha256 committed
   first; then sealed (no model scored on it until the final candidate).
