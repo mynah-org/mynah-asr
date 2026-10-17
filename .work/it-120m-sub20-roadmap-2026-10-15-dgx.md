@@ -638,3 +638,24 @@ Reading (mechanistic probe, not a WER claim; harness oracle@8 primary, EOF):
   oracle <= ctl - 1.0 at 2k = strong early signal; greedy / beam / CER / empties reported alongside;
 - stop (KD null at this layer pair) if unhealthy, or oracle > ctl + 0.5; fallback E2 = S4 -> T5 (separate
   pre-registration).
+
+### Phase D result: D1 (selected) vs D0 (random) (OBSERVED, one seed, same box; EOF; greedy / beam-8 / oracle@8)
+
+| | harness raw | harness 0.5 s flush | clean raw | clean 0.5 s flush |
+|---|---|---|---|---|
+| D0 random | 26.56 / 24.29 / **19.87** | 26.55 / 24.30 / 19.79 | 27.28 / 25.23 / 18.27 | 25.86 / 23.80 / 17.27 |
+| D1 selected | 26.87 / 24.74 / **20.41** | 26.97 / 24.87 / 20.46 | 27.23 / 24.94 / 18.05 | 26.27 / 24.08 / 17.45 |
+| ref W4-C250-8k | 26.12 / 23.67 / 19.43 | | | |
+
+Harness per set, greedy (oracle@8): D0 MLS 25.16 (20.06), FLEURS 19.57 (14.78), CV 29.36 (18.64), VP 32.16 (26.00);
+D1 MLS 24.71 (20.16), FLEURS 20.24 (15.27), CV 28.20 (19.17), VP 34.33 (27.05). Harness CER 10.22 vs 10.51.
+In-run harness val at 8k: 26.56 vs 26.87.
+
+- **Pre-registered reading: selection NULL** (D1 - D0 oracle@8 = +0.54, inside +-1.0; the sign is against D1).
+  D0 itself is null vs the reference (+0.44): a fixed 10 % of draws on 7.9 h of credible random yg7 does not help.
+- Reading (scoped): spending a fixed 10 % budget on the clips where the W4-16k scorer fails but the two-teacher
+  agreement is high (short-clip heavy, 2.8 passes) does not improve candidate generation at 8k vs the same budget
+  on random credible clips; if anything it costs a little (VP greedy +2.2). With C1 (static difficulty re-weighting
+  inside C250, null) this closes static student-difficulty selection / re-weighting at this scale. Not tested:
+  larger selected sets from a bigger pool, dynamic / loss-aware selection.
+- Compute moves to E (encoder KD).
