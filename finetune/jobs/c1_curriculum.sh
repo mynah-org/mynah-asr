@@ -6,7 +6,7 @@
 #   FT_ROOT=/root/ft CUR=/root/ft/cur/c1 tmux new -d -s c1 'bash finetune/jobs/c1_curriculum.sh 2>&1 | tee -a /root/ft/logs/c1.log'
 . "$(dirname "$0")/gpu_lock.sh"
 MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/it; R=$FT_ROOT/runs; TAG=${TAG:-it-c1-cur-8k}
-MIX=$(cat ${CUR:?}/mix.txt) || exit 2
+MIX=$(cat ${MIXFILE:-${CUR:?}/mix.txt}) || exit 2   # MIXFILE: any frozen mix (phase D: d_select.py's mix_D0 / mix_D1)
 echo "== c1 $TAG $(date +%T)"; echo "   MIX=$MIX"
 MIX="$MIX" POL="--freeze-enc 0 --enc-lr 4e-4 --lr 3e-4 --bs 16" STEPS=${STEPS:-8000} SMOKE=1 bash "$FINETUNE/jobs/mix_arm.sh" $TAG \
     --max-dur 30 --eval-steps 100,250,1000 --abort-wer 1000:85 --lr-shape wsd --decay-frac 0.2 \
