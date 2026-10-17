@@ -608,3 +608,33 @@ Primary = harness oracle@8 (reference W4-C250-8k 19.43):
 - D0 and D1 both clearly below 19.43 (> 0.5) -> new yg7 exposure useful, selection not needed;
 - D1 better on greedy / beam but not oracle -> not a candidate-generation win;
 - deltas < 0.5 are not read; a -0.3 is never promoted to 16k. Clean-it diagnostic only.
+
+### Phase E1-short pre-registration (2026-10-17 ~14:25 UTC, before any E1 training)
+
+KD gradient calibration (`two_stage.py --kd-calib 16`, same 16 C250 batches / seed, fresh random projection, no
+optimizer step, no eval, no WER):
+
+| student state | median ‖g_RNNT‖ enc | median ‖g_KD‖ enc (lambda 1) | median ratio | ratio of summed grads | grad cosine (mean / summed) | RNNT / KD loss |
+|---|---|---|---|---|---|---|
+| stock (step 0) | ~5,300 | 0.150 | 4e-5 | 4e-5 | 0.008 / -0.001 | 508 / 0.998 |
+| W4-C250-16k | 92.3 | 0.1271 | 0.00138 | 0.0049 | -0.009 / -0.007 | 54 / 0.997 |
+
+The stock step 0 is a transient (in-run encoder grad norm ~1,460 at step 25, ~100-185 from step 100 on, C1 logs):
+not used. Rule (unchanged): lambda0 = 0.375 x median ‖g_RNNT‖ / median ‖g_KD‖ on the adapted student = 272 ->
+**lambda0 = 270**, lambda(s) = 270 x (1 - s / 2000). The KD and RNNT gradients are ~orthogonal (complementary).
+The summed-gradient ratio (0.0049 -> lambda ~76) is a diagnostic only. No lambda sweep.
+
+Arms (`e1_kd.sh`, run in this order after D1): ctl = W4-C250 (it-yg + it-yg6 agree<=15, W 0.4388), FIX_STEPS 2000,
+W4 recipe, seed 0, sparse evals (500 / 250), final.nemo = EOF; kd = the same + `--kd-teacher` Nemotron 0.6B, student
+L7 -> fresh Linear(512, 1024) -> teacher L17 (default context [56, 3]), 1 - cos over valid frames, teacher on the
+student's pre-SpecAugment features (eval, no grad, bf16), lambda as above. Only variable: the KD term.
+Stop rules: KD smoke peak reserved within ~2 GB of the 44.4 GB card -> stop (no batch / duration change in one arm);
+NaN / divergence -> stop.
+Reading (mechanistic probe, not a WER claim; harness oracle@8 primary, EOF):
+- healthy = KD loss falls and the cosine rises clearly (> +0.1 over its step-25 value), RNNT train loss at EOF
+  not worse than ctl by > 3 % (mean of the last 200 logged steps), encoder grad norm in ctl's range, step-time
+  overhead reported;
+- promote to a pre-registered E1-8k if healthy AND harness oracle@8 <= ctl + 0.5 (not materially worse);
+  oracle <= ctl - 1.0 at 2k = strong early signal; greedy / beam / CER / empties reported alongside;
+- stop (KD null at this layer pair) if unhealthy, or oracle > ctl + 0.5; fallback E2 = S4 -> T5 (separate
+  pre-registration).
