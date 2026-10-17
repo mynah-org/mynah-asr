@@ -486,3 +486,29 @@ scores (`student_w4_16k.jsonl.gz`, 11.8 MB); to be uploaded to the Hub under res
   layer, projection (512 -> D_teacher) and loss.
 - Target stays candidate generation: clean flushed oracle@8 13.71 -> <10-12 first, ranking (21.74 -> oracle) after.
 - Box: restore with `resume_it.sh SNAPSHOT=it-c250`; upload today's C1 artifacts with the new (rotated) token.
+
+## 2026-10-17 — Japan L40S (Vast instance 56378381; TLS fingerprints matched the dev machine, no proxy)
+
+### Phase D design (pre-registered 2026-10-17 before any yg7 score is seen; the amount H is fixed after the bucket table)
+
+Question: at the same new-audio hours, source, duration distribution, external draw share, steps and recipe, do
+clips where a credible teacher succeeds and the 120M fails (D1) move the candidate set more than random new clips
+(D0)?
+- Pool: it-yg7 rebuilt from the same shard spread (it000/it100/it101 300/300/300 minus the it-yg / it-yg6 shards,
+  500 h, 0 shard / video overlap with C250), FLAC; teacher pass (Nemotron 0.6B, forced it); `pseudo_subsets.py`
+  C250 defaults -> `yg_all.json` (label = teacher text, digits dropped).
+- Frozen scorer: W4-C250-16k (`runs/ada-it-w4-c250-16k/final.nemo`), `student_score.py`, greedy as the probe.
+- Buckets (`d_select.py`, thresholds = curriculum_mix.py's, not tuned): E label flags or empty student; D teacher_wer
+  >= 30 and student agrees with Granary-Whisper (<= 10); C teacher_wer > 15; B student <= 5; A teacher_wer <= 5 and
+  student >= 30; M the rest. Credibility never uses the student.
+- D1 = H h random from A. D0 = H h random from the student-free gate (teacher_wer <= 5, no label flags), matched to
+  D1 per duration bin (1-2-4-8-15-30 s); overlap reported. Seed 20261017.
+- Mix: A2 weights unchanged (mls 0.1964, cv 0.1684, vp_t50 0.1122, fleurs 0.0842); external W 0.4388 split over
+  yg / yg6 / D set in proportion to hours (D set counted as H in both arms: identical weights).
+- Training: W4 8k (enc 4e-4, dec/joint 3e-4, WSD decay 0.2, bs 16, seed 0, max-dur 30), stock init, sparse evals
+  (100, 250, 1000; every 2000 flat / 500 decay), final.nemo = EOF. Order: D0 then D1; D1 is not changed after D0.
+- Primary: harness oracle@8 D1 vs D0 (reference W4-C250-8k 26.12 / 23.67 / 19.43). Reading:
+  D1 <= D0 - 1.0 and <= 18.4 -> selection helps, promote D1 to 16k; D1 < D0 - 1.0 but > 18.4 -> selection signal,
+  per-domain check before promotion; |D1 - D0| < 1.0 -> selection heuristic null (no threshold tuning); both <= 18.4
+  vs the reference while D0 ~ D1 -> new yg7 exposure matters, selection less; neither beats the reference by > 0.5
+  -> simple extra-data route weak, compute to E. Differences < 0.5 are not read. Clean-it diagnostic only.
