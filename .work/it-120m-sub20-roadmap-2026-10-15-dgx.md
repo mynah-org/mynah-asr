@@ -527,7 +527,7 @@ Teacher Nemotron 3.5 streaming 0.6B (`EncDecRNNTBPEModelWithPrompt`, 638M) vs st
 | att_context | [70, 1] | [56, 3] default (0 / 3 / 6 / 13 selectable) |
 | encoder fwd 16 x 10 s bf16 (uncontended) | 19.6 ms | 37.5 ms |
 
-- T_teacher == T_student on every clip (412 real + synthetic 0.4-20 s, 4 teacher contexts): no interpolation /
+- T_teacher == T_student on every clip of every audit (up to 300 real clips + synthetic 0.4-20 s; contexts [56,3] and [56,0]): no interpolation /
   DTW; frame-to-frame 1:1. The language prompt enters AFTER the encoder (`prompt_kernel` on the encoder output):
   the teacher encoder states are prompt-free.
 - Linear alignability (standardised ridge, fitted on half the clips of each domain, scored held out; 248 training
