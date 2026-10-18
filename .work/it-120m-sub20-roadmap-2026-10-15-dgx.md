@@ -909,3 +909,26 @@ without sacrificing true-endpoint recall / latency or ASR?
   frames) of speech in the original clip, so errors cannot hide by moving under the 0.5 s FE definition. Gates and
   b202980 unchanged. After the run: table v4 vs v5-B (FE | FE_any | R | L p50/p90 | reset-WER) + verdict; only a
   PASS continues to the follow-up probes; PARTIAL / NULL / FAIL stop (no automatic v5-C / A or E2).
+
+### Result: stage-2 v5-B vs v4 (OBSERVED, same box / parent / batches; EOU protocol of b202980) -- pre-registered FAIL (latency)
+
+Selected step (fixed rule) 1000: in-run val 22.07, EOU 93.2 %, 3 empty (v4: step 250, 23.89, 99.5 %, 0).
+
+| harness, reset protocol, +2 s quiet | FE (gate) | FE_any (diag) | true-EOU recall | latency p50 / p90 s | reset greedy WER | CER | empty |
+|---|---|---|---|---|---|---|---|
+| v4 | 8.36 % | 8.90 % | 94.38 % | 0.72 / 1.92 | 22.54 | 8.95 | 0 |
+| v5-B | **0.82 %** | **1.64 %** | 92.47 % | **1.84 / 3.04** | 22.08 | 9.26 | 3 (VP) |
+
+Per set FE v4 -> v5-B: MLS 6.0 -> 0.5, FLEURS 17.0 -> 2.0, CV 3.5 -> 0.5, VP 6.2 -> 0.0; recall 98.0 -> 96.5, 86.0 -> 92.5,
+96.0 -> 90.0, 99.2 -> 90.0; latency p50 0.56 -> 1.04, 0.80 -> 2.32, 0.72 -> 2.32, 0.72 -> 2.00 s.
+Gates: FE 0.82 <= 4.18 PASS; recall 92.47 >= 92.38 pass (by 0.09); WER 22.08 <= 23.04 pass; **latency p50 1.84 s >
+L(v4) + 0.40 = 1.12 s -> FAIL (safety)**. Per the pre-registration: no recipe change is promoted; stop.
+Informational (standard probes, offline no reset): v5-B harness raw 22.09 / 20.33 / 16.28 vs parent C250-36k 22.27 /
+20.53 / 16.25 (v4: 24.14 / 22.64 / 18.01) -- the plain -> EOU WER regression is GONE; clean flushed 22.25 / 20.13 / 13.68
+vs parent 21.74 / 20.23 / 13.71.
+Reading (scoped): the positive-label policy causally controls premature endpoints (-90 % FE, FLEURS 17 -> 2 %), and
+removing the ambiguous positives also removes the offline ASR damage; the cost is a later decision boundary (EOU
+~1.1 s later at p50: the remaining positives are mostly the 1-3 s padded tails). Best-supported cause of the v4
+false endpoints: ambiguous positive EOU labels (now supported by an intervention, one seed). Open, NOT run: the
+precision / latency trade-off (e.g. padding range / credible-tail threshold) -- any next arm needs its own
+pre-registration; FINAL-IT still sealed.
