@@ -702,3 +702,56 @@ wall +19 % (1385 vs 1166 s incl. evals; teacher on the fly).
 - Restore: `SNAPSHOT=it-c250 resume_it.sh`; the it-yg7 pool + teacher / student scores are in results/l40s-jp-2026-10-17
   (audio rebuild: `d_yg7.sh` download only, the teacher pass is skipped when train_yg.teacher.json is restored).
 - Rotate the HF token (exposed in this session's transcript).
+
+## 2026-10-18 — Japan L40S (Vast, same host 61.206.39.5, new instance; empty disk; TLS issuers public)
+
+Mission: converge to a production EOU-IT v4 (IT first, FR transfer after the IT recipe freezes). Order: E1-8k
+A/B (frozen below) on the GPU, FINAL-IT built + sealed on CPU in parallel, then conservative stage 2 on the best
+plain parent, FINAL-IT once, Mynah export + serving.
+
+### FINAL-IT pre-registration (2026-10-18 ~12:10 UTC, before any clip is selected; `eou/prepare_final_it.py`)
+
+Purpose: the one-shot final test of the frozen candidates (plain parent, EOU-v4, Nemotron as context). The old
+clean-it bank stays a DEV bank (it has been read many times).
+- **Sources = six sub-banks, each from a split no run of ours trained on, selected on or was scored on:**
+  MLS-it dev; Common Voice 17 it validation; VoxPopuli it validation; FLEURS it_it dev; Multilingual TEDx it
+  TRAIN shards 0-1 (talks absent from mTEDx test / valid = the clean dev talks, and absent from EVERY Granary-it
+  original_audio_id, not only our pools); ITALIC hard_speaker validation.
+- **Disjointness:** MLS dev speakers asserted absent from MLS train + test; CV clips whose client_id occurs in CV
+  train or test dropped; VP clips whose speaker_id occurs in VP train or test dropped; FLEURS dev sentence ids
+  asserted absent from train / test (FLEURS has no speaker id: one reading per sentence); ITALIC validation
+  speakers asserted absent from hard_speaker test (the clean dev speakers); normalised text absent from every
+  training pool and dev bank manifest on the box; decoded-sample duplicates vs C250 / yg7 pools checked with
+  `pool_sanity.py --xhash` (any hit dropped, count reported).
+- **Clip rules (all banks):** 1-20 s; no digit and none of []()&<>; >= 2 words (tedx >= 3); natural ending =
+  whole utterances (read / dictated corpora) and tedx segments ending in . ? ! or ...; text unique in FINAL-IT.
+- **Selection:** candidates in sha1("<bank>:<id>") order, round-robin over speakers / talks, <= 400 clips per bank
+  (tedx <= 25 per talk). Model-free: no ASR / teacher / student output, WER or manual listening is used; the only
+  audio measurement is an energy endpoint (20 ms frames, last frame within 35 dB of the clip peak) giving
+  `trail_s`, recorded, never filtered on.
+- **EOF variant:** `final_trim_<bank>` = the same clips cut at the energy endpoint + 50 ms, so the finalisation /
+  flush policy is measured on clips WITHOUT trailing silence instead of being inferred from clips that already
+  carry it.
+- **Seal:** sha256 of every manifest and wav (SHA256SUMS), the SHA256SUMS hash committed here, set uploaded to the
+  private Hub repo (`data/final-it/`; mTEDx is CC BY-NC-ND: private evaluation only). No model is run on it until
+  the Phase-4 candidates (model + decoding + flush policy) are frozen in writing.
+- **Primary metric (Phase 4):** FINAL-IT WER = unweighted macro over the six banks, 1-best greedy, the frozen
+  production finalisation policy, on the natural clips; beam-8, CER, empty rate, per bank, the trim variant, EOU
+  detection and endpoint latency reported alongside. Bands: < 20 = v4 success, 15-18 strong, ~10-12 stretch.
+  Caveat for the Nemotron reference: MLS / CV / VP / FLEURS (train splits at least) are in its training data.
+
+### E1-8k (the 2026-10-17 pre-registration, unchanged; decision rule made explicit before launch)
+
+Arms in order: `e1_kd.sh ARM=ctl STEPS=8000`, then `ARM=kd STEPS=8000 KD_LAMBDA=270 KD_END=1.0` (lambda(s) = 270 x
+(1 - s / 8000); S7 -> fresh Linear(512, 1024) -> T17, Nemotron 0.6B default context, 1 - cos); same code path, data
+(C250 mix), seed 0, sparse evals, final.nemo = EOF; probes harness + clean, greedy / beam-8 / oracle@8, raw + 0.5 s
+flush. lambda is not touched after any partial number; stop only on NaN / divergence / OOM. Deltas kd - ctl on harness
+raw EOF:
+- **plain win:** oracle@8 <= -1.0 AND beam-8 <= -0.5 AND greedy <= -0.5 -> promote KD (no other KD layer), staged
+  16k next (vs W4-C250-16k 22.76 / 21.02 / 16.71), then stage 2;
+- **oracle-only win:** oracle@8 <= -1.0 with beam-8 and greedy within +-0.5 -> stop encoder-KD variants; one bounded
+  ranking / N-best experiment;
+- **null:** oracle@8 > -1.0 -> close E1; ONE bounded E2 = S4 -> T5 (same discipline, own control = ctl-8k); if E2 is
+  null too, cosine feature KD is closed (no layer sweep).
+In every branch the v4 production path continues in parallel: plain parent = C250-36k unless KD produces a
+clearly superior plain model.
