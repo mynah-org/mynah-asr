@@ -320,14 +320,18 @@ def main():
     a = ap.parse_args()
     for d in (a.out, a.audio, a.tmp):
         os.makedirs(d, exist_ok=True)
-    ex, nman = set(), 0
+    ex, nman, nskip = set(), 0, 0
     for g in a.exclude_texts.split(","):
         for p in sorted(glob.glob(g)):
+            try:   # JSONL manifests only (hours.json, stats files ... are skipped)
+                rows = [json.loads(l) for l in open(p) if l.strip()]
+                txt = [r["text"] for r in rows]
+            except (ValueError, KeyError, TypeError):
+                nskip += 1
+                continue
             nman += 1
-            for l in open(p):
-                if l.strip():
-                    ex.add(norm(json.loads(l).get("text", "")))
-    print(f"== exclusion texts: {len(ex)} from {nman} manifests", flush=True)
+            ex.update(norm(t) for t in txt)
+    print(f"== exclusion texts: {len(ex)} from {nman} manifests ({nskip} non-manifest files skipped)", flush=True)
     seen, hub, allr = {"exclude": ex, "final": set()}, Hub(), []
     fns = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic}
     for name in a.banks.split(","):
