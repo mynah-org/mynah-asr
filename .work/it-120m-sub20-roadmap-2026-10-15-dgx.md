@@ -783,3 +783,34 @@ VP speakers absent from OUR VP pools and bank (`train_vp.json` = every VP clip e
 t50, and the harness `eval_vp.json`), i.e. disjoint from what our models saw, as for the other sources. The set is
 rebuilt from scratch with this rule (deterministic). FLEURS stays at its natural size (116 unique dev sentences
 <= 20 s without digits).
+
+### Result: stage 2 v4 on C250-36k (OBSERVED, Singapore L40S, same box re-probe of the parent)
+
+Run 875 s; fixed rule picked step 250 (in-run harness 23.89, EOU 99.5 %, 0 empty; later evals worse: 26.23 /
+25.08 / 27.47 / 25.64 / 25.51 at 500-1500). Parent re-probe reproduces 2026-10-15 exactly (22.27 / 20.53 / 16.25).
+
+| greedy / beam-8 / oracle@8 | parent C250-36k | stage 2 v4 @250 | delta |
+|---|---|---|---|
+| harness raw | 22.27 / 20.53 / 16.25 | 24.14 / 22.64 / 18.01 | +1.87 / +2.11 / +1.76 |
+| harness 0.5 s flush | 22.21 / 20.57 / 16.27 | 23.89 / 22.49 / 17.89 | +1.68 / +1.93 / +1.63 |
+| clean raw (dev) | 23.73 / 22.00 / 15.11 | 25.35 / 23.48 / 16.08 | +1.62 / +1.48 / +0.97 |
+| clean 0.5 s flush (dev) | 21.74 / 20.23 / 13.71 | 23.18 / 21.37 / 14.54 | +1.44 / +1.14 / +0.82 |
+
+Greedy per set: MLS +2.85, FLEURS +2.71, CV -0.10, VP +2.04. **Pre-registered reading: NOT a v4 candidate**
+(greedy +1.87 is in the diagnose band, beam +2.11 > +1.0, three domains > +2.0; EOU rate passes).
+
+Diagnosis (CPU, offline greedy, 200 clips / set; `s2_diag.py`, `s2_frames.py`):
+- the loss is end-of-clip deletions (MLS D_end 0.20 -> 2.46 % of ref words, FLEURS 0.02 -> 0.90, VP 2.21 -> 3.26);
+  CV unchanged; flushes of 1.0 / 2.0 s change nothing (not an EOF-flush problem); no MLS clip > 20 s (not max-dur);
+- component swap: parent encoder + s2 decoder/joint 21.77 / 15.32 / 27.55 (MLS / FLEURS / VP), s2 encoder +
+  parent decoder/joint 22.14 / 15.85 / 28.53, neither truncates: the failure needs the s2 encoder (pause read as
+  an end) AND the s2 decoder/joint;
+- all 15 pathological clips (s2 drops >= 3 final words, parent none): an <EOU> emitted at an INTERNAL pause (median
+  0.32 s, 0.08-2.1 s) with 3-18 s of speech left; after it s2 sits at P(blank) 0.988, best text-token prob 0.000 on
+  every remaining frame (EOU max 0.97), while the parent keeps emitting (P(text) ~0.37, 5-93 tokens on the same
+  frames). The "premature EOU" counter of s2_diag missed it (it required text AFTER the EOU).
+- **Candidate cause: premature <EOU> at internal pauses + an absorbing blank state after <EOU>** (stage-2 targets
+  never contain text after <EOU>). Offline NeMo decoding has no reset; Mynah resets the decoder after every model
+  <EOU>, so part of this WER may be an offline-evaluation artefact while the real product cost is premature
+  endpoints. Next (CPU, not run): offline decode with a decoder reset after <EOU> to split the two. No stage-2 v5
+  launched today (E1-8k keeps the GPU).
