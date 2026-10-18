@@ -17,7 +17,6 @@ emitted? does the text probability collapse (the encoder still carries the words
 blank attractor), or does the encoder lose them (swap)?
 """
 import argparse
-import copy
 import json
 import re
 import unicodedata
@@ -72,13 +71,13 @@ tk = S.tokenizer
 EOU, EOB, BLANK = tk.token_to_id("<EOU>"), tk.token_to_id("<EOB>"), tk.vocab_size
 
 
-def hybrid(enc_from, dj_from):
-    h = copy.deepcopy(dj_from)
+def hybrid(enc_from, dj_path):   # a fresh copy of the decoder / joint model, the other model's encoder weights
+    h = EncDecRNNTBPEModel.restore_from(dj_path, map_location="cpu").eval()
     h.encoder.load_state_dict(enc_from.encoder.state_dict())
-    return h.eval()
+    return h
 
 
-MODELS = {"parent": P, "s2": S, "encP+djS2": hybrid(P, S), "encS2+djP": hybrid(S, P)}
+MODELS = {"parent": P, "s2": S, "encP+djS2": hybrid(P, a.s2), "encS2+djP": hybrid(S, a.parent)}
 
 
 def load(r):
