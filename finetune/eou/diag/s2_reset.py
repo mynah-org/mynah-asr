@@ -30,6 +30,9 @@ ap.add_argument("--s2", required=True)
 ap.add_argument("--vals", required=True)
 ap.add_argument("--per-set", type=int, default=200)
 ap.add_argument("--threads", type=int, default=8)
+ap.add_argument("--post-pad-s", type=float, default=0.0, help="quiet (-75 dB noise, as the in-run stage-2 eval) appended "
+                "so a true end-of-utterance <EOU> can fire; endpoints are measured on the ORIGINAL clip")
+ap.add_argument("--models", default="parent,s2,s2_reset", help="subset of protocols to run")
 ap.add_argument("--out", default="")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -116,15 +119,21 @@ for spec in a.vals.split(","):
     sname, p = spec.split("=", 1)
     rows = [json.loads(l) for l in open(p)]
     rows = rows[:: max(1, len(rows) // a.per_set)][: a.per_set]
-    acc = {k: dict(S=0, D=0, I=0, N=0, D_end=0, cerr=0, cN=0, eou=0, split=0, premature=0, prem_clips=0, clips=0)
-           for k in ("parent", "s2", "s2_reset")}
+    want = a.models.split(",")
+    acc = {k: dict(S=0, D=0, I=0, N=0, D_end=0, cerr=0, cN=0, eou=0, split=0, premature=0, prem_clips=0, clips=0,
+                   true_eou=0, lat=[], empty=0) for k in want}
     for r in rows:
         x, _ = sf.read(r["audio_filepath"], dtype="float32")
         x = x.mean(1) if x.ndim > 1 else x
         end = speech_end(x)
+        if a.post_pad_s:
+            x = np.concatenate([x, (np.random.RandomState(len(x)).randn(int(a.post_pad_s * 16000)) * 10 ** (-75 / 20)).astype(np.float32)])
         ref = norm(r["text"]).split()
-        eP, eS = encode(P, x), encode(S, x)
+        eP = encode(P, x) if "parent" in want else None
+        eS = encode(S, x) if want != ["parent"] else None
         for k, (m, e, rs) in {"parent": (P, eP, False), "s2": (S, eS, False), "s2_reset": (S, eS, True)}.items():
+            if k not in want:
+                continue
             ys, fr = greedy(m, e, reset=rs)
             hyp = norm(tk.ids_to_text([t for t in ys if t < 1024])).split()
             o = ops(ref, hyp)
@@ -144,17 +153,40 @@ for spec in a.vals.split(","):
             c["eou"] += len(ef); c["split"] += len(ef) >= 2
             prem = [f for f in ef if f * FR < end - 0.5]
             c["premature"] += len(prem); c["prem_clips"] += bool(prem)
+            true = [f * FR for f in ef if f * FR >= end - 0.5]   # first <EOU> at / after the speech end (-0.5 s slack)
+            if true:
+                c["true_eou"] += 1; c["lat"].append(true[0] - end)
+            c["empty"] += not hyp
     out = {}
     for k, c in acc.items():
         err = c["S"] + c["D"] + c["I"]
         out[k] = {"wer": round(100 * err / c["N"], 2), "cer": round(100 * c["cerr"] / c["cN"], 2),
                   **{f"{o}%": round(100 * c[o] / c["N"], 2) for o in ("S", "D", "I", "D_end")},
                   "errors": err, "eou_per_clip": round(c["eou"] / c["clips"], 3), "clips_split": c["split"],
-                  "premature_eou": c["premature"], "clips_with_premature": c["prem_clips"], "clips": c["clips"]}
-    out["words_recovered_by_reset"] = out["s2"]["errors"] - out["s2_reset"]["errors"]
+                  "premature_eou": c["premature"], "clips_with_premature": c["prem_clips"], "clips": c["clips"],
+                  "false_endpoint_clip%": round(100 * c["prem_clips"] / c["clips"], 1),
+                  "true_eou_recall%": round(100 * c["true_eou"] / c["clips"], 1), "empty": c["empty"],
+                  "eou_latency_s_p50_p90": [round(float(np.percentile(c["lat"], q)), 2) for q in (50, 90)] if c["lat"] else None,
+                  "_lat": c["lat"], "_prem": c["prem_clips"], "_true": c["true_eou"]}
+    if "s2" in out and "s2_reset" in out:
+        out["words_recovered_by_reset"] = out["s2"]["errors"] - out["s2_reset"]["errors"]
     res[sname] = out
-    print("==", sname, json.dumps(out), flush=True)
-macro = {k: round(float(np.mean([res[s][k]["wer"] for s in res])), 2) for k in ("parent", "s2", "s2_reset")}
-print("== MACRO greedy WER", json.dumps(macro), flush=True)
+    print("==", sname, json.dumps({k: ({kk: vv for kk, vv in v.items() if not kk.startswith("_")} if isinstance(v, dict) else v)
+                                    for k, v in out.items()}), flush=True)
+macro = {}
+for k in want:
+    lat = [x for s_ in res for x in res[s_][k]["_lat"]]
+    n = sum(res[s_][k]["clips"] for s_ in res)
+    macro[k] = {"wer_macro": round(float(np.mean([res[s_][k]["wer"] for s_ in res])), 2),
+                "cer_macro": round(float(np.mean([res[s_][k]["cer"] for s_ in res])), 2),
+                "false_endpoint_clip%": round(100 * sum(res[s_][k]["_prem"] for s_ in res) / n, 2),
+                "true_eou_recall%": round(100 * sum(res[s_][k]["_true"] for s_ in res) / n, 2),
+                "eou_latency_s_p50_p90": [round(float(np.percentile(lat, q)), 2) for q in (50, 90)] if lat else None,
+                "empty": sum(res[s_][k]["empty"] for s_ in res), "clips": n}
+print("== MACRO", json.dumps(macro), flush=True)
+for s_ in res:
+    for k in want:
+        for kk in ("_lat", "_prem", "_true"):
+            res[s_][k].pop(kk, None)
 if a.out:
     json.dump({"sets": res, "macro": macro}, open(a.out, "w"), indent=1)
