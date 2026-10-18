@@ -814,3 +814,21 @@ Diagnosis (CPU, offline greedy, 200 clips / set; `s2_diag.py`, `s2_frames.py`):
   <EOU>, so part of this WER may be an offline-evaluation artefact while the real product cost is premature
   endpoints. Next (CPU, not run): offline decode with a decoder reset after <EOU> to split the two. No stage-2 v5
   launched today (E1-8k keeps the GPU).
+
+Reset test (`s2_reset.py`, CPU, offline encoder, frame-synchronous greedy; decoder reset after every <EOU> as Mynah
+does, encoder untouched): harness greedy macro parent 22.29 / s2 no reset 24.14 / **s2 with reset 22.77** (MLS 21.45 /
+24.29 / 22.27, FLEURS 15.21 / 17.92 / 15.96, CV 24.37 / 24.16 / 24.16, VP 28.14 / 30.18 / 28.70); words recovered by
+the reset 131 / 91 / 0 / 45; end deletions back to the parent's level. Premature <EOU> (>= 0.5 s of speech left):
+MLS 12 / 200 clips, FLEURS 34 / 200, CV 7 / 200, VP 8 / 130 = 61 / 730 (8.4 %).
+- ~74 % of the offline +1.85 is a decoding-protocol mismatch (no reset): ASR continues after the false EOU; the
+  remaining ASR cost of this stage 2 is ~+0.5 greedy (MLS +0.8, FLEURS +0.75, VP +0.56, CV 0).
+- The product problem is EOU PRECISION: ~8 % of clips (17 % FLEURS) get a false endpoint at an internal pause
+  (0.08-2 s). Two metrics from now on: ASR continuity under the serving protocol, and the false-endpoint rate.
+  A stage-2 v5 must cut false EOUs at internal pauses without losing true-endpoint recall; not launched today.
+- The DEV probes of stage-2 models must use the serving protocol (reset after <EOU>) from now on.
+
+### Result: E1 ctl-8k (OBSERVED, Singapore L40S, same code path as kd-8k; EOF)
+
+Harness raw 26.32 / 24.27 / **19.84** (CER 10.22; MLS 24.52 (19.87), FLEURS 18.65 (14.24), CV 29.67 (19.49), VP 32.45
+(25.77)); 0.5 s flush 26.36 / 24.39 / 19.84; clean raw 27.06 / 24.73 / 17.43, flushed 26.12 / 23.77 / 16.82. Wall
+~77 min incl. evals (13:58-14:15 UTC train end), peak 36.5 / 40.2 GB. kd-8k launched 14:22 UTC.
