@@ -870,3 +870,38 @@ no real trailing silence (VP / Granary clips end ON speech in 42-58 % of unpadde
 positives; NOT a lack of negatives (pauses followed by speech outnumber pause -> EOU 4-50x in the same range).
 Best-supported candidate cause (not demonstrated): ambiguous positive EOU labels. v5-B (EOU only on credible
 endpoints, model-free rule, same exposure) would test it; v5-C (A + pause + B) and NVIDIA-style padding (A) later.
+
+### Stage-2 v5-B pre-registration (2026-10-18 ~16:20 UTC, before launch; E2 parked)
+
+Question: does removing acoustically ambiguous POSITIVE <EOU> supervision reduce premature internal-pause endpoints
+without sacrificing true-endpoint recall / latency or ASR?
+- **Acoustic endpoint credibility (model-free, fixed before any v5 output):** an unpadded training sample is a
+  credible acoustic endpoint iff its natural trailing non-speech `trail_s` >= 0.5 s (`annotate_tail.py`: energy
+  mask on 80 ms frames, speech = within 35 dB of the clip peak and >= 10 dB above its 10th-percentile frame).
+  0.5 s is set a priori: the shortest pause we would accept as an end of turn in production (published recipes:
+  NVIDIA asr_eou never trains <EOU> with < 3 s after it; arXiv 2609.04225 uses >= 0.3 s PLUS lexical completeness,
+  which we cannot check, so a stricter acoustic margin). It is acoustic credibility, NOT semantic completion. Not
+  chosen with WER, EOU predictions, the pathological set or FINAL-IT.
+- **Treatment (one variable):** `two_stage.py --eou-min-tail 0.5`: an UNPADDED sample with trail_s < 0.5 gets the
+  text target WITHOUT <EOU>; padded samples (p 0.5, U(1, 3) s quiet, unchanged) and credible ends keep <EOU>.
+  Same parent (C250-36k), mix rows and weights (annotated copies of the same manifests, same order), seed, LR
+  (top-4 enc 3e-5, dec/joint 2e-5), bs, 1500 steps, evals, selection rule, max-dur 20; the random-call order of the
+  padding loop is unchanged, so the audio batches are those of v4 and only labels differ.
+- Pool after annotation (rows <= 20 s; accepted = trail_s >= 0.5): MLS 9,683 / 29.7 %, CV 26,800 / 51.8 %, VP
+  10,955 / 5.6 %, FLEURS 2,375 / 60.9 %, yg 22,875 / 27.7 %, yg6 29,914 / 19.1 %; all 102,602 clips 251.0 h, 30.1 %
+  (67.2 h) accepted; accepted / rejected duration distributions similar except FLEURS / CV (accepted slightly longer).
+  Exposure: identical draws; share of samples whose target ends in <EOU> 100 % (v4) -> ~65 % (0.5 padded + 0.5 x
+  0.303 draw-weighted accepted); VP keeps <EOU> only on its padded half.
+- **Evaluation protocol (both v4 and v5-B, DEV harness only, FINAL-IT sealed):** `s2_reset.py --post-pad-s 2.0`:
+  730 harness clips (MLS / FLEURS / CV 200, VP 130), offline encoder, frame-synchronous greedy with the Mynah decoder
+  reset after <EOU>, 2 s of -75 dB quiet appended; FE = % clips with a premature <EOU> (>= 0.5 s of speech left,
+  energy endpoint of the original clip), R = % clips with an <EOU> at >= speech end - 0.5 s, L = latency of that
+  first true <EOU> (p50 / p90), W = greedy WER macro with reset; CER, empties alongside; no-reset WER and the usual
+  probes informational.
+- **Gates (v5-B vs v4, same protocol):**
+  - PASS: FE <= 0.5 x FE(v4) AND R >= R(v4) - 2.0 pts AND L p50 <= L(v4) + 0.20 s AND W <= W(v4) + 0.5;
+  - PARTIAL: 0.5 x FE(v4) < FE <= 0.75 x FE(v4) with the safety conditions met;
+  - NULL: FE > 0.75 x FE(v4) with safety met;
+  - FAIL (safety): R < R(v4) - 5.0 pts or R < 90 %, or L p50 > L(v4) + 0.40 s, or W > W(v4) + 1.0.
+  A PASS makes v5-B the EOU recipe candidate (then plain->EOU delta, Mynah m1, FINAL-IT once); otherwise no recipe
+  change is promoted on this run.
