@@ -932,3 +932,33 @@ removing the ambiguous positives also removes the offline ASR damage; the cost i
 false endpoints: ambiguous positive EOU labels (now supported by an intervention, one seed). Open, NOT run: the
 precision / latency trade-off (e.g. padding range / credible-tail threshold) -- any next arm needs its own
 pre-registration; FINAL-IT still sealed.
+
+**Frozen conclusion (2026-10-18):** v5-B = pre-registered FAIL (latency) but a strong mechanistic positive result:
+positive EOU supervision at acoustically ambiguous clip boundaries is a MAJOR causal driver of premature EOU (this
+seed / protocol; not shown to be the only cause). Removing it largely solves false endpoints (8.36 -> 0.82 %) and
+removes the stage-2 ASR regression, but over-corrects the EOU decision boundary toward waiting (p50 0.72 -> 1.84 s).
+v5-B is NOT promoted to production.
+
+### PROPOSED (not pre-registered, not run): Stage2-v5-CAL
+
+Same frozen definition credible = trail_s >= 0.5 s; <EOU> always on credible and on padded samples; on AMBIGUOUS
+unpadded samples <EOU> reintroduced stochastically with a fraction q fixed a priori (one midpoint arm, e.g. q 0.5,
+chosen in the pre-registration, not on these numbers), to test the precision / latency dose-response between v4
+(q 1: FE 8.36 %, p50 0.72 s) and v5-B (q 0: FE 0.82 %, p50 1.84 s). The decision threshold stays in the checkpoint;
+a runtime debounce / commit policy is a separate, later layer. No q chosen today.
+
+### State map (end of 2026-10-18)
+
+| role | checkpoint | key numbers |
+|---|---|---|
+| best plain IT | `plain-it-c250-36k` (Hub runs/plain-it-c250-36k) | harness 22.27 / 20.53 / 16.25; clean flushed 21.74 / 20.23 / 13.71 |
+| production EOU | EOU-v3 `plain-it-s2-e3-djlr` (unchanged) | Mynah FLEURS-it 30.91, EOU 200 / 200, p50 810 ms |
+| EOU candidates tested | stage 2 v4 (FAIL: +1.87 offline, false endpoints 8.4 %), v5-B (FAIL: latency 1.84 s; FE 0.82 %, no ASR regression) | see above |
+| closed today | E1-8k encoder KD S7 -> T17 (NULL, oracle +0.01); static selection (D, 10-17) | |
+| FINAL-IT | 5 / 6 banks built (MLS 400, CV 400, VP 110 / 3 speakers, FLEURS 116, TEDx 400 / 30 talks); ITALIC pending (Zenodo throttled); NOT sealed, never decoded | |
+
+Why v4 fails: premature <EOU> at internal pauses (ambiguous positive labels) + an absorbing blank state after
+<EOU>; with the Mynah reset ~74 % of its offline WER loss disappears, the false-endpoint rate (8.4 %) remains.
+Why v5-B fails: the label fix over-shoots the endpoint timing (latency gate). Next decision: pre-register v5-CAL (q),
+or keep v3 in production; plain 1-best < 20 remains a separate axis (oracle 16.25 vs 1-best 22.27: ranking /
+candidate conversion, not encoder KD). E2 (S4 -> T5) parked.
