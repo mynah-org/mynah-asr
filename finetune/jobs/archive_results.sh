@@ -24,7 +24,7 @@ repo, s, dest = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
 api = HfApi(token=Path("/root/.hf_token").read_text().strip())
 api.upload_folder(folder_path=str(s), path_in_repo=f"results/{dest}", repo_id=repo, commit_message=f"Add results/{dest}")
 files = [p for p in s.rglob("*") if p.is_file()]
-info = {i.path: (getattr(i, "size", None) or i.lfs.size) for i in
+info = {i.path: (i.size if getattr(i, "size", None) is not None else i.lfs.size) for i in   # empty files have size 0
         api.get_paths_info(repo, [f"results/{dest}/{p.relative_to(s)}" for p in files])}
 bad = [str(p) for p in files if info.get(f"results/{dest}/{p.relative_to(s)}") != p.stat().st_size]
 print("VERIFY", dest, len(files), "files", "OK" if not bad else f"MISMATCH {bad[:5]}")
