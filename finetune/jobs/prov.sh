@@ -106,6 +106,11 @@ if step model-nemotron; then
       && (cd tools && timeout 1800 uv run python convert_nemo.py ../models/nemotron-3.5-asr-streaming-0.6b >$R/convert-nemotron.log 2>&1) \
       && ok model-nemotron || tail -5 $R/dl-nemotron.log $R/convert-nemotron.log
 fi
+# the NeMo .nemo of the same teacher: encoder KD (e1_kd.sh / kd_audit.py TEACHER) loads it with NeMo
+if step teacher-nemo; then
+    hf nvidia/nemotron-3.5-asr-streaming-0.6b nemotron-3.5-asr-streaming-0.6b.nemo /root/ft/models/nemotron-3.5-asr-streaming-0.6b.nemo \
+      && ok teacher-nemo
+fi
 [ -n "${KEEP_TOKEN:-}" ] || { rm -f /root/.hf_token; echo "== token removed"; }
 # Silero VAD: the ONNX AND its Mynah conversion (eou_metrics.py SKIPs, rc 77, without it)
 if step vad; then make fetch-vad >$R/vad.log 2>&1 \
