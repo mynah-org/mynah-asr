@@ -832,3 +832,41 @@ MLS 12 / 200 clips, FLEURS 34 / 200, CV 7 / 200, VP 8 / 130 = 61 / 730 (8.4 %).
 Harness raw 26.32 / 24.27 / **19.84** (CER 10.22; MLS 24.52 (19.87), FLEURS 18.65 (14.24), CV 29.67 (19.49), VP 32.45
 (25.77)); 0.5 s flush 26.36 / 24.39 / 19.84; clean raw 27.06 / 24.73 / 17.43, flushed 26.12 / 23.77 / 16.82. Wall
 ~77 min incl. evals (13:58-14:15 UTC train end), peak 36.5 / 40.2 GB. kd-8k launched 14:22 UTC.
+
+### Result: E1-8k KD vs ctl-8k (OBSERVED, one seed, same box / code path; EOF) -- E1 NULL
+
+| greedy / beam-8 / oracle@8 | harness raw | harness 0.5 s flush | clean raw (dev) | clean flushed (dev) |
+|---|---|---|---|---|
+| ctl-8k | 26.32 / 24.27 / 19.84 | 26.36 / 24.39 / 19.84 | 27.06 / 24.73 / 17.43 | 26.12 / 23.77 / 16.82 |
+| kd-8k (lambda0 270 -> 0) | 26.43 / 23.88 / **19.85** | 26.48 / 23.96 / 19.91 | 27.06 / 25.01 / 17.85 | 26.23 / 24.17 / 17.30 |
+| kd - ctl | +0.11 / -0.39 / +0.01 | +0.12 / -0.43 / +0.07 | 0.00 / +0.28 / +0.42 | +0.11 / +0.40 / +0.48 |
+
+Per set greedy (oracle) kd: MLS 25.56 (20.26), FLEURS 19.38 (14.43), CV 28.31 (19.28), VP 32.49 (25.44); ctl: 24.52
+(19.87), 18.65 (14.24), 29.67 (19.49), 32.45 (25.77). Harness CER greedy 10.13 vs 10.22, beam 8.85 vs 8.97.
+Mechanism: cos S7 -> T17 0.84 at 1k, ~0.87 plateau, 0.88 at EOF; RNNT not obstructed; teacher 50-85 ms / step; wall
+5832 s vs ~4620 s (+26 %), peak 37.9 / 42.2 GB. In-run greedy kd was 0.5-1.2 behind ctl at 2-3k (not acted on).
+- **Pre-registered reading: NULL** (oracle@8 +0.01 > -1.0; greedy / beam inside +-0.5). E1 (cosine feature KD
+  S7 -> T17, Nemotron 0.6B) closed: the student layer matches the teacher closely (cos ~0.87) without moving the
+  candidate set or the 1-best at 8k. Per the tree the next KD step would be ONE bounded E2 (S4 -> T5); NOT launched:
+  the next GPU experiment is chosen by information gain against stage-2 v5-B (see endpoint audit below).
+
+### Stage-2 endpoint audit (model-free, `s2_endpoints.py`, 600 clips / source, energy mask on 80 ms frames; aggregate only)
+
+Code facts (two_stage.py): every stage-2 target = text + <EOU>; pad p 0.5, U(1, 3) s near-digital quiet (-90..-60 dB);
+--concat-prob 0 (A + pause + B exists, unused); no augmentation in stage 2.
+
+| source | natural tail p10/p50/p90 s | ends on speech (< 0.1 s) | tail < 0.5 s | trained EOU tails < 0.5 s | pauses 0.08-2.1 s -> EOU vs -> speech |
+|---|---|---|---|---|---|
+| MLS | 0.16 / 0.40 / 0.80 | 3.8 % | 69 % | 34 % | 292 vs 5,737 |
+| CV | 0.16 / 0.56 / 1.12 | 9.7 % | 49 % | 25 % | 281 vs 1,132 |
+| VP | 0.00 / 0.16 / 0.48 | 44 % | 93 % | 45 % | 216 vs 10,180 |
+| FLEURS | 0.32 / 0.72 / 2.48 | 6.2 % | 38 % | 20 % | 234 vs 2,921 |
+| Granary yg | 0.00 / 0.24 / 1.60 | 42 % | 72 % | 37 % | 184 vs 7,272 |
+| Granary yg6 | 0.00 / 0.08 / 0.88 | 58 % | 81 % | 40 % | 157 vs 6,509 |
+
+Premature-EOU pauses (15 pathological clips) 0.08-2.08 s, median 0.32; 51 % of natural training tails are <= 0.32 s.
+Reading: hypothesis "stage 2 teaches pause / cut = EOU" PARTIALLY SUPPORTED: ~20-45 % of trained <EOU> labels have
+no real trailing silence (VP / Granary clips end ON speech in 42-58 % of unpadded cases) -> acoustically ambiguous
+positives; NOT a lack of negatives (pauses followed by speech outnumber pause -> EOU 4-50x in the same range).
+Best-supported candidate cause (not demonstrated): ambiguous positive EOU labels. v5-B (EOU only on credible
+endpoints, model-free rule, same exposure) would test it; v5-C (A + pause + B) and NVIDIA-style padding (A) later.
