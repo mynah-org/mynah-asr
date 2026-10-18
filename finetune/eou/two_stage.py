@@ -88,6 +88,9 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--init", default="", help="start from this .nemo instead of --stock (stage 2 from the plain-IT best)")
 ap.add_argument("--eou-append", type=int, default=0, help="stage 2: target = text + <EOU> (NVIDIA EOU dataset semantics)")
 ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of trailing silence after the speech")
+ap.add_argument("--eou-min-tail", type=float, default=0.0, help="stage 2 v5-B: an UNPADDED sample gets <EOU> only if its "
+                "manifest trail_s (natural trailing non-speech, diag/annotate_tail.py) is >= S s, otherwise text only; "
+                "padded samples keep <EOU> (0 = every target ends in <EOU>, v4)")
 ap.add_argument("--pre-pad-prob", type=float, default=0.0, help="stage 2: prob of LEADING quiet U(0, --pre-pad-max) s "
                 "(NVIDIA's EOU dataset pads before the speech too; VP clips start at frame 0)")
 ap.add_argument("--pre-pad-max", type=float, default=4.0)
@@ -388,9 +391,15 @@ def batch(rs, train=False):
     if train and a.pre_pad_prob > 0:   # leading silence, same noise floor (stage 2 v3)
         xs = [np.concatenate([quiet(random.uniform(0.0, a.pre_pad_max)), x])
               if random.random() < a.pre_pad_prob else x for x in xs]
+    padded = [False] * len(xs)
     if train and a.pad_prob > 0:   # trailing silence with a faint noise floor (stage 2)
-        xs = [np.concatenate([x, quiet(random.uniform(a.pad_min, a.pad_max))])
-              if random.random() < a.pad_prob else x for x in xs]
+        for i, x in enumerate(xs):   # same random-call order as before (v4 draws are reproduced exactly)
+            if random.random() < a.pad_prob:
+                xs[i] = np.concatenate([x, quiet(random.uniform(a.pad_min, a.pad_max))]); padded[i] = True
+    if train and a.eou_append and a.eou_min_tail > 0:   # v5-B: no <EOU> on an acoustically ambiguous (unpadded) end
+        for i, r in enumerate(rs):
+            if not padded[i] and r["trail_s"] < a.eou_min_tail and ids[i] and ids[i][-1] == EOU_ID:
+                ids[i] = ids[i][:-1]
     if train and (a.aug_speed or a.aug_noise or a.aug_gain):
         xs = [augment(x) for x in xs]
     if not train and a.eou_append:  # evaluation of stage 2: 2 s of trailing quiet so an EOU can fire
