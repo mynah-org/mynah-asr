@@ -775,3 +775,11 @@ Gates (delta = stage 2 - parent, harness raw EOF, same box):
   pre-registered separately (not tuned on these numbers).
 Then the frozen candidate goes to Mynah (m1.sh: export, FLEURS-it 200 stream WER / EOU / endpoint latency, CPU /
 CUDA parity) and only then to FINAL-IT.
+
+FINAL-IT amendment (2026-10-18 ~12:47 UTC; from selection COUNTS only, no model has decoded any clip): dropping every
+VP validation clip whose speaker occurs anywhere in the VP train / test splits left 110 clips from 3 speakers (VP's
+splits are not speaker-disjoint: 1,124 of 1,257 clips dropped) -- too narrow for a 1/6 macro weight. Rule now:
+VP speakers absent from OUR VP pools and bank (`train_vp.json` = every VP clip ever drawn for training, superset of
+t50, and the harness `eval_vp.json`), i.e. disjoint from what our models saw, as for the other sources. The set is
+rebuilt from scratch with this rule (deterministic). FLEURS stays at its natural size (116 unique dev sentences
+<= 20 s without digits).

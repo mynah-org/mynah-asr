@@ -7,7 +7,8 @@
 Six sub-banks, each from a split that no run of ours has trained on, selected on or scored with:
   mls     MLS-it dev (facebook/multilingual_librispeech italian/dev); speakers asserted absent from train + test
   cv      Common Voice 17 it validation (fixie-ai/common_voice_17_0); client_ids in train / test dropped
-  vp      VoxPopuli it validation (facebook/voxpopuli); speaker_ids in train / test dropped
+  vp      VoxPopuli it validation (facebook/voxpopuli); speaker_ids in train / test dropped (--vp-exclude: only the
+          speakers of our VP pools / bank; VP's own splits share speakers)
   fleurs  FLEURS it_it dev (google/fleurs); sentence ids asserted absent from train / test; one reading per
           sentence (FLEURS has no speaker id)
   tedx    Multilingual TEDx it TRAIN shards 0-1 (deepdml/mtedx): talks absent from the mTEDx test / valid talks
@@ -221,7 +222,11 @@ def cv(a, hub, seen):
 
 def vp(a, hub, seen):
     R = "facebook/voxpopuli"
-    ex = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, "it", "train") + hub.files(R, "it", "test"), ["speaker_id"])}
+    if a.vp_exclude:   # amendment 2026-10-18: speakers of OUR VP pools / bank (VP splits are not speaker-disjoint)
+        ex = {r["speaker"].split(":", 1)[-1] for p in a.vp_exclude.split(",") for r in map(json.loads, open(p)) if r.get("speaker")}
+        print(f"== vp: {len(ex)} excluded speakers from our VP manifests", flush=True)
+    else:
+        ex = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, "it", "train") + hub.files(R, "it", "test"), ["speaker_id"])}
     rows = parquet_audio(fetch(f"{HF}/{R}/resolve/main/it/validation-00000-of-00001.parquet", f"{a.tmp}/vp_val.parquet"))
     b = Bank("vp", a, seen)
     for r in rows:
@@ -317,6 +322,8 @@ def main():
     ap.add_argument("--tedx-per-talk", type=int, default=25)
     ap.add_argument("--exclude-texts", required=True, help="comma-separated globs of training / dev manifests")
     ap.add_argument("--banks", default="mls,cv,vp,fleurs,tedx,italic")
+    ap.add_argument("--vp-exclude", default="", help="VP: exclude the speakers of these manifests (ours) instead of every "
+                    "VP train / test speaker (amendment 2026-10-18: the latter left 3 speakers)")
     a = ap.parse_args()
     for d in (a.out, a.audio, a.tmp):
         os.makedirs(d, exist_ok=True)
