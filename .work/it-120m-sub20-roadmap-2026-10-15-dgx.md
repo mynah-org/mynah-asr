@@ -905,3 +905,7 @@ without sacrificing true-endpoint recall / latency or ASR?
   - FAIL (safety): R < R(v4) - 5.0 pts or R < 90 %, or L p50 > L(v4) + 0.40 s, or W > W(v4) + 1.0.
   A PASS makes v5-B the EOU recipe candidate (then plain->EOU delta, Mynah m1, FINAL-IT once); otherwise no recipe
   change is promoted on this run.
+- Diagnostic added before launch (NOT a gate): FE_any = % clips with an <EOU> followed by >= 0.16 s (2 x 80 ms
+  frames) of speech in the original clip, so errors cannot hide by moving under the 0.5 s FE definition. Gates and
+  b202980 unchanged. After the run: table v4 vs v5-B (FE | FE_any | R | L p50/p90 | reset-WER) + verdict; only a
+  PASS continues to the follow-up probes; PARTIAL / NULL / FAIL stop (no automatic v5-C / A or E2).

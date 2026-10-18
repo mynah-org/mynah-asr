@@ -106,11 +106,15 @@ def greedy(m, enc, reset=False, max_symbols=10):
     return ys, frames
 
 
-def speech_end(x):
+def speech_mask(x):
     n = int(FR * 16000)
     f = x[: len(x) // n * n].reshape(-1, n)
     db = 10 * np.log10((f ** 2).mean(1) + 1e-10)
-    on = np.nonzero(db > db.max() - 35)[0]
+    return db > db.max() - 35
+
+
+def speech_end(x):
+    on = np.nonzero(speech_mask(x))[0]
     return (on[-1] + 1) * FR if len(on) else len(x) / 16000
 
 
@@ -121,11 +125,12 @@ for spec in a.vals.split(","):
     rows = rows[:: max(1, len(rows) // a.per_set)][: a.per_set]
     want = a.models.split(",")
     acc = {k: dict(S=0, D=0, I=0, N=0, D_end=0, cerr=0, cN=0, eou=0, split=0, premature=0, prem_clips=0, clips=0,
-                   true_eou=0, lat=[], empty=0) for k in want}
+                   true_eou=0, lat=[], empty=0, fe_any=0) for k in want}
     for r in rows:
         x, _ = sf.read(r["audio_filepath"], dtype="float32")
         x = x.mean(1) if x.ndim > 1 else x
         end = speech_end(x)
+        sm = speech_mask(x)   # of the ORIGINAL clip (before any post-pad)
         if a.post_pad_s:
             x = np.concatenate([x, (np.random.RandomState(len(x)).randn(int(a.post_pad_s * 16000)) * 10 ** (-75 / 20)).astype(np.float32)])
         ref = norm(r["text"]).split()
@@ -157,6 +162,8 @@ for spec in a.vals.split(","):
             if true:
                 c["true_eou"] += 1; c["lat"].append(true[0] - end)
             c["empty"] += not hyp
+            # FE_any (diagnostic, fixed 2026-10-18 before v5-B): an <EOU> followed by >= 0.16 s (2 frames) of speech
+            c["fe_any"] += any(int(sm[f + 1:].sum()) >= 2 for f in ef)
     out = {}
     for k, c in acc.items():
         err = c["S"] + c["D"] + c["I"]
@@ -166,6 +173,7 @@ for spec in a.vals.split(","):
                   "premature_eou": c["premature"], "clips_with_premature": c["prem_clips"], "clips": c["clips"],
                   "false_endpoint_clip%": round(100 * c["prem_clips"] / c["clips"], 1),
                   "true_eou_recall%": round(100 * c["true_eou"] / c["clips"], 1), "empty": c["empty"],
+                  "FE_any_clip%": round(100 * c["fe_any"] / c["clips"], 1), "_feany": c["fe_any"],
                   "eou_latency_s_p50_p90": [round(float(np.percentile(c["lat"], q)), 2) for q in (50, 90)] if c["lat"] else None,
                   "_lat": c["lat"], "_prem": c["prem_clips"], "_true": c["true_eou"]}
     if "s2" in out and "s2_reset" in out:
@@ -180,13 +188,14 @@ for k in want:
     macro[k] = {"wer_macro": round(float(np.mean([res[s_][k]["wer"] for s_ in res])), 2),
                 "cer_macro": round(float(np.mean([res[s_][k]["cer"] for s_ in res])), 2),
                 "false_endpoint_clip%": round(100 * sum(res[s_][k]["_prem"] for s_ in res) / n, 2),
+                "FE_any_clip%": round(100 * sum(res[s_][k]["_feany"] for s_ in res) / n, 2),
                 "true_eou_recall%": round(100 * sum(res[s_][k]["_true"] for s_ in res) / n, 2),
                 "eou_latency_s_p50_p90": [round(float(np.percentile(lat, q)), 2) for q in (50, 90)] if lat else None,
                 "empty": sum(res[s_][k]["empty"] for s_ in res), "clips": n}
 print("== MACRO", json.dumps(macro), flush=True)
 for s_ in res:
     for k in want:
-        for kk in ("_lat", "_prem", "_true"):
+        for kk in ("_lat", "_prem", "_true", "_feany"):
             res[s_][k].pop(kk, None)
 if a.out:
     json.dump({"sets": res, "macro": macro}, open(a.out, "w"), indent=1)
