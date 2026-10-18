@@ -111,10 +111,14 @@ for tag, path in (("parent", a.parent), ("s2", a.s2)):
                         elif o in ("C", "S"):
                             break
                     c["D_end"] += k; c["clips_D_end"] += k > 0
+                    if k:
+                        c.setdefault("D_end_clips", []).append({"dur": round(len(sf.info(r["audio_filepath"]).frames
+                            and sf.info(r["audio_filepath"]).frames) / 16000, 2), "ref_words": len(ref), "missing_end": k})
                     c["N"] += len(ref); c["hyp_words"] += len(hyp)
         c.update({"wer": round(100 * (c["S"] + c["D"] + c["I"]) / c["N"], 2),
                   **{f"{o}%": round(100 * c[o] / c["N"], 2) for o in ("S", "D", "I", "D_end")}})
         res[f"{tag}/{sname}"] = c
+        print(tag, f"post{a.post_pad_s:g}", sname, "D_end_clips", sorted((x["dur"], x["missing_end"]) for x in c.get("D_end_clips", [])))
         print(tag, f"post{a.post_pad_s:g}", sname, {k: c[k] for k in ("wer", "S%", "D%", "I%", "D_end%", "clips_D_end", "eou_clips",
                                             "eou_premature", "eob", "hyp_words", "N")}, flush=True)
 if a.out:
