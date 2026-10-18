@@ -755,3 +755,23 @@ raw EOF:
   null too, cosine feature KD is closed (no layer sweep).
 In every branch the v4 production path continues in parallel: plain parent = C250-36k unless KD produces a
 clearly superior plain model.
+
+### Stage 2 v4 pre-registration (2026-10-18 ~12:35 UTC, before launch): conservative EOU-v3 recipe on C250-36k
+
+Production path, independent of the E1 outcome (if KD later yields a clearly better plain parent, the SAME
+recipe is re-applied to it). Run `s2_mix.sh` TAG=it-s2v4-c250-36k: init `plain-it-c250-36k/final.nemo`; the
+EOU-v3 recipe unchanged (text + <EOU>, 50 % of samples with 1-3 s trailing quiet, top-4 encoder at 3e-5, decoder +
+joint 2e-5 = the djlr fix of the v3 VP blanking, bs 16, 1500 steps, FastEmit 0, max-dur 20, evals every 250 on the
+four harness sets, final.nemo = min WER among evals with EOU >= 80 % and <= 10 % empty); the only adaptation is
+the principle s2_mix.sh already follows: stage 2 on the parent's OWN mix = the C250 mix (MLS 0.1964, CV 0.1684,
+VP-t50 0.1122, FLEURS 0.0842, it-yg 0.1885, it-yg6 0.2503). GPU order today: this first (~1 h incl. probes), then
+E1 ctl-8k, kd-8k. Probes (lm_fusion_probe, <EOU>/<EOB> dropped from the text) of the stage-2 model AND the parent
+on the same box: harness + clean, greedy / beam-8 / oracle-8, raw and 0.5 s flush.
+Gates (delta = stage 2 - parent, harness raw EOF, same box):
+- **v4 candidate** if greedy <= +1.0 AND beam-8 <= +1.0 AND no harness domain greedy > +2.0 AND in-run EOU rate
+  at the selected step >= 98 % AND empty clips <= parent + 1 % abs; clean (dev) and flushed numbers reported;
+- **diagnose before promoting** (per domain, empties, EOU placement) if +1.0 < greedy <= +2.0;
+- **not v4** if greedy > +2.0 or EOU < 95 %: the stage-2 update pays back the plain gains; a next arm is
+  pre-registered separately (not tuned on these numbers).
+Then the frozen candidate goes to Mynah (m1.sh: export, FLEURS-it 200 stream WER / EOU / endpoint latency, CPU /
+CUDA parity) and only then to FINAL-IT.
