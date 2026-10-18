@@ -24,6 +24,7 @@ ap.add_argument("--vals", required=True)
 ap.add_argument("--per-set", type=int, default=200)
 ap.add_argument("--device", default="cpu")
 ap.add_argument("--threads", type=int, default=8)
+ap.add_argument("--post-pad-s", type=float, default=0.0, help="digital silence appended (EOF flush), as lm_fusion_probe.py")
 ap.add_argument("--out", default="")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -81,6 +82,7 @@ for tag, path in (("parent", a.parent), ("s2", a.s2)):
                 ch = rows[i:i + 8]
                 xs = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in ch]
                 xs = [x.mean(1) if x.ndim > 1 else x for x in xs]
+                xs = [np.concatenate([x, np.zeros(int(a.post_pad_s * 16000), np.float32)]) for x in xs]
                 L = max(len(x) for x in xs)
                 X = torch.zeros(len(xs), L)
                 for b, x in enumerate(xs):
@@ -113,7 +115,7 @@ for tag, path in (("parent", a.parent), ("s2", a.s2)):
         c.update({"wer": round(100 * (c["S"] + c["D"] + c["I"]) / c["N"], 2),
                   **{f"{o}%": round(100 * c[o] / c["N"], 2) for o in ("S", "D", "I", "D_end")}})
         res[f"{tag}/{sname}"] = c
-        print(tag, sname, {k: c[k] for k in ("wer", "S%", "D%", "I%", "D_end%", "clips_D_end", "eou_clips",
+        print(tag, f"post{a.post_pad_s:g}", sname, {k: c[k] for k in ("wer", "S%", "D%", "I%", "D_end%", "clips_D_end", "eou_clips",
                                             "eou_premature", "eob", "hyp_words", "N")}, flush=True)
 if a.out:
     json.dump(res, open(a.out, "w"), indent=1)
