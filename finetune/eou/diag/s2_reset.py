@@ -40,6 +40,8 @@ ap.add_argument("--margin-rule", type=float, default=0.0, help="scale rule only 
                 "path, M_t = max over the frame's symbol steps of z_EOU - max(other outputs); per clip need = -max M_t over "
                 "frames in [speech end, speech end + W s); prints need p10/p50/p90 and b = max(0, median need) rounded UP "
                 "to 0.05, then exits (no FE / latency / WER is computed)")
+ap.add_argument("--dump", default="", help="also write one JSON line per (clip, protocol): audio, ref, hyp, token ids, "
+                "<EOU> frames, speech end and per-clip flags (artifact only; no computation changes)")
 ap.add_argument("--out", default="")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -154,6 +156,7 @@ if a.margin_rule:   # scale rule for --eou-bias (pre-registered): no biased deco
     raise SystemExit(0)
 
 res = {}
+dump = open(a.dump, "w") if a.dump else None
 for spec in a.vals.split(","):
     sname, p = spec.split("=", 1)
     rows = [json.loads(l) for l in open(p)]
@@ -199,6 +202,11 @@ for spec in a.vals.split(","):
             c["empty"] += not hyp
             # FE_any (diagnostic, fixed 2026-10-18 before v5-B): an <EOU> followed by >= 0.16 s (2 frames) of speech
             c["fe_any"] += any(int(sm[f + 1:].sum()) >= 2 for f in ef)
+            if dump:
+                dump.write(json.dumps({"set": sname, "protocol": k, "audio": r["audio_filepath"], "ref": " ".join(ref),
+                                       "hyp": " ".join(hyp), "ids": ys, "eou_frames": ef, "speech_end_s": round(end, 3),
+                                       "premature": bool(prem), "fe_any": any(int(sm[f + 1:].sum()) >= 2 for f in ef),
+                                       "true_eou_s": true[0] if true else None}, ensure_ascii=False) + "\n")
     out = {}
     for k, c in acc.items():
         err = c["S"] + c["D"] + c["I"]
