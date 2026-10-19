@@ -410,3 +410,23 @@ turn-taking the splits are the failure. Per the pre-registration: **IT EOU resea
 
 One run. No change to checkpoint, runtime, normalisation or reporting in response to FINAL-IT. FINAL-IT is
 characterisation, not selection; after this decode it is spent for IT development.
+
+### Result: FINAL-IT one-shot of RC-IT v4 (OBSERVED, 2026-10-19 10:42-10:52 UTC, git 9f0bc8d, seal verified 3,665 files)
+
+Natural clips (primary), reset protocol, +2 s quiet, greedy:
+
+| bank | clips | WER | CER | FE | FE_any | R | L p50 / p90 s | empty | split |
+|---|---|---|---|---|---|---|---|---|---|
+| mls | 400 | 23.44 | 5.90 | 2.5 % | 2.8 % | 97.5 % | 0.56 / 2.24 | 0 | 10 |
+| cv | 400 | 19.44 | 5.51 | 2.5 % | 3.5 % | 97.2 % | 0.80 / 2.32 | 0 | 10 |
+| vp | 110 | 20.35 | 10.55 | 7.3 % | 7.3 % | 98.2 % | 0.32 / 1.04 | 1 | 8 |
+| fleurs | 116 | 12.56 | 3.02 | 16.4 % | 16.4 % | 84.5 % | 0.96 / 2.63 | 0 | 2 |
+| tedx | 400 | 21.45 | 9.79 | 4.2 % | 4.2 % | 95.5 % | 0.96 / 2.08 | 8 | 23 |
+| italic | 400 | 25.68 | 6.91 | 0.0 % | 0.0 % | 97.2 % | 1.12 / 2.40 | 0 | 0 |
+| **macro / pooled** | 1,826 | **20.49** | **6.95** | **3.50 %** | **3.78 %** | **96.17 %** | **0.88 / 2.24** | **9** | |
+
+(WER / CER = unweighted macro over the 6 banks; FE / FE_any / R / L / empty pooled over clips.)
+Trim variant (secondary): macro WER 20.52, CER 6.95, FE 3.40 %, FE_any 3.67 %, R 96.44 %, L 0.80 / 2.00 s, empty 9;
+per bank WER within 0.2 of natural (FLEURS FE 14.7 %).
+Band (2026-10-18 pre-registration): < 20 = success -> **20.49 misses the success band by 0.49**; not "strong".
+FINAL-IT is now spent for IT development. Nothing changes in response.
