@@ -266,3 +266,30 @@ stage 2 with the frozen IT EOU recipe, Mynah export, FINAL-FR once. No FR < 20 p
   FT_ROOT=/root/ft INIT=/root/ft/runs/plain-it-c250-36k/final.nemo TAG=it-s2v5cal-c250-36k
   S2EXTRA="--lr 2e-5 --eou-min-tail 0.5 --eou-amb-keep 0.5" PROBE=1 M1=0 timeout 7200 bash finetune/jobs/s2_mix.sh`
   (<s2tail> = /root/ft/mix/s2tail), then `s2_reset.py --post-pad-s 2.0 --models s2_reset,s2` on the 730 harness clips.
+
+### Result: Stage2-v5-CAL (q = 0.5) -- pre-registered class NULL (OBSERVED, Japan L40S, same box / parent / batches)
+Selected step (fixed rule, EOU >= 80 %, <= 10 % empty): 500 (in-run val 22.40, EOU 92.8 %; step 250 had EOU 78.6 %);
+v5-B selected 1000, v4 250. final.nemo sha256 7c8236c6. Not uploaded (NULL arm; results/jp-2026-10-19 has metrics).
+
+| harness, reset, +2 s quiet | FE | FE_any | R | L p50 / p90 s | reset-WER | CER | empty |
+|---|---|---|---|---|---|---|---|
+| v4 (q = 1, 100 % positives) | 8.36 % | 8.90 % | 94.38 % | 0.72 / 1.92 | 22.54 | 8.95 | 0 |
+| **v5-CAL (q = 0.5, 82.1 %)** | **1.51 %** | **2.19 %** | **91.92 %** | **1.92 / 3.04** | **22.14** | 9.02 | **0** |
+| v5-B (q = 0, 65.0 %) | 0.82 % | 1.64 % | 92.47 % | 1.84 / 3.04 | 22.08 | 9.26 | 3 |
+| production v3 | 5.89 % | 6.58 % | 94.66 % | 0.64 / 1.92 | 36.07 | 12.82 | 4 |
+
+Per set (FE / R / L p50): MLS 1.5 % / 95.0 / 1.44 s; FLEURS 3.5 % / 91.0 / 2.48 s; CV 0.5 % / 90.0 / 2.20 s;
+VP 0.0 % / 91.5 / 1.44 s (v4 FLEURS 17 %, v5-B 2 %, v3 14.5 %).
+Gates: PASS no (L 1.92 > 1.04; R 91.92 < 92.66); PARTIAL no (L > 1.28); FAIL no (R >= 90, W 22.14 <= 23.08, empty 0,
+FE <= 5.89); NULL yes -- within 1.0 pt FE (0.69) and 0.20 s L p50 (0.08) of the v5-B anchor. **Class: NULL.**
+Diagnostic (not a gate): L_chord(1.51 %) = 1.74 s; CAL 1.92 s = 0.18 s ABOVE the v4 -> v5-B chord (worse than
+interpolation): reintroducing half of the ambiguous positives buys back almost none of v4's latency (and some FE).
+Informational offline probes (no reset): s2 harness 22.67 / 20.98 / 16.71 vs parent 22.27 / 20.54 / 16.26 (+0.40
+greedy; v5-B -0.18); clean flushed 22.64 / 20.81 / 14.01 vs parent 21.73 / 20.23 / 13.71.
+Reading (HYPOTHESIS, scoped, one seed): the latency response to the positive dose is strongly non-linear -- with
+greedy argmax, an <EOU> trained as a coin flip on short tails stays below blank there, so the model still fires only
+on the unambiguous (padded, long-tail) evidence; the fast v4 boundary needs (nearly) all short-tail positives,
+which also carry its false endpoints. The selected step differs (500 vs 1000; the fixed rule), a known confound of
+the latency comparison, not acted on. Per the pre-registration: **the stage-2 label-dose axis is CLOSED** (no
+v5-C, no q grid, no threshold change on this DEV). A decision-layer knob (EOU posterior bias / threshold or a
+runtime commit policy on v5-B) would be a NEW, separately pre-registered axis -- not opened today.
