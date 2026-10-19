@@ -339,3 +339,12 @@ up to the first <EOU>). That curve is deliberately NOT computed: one b, one deco
 - PASS: Mynah parity of the bias (runtime implementation, CPU / CUDA), freeze v5-B weights + runtime policy, then
   FINAL-IT once, then RC.
 - Otherwise: STOP IT EOU research (no sweep, no second b, no threshold search) and choose v5-B / v3 on product grounds.
+
+**Rule output (OBSERVED, 2026-10-19 ~10:05 UTC, before any biased decode):**
+`s2_reset.py --margin-rule 0.64` on v5-B, DEV730: need p10 / p50 / p90 = 6.8 / 110.3 / 946.9, so **b = 110.3**.
+Units are joint log-probability differences.
+- At the energy speech end + 0.64 s, the median clip's <EOU> trails the winning output (blank) by ~110 nats.
+- Fewer than 10 % of clips are within 7 nats.
+The scale is degenerate for a "small calibration": v5-B is not marginally under-confident at the true end; its
+<EOU> evidence is absent there and appears ~1-2 s later. Biased decode NOT run; stopped for a decision (the rule is
+pre-registered, its output is reported as is).
