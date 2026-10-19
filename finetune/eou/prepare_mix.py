@@ -14,7 +14,8 @@ or streamed tarballs, one shard at a time (transient):
            fully out-of-domain probe; cv/vp test are the extra held-out domains.
 
 Filters (all sources): 1-20 s, no digits (the de-accented a-z targets cannot spell
-them), latin script only. The budget per source is spread evenly over its train
+them), latin script only: common/textnorm.text_ok(t, --lang) (it == the historical rule; fr also keeps
+oe / ae words and typographic apostrophes). The budget per source is spread evenly over its train
 shards so the cut touches every shard (speaker diversity), not the first one.
 
 Output: 16 kHz mono PCM16 wav under --audio (default /dev/shm/mix/<lang>, RAM-backed:
@@ -65,13 +66,14 @@ import re
 import sys
 import tarfile
 import time
-import unicodedata
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "canary"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 import prepare_it as D  # noqa: E402  (curl, decode_bytes, write_wav, fleurs tsv helpers, ftlib)
+import textnorm  # noqa: E402
 
 HF = "https://huggingface.co"
 CV_REPO = "fixie-ai/common_voice_17_0"
@@ -120,11 +122,8 @@ def write_audio(dst, audio, sr):
     return len(audio) / sr
 
 
-def text_ok(t):
-    if not t or re.search(r"\d", t):
-        return False
-    letters = [c for c in unicodedata.normalize("NFKD", t) if c.isalpha()]
-    return bool(letters) and all("a" <= c.lower() <= "z" for c in letters)
+def text_ok(t, lang="it"):
+    return textnorm.text_ok(t, lang)   # lang="it" == the historical rule of this file (proven, tests)
 
 
 def pick(cols, names):
@@ -135,7 +134,7 @@ def pick(cols, names):
 
 
 def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_n=0, keep_all=False, max_s=20.0,
-              yg=None):
+              yg=None, lang="it"):
     """Download one parquet shard, keep a speaker-capped random subset up to budget_s
     (or eval_n clips), write wavs, delete the shard. Returns manifest rows.
     yg: incremental-mode options (dict: split_s, piece_min_s, vad, ext, rev, threads) or None (legacy)."""
@@ -159,7 +158,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
         spk_n, want = {}, []
         for i in order:
             r = meta[i]
-            if not (r[tc] or "").strip() or (not keep_all and not text_ok(r[tc])):
+            if not (r[tc] or "").strip() or (not keep_all and not text_ok(r[tc], lang)):
                 continue
             s = r.get(sc) or f"anon{i}"
             if spk_n.get(s, 0) >= spk_cap:
@@ -240,7 +239,7 @@ def shard_job(src, repo, rel, budget_s, spk_cap, audio_dir, tmp_dir, seed, eval_
 def fleurs_train(lang, audio_dir):
     cfg = FLEURS_CFG[lang]
     tsv = D.fleurs_tsv(cfg, "train")
-    by = {r["file"]: r for r in tsv if text_ok(r["raw"]) and 1.0 <= r["duration"] <= 20.0}
+    by = {r["file"]: r for r in tsv if text_ok(r["raw"], lang) and 1.0 <= r["duration"] <= 20.0}
     rows, url = [], f"{D.FLEURS}/{cfg}/audio/train.tar.gz"
     with urllib.request.urlopen(url, timeout=120) as resp, tarfile.open(fileobj=resp, mode="r|gz") as tar:
         for m in tar:
@@ -337,7 +336,7 @@ def yg_incremental(a, spread, audio, tmp, out):
                 if rel is None:
                     break
                 live[ex.submit(shard_job, "yg", YG_REPO, rel, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0,
-                               a.yg_keep_all, a.yg_max_s, opts)] = rel
+                               a.yg_keep_all, a.yg_max_s, opts, a.lang)] = rel
             if not live:
                 break
             done, _ = wait(live, return_when=FIRST_COMPLETED)
@@ -439,7 +438,8 @@ def main():
         pick = [files[i] for i in sorted(set(idx))]
         rows = []
         with ProcessPoolExecutor(max_workers=a.workers) as ex:
-            futs = [ex.submit(shard_job, "yg", YG_REPO, f, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0, a.yg_keep_all, a.yg_max_s) for f in pick]
+            futs = [ex.submit(shard_job, "yg", YG_REPO, f, 1e12, 10 ** 9, str(audio), str(tmp), a.seed, 0, a.yg_keep_all, a.yg_max_s,
+                              lang=a.lang) for f in pick]
             for fu in futs:
                 rel, r = fu.result()
                 rows += r
@@ -448,8 +448,8 @@ def main():
         print(f"== yg: {len(rows)} utts {sum(x['duration'] for x in rows) / 3600:.2f} h, {len({x['speaker'] for x in rows})} videos", flush=True)
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         for src, repo, tr, te, per, cap in jobs:
-            futs = [ex.submit(shard_job, src, repo, rel, per, cap, str(audio), str(tmp), a.seed) for rel in tr]
-            ev = ex.submit(shard_job, src, repo, te[0], 0, 2, str(audio), str(tmp), a.seed, a.eval_n)
+            futs = [ex.submit(shard_job, src, repo, rel, per, cap, str(audio), str(tmp), a.seed, lang=a.lang) for rel in tr]
+            ev = ex.submit(shard_job, src, repo, te[0], 0, 2, str(audio), str(tmp), a.seed, a.eval_n, lang=a.lang)
             rows = []
             for f in futs:
                 rel, r = f.result()

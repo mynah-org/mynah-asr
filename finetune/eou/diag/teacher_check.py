@@ -14,14 +14,18 @@ import argparse
 import concurrent.futures as cf
 import json
 import random
-import re
 import subprocess
-import unicodedata
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
+import textnorm  # noqa: E402
+
+NORM_LANG = "it"   # = --lang (main); "it" == the historical rule of this file
 
 
 def norm(t):
-    t = "".join(c for c in unicodedata.normalize("NFKD", t.lower()) if not unicodedata.combining(c))
-    return " ".join(re.sub(r"[^a-z' ]", " ", t).split())
+    return textnorm.norm(t, NORM_LANG)
 
 
 def lev(x, y):
@@ -44,6 +48,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--json", default="")
     a = ap.parse_args()
+    global NORM_LANG
+    NORM_LANG = a.lang   # the CLI --lang and the ref/teacher normaliser are the same flag (teacher_ws.py too)
     rows = [json.loads(l) for l in open(a.manifest)]
     rows = random.Random(a.seed).sample(rows, min(a.n, len(rows)))
 

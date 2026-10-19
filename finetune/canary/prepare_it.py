@@ -24,6 +24,15 @@ Stages (each leaves a marker in $FT_ROOT/done/, re-runs skip finished work):
   manifests  NeMo/lhotse manifests with canary2 fields, exact hours from the
              written wav files (hours.json), SentencePiece text pool.
 
+  --lang fr      French (FR-P1): MLS `french` (all 34 train shards + test), FLEURS fr_fr; no CV tarball,
+                 no English probe. Pool rows failing textnorm.text_ok(t, "fr") (digits / markup) are dropped;
+                 the MLS order is seed-free (speakers and clips in sha1 order, subsets.balanced_order_sha1)
+                 and the speaker cap defaults to the equal share of the largest cut over ALL pool speakers
+                 (subsets.equal_share_cap_min: 40 h / n_speakers rounded up to a minute, raised only if a
+                 speaker has less), so the 40 h cut touches every speaker. Every path gets a `fr` tag, IT
+                 files are never touched: meta/mls_fr_*.jsonl, plan_fr.json, done/data-fr-*, audio/mls_fr,
+                 audio/fleurs_fr, manifests/eval_{mls,fleurs}_fr.json, eval_fr_all.json, train_<h>h_fr.json,
+                 hours_fr.json, text/fr_pool.txt. --lang it (default) is byte-identical to before.
   --dry-run      run meta + plan and print the plan; no audio.
   --synthetic    fabricate MLS-shaped metadata (laptop test of the plan logic,
                  no network at all). Implies --dry-run.
@@ -47,7 +56,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 import ftlib  # noqa: E402
-from subsets import balanced_order, merge_by_share, nested_cuts  # noqa: E402,F401
+import textnorm  # noqa: E402
+from subsets import balanced_order, balanced_order_sha1, equal_share_cap_min, merge_by_share, nested_cuts  # noqa: E402,F401
 
 FT = ftlib.FT
 SR = ftlib.SR
@@ -57,6 +67,22 @@ MLS_TRAIN = [f"italian/train-{i:05d}-of-00008.parquet" for i in range(8)]
 MLS_TEST = ["italian/test-00000-of-00001.parquet"]
 MLS_META_COLS = ["id", "speaker_id", "chapter_id", "transcript", "audio_duration"]
 FLEURS = f"{HF}/google/fleurs/resolve/main/data"
+LANGS = {"it": ("italian", 8, "it_it"), "fr": ("french", 34, "fr_fr")}   # MLS config, train shards, FLEURS config
+LANG, FL = "it", "it_it"
+
+
+def set_lang(lang):
+    global LANG, FL, MLS_TRAIN, MLS_TEST
+    cfg, n, FL = LANGS[lang]
+    LANG = lang
+    MLS_TRAIN = [f"{cfg}/train-{i:05d}-of-{n:05d}.parquet" for i in range(n)]
+    MLS_TEST = [f"{cfg}/test-00000-of-00001.parquet"]
+
+
+def tag(base):
+    """IT names unchanged; other languages get a _<lang> suffix (meta, plan, markers, audio dirs, manifests)."""
+    return base if LANG == "it" else f"{base}_{LANG}"
+
 
 # --------------------------------------------------------------------------
 # small utils
@@ -174,7 +200,7 @@ def stage_meta(a):
     out = FT / "meta"
     out.mkdir(parents=True, exist_ok=True)
     for split, files in (("train", MLS_TRAIN), ("test", MLS_TEST)):
-        dst = out / f"mls_{split}.jsonl"
+        dst = out / f"{tag('mls')}_{split}.jsonl"
         if dst.exists():
             continue
         rows = []
@@ -186,9 +212,10 @@ def stage_meta(a):
             rows += rs
             print(f"  meta {rel}: {len(rs)} rows ({how}, {time.time() - t0:.0f}s)", flush=True)
         ftlib.write_manifest(dst, rows)
-    fleurs_tsv("it_it", "test")
-    fleurs_tsv("it_it", "train")
-    fleurs_tsv("en_us", "test")
+    fleurs_tsv(FL, "test")
+    fleurs_tsv(FL, "train")
+    if LANG == "it":   # English forgetting probe: IT kit only
+        fleurs_tsv("en_us", "test")
     if CV_TARBALL:
         cv_meta()
 
@@ -261,7 +288,7 @@ def synthetic_meta():
         s = rng.choices(range(65), weights=spk_w)[0]
         train.append({"id": f"syn_{s}_{i}", "speaker_id": f"{s}", "chapter_id": "0",
                       "transcript": "testo di prova", "audio_duration": rng.uniform(10, 20),
-                      "shard": MLS_TRAIN[i % 8]})
+                      "shard": MLS_TRAIN[i % len(MLS_TRAIN)]})
     for i in range(1262):
         s = 100 + i % 10
         test.append({"id": f"syn_{s}_{i}", "speaker_id": f"{s}", "chapter_id": "0",
@@ -287,9 +314,11 @@ def stage_plan(a, synthetic=False):
     if synthetic:
         mls_tr, mls_te, fl_te, fl_tr, fl_en = synthetic_meta()
     else:
-        mls_tr = ftlib.read_manifest(FT / "meta" / "mls_train.jsonl")
-        mls_te = ftlib.read_manifest(FT / "meta" / "mls_test.jsonl")
-        fl_te, fl_tr, fl_en = fleurs_tsv("it_it", "test"), fleurs_tsv("it_it", "train"), fleurs_tsv("en_us", "test")
+        mls_tr = ftlib.read_manifest(FT / "meta" / f"{tag('mls')}_train.jsonl")
+        mls_te = ftlib.read_manifest(FT / "meta" / f"{tag('mls')}_test.jsonl")
+        fl_te, fl_tr = fleurs_tsv(FL, "test"), fleurs_tsv(FL, "train")
+        fl_en = fleurs_tsv("en_us", "test") if LANG == "it" else []
+    fr = LANG != "it"   # the FR additions below never run for IT (plan.json byte-identical)
 
     # ---- frozen eval: ALL of FLEURS it test + ALL of MLS it test ----
     eval_mls = [{"src": "mls", "id": r["id"], "speaker": str(r["speaker_id"]), "duration": float(r["audio_duration"]),
@@ -300,7 +329,7 @@ def stage_plan(a, synthetic=False):
     test_sid = {u["sid"] for u in eval_fl}
 
     # ---- training pool ----
-    pool_mls, dropped = {}, {"duration": 0, "test_speaker": 0}
+    pool_mls, dropped = {}, {"duration": 0, "test_speaker": 0, **({"text": 0} if fr else {})}
     for r in mls_tr:
         d = float(r["audio_duration"])
         if not (a.min_dur <= d <= a.max_dur):
@@ -309,12 +338,22 @@ def stage_plan(a, synthetic=False):
         if str(r["speaker_id"]) in test_spk:
             dropped["test_speaker"] += 1
             continue
+        if fr and not textnorm.text_ok(r["transcript"], LANG):   # digits / markup: the a-z targets cannot spell them
+            dropped["text"] += 1
+            continue
         pool_mls.setdefault(str(r["speaker_id"]), []).append(
             {"src": "mls", "id": r["id"], "speaker": str(r["speaker_id"]), "duration": d, "text": r["transcript"],
              "shard": r["shard"]})
     for s in pool_mls:
         pool_mls[s].sort(key=lambda u: u["id"])  # input order must not depend on the shard read order
-    seqs = {"mls": balanced_order(pool_mls, a.mls_cap_min * 60, a.seed)}
+    if fr:   # equal-share cap over ALL pool speakers + seed-free sha1 order (FR-P1 pre-registration)
+        if a.mls_cap_min is None:
+            a.mls_cap_min = equal_share_cap_min(pool_mls, max(float(h) for h in a.hours.split(",")))
+        seqs = {"mls": balanced_order_sha1(pool_mls, a.mls_cap_min * 60, "mls")}
+    else:
+        if a.mls_cap_min is None:
+            a.mls_cap_min = 60.0
+        seqs = {"mls": balanced_order(pool_mls, a.mls_cap_min * 60, a.seed)}
     shares = {"mls": 1.0}
     pool_fl_n = 0
     if a.with_fleurs_train:
@@ -323,6 +362,8 @@ def stage_plan(a, synthetic=False):
         by_sid = {}
         for r in fl_tr:
             if r["sid"] in test_sid or not (a.min_dur <= r["duration"] <= a.max_dur):
+                continue
+            if fr and not textnorm.text_ok(r["raw"], LANG):
                 continue
             by_sid.setdefault(r["sid"], []).append(
                 {"src": "fleurs", "id": r["file"].rsplit(".", 1)[0], "file": r["file"], "sid": r["sid"],
@@ -366,7 +407,7 @@ def stage_plan(a, synthetic=False):
 
     # ---- English forgetting probe: first N FLEURS en_us test clips (sorted) ----
     en = [{"src": "fleurs_en", "id": r["file"].rsplit(".", 1)[0], "file": r["file"], "duration": r["duration"],
-           "text": r["raw"]} for r in fl_en[: a.en_clips]]
+           "text": r["raw"]} for r in (fl_en[: a.en_clips] if not fr else [])]
 
     plan = {
         "seed": a.seed, "min_dur": a.min_dur, "max_dur": a.max_dur, "mls_cap_min": a.mls_cap_min,
@@ -378,7 +419,8 @@ def stage_plan(a, synthetic=False):
         "checks": {"mls_train_test_speaker_overlap_in_metadata": len(test_spk & {str(r["speaker_id"]) for r in mls_tr}),
                    "fleurs_train_test_sentence_overlap": len({r["sid"] for r in fl_tr} & test_sid)},
         "cuts": {},
-        "eval": {"fleurs_it_test": eval_fl, "mls_it_test": eval_mls, **({"cv_it_test2000": eval_cv} if eval_cv else {})},
+        "eval": {f"fleurs_{LANG}_test": eval_fl, f"mls_{LANG}_test": eval_mls,
+                 **({"cv_it_test2000": eval_cv} if eval_cv else {})},
         "en_sanity": en,
         "train_sequence": need,
     }
@@ -399,7 +441,17 @@ def stage_plan(a, synthetic=False):
             "mls_min_per_speaker_max": round(max(spk.values()) / 60, 2) if spk else 0,
             "mls_min_per_speaker_min": round(min(spk.values()) / 60, 2) if spk else 0,
         }
-    ftlib.write_json(FT / ("plan.synthetic.json" if synthetic else "plan.json"), plan)
+        if fr:   # clips per speaker min / median / max of the MLS part of the cut
+            nc = {}
+            for u in sub:
+                if u["src"] == "mls":
+                    nc[u["speaker"]] = nc.get(u["speaker"], 0) + 1
+            v = sorted(nc.values())
+            plan["cuts"][name]["mls_clips_per_speaker_min_med_max"] = [v[0], v[len(v) // 2], v[-1]] if v else []
+    if fr:
+        plan.update(lang=LANG, mls_order="sha1", mls_cap_rule="equal-share of the largest cut (minutes, rounded up)"
+                    if a.mls_cap_rule_auto else "--mls-cap-min")
+    ftlib.write_json(FT / (tag("plan") + (".synthetic.json" if synthetic else ".json")), plan)
     print_plan(plan)
     if plan["checks"]["mls_train_test_speaker_overlap_in_metadata"]:
         print("NOTE: MLS train/test speaker overlap found in metadata; those train rows were dropped.")
@@ -421,7 +473,11 @@ def print_plan(p):
     print(f"  checks {p['checks']}")
     for name, c in p["cuts"].items():
         print(f"  cut {name:>4s}: {c['n_utts']:6d} utts {c['planned_hours']:7.3f} h {c['hours_by_source']} "
-              f"MLS speakers {c['mls_speakers']} ({c['mls_min_per_speaker_min']}-{c['mls_min_per_speaker_max']} min each)")
+              f"MLS speakers {c['mls_speakers']} ({c['mls_min_per_speaker_min']}-{c['mls_min_per_speaker_max']} min each)"
+              + (f" clips/speaker min/med/max {c['mls_clips_per_speaker_min_med_max']}"
+                 if "mls_clips_per_speaker_min_med_max" in c else ""))
+    if "mls_order" in p:
+        print(f"  MLS order {p['mls_order']}, cap {p['mls_cap_min']} min/speaker ({p['mls_cap_rule']})")
     seq_h = sum(u["duration"] for u in p["train_sequence"]) / 3600
     ev_h = sum(r["duration"] for rows in ev.values() for r in rows) / 3600
     print(f"  audio to fetch: train {seq_h:.2f} h + eval {ev_h:.2f} h -> ~{(seq_h + ev_h) * 0.115:.1f} GB of 16 kHz PCM16")
@@ -436,14 +492,14 @@ def wav_path(src, uid):
     return FT / "audio" / src / f"{uid}.wav"
 
 
-def mls_shard_job(rel, ids):
-    """Download one shard (transient), write the wanted rows as wav, delete it."""
+def mls_shard_job(rel, ids, adir="mls", tdir="tmp"):
+    """Download one shard (transient) into FT/<tdir>, write the wanted rows as wav under audio/<adir>, delete it."""
     import pyarrow.parquet as pq
 
-    want = {i for i in ids if not wav_path("mls", i).exists()}
+    want = {i for i in ids if not wav_path(adir, i).exists()}
     if not want:
         return rel, 0, 0
-    tmp = FT / "tmp" / Path(rel).name
+    tmp = FT / tdir / Path(rel).name
     curl(f"{HF}/{MLS_REPO}/resolve/main/{rel}", tmp)
     n = fail = 0
     try:
@@ -458,7 +514,7 @@ def mls_shard_job(rel, ids):
                     continue
                 try:
                     arr, sr = decode_bytes(au["bytes"])
-                    write_wav(wav_path("mls", uid), arr, sr)
+                    write_wav(wav_path(adir, uid), arr, sr)
                     n += 1
                 except Exception as e:
                     fail += 1
@@ -494,31 +550,32 @@ def fleurs_stream(cfg, split, files, dst_src):
 
 
 def stage_audio(a):
-    plan = json.loads((FT / "plan.json").read_text())
-    (FT / "tmp").mkdir(parents=True, exist_ok=True)
+    plan = json.loads((FT / (tag("plan") + ".json")).read_text())
+    (FT / tag("tmp")).mkdir(parents=True, exist_ok=True)
     jobs = {}
-    for u in plan["train_sequence"] + plan["eval"]["mls_it_test"]:
+    for u in plan["train_sequence"] + plan["eval"][f"mls_{LANG}_test"]:
         if u["src"] == "mls":
             jobs.setdefault(u["shard"], []).append(u["id"])
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
-        futs = [ex.submit(mls_shard_job, rel, ids) for rel, ids in sorted(jobs.items())]
+        futs = [ex.submit(mls_shard_job, rel, ids, tag("mls"), tag("tmp")) for rel, ids in sorted(jobs.items())]
         for f in futs:
             rel, n, fail = f.result()
             print(f"  mls {rel}: wrote {n}, failed {fail} ({time.time() - t0:.0f}s)", flush=True)
-    n = fleurs_stream("it_it", "test", [u["file"] for u in plan["eval"]["fleurs_it_test"]], "fleurs_it")
-    print(f"  fleurs it test: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
+    n = fleurs_stream(FL, "test", [u["file"] for u in plan["eval"][f"fleurs_{LANG}_test"]], f"fleurs_{LANG}")
+    print(f"  fleurs {LANG} test: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
     fl_tr = [u["file"] for u in plan["train_sequence"] if u["src"] == "fleurs"]
     if fl_tr:
-        n = fleurs_stream("it_it", "train", fl_tr, "fleurs_it")
-        print(f"  fleurs it train: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
+        n = fleurs_stream(FL, "train", fl_tr, f"fleurs_{LANG}")
+        print(f"  fleurs {LANG} train: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
     cv = [u["file"] for u in plan["train_sequence"] + plan["eval"].get("cv_it_test2000", []) if u["src"] == "cv"]
     if cv:
         n = cv_stream(cv)
         print(f"  cv: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
-    n = fleurs_stream("en_us", "test", [u["file"] for u in plan["en_sanity"]], "fleurs_en")
-    print(f"  fleurs en test: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
-    shutil.rmtree(FT / "tmp", ignore_errors=True)
+    if plan["en_sanity"]:
+        n = fleurs_stream("en_us", "test", [u["file"] for u in plan["en_sanity"]], "fleurs_en")
+        print(f"  fleurs en test: wrote {n} ({time.time() - t0:.0f}s)", flush=True)
+    shutil.rmtree(FT / tag("tmp"), ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -529,7 +586,7 @@ def stage_audio(a):
 def stage_manifests(a):
     import soundfile as sf
 
-    plan = json.loads((FT / "plan.json").read_text())
+    plan = json.loads((FT / (tag("plan") + ".json")).read_text())
     man = FT / "manifests"
     hours = {"note": "seconds summed from the written 16 kHz wav files, not from metadata; "
                      "peak_dbfs = per-clip sample peak (level-robustness context)"}
@@ -538,7 +595,7 @@ def stage_manifests(a):
     def rows_for(units, lang, pnc_of):
         rows, miss = [], 0
         for u in units:
-            src = {"mls": "mls", "fleurs": "fleurs_it", "fleurs_en": "fleurs_en", "cv": "cv"}[u["src"]]
+            src = {"mls": tag("mls"), "fleurs": f"fleurs_{LANG}", "fleurs_en": "fleurs_en", "cv": "cv"}[u["src"]]
             p = wav_path(src, u["id"])
             if not p.exists():
                 miss += 1
@@ -555,15 +612,17 @@ def stage_manifests(a):
     # and punctuated -> pnc=yes. Scoring always normalises both sides.
     pnc_of = lambda u: "no" if u["src"] == "mls" else "yes"  # noqa: E731  (CV sentences are cased too)
     sets = {
-        "eval_fleurs_it": (plan["eval"]["fleurs_it_test"], "it"),
-        "eval_mls_it": (plan["eval"]["mls_it_test"], "it"),
-        "en_sanity": (plan["en_sanity"], "en"),
+        f"eval_fleurs_{LANG}": (plan["eval"][f"fleurs_{LANG}_test"], LANG),
+        f"eval_mls_{LANG}": (plan["eval"][f"mls_{LANG}_test"], LANG),
+        **({"en_sanity": (plan["en_sanity"], "en")} if LANG == "it" else {}),
     }
     if "cv_it_test2000" in plan["eval"]:
         sets["eval_cv_it"] = (plan["eval"]["cv_it_test2000"], "it")
     seq = plan["train_sequence"]
+    trains = []   # (hours, manifest name) of the nested cuts
     for name, c in plan["cuts"].items():
-        sets[f"train_{name}"] = (seq[: c["n_utts"]], "it")
+        sets[tag(f"train_{name}")] = (seq[: c["n_utts"]], LANG)
+        trains.append((float(name[:-1]), tag(f"train_{name}")))
     for name, (units, lang) in sets.items():
         rows, miss = rows_for(units, lang, pnc_of)
         ftlib.write_manifest(man / f"{name}.json", rows)
@@ -577,10 +636,10 @@ def stage_manifests(a):
             missing[name] = miss
         print(f"  {name:16s} {len(rows):6d} utts {secs / 3600:8.4f} h  missing {miss}  "
               f"peak dBFS p10/p50/p90 {hours[name]['peak_dbfs_p10_p50_p90']}", flush=True)
-    ftlib.write_manifest(man / "eval_it_all.json",
-                         ftlib.read_manifest(man / "eval_fleurs_it.json") + ftlib.read_manifest(man / "eval_mls_it.json"))
+    ftlib.write_manifest(man / f"eval_{LANG}_all.json", ftlib.read_manifest(man / f"eval_fleurs_{LANG}.json")
+                         + ftlib.read_manifest(man / f"eval_mls_{LANG}.json"))
     # nesting check on what was actually written
-    names = sorted([n for n in sets if n.startswith("train_")], key=lambda n: float(n[6:-1]))
+    names = [n for _, n in sorted(trains)]
     prev = set()
     for n in names:
         cur = {r["utt_id"] for r in ftlib.read_manifest(man / f"{n}.json")}
@@ -588,11 +647,11 @@ def stage_manifests(a):
         prev = cur
     hours["nested_check"] = "ok: " + " c ".join(names)
     # SentencePiece text: the whole TRAINING POOL (never eval text)
-    pool_txt = FT / "text" / "it_pool.txt"
+    pool_txt = FT / "text" / f"{LANG}_pool.txt"
     pool_txt.parent.mkdir(parents=True, exist_ok=True)
     n_lines = 0
     with open(pool_txt, "w", encoding="utf-8") as f:
-        for r in ftlib.read_manifest(FT / "meta" / "mls_train.jsonl"):
+        for r in ftlib.read_manifest(FT / "meta" / f"{tag('mls')}_train.jsonl"):
             f.write(r["transcript"].strip() + "\n")
             n_lines += 1
         for u in plan["train_sequence"]:
@@ -600,14 +659,15 @@ def stage_manifests(a):
                 f.write(u["text"].strip() + "\n")
                 n_lines += 1
         if plan["with_fleurs_train"]:
-            test_sid = {u["sid"] for u in plan["eval"]["fleurs_it_test"]}
-            for r in fleurs_tsv("it_it", "train"):
+            test_sid = {u["sid"] for u in plan["eval"][f"fleurs_{LANG}_test"]}
+            for r in fleurs_tsv(FL, "train"):
                 if r["sid"] not in test_sid:
                     f.write(r["raw"].strip() + "\n")
                     n_lines += 1
     hours["sentencepiece_text"] = {"path": str(pool_txt), "lines": n_lines,
-                                   "sources": "MLS it train (all)" + (" + FLEURS it train" if plan["with_fleurs_train"] else "")}
-    ftlib.write_json(FT / "hours.json", hours)
+                                   "sources": f"MLS {LANG} train (all)"
+                                   + (f" + FLEURS {LANG} train" if plan["with_fleurs_train"] else "")}
+    ftlib.write_json(FT / (tag("hours") + ".json"), hours)
     if missing:
         print(f"WARNING missing audio: {missing} (re-run the audio stage; it only fetches what is missing)")
     du = subprocess.run(["du", "-sh", str(FT / "audio")], capture_output=True, text=True).stdout.strip()
@@ -619,6 +679,7 @@ def stage_manifests(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--lang", default="it", choices=sorted(LANGS), help="it (default, unchanged) | fr (see the docstring)")
     ap.add_argument("--stage", default="all", choices=["all", "meta", "plan", "audio", "manifests"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--synthetic", action="store_true")
@@ -626,8 +687,9 @@ def main():
     ap.add_argument("--hours", default="5,20,40")
     ap.add_argument("--min-dur", type=float, default=1.0)
     ap.add_argument("--max-dur", type=float, default=20.0)
-    ap.add_argument("--mls-cap-min", type=float, default=60.0,
-                    help="max minutes per MLS speaker in the largest cut (65 speakers -> 65 h ceiling)")
+    ap.add_argument("--mls-cap-min", type=float, default=None,
+                    help="max minutes per MLS speaker in the largest cut (it default 60: 65 speakers -> 65 h ceiling; "
+                         "fr default: the equal share of the largest cut over all pool speakers)")
     ap.add_argument("--with-fleurs-train", action="store_true",
                     default=os.environ.get("WITH_FLEURS_TRAIN", "0") == "1")
     ap.add_argument("--fleurs-share", type=float, default=0.15)
@@ -635,6 +697,10 @@ def main():
     ap.add_argument("--en-clips", type=int, default=100)
     ap.add_argument("--workers", type=int, default=4, help="MLS shards processed in parallel (each ~0.5 GB transient)")
     a = ap.parse_args()
+    a.mls_cap_rule_auto = a.mls_cap_min is None
+    set_lang(a.lang)
+    if CV_TARBALL and a.lang != "it":
+        raise SystemExit("CV_TARBALL is the IT kit's optional source: not supported with --lang " + a.lang)
 
     if a.synthetic:
         global FT
@@ -646,13 +712,14 @@ def main():
     if a.dry_run:
         stages = [s for s in stages if s in ("meta", "plan")]
     for s in stages:
-        if done(f"data-{s}") and not a.dry_run:
-            print(f"== skip data-{s}")
+        mk = "data-" + ("" if a.lang == "it" else f"{a.lang}-") + s
+        if done(mk) and not a.dry_run:
+            print(f"== skip {mk}")
             continue
-        print(f"== data-{s} {time.strftime('%T')}", flush=True)
+        print(f"== {mk} {time.strftime('%T')}", flush=True)
         {"meta": stage_meta, "plan": stage_plan, "audio": stage_audio, "manifests": stage_manifests}[s](a)
         if not a.dry_run:
-            mark(f"data-{s}")
+            mark(mk)
     return 0
 
 

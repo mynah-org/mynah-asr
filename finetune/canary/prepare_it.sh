@@ -5,12 +5,20 @@
 #   bash prepare_it.sh --dry-run          # metadata + plan only, prints hours
 #   tmux new -d -s ft 'bash prepare_it.sh 2>&1 | tee -a /root/ft/logs/data.log'
 # Options pass through to prepare_it.py (e.g. --with-fleurs-train, --hours 5,20,40).
+# French (FR-P1): bash prepare_it.sh --lang fr  (own marker done/data_fr, fr-tagged files; IT untouched)
 # Optional Common Voice (CC0, Mozilla Data Collective, API key needed):
 #   CV_TARBALL=/path/to/it.tar.gz bash prepare_it.sh
 #   or MDC_API_KEY=... CV_DATASET=<MDC dataset id> bash prepare_it.sh  (UNVERIFIED SDK call)
 . "$(dirname "$0")/env.sh"
 
-dry=0; for x in "$@"; do [ "$x" = "--dry-run" ] && dry=1; done
+dry=0; lang=it; prev=""
+for x in "$@"; do
+    [ "$x" = "--dry-run" ] && dry=1
+    [ "$prev" = "--lang" ] && lang=$x
+    case $x in --lang=*) lang=${x#--lang=} ;; esac
+    prev=$x
+done
+mk=data; [ "$lang" = it ] || mk=data_$lang
 
 if [ -z "${CV_TARBALL:-}" ] && [ -n "${MDC_API_KEY:-}" ] && [ -n "${CV_DATASET:-}" ] && [ $dry = 0 ]; then
     need_gb 25 "the Common Voice tarball (~10.5 GB) + audio"
@@ -26,10 +34,10 @@ fi
 if [ $dry = 1 ]; then
     timeout 1800 "$PY" "$KIT/prepare_it.py" "$@"; exit $?
 fi
-if step data; then
+if step $mk; then
     need_gb 12 "40 h + eval audio (~6-7 GB) + transient MLS shards"
     timeout "${T_DATA:-10800}" "$PY" "$KIT/prepare_it.py" "$@" || fail data $?
     [ -n "${CV_TARBALL:-}" ] && [ "${CV_DELETE_TARBALL:-0}" = 1 ] && rm -f "$CV_TARBALL"
     du -sh "$FT/audio" "$FT/manifests"
-    ok data
+    ok $mk
 fi

@@ -31,12 +31,17 @@ Multi-domain extensions (2026-10-10; every default reproduces the 2026-10-09 run
                                       the stock SPE splits their text into; blank/<EOU>/<EOB> keep
                                       their ids and rows. Targets keep accents (norm_text); WER/CER
                                       stay accent-insensitive (hypotheses normalised like refs)
+  --lang it|fr                        stock-SPE targets and WER/CER refs/hyps through common/textnorm.norm(t, lang)
+                                      (it, default = the frozen rule; fr maps oe / ae and typographic apostrophes)
   --accented 1|0                      accented targets (default: 1 with --tokenizer, else 0); 1 on a
                                       model that already carries such an SPE (stage 2 from a
                                       --tokenizer run), 0 with a --deaccent SPE (vocabulary-only arm)
 """
-import argparse, hashlib, json, math, os, random, re, time, unicodedata
+import argparse, hashlib, json, math, os, random, re, sys, time, unicodedata
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+import textnorm  # noqa: E402
 
 import numpy as np
 import soundfile as sf
@@ -124,6 +129,8 @@ ap.add_argument("--lr-shape", default="cosine", choices=("cosine", "wsd"), help=
 ap.add_argument("--decay-frac", type=float, default=0.2)
 ap.add_argument("--tokenizer", default="", help="warm-started language SPE dir (tokenizer_eou.py output)")
 ap.add_argument("--accented", type=int, default=-1, help="accented targets (default: 1 with --tokenizer, else 0)")
+ap.add_argument("--lang", default="it", choices=sorted(textnorm.PRE), help="stock-SPE target + scorer normaliser "
+                "(common/textnorm.py; it = the frozen rule, fr = + oe / ae and typographic apostrophes)")
 a = ap.parse_args()
 a.accented = bool(a.tokenizer) if a.accented < 0 else bool(a.accented)
 random.seed(a.seed); torch.manual_seed(a.seed)
@@ -191,10 +198,7 @@ loss_fn = RNNTLoss(num_classes=V, reduction="mean_batch", loss_name="warprnnt_nu
 
 
 def norm(t):
-    t = unicodedata.normalize("NFKD", t.lower())
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    t = re.sub(r"[^a-z' ]", " ", t)
-    return " ".join(t.split())
+    return textnorm.norm(t, a.lang)   # lang="it" == the historical rule of this file (byte-identical, tests)
 
 
 if a.accented:

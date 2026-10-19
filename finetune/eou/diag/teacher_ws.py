@@ -28,21 +28,29 @@ import base64
 import concurrent.futures as cf
 import json
 import os
-import re
 import socket
 import sys
 import time
-import unicodedata
 import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
 from eval.ws_client import ws_recv, ws_send  # noqa: E402
+import textnorm  # noqa: E402
+
+NORM_LANG = "it"   # set from --lang (or --norm-lang) in main(); "it" == the historical rule of this file
 
 
 def norm(t):
-    t = "".join(c for c in unicodedata.normalize("NFKD", t.lower()) if not unicodedata.combining(c))
-    return " ".join(re.sub(r"[^a-z' ]", " ", t).split())
+    return textnorm.norm(t, NORM_LANG)
+
+
+def teacher_wer(ref, hyp):
+    """100 x word Levenshtein(ref, hyp) / len(ref words) on normalised texts, 1 decimal; empty hyp -> 100,
+    empty / missing ref -> None (unlabelled audio: the teacher text is the label)."""
+    r = ref.split()
+    return round(100 * lev(r, hyp.split()) / len(r), 1) if r else None
 
 
 def lev(x, y):
@@ -146,12 +154,17 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=8295)
-    ap.add_argument("--lang", default="it")
+    ap.add_argument("--lang", default="it", help="server ?lang= AND the ref/teacher normaliser (common/textnorm.py)")
+    ap.add_argument("--norm-lang", default="", help="normaliser language when --lang is not one (e.g. --lang auto)")
     ap.add_argument("--conc", type=int, default=128)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--check", default="", help="teacher_check.py JSON of the same clips: agreement report")
     ap.add_argument("--reuse", default="", help="previous teacher_ws outputs (comma list): their clips are not re-streamed")
     a = ap.parse_args()
+    global NORM_LANG
+    NORM_LANG = a.norm_lang or a.lang
+    if NORM_LANG not in textnorm.PRE:
+        raise SystemExit(f"no normaliser for {NORM_LANG!r}: pass --norm-lang {'|'.join(sorted(textnorm.PRE))}")
     rows = [json.loads(l) for l in open(a.manifest)]
     if a.check:
         want = {x["audio_filepath"] for x in json.load(open(a.check))}
@@ -173,12 +186,12 @@ def main():
         return r, transcribe(r["audio_filepath"], a.host, a.port, a.lang)
 
     def annotate(r, t, lang_out, err):
-        ref = norm(r["text"])
+        ref = norm(r.get("text") or "")
         r["teacher"] = norm(t)
         r["teacher_raw"] = t.strip()
         r["teacher_lang"] = lang_out
         # no reference (unlabelled audio, e.g. YODAS): no WER, the teacher text is the label
-        r["teacher_wer"] = round(100 * lev(ref.split(), r["teacher"].split()) / max(1, len(ref.split())), 1) if ref else None
+        r["teacher_wer"] = teacher_wer(ref, r["teacher"])
         r["teacher_ok"] = bool(r["teacher"]) and not err
         return r
 

@@ -6,6 +6,8 @@ once; every subset is a PREFIX of it, so 5 h c 20 h c 40 h by construction.
 """
 from __future__ import annotations
 
+import hashlib
+import math
 import random
 
 
@@ -39,6 +41,45 @@ def balanced_order(groups, cap_s, seed):
         acc[s] += u["duration"]
         seq.append(u)
     return seq
+
+
+def sha1(x):
+    return hashlib.sha1(str(x).encode()).hexdigest()
+
+
+def balanced_order_sha1(groups, cap_s, salt="mls"):
+    """balanced_order with a seed-free order (FR-P1): speakers ranked by sha1("<salt>:<speaker>"), each
+    speaker's clips taken in sha1("<salt>:<id>") order. Same least-duration-first rule and cap, so every
+    prefix is speaker-balanced and the 5 / 20 / 40 h cuts are nested."""
+    spk = sorted(groups, key=lambda s: sha1(f"{salt}:{s}"))
+    queues = {s: sorted(groups[s], key=lambda u: sha1(f"{salt}:{u['id']}"), reverse=True) for s in spk}  # pop() = lowest
+    acc = {s: 0.0 for s in spk}
+    rank = {s: i for i, s in enumerate(spk)}
+    seq, live = [], set(spk)
+    while live:
+        s = min(live, key=lambda x: (acc[x], rank[x]))
+        q = queues[s]
+        if not q or acc[s] >= cap_s:
+            live.discard(s)
+            continue
+        u = q.pop()
+        acc[s] += u["duration"]
+        seq.append(u)
+    return seq
+
+
+def equal_share_cap_min(groups, hours):
+    """Equal-share speaker cap (minutes, rounded UP to a whole minute) for a `hours` cut: the water level c
+    with sum_s min(total_s, c) >= hours, i.e. hours / n_speakers when every speaker has that much, raised
+    when some speakers have less. With it the cut spreads over every speaker of `groups`."""
+    tot = sorted(sum(u["duration"] for u in g) for g in groups.values())
+    need, n = hours * 3600, len(tot)
+    for i, t in enumerate(tot):   # speakers below the level give all they have
+        lvl = need / (n - i)
+        if t >= lvl:
+            return math.ceil(lvl / 60)
+        need -= t
+    return math.ceil(tot[-1] / 60) if tot else 0   # the pool is shorter than the cut: cap = the largest speaker
 
 
 def merge_by_share(seqs, shares):

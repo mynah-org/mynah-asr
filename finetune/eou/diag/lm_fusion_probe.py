@@ -10,13 +10,17 @@ and the prediction network + joint (internal LM / output side) is what limits; n
 high oracle => the encoder representation itself is the bottleneck.
 
 Runs on CPU or GPU (device follows CUDA_VISIBLE_DEVICES). WER/CER are scored like
-two_stage.py (lower case, de-accented). Clip choice = two_stage.py subsample() with --per-set.
+two_stage.py (lower case, de-accented: textnorm.norm(t, --lang), default it). Clip choice = two_stage.py subsample() with --per-set.
 
   CUDA_VISIBLE_DEVICES= python lm_fusion_probe.py --nemo /root/ft/runs/plain-it-b2-gradual/final.nemo \
       --lm lm4_trainmix.arpa --per-set 60 --alphas 0.3,0.6 --beam 4 --out fusion_b2.json
 """
-import argparse, json, re, time, unicodedata
+import argparse, json, re, sys, time, unicodedata
+from pathlib import Path
 import numpy as np, soundfile as sf, torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common"))
+import textnorm  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--nemo", required=True)
@@ -38,6 +42,7 @@ ap.add_argument("--skip-greedy", type=int, default=0)
 ap.add_argument("--threads", type=int, default=16)
 ap.add_argument("--post-pad-s", type=float, default=0.0, help="digital silence appended to every clip: lets the streaming "
                 "encoder emit the last tokens (0 = raw end of file, the historical protocol)")
+ap.add_argument("--lang", default="it", choices=sorted(textnorm.PRE), help="ref/hyp normaliser (common/textnorm.py)")
 ap.add_argument("--out", default="fusion.json")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -45,10 +50,7 @@ dev = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def norm(t):
-    t = unicodedata.normalize("NFKD", t.lower())
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    t = re.sub(r"[^a-z' ]", " ", t)
-    return " ".join(t.split())
+    return textnorm.norm(t, a.lang)   # lang="it" == the historical rule of this file
 
 
 def lev(x, y):

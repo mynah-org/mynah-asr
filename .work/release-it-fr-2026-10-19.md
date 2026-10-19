@@ -526,3 +526,19 @@ Common to all sources: digit / markup rows dropped (text_ok) and durations 1-20 
 - FR-0 coverage complete:
   - every FR source has 0 % <unk> and 100 % round trip with the stock SPE;
   - curly apostrophes occur in 8.9 % of CV-fr and 20 % of FLEURS-fr sentences, so the fr pre-map is required.
+
+**FR-P1 clarifications (2026-10-19 ~13:05 UTC, before any FR model score; metadata-only dry run):**
+- MLS-fr pool: 258,146 clips, 142 speakers, 1,076.2 h, very uneven (median speaker 13 min in the whole pool).
+- "Equal-share cap" resolves to 36 min per speaker: the smallest cap reaching 40 h with all 142 speakers.
+  - 91 speakers give all they have; 51 are capped at 36 min.
+  - Cut: 9,608 clips, 39.996 h, 142 speakers; clips per speaker min 1 / median 52 / max 149.
+  - A hard 17-min cap would give well under 40 h.
+  - Speakers and their clips are taken in sha1 order.
+- final.nemo = the last step (`--final-eof 1`): in-run harness evals are diagnostic and never select. Eval cadence
+  as the IT W4 runs (100 / 250 / 1000, then every 2000 flat / 500 in decay).
+- clean-fr (mTEDx-fr test / valid) is not built for FR-P1: the post-hoc clean bank is skipped; the harness-fr and
+  FINAL-FR are unaffected.
+- IT equivalence of the wiring:
+  - IT MLS plan.json is byte-identical old vs new (sha256 1036420f);
+  - norm / text_ok show 0 mismatches on 608,252 IT text fields + every code point;
+  - the IT VP t50 filter is reproduced byte-identically.
