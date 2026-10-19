@@ -1020,3 +1020,30 @@ large enough for that fires at internal pauses in 15 % of clips (2.5 x v3, 1.8 x
 on v5-B the <EOU>-vs-blank score does not separate true ends from pauses at fast operating points; it is dominated
 by v4 and v3 there. Reset-WER is preserved only because the reset makes split segments transcribe correctly; for
 turn-taking the splits are the failure. Per the pre-registration: **IT EOU research STOPS** (no sweep, no second b).
+
+### RC-IT v4 -- FROZEN (2026-10-19 ~11:45 UTC). IT model development CLOSED.
+- **Artifact reproduction** (NOT a second FINAL evaluation):
+  - the frozen decode re-run only to save per-clip outputs (`--dump`);
+  - aggregates byte-identical to the authoritative run: natural sha256 91bec6df..., trim 11b31d34...;
+  - per-clip files `final-it-v4/repro/v4_{final,final_trim}_clips.jsonl`;
+  - the first run stays authoritative.
+- **Mynah parity** (m1.sh, DEV FLEURS-it test 200, never FINAL-IT):
+  - CLI stream f32: WER 17.17, CER 7.19, 0 empty, model <EOU> on 196 / 200 (EOU-v3: 30.91, 200 / 200);
+  - eou_metrics (60 clips): speech end -> EOU p50 778 / p90 2794 ms (v3 p50 810), premature 3.3 %;
+  - A + 1 s + B: EOU in gap 83.3 %, p50 426 ms;
+  - CUDA test_cuda_stream gates A / B / C PASS (cpu f32 == gpu);
+  - CUDA server v0.9.1-607-g52e5271 bf16, cap 128, 1.93 GB VRAM used, start-up 520 ms.
+- **Frozen RC:**
+  - checkpoint sha256 0a4d1b10...3ff;
+  - pack (Hub `rc/it-v4/mynah-pack/`): model.safetensors 2aa4783d, mynah.json ff6d7c5a, tokens.json 70a5a46e,
+    mel_filters 2dde1d9b;
+  - runtime mynah-asr 52e5271 (v0.9.1-607): att_context [70, 1], lookahead 1, 80 ms frames, max 10 symbols / step;
+  - decoder-only reset after <EOU>;
+  - finalisation as the FINAL protocol (2 s quiet offline; Mynah stream flushes at EOF);
+  - normalisation NFKD [a-z' ]; CPU f32 / CUDA bf16;
+  - commands: finalv4.sh / rcv4.sh in results/jp-2026-10-19.
+- Model-card draft: `finetune/release/it/README.md` (not published; LICENSE / NOTICE files and usage examples still
+  to write).
+- FR-0 coverage complete:
+  - every FR source has 0 % <unk> and 100 % round trip with the stock SPE;
+  - curly apostrophes occur in 8.9 % of CV-fr and 20 % of FLEURS-fr sentences, so the fr pre-map is required.

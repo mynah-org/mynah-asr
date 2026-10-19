@@ -430,3 +430,79 @@ Trim variant (secondary): macro WER 20.52, CER 6.95, FE 3.40 %, FE_any 3.67 %, R
 per bank WER within 0.2 of natural (FLEURS FE 14.7 %).
 Band (2026-10-18 pre-registration): < 20 = success -> **20.49 misses the success band by 0.49**; not "strong".
 FINAL-IT is now spent for IT development. Nothing changes in response.
+
+## I. FR-P1 -- PROPOSED pre-registration (draft 2026-10-19; NOT frozen, no FR GPU until approved)
+
+Question: how much of the old FR gap is recipe + data diversity? One plain run, the frozen IT methodology, no
+Granary-fr, no new label source beyond the IT-style VP teacher filter.
+
+**Prerequisites (CPU / network, before any FR number is seen):**
+1. FR-0 wiring: `--lang fr` through prepare_mix (textnorm.text_ok: keeps the 3.4 % oe rows), two_stage /
+   lm_fusion_probe / s2_reset / teacher_ws norm. IT default byte-identical (proven on 389,564 texts).
+2. FINAL-FR built and sealed before any FR training output. Banks:
+   - MLS-fr dev (18 speakers), CV17-fr validation, VP-fr validation (speakers outside our pool), FLEURS fr_fr dev;
+   - mTEDx-fr train talks outside clean-fr and every Granary-fr original_audio_id;
+   - Speech-MASSIVE fr-FR validation (CC BY-NC-SA: private only), or PxSLU if its CC BY licence is confirmed.
+   Same model-free rules as FINAL-IT.
+3. Dev banks: harness-fr = MLS-fr / FLEURS-fr / CV17-fr / VP-fr test, 200 each; clean-fr = mTEDx-fr test + valid.
+4. Data A2-fr, mirroring IT A2+:
+
+| source | cut | weight |
+|---|---|---|
+| MLS-fr | 40 h, <= 120 min / speaker spread over all 142 train speakers, all 34 shards | 0.35 |
+| CV17-fr | 40 h, <= 20 clips / speaker | 0.30 |
+| VP-fr | <= 60 / speaker, teacher-WER <= 50 % (Nemotron `--lang fr` on VP-fr train) | 0.20 |
+| FLEURS fr_fr train | all | 0.15 |
+
+   1-20 s, digit clips dropped. The VP teacher pass is the only GPU step before the run (~20-30 min, GPU lock).
+
+**Baselines on harness-fr (same box, same protocol; GPU probe, minutes):** stock parakeet_realtime_eou_120m-v1
+(never measured on FR), old `runs/plain-fr-p40`, old `runs/plain-fr-s2-eou`.
+
+**Arm FR-P1 (one variable set = the IT recipe, NOT tuned for FR):**
+- recipe W4: stock init, whole encoder 4e-4, dec / joint 3e-4, WSD 5 % warm-up, decay last 20 %;
+- 8k steps, bs 16, max-dur 30, seed 0, evals as the IT W4 runs; `--abort-wer 1000:85`;
+- ~70 min L40S.
+
+**Readout:** harness-fr greedy / beam-8 / oracle-8, raw EOF + 0.5 s flush, per set + macro; clean-fr post hoc.
+Bands vs old plain-fr-p40 on the same harness, macro greedy flushed:
+- LEVER <= -10 WER;
+- CLEAR -5..-10;
+- WEAK -2..-5;
+- NULL within +-2;
+- HARM > +2.
+
+**Decision rule:**
+- LEVER / CLEAR: scale as IT did (Granary-fr agree <= 15 pools to ~C250 size + the long schedule, its own
+  pre-registration), then stage 2 = the frozen IT EOU recipe (v4), Mynah, FINAL-FR once.
+- WEAK / NULL: diagnose text / tokenizer / labels on the dev banks before scaling (no recipe tuning).
+- HARM: stop and audit.
+
+No FR < 20 promise (Nemotron itself is ~2x worse on FR than on IT).
+
+### RC-IT v4 -- FROZEN (2026-10-19 ~11:45 UTC). IT model development CLOSED.
+- **Artifact reproduction** (NOT a second FINAL evaluation):
+  - the frozen decode re-run only to save per-clip outputs (`--dump`);
+  - aggregates byte-identical to the authoritative run: natural sha256 91bec6df..., trim 11b31d34...;
+  - per-clip files `final-it-v4/repro/v4_{final,final_trim}_clips.jsonl`;
+  - the first run stays authoritative.
+- **Mynah parity** (m1.sh, DEV FLEURS-it test 200, never FINAL-IT):
+  - CLI stream f32: WER 17.17, CER 7.19, 0 empty, model <EOU> on 196 / 200 (EOU-v3: 30.91, 200 / 200);
+  - eou_metrics (60 clips): speech end -> EOU p50 778 / p90 2794 ms (v3 p50 810), premature 3.3 %;
+  - A + 1 s + B: EOU in gap 83.3 %, p50 426 ms;
+  - CUDA test_cuda_stream gates A / B / C PASS (cpu f32 == gpu);
+  - CUDA server v0.9.1-607-g52e5271 bf16, cap 128, 1.93 GB VRAM used, start-up 520 ms.
+- **Frozen RC:**
+  - checkpoint sha256 0a4d1b10...3ff;
+  - pack (Hub `rc/it-v4/mynah-pack/`): model.safetensors 2aa4783d, mynah.json ff6d7c5a, tokens.json 70a5a46e,
+    mel_filters 2dde1d9b;
+  - runtime mynah-asr 52e5271 (v0.9.1-607): att_context [70, 1], lookahead 1, 80 ms frames, max 10 symbols / step;
+  - decoder-only reset after <EOU>;
+  - finalisation as the FINAL protocol (2 s quiet offline; Mynah stream flushes at EOF);
+  - normalisation NFKD [a-z' ]; CPU f32 / CUDA bf16;
+  - commands: finalv4.sh / rcv4.sh in results/jp-2026-10-19.
+- Model-card draft: `finetune/release/it/README.md` (not published; LICENSE / NOTICE files and usage examples still
+  to write).
+- FR-0 coverage complete:
+  - every FR source has 0 % <unk> and 100 % round trip with the stock SPE;
+  - curly apostrophes occur in 8.9 % of CV-fr and 20 % of FLEURS-fr sentences, so the fr pre-map is required.
