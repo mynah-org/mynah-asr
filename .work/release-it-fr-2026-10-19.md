@@ -766,3 +766,22 @@ Per source, greedy / beam-8 / oracle-8, FR-G1 vs FR-P1:
 Not run (would need their own pre-registration): an exposure-preserving additive design (A2 held at FR-P1 draws,
 Granary on top, i.e. longer steps), a stricter label threshold with a larger pool, or a clean-fr / out-of-domain
 bank where Granary diversity could show (harness-fr is in-domain for A2).
+
+## State map (end of 2026-10-19)
+
+| item | state | key numbers |
+|---|---|---|
+| RC-IT | **Stage2-v4 on C250-36k, FROZEN** (ckpt 0a4d1b10, Mynah pack Hub rc/it-v4) | FINAL-IT one-shot macro greedy reset-WER 20.49 (band < 20 missed), FE 3.50 %, recall 96.2 %, p50 0.88 s; FLEURS FE 16.4 %; Mynah FLEURS-it 17.17, EOU p50 778 ms |
+| IT EOU research | CLOSED | v5-B FE 0.82 % / p50 1.84 s (precision-first variant); v5-CAL NULL; logit bias NOT-SEPARABLE |
+| FINAL-IT | spent (one decode + artifact reproduction) | |
+| FINAL-FR | SEALED 8b0ebba0, never decoded | 6 banks, 2,113 clips |
+| best plain FR | **FR-P1** (stock -> A2-fr, W4 8k; Hub runs/jp-fr-p1-w4-8k, 1ec3fec4) | harness-fr 27.66 / 25.91 / 21.76 vs old p40 65.85 (LEVER) |
+| FR-G1 | HARM | +89 h Granary-fr agree <= 20 at fixed 8k: 29.41 / 26.54 / 22.74 |
+| release | model-card draft finetune/release/it/README.md; licence NVOML; token to rotate | |
+
+Next (each its own pre-registration):
+1. FR: an exposure-preserving additive Granary design, or a stricter label threshold on a larger pool, or a clean-fr
+   bank first.
+2. Then FR stage 2 with the frozen IT recipe.
+3. Then RC-FR and FINAL-FR once.
+4. IT release: LICENSE / NOTICE files and usage examples.
