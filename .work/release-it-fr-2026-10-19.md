@@ -348,3 +348,7 @@ Units are joint log-probability differences.
 The scale is degenerate for a "small calibration": v5-B is not marginally under-confident at the true end; its
 <EOU> evidence is absent there and appears ~1-2 s later. Biased decode NOT run; stopped for a decision (the rule is
 pre-registered, its output is reported as is).
+
+**Biased decode launch record (before any output):** git dc03a16, v5-B sha256 ab84cd3b, b = 110.3,
+utc 2026-10-19T10:09:50Z, `s2_reset.py --post-pad-s 2.0 --models s2_reset,s2 --eou-bias 110.3` on DEV730 (same vals,
+parent C250-36k unbiased). No clipping / debounce / threshold / conditional bias; no second b.
