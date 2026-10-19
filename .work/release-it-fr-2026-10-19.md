@@ -527,18 +527,34 @@ Common to all sources: digit / markup rows dropped (text_ok) and durations 1-20 
   - every FR source has 0 % <unk> and 100 % round trip with the stock SPE;
   - curly apostrophes occur in 8.9 % of CV-fr and 20 % of FLEURS-fr sentences, so the fr pre-map is required.
 
-**FR-P1 clarifications (2026-10-19 ~13:05 UTC, before any FR model score; metadata-only dry run):**
-- MLS-fr pool: 258,146 clips, 142 speakers, 1,076.2 h, very uneven (median speaker 13 min in the whole pool).
-- "Equal-share cap" resolves to 36 min per speaker: the smallest cap reaching 40 h with all 142 speakers.
-  - 91 speakers give all they have; 51 are capped at 36 min.
-  - Cut: 9,608 clips, 39.996 h, 142 speakers; clips per speaker min 1 / median 52 / max 149.
-  - A hard 17-min cap would give well under 40 h.
-  - Speakers and their clips are taken in sha1 order.
-- final.nemo = the last step (`--final-eof 1`): in-run harness evals are diagnostic and never select. Eval cadence
-  as the IT W4 runs (100 / 250 / 1000, then every 2000 flat / 500 in decay).
-- clean-fr (mTEDx-fr test / valid) is not built for FR-P1: the post-hoc clean bank is skipped; the harness-fr and
-  FINAL-FR are unaffected.
-- IT equivalence of the wiring:
-  - IT MLS plan.json is byte-identical old vs new (sha256 1036420f);
-  - norm / text_ok show 0 mismatches on 608,252 IT text fields + every code point;
-  - the IT VP t50 filter is reproduced byte-identically.
+**FR-P1 AMENDMENT A1 (2026-10-19 ~13:20 UTC; pre-score: no FR model, teacher or baseline decode has run).**
+Labelled amendment, not clarification: "equal-share cap" in the frozen text was ambiguous, and it was resolved after
+seeing FR pool METADATA (durations per speaker, no scores).
+
+1. **MLS-fr 40 h cut rule.**
+   - The IT procedure (`subsets.balanced_order`): each step adds the next clip of the speaker with the least
+     accumulated duration.
+   - Speakers and their clips are taken in sha1("mls:<id>") order, with 1-20 s clips; cut at 40 h.
+   - Pool: 258,146 clips, 142 speakers, 1,076.2 h, very uneven (median speaker 13 min in the whole pool).
+   - The resulting cut: 9,608 clips, 39.996 h, all 142 speakers.
+     - The highest speaker level is 35.4 min; 91 speakers are exhausted before the cut.
+     - Clips per speaker: min 1 / median 52 / max 149.
+   - The per-speaker cap is NOT a free parameter: re-planning from the same metadata with a cap of 36, 60 and
+     120 min gives the identical 40 h cut (sha256 e8d62ba3 in all three).
+   - A hard 17-min cap (40 h / 142) cannot reach 40 h; it is rejected because it would contradict the
+     pre-registered 40 h.
+2. **Checkpoint selection.**
+   - final.nemo = the last step (`--final-eof 1`), exactly as every IT W4 run: W4-C250-8k final = step 8000, C1,
+     D0 / D1, E1.
+   - This flag is the checkpoint decision point only. It is NOT an audio EOF / flush policy: the probes stay raw
+     EOF + 0.5 s flush as pre-registered.
+   - The frozen text did not state the selection, so it is fixed here.
+   - In-run harness evals at 100 / 250 / 1000, then every 2000 flat / 500 in decay, are diagnostic only.
+3. **clean-fr** (post hoc, mTEDx-fr test / valid) is not built for FR-P1; harness-fr and FINAL-FR are unaffected.
+
+IT equivalence of the wiring (c6cfe56):
+- IT MLS plan.json byte-identical (sha256 1036420f);
+- 0 norm / text_ok mismatches on 608,252 IT text fields + every code point;
+- the IT VP t50 manifest reproduced byte-identically.
+
+FR-P1 is FINAL with A1; no further change.
