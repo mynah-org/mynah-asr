@@ -16,7 +16,7 @@ MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/fr; R=$FT_ROOT/runs; TAG=${TAG:-fr-p1-w4-
 HARNESS=${HARNESS:-"mls=$MF/eval_mls_fr.json,fleurs=$MF/eval_fleurs_fr.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"}
 CLEAN=${CLEAN:-"tedx=$MF/eval_tedx_fr.json"}
 if [ -z "${NEMO:-}" ]; then
-    MIX="$MF/train_40h_fr.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp_t50.json:0.20,$MX/train_fleurs.json:0.15"
+    MIX=${MIX:-"$MF/train_40h_fr.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp_t50.json:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides (FR-G1)
     for p in ${MIX//,/ }; do [ -s "${p%:*}" ] || { echo "== missing ${p%:*}"; exit 2; }; done
     echo "== fr_p1 $TAG $(date +%T)"; echo "   MIX=$MIX"
     MIX="$MIX" VALS="$HARNESS" POL="--freeze-enc 0 --enc-lr 4e-4 --lr 3e-4 --bs 16" STEPS=8000 SMOKE=1 \

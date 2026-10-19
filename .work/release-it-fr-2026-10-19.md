@@ -642,3 +642,76 @@ Sanity: old p40 MLS 50.97 raw = its 2026-10-09 number 50.99.
 
 Per the decision rule: LEVER does NOT authorise stage 2. Next = ONE pre-registered decision on how to scale plain FR
 (Granary-fr pools, MLS-fr hours, schedule). Stopped here.
+
+## J. FR-G1 -- PRE-REGISTERED (2026-10-19 ~19:00 CEST, before launch)
+
+Question: with init, recipe and 8k steps fixed, does adding physically diverse Granary-fr speech to A2-fr lower the
+FR WER? The comparison is FR-P1 (stock -> A2-fr, W4 8k) vs FR-G1 (stock -> A2-fr + Granary-fr, W4 8k).
+
+**Granary-fr audit pool (model-free w.r.t. any student):**
+- 8 spread ast shards per dir of fr000 / fr100-fr103: 78,246 clips, 156.5 h, 1,470 videos;
+- every clip scored by Nemotron `--lang fr` (agree = teacher vs Granary reference, fr normalisation);
+- agree p10 / p25 / p50 / p75 / p90 = 0 / 7.1 / 18.2 / 33.3 / 57.1 (IT pool: 0 / 2.5 / 8.7 / 18.8 / 33.3);
+- excluded: 3,119 empty teacher texts, 201 duplicate texts, 1 dev / FINAL-FR leak (word 8-gram vs harness-fr + sealed
+  FINAL-FR manifests: a model-free dedup, no FINAL decode); 0 digit clips; 48 clips overlap the A2-fr text (kept).
+
+**Eligibility rule (fixed from this data table only, no model output):**
+- the strictest T in {5, 10, 15, 20} keeping >= 90 % of the pool's videos AND >= 50 % of every dir's hours;
+- 15 fails (fr103 37.4 %); **T = 20** gives agree <= 20 (inclusive): 41,415 clips, 88.97 h, 1,408 videos (95.8 %);
+- per dir kept: fr000 67 %, fr100 58 %, fr101 55 %, fr102 59 %, fr103 51 %;
+- label = the teacher text; manifest `mix/fr-yg/yg_agree20.json` sha256 158cb9cd.
+
+**Sampler (IT `p1_additive.sh` rule, numerically):**
+- PASSES 1.5 over the external hours gives W = 0.3267 (formula steps 11,883); then FIX_STEPS = 8000, exactly as
+  it-w4-c250-8k.
+- Source weights:
+
+| source | weight |
+|---|---|
+| MLS-fr 40 h | 0.2356 |
+| CV-fr | 0.2020 |
+| VP-fr t50 | 0.1347 |
+| FLEURS-fr | 0.1010 |
+| Granary-fr agree <= 20 | 0.3267 |
+
+- Expected exposure over 8000 x 16 draws, G1 vs FR-P1:
+
+| source | G1 h | G1 passes | FR-P1 h | FR-P1 passes |
+|---|---|---|---|---|
+| MLS | 125.6 | 3.1 | 186.5 | 4.7 |
+| CV | 36.7 | 0.9 | 54.5 | 1.4 |
+| VP | 42.7 | 1.1 | 63.5 | 1.6 |
+| FLEURS | 40.2 | 5.2 | 59.7 | 7.8 |
+| Granary | 89.8 | 1.0 | -- | -- |
+| **total processed audio** | **335.0** | | **364.2** | |
+
+  G1 sees 8 % LESS audio than FR-P1 (Granary clips are short) and 33 % fewer A2 draws: a G1 gain is not an exposure
+  effect.
+
+**Everything else = FR-P1:**
+- stock parakeet_realtime_eou_120m-v1 init;
+- W4 (whole encoder 4e-4, dec / joint 3e-4, WSD 5 % warm-up, decay last 20 %), 8000 steps, bs 16, max-dur 30, seed 0;
+- final.nemo = the last step; `--abort-wer 1000:85`; `--lang fr`; same harness-fr evals;
+- no stage 2 / KD / CTC / LM / tokenizer change;
+- FINAL-FR sealed.
+
+Launch: `MIX=<above> TAG=fr-g1-w4-8k bash finetune/jobs/fr_p1.sh`.
+
+**Reporting:** harness-fr macro + per source greedy / beam-8 / oracle-8 / CER / empty, raw EOF and 0.5 s flush.
+
+**Class** (macro greedy, 0.5 s flush, FR-G1 - FR-P1 = 27.66):
+
+| class | delta |
+|---|---|
+| LEVER | <= -3.0 |
+| CLEAR | -1.5 .. -3.0 |
+| WEAK | -0.5 .. -1.5 |
+| NULL | within +-0.5 |
+| HARM | > +0.5 |
+
+Oracle is diagnostic.
+
+**After:**
+- LEVER / CLEAR: STOP. The next experiment (more Granary vs more exposure) gets its own pre-registration; no
+  automatic 16k or 200-260 h pool.
+- NULL / HARM: no compensation by hours or steps. First per source and greedy -> beam -> oracle.

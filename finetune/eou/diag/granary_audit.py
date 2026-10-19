@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--thresholds", default="5,10,15,20,30")
     ap.add_argument("--max-s", type=float, default=30.0)
     ap.add_argument("--json", default="")
+    ap.add_argument("--write", default="", help="T:path -> write the eligible clips with agree <= T (after every exclusion "
+                    "above) as a training manifest: label = the teacher text (as pseudo_subsets.py), pool order kept")
     a = ap.parse_args()
     nf = lambda t: textnorm.norm(t or "", a.lang)  # noqa: E731
     leak, train = index(a.leak, nf), index(a.train, nf)
@@ -105,6 +107,16 @@ def main():
               f"{dirs} |", flush=True)
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1)
+    if a.write:
+        T, path = a.write.split(":", 1)
+        sub = [r for r in ok if r["teacher_wer"] <= float(T)]
+        with open(path, "w") as f:
+            for r in sub:
+                f.write(json.dumps({"audio_filepath": r["audio_filepath"], "duration": r["duration"], "text": r["teacher"],
+                                    "speaker": r.get("speaker"), "agree": r["teacher_wer"], "ref": r.get("text")},
+                                   ensure_ascii=False) + "\n")
+        print(f"== wrote {path}: {len(sub)} clips, {sum(r['duration'] for r in sub) / 3600:.2f} h, "
+              f"{len({vid(r) for r in sub})} videos (agree <= {T})", flush=True)
 
 
 if __name__ == "__main__":
