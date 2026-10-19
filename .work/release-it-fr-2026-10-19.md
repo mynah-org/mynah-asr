@@ -1,0 +1,253 @@
+# EOU-120M IT + FR: path to a public release (2026-10-19, Japan L40S)
+
+Goal shift: from open-ended FT to two frozen, reproducible artifacts (IT, FR), each going
+research candidate -> release candidate -> public model. Nothing is published from this document.
+
+## A. Japan box qualification (Vast, 61.206.39.5:26451, new host; OBSERVED 07:40-07:55 UTC)
+
+| item | value |
+|---|---|
+| GPU | 1x L40S 46068 MiB, driver 580.65.06, CUDA 13.0 toolkit in image; idle P8 34 C 34 W, 0 MiB, no foreign GPU process |
+| CPU / RAM | 2x Xeon Gold 6430, 128 threads, 2 NUMA; 503 GB RAM (~400 GB available); load ~3 (shared host), steal 0 %, idle 98 % |
+| disk | overlay root 100 GB (98 GB free); /dev/shm 62 GB (< 120 GB -> prov.sh puts the audio dirs on the root disk); dd 8 GiB direct write 4.7 GB/s, read 5.6 GB/s |
+| network | eth0 docker bridge 172.17.0.4; DNS 1.1.1.1 / 8.8.8.8; no *_PROXY variables; UTC clock correct |
+| latency (TCP connect / TLS / TTFB, avg of 5) | HF 8 / 31 / 37 ms; GitHub 8 / 32 / 38; PyPI 9 / 32 / 35; pythonhosted 8 / 30 / 33; PyTorch CDN 16 / 39 / 322; Zenodo 253 / 508 / 864 (EU origin) |
+| sustained download | HF 2.51 GB file 2x: 37.9 / 38.4 MB/s (~305 Mbit/s, stable); PyTorch CDN 89 MB/s; GitHub release 9.7 MB/s (5 MB file, too short to saturate) |
+| TLS (issuer + leaf sha256, Mac vs box) | identical on huggingface.co, cas-bridge.xethub.hf.co, github.com, objects.githubusercontent.com, pypi.org, files.pythonhosted.org, download.pytorch.org, zenodo.org, api.ngc.nvidia.com (all public CAs: Amazon, Sectigo, Let's Encrypt, GlobalSign) |
+| trust store / config | only extra CA = `jvastai.crt` (Vast's own, used for the instance portal cert; not in any chain we use); no git config / credential helper; caches: conda, pip only |
+| processes | Vast base image services only (jupyter, tensorboard, syncthing, caddy, cloudflared tunnels, portal); no unexpected mounts |
+
+Verdict: PASS (sanity check only, not proof of host safety). Token written over ssh stdin to /root/.hf_token (0600),
+never in argv / logs; prov.sh re-runs its own TLS gate before using it. ICMP not permitted in the container (ping n/a).
+
+## B. Restore / parity (OBSERVED, 2026-10-19)
+
+- Code: prov.sh clone of `lw-finetune-tooling` (52e5271 at restore, then 347ff4b / 59ad40c / 3490e2b for today's tooling);
+  venv torch 2.11.0+cu128 (prov.sh pin), prov 07:43-07:51 UTC.
+- Data: `resume_it.sh SNAPSHOT=it-c250` (22.1 GiB, 22 shards) -- data_snapshot.py hung again in the ProcessPool shutdown
+  after extracting every file (12 defunct + 3 sleeping workers, as in Singapore). Not accepted on file count:
+  `snapcheck.py` read every manifest row of the snapshot: **120,367 / 120,367 present, duration within 0.05 s, 0
+  unreadable**; then the hung process group was killed and the chain resumed after the snapshot step.
+- Checkpoints sha256: C250-36k 7e919281, EOU-v3 57d04dc4, v4 0a4d1b10, v5-B ab84cd3b -- **all match**. trail_s
+  manifests (s2tail): 6 sources, 116,526 rows, 0 missing audio.
+- Parity 1, GPU harness probe of C250-36k (lm_fusion_probe, 730 clips): **22.27 / 20.54 / 16.26** vs Singapore
+  22.27 / 20.53 / 16.25 (greedy identical; beam / oracle +0.01 = numerical noise).
+- Parity 2, CPU EOU protocol (s2_reset --post-pad-s 2.0, reset): **v4 FE 8.36 % / R 94.38 % / L 0.72 / 1.92 s / reset-WER
+  22.54; v5-B 0.82 % / 92.47 % / 1.84 / 3.04 s / 22.08** -- identical to Singapore on every number.
+- Anchor 3 (new, measured before any v5-CAL output): production EOU-v3 under the same protocol:
+  FE 5.89 %, FE_any 6.58 %, R 94.66 %, L p50 / p90 0.64 / 1.92 s, reset-WER 36.07, CER 12.82, empty 4;
+  per set FE MLS 1.5 / FLEURS 14.5 / CV 2.5 / VP 4.6 %, WER 32.27 / 30.57 / 39.23 / 42.21 (FLEURS 30.57 vs Mynah 30.91:
+  consistent). v3 already has a ~6 % false-endpoint rate (FLEURS 14.5 %), and its ASR is 14 points worse than C250-36k.
+- Disk: 100 GB root; after the sealed FINAL-IT was archived and verified, the duplicates (ITALIC zip, wip bundle,
+  reference copies, qual dir) were deleted: **43 GB free** (gate >= 20 GB before training: PASS).
+
+Verdict: environment parity PASS; the Japan box is the box of the day.
+
+### data_snapshot.py restore hang -- diagnosed and fixed (axis closed)
+- Symptom (2026-10-18 SG, 2026-10-19 JP): every shard extracted and verified, then the `ProcessPoolExecutor` never
+  shut down (defunct + sleeping workers).
+- Reproduction (`tests/snapshot_pool_smoke.sh`): a tiny 41-shard snapshot (200 CV clips) restored with the real code:
+  **fork: 5 / 5 runs hung** (180 s timeout; 4 in the A/B, 1 more to keep a stack log). **spawn: 6 / 6 completed** in
+  9-14 s with the full restore gate (per-shard size + sha256, file count, every referenced path present).
+- Cause (OBSERVED, faulthandler stacks of the hung workers via SIGUSR1):
+  1. `huggingface_hub/utils/_http.py:458` registers `os.register_at_fork(after_in_child=close_session)`.
+  2. In each forked worker, close_session -> `httpx Client.close` -> `httpcore` connection pool close -> `_synchronization.py:285 RLock.acquire()`.
+  3. That lock was held by a download thread (hf_hub_download, 16 threads in flight) at fork time; the thread does
+     not exist in the child, so the worker blocks forever before taking any task.
+  4. The other workers do all the extraction; the executor shutdown then waits forever for the blocked ones.
+- Fix: extraction pool started with `spawn` (fresh interpreter, no inherited locks / at-fork hooks); `--mp-context`
+  keeps fork available only to reproduce; SIGUSR1 dumps all thread stacks of a hung restore (faulthandler).
+- Evidence log of one fork hang: `ft_logs/snaptest-fork-evidence/fork-1.log` in today's archive. The first 4 hang
+  logs were deleted by a cleanup glob (operator error); their summary lines remain in `snaptest.log`.
+
+## C. State map
+
+### Italian (frozen facts, 2026-10-18)
+| role | checkpoint (Hub) | numbers |
+|---|---|---|
+| best plain | `runs/plain-it-c250-36k` (sha 7e919281) | harness greedy / beam-8 / oracle-8 22.27 / 20.53 / 16.25; clean + 0.5 s flush 21.74 / 20.23 / 13.71 |
+| production EOU | EOU-v3 `runs/plain-it-s2-e3-djlr` (57d04dc4; parent = E3, not C250) | Mynah FLEURS-it 30.91, EOU 200 / 200, p50 810 ms |
+| stage 2 v4 | `runs/sg-it-s2v4-c250-36k` | FE 8.36 %, R 94.38 %, L p50 / p90 0.72 / 1.92 s, reset-WER 22.54; offline +1.87 vs parent |
+| stage 2 v5-B | `runs/sg-it-s2v5b-c250-36k` | FE 0.82 %, R 92.47 %, L 1.84 / 3.04 s (pre-registered FAIL, latency), reset-WER 22.08; offline = parent |
+| closed | KD E1-8k (NULL), static selection D, schedule axis (W4 = same ceiling) | do not reopen |
+
+Next EOU axis: v5-CAL (section E). Plain 1-best < 20 is a separate ranking axis (oracle 16.25 vs greedy 22.27).
+
+### French (reconstructed; nothing run since 2026-10-09, commits ff9d583 / f12f298 / a1153f1)
+| item | value |
+|---|---|
+| data | MLS-fr only, 6 / 34 shards, 38.58 h, 37 speakers (IT A2-era had 65 speakers, now ~357 h / 6 sources) |
+| stock EOU-120M on FR | NOT MEASURED (first eval at step 1500) |
+| plain `runs/plain-fr-p40` | top-4 encoder 3e-5, dec/joint 3e-4, 4000 steps: MLS-fr val 50.99 / CER 26.91 |
+| stage 2 `runs/plain-fr-s2-eou` | dec/joint 1e-4 (pre-djlr), pad p 0.5 U(1,3), every target + <EOU>: 49.18 / 25.87, EOU 97 % |
+| Mynah FLEURS-fr 200 | 78.70 WER as recorded (47 empty); 73.39 peak-normalised; EOU p50 2154 ms, never 27.5 % |
+| references | Nemotron 0.6B FLEURS-fr 13.2 (card 10.97 vs IT 5.23: FR ~2x harder for the teacher); Canary 180M 8.86 |
+
+FR is ~5 recipe generations behind IT: data diversity, whole-encoder LR, steps / exposure, djlr, own-mix stage 2,
+label policy, harness + flush + beam/oracle evaluation are all missing (section F).
+
+## D. Release-readiness checklist and licensing audit
+
+### Licensing (web-verified 2026-10-19; not legal advice)
+- Base `nvidia/parakeet_realtime_eou_120m-v1`: NVIDIA Open Model License (NVOML, text of 2025-10-24). Derivative
+  Models may be created and distributed, commercially; we own our Derivative Model "subject to NVIDIA's underlying
+  ownership rights". Distribution: ship a copy of the Agreement + a NOTICE file with "Licensed by NVIDIA Corporation
+  under the NVIDIA Open Model License". We may add terms for the derivative as a whole but may not drop NVOML's
+  conditions -> the weights are released as `license: other / nvidia-open-model-license`, NOT Apache / MIT / CC.
+  Guardrail clause (none documented in the base, so none removed), Trustworthy-AI terms apply, licence revocable /
+  updatable by NVIDIA. Trademarks: "Parakeet" / "NVIDIA" only to describe origin -> name e.g.
+  `mynah-eou-it-120m` / `mynah-eou-fr-120m`, "fine-tuned from NVIDIA Parakeet Realtime EOU 120M" in the card.
+- Teacher `nvidia/nemotron-3.5-asr-streaming-0.6b`: OpenMDW-1.1. NOTE: the teacher IS in the final IT data path:
+  the Granary pools of C250 (~228 h) carry Nemotron transcripts (agree <= 15). OpenMDW imposes no obligation on
+  outputs; acknowledge it in the card anyway. NeMo toolkit: Apache-2.0 (only if we ship its code).
+- Training data (all permit permissive release of weights; attribution in the card):
+  MLS CC BY 4.0; Common Voice 17 CC0 (+ no speaker identification); VoxPopuli CC0 (European Parliament source);
+  FLEURS CC BY 4.0; YODAS-Granary CC BY 3.0 (YouTube CC-BY uploads, self-declared -> mention takedown channel).
+- Eval only: mTEDx CC BY-NC-ND 4.0 -> report numbers only, NEVER redistribute audio / segments / manifests
+  (this covers clean-it tedx and the FINAL-IT tedx bank); ITALIC CC BY 4.0 + no identification / voice cloning.
+  The FINAL-IT / clean-it bundles stay in the private Hub repo; publish selection scripts + ids + SHA256 instead.
+- Uncertain: weights-as-adaptation of CC-BY data (attribution covers it); NC eval if a commercial purpose is
+  attached (mTEDx); "Parakeet" trademark registry not checked.
+- No blocking issue found.
+
+### Release checklist (per language; all must be filled from frozen artifacts, none from memory)
+- [ ] LICENSE (full NVOML text) + NOTICE (NVIDIA sentence, base-model link, "Modifications (c) 2026 Gabriele
+      Mastrapasqua", dataset attributions, Nemotron pseudo-label acknowledgement)
+- [ ] model card front-matter: license other / nvidia-open-model-license + link, base_model, language, pipeline tag,
+      library nemo, datasets
+- [ ] architecture: FastConformer cache-aware streaming encoder ([70,1] context), RNNT, stock SPE 1024 + <EOU> / <EOB>
+      (blank 1026), 120M params, 80 ms frames; what changed vs base (all weights fine-tuned; vocabulary unchanged)
+- [ ] training data table: source, hours, speakers / videos, licence, sampling weight; label provenance (human vs
+      Nemotron pseudo-label, filters: VP teacher-WER <= 50, Granary agree <= 15, digits dropped)
+- [ ] recipe: stage 1 (init, LR per group, schedule, steps, bs, max-dur, seed), stage 2 (EOU label policy, padding,
+      LR, steps, selection rule); exact commands + git SHA
+- [ ] compute: GPU type, wall-clock per stage (C250-36k ~5 h on one L40S at ~120 steps/min; stage 2 ~0.5 h)
+- [ ] checkpoint sha256 of the released .nemo (and of the Mynah pack)
+- [ ] accuracy: WER and CER, greedy / beam-8 / oracle-8 reported SEPARATELY; normalisation spelled out
+      (lowercase, accents stripped, [a-z' ]); flush protocol (raw EOF vs 0.5 s); per test set; FINAL holdout one-shot
+      result + the dev results, clearly labelled. "sub-20" only if 1-best greedy (or the stated decode) is < 20
+- [ ] streaming parameters: chunk / lookahead / cache config used by Mynah and NeMo; decoder reset after <EOU>
+- [ ] EOU metrics: false-endpoint rate (FE, >= 0.5 s speech left) and FE_any, true-EOU recall, latency p50 / p90
+      from speech end, under the stated protocol (+2 s quiet, energy endpoint); Mynah streaming numbers
+- [ ] known limitations: accent-free lowercase output, no punctuation / casing, digits not verbalised (numbers
+      read as words only), domain gaps (VP / spontaneous), EOU is acoustic (pause) not semantic, latency vs FE trade-off
+- [ ] inference examples: NeMo (`ASRModel.restore_from` + cache-aware streaming) and Mynah (pack export,
+      CLI / server); export instructions (`export_to_mynah.sh`), Mynah version tested, CPU / CUDA parity
+- [ ] reproducibility: public selection scripts for eval sets (no ND audio), SHA256 of eval manifests
+- [ ] private archive keeps everything else (raw outputs, logs, pools)
+
+## E. Stage2-v5-CAL -- PROPOSED pre-registration (2026-10-19 ~08:30 UTC; shown before launch, NOT launched)
+
+Question: is the precision / latency trade-off controlled by the DOSE of positive <EOU> supervision on acoustically
+ambiguous ends, with a usable operating point between v4 (q = 1) and v5-B (q = 0)?
+
+**Exact definition.** Every stage-2 training draw i has the v4 target t_i = text_i + <EOU>. Unchanged from v4 / v5-B:
+the global Python RNG (`random.seed(seed)`) draws, in this order, the sources, rows, and padded_i ~ Bernoulli(0.5)
+with U(1, 3) s of quiet at U(-90, -60) dB. credible_i = trail_s_i >= 0.5 s (annotate_tail.py, frozen in b202980).
+Then:
+- padded_i or credible_i: keep <EOU> (as v4 and v5-B);
+- otherwise (ambiguous): keep <EOU> iff u_i < q, with u_i ~ U(0, 1) from a DEDICATED generator
+  `CAL_RNG = random.Random(seed + 7919)`, consumed only for ambiguous unpadded draws, in draw order; else the target
+  is text_i only (as v5-B).
+q = 0 is v5-B exactly (no CAL_RNG call), q = 1 is v4 exactly. `two_stage.py --eou-amb-keep q` (347ff4b).
+
+**q = 0.5.** The a-priori midpoint of the only two anchors (q = 0, q = 1): no value fitted to, or interpolated from,
+DEV numbers; one arm, no sweep.
+
+**Expected EOU-positive share.** E[share] = p + (1 - p)(c + (1 - c) q), with p = 0.5 the pad probability and c the
+draw-weighted credible share (~0.30): q = 0 -> ~0.65, q = 0.5 -> ~0.83, q = 1 -> 1. MEASURED by
+`--batch-audit 300` (4,800 draws, the exact launch arguments): **v4 1.0000, v5-B 0.6498, v5-CAL 0.8213**.
+
+**Determinism and invariance (OBSERVED, batch audit, 59ad40c).**
+- 300 batches each: the audio hash (X, lens) is **identical** for v4, v5-B and v5-CAL
+  (7a24a83e...aa799); only the target hash (Y) differs.
+- A second v5-CAL run gives the identical Y hash (9b216053...533e6): the label draws are deterministic given the seed.
+- Caveat (pre-existing, applies equally to the anchors): `np.random` is never seeded in training, so the sample-level
+  realisation of the -90..-60 dB pad noise floor differs run to run (v4 and v5-B differed in it too). The audit seeds
+  np only to make X hashable. Clip choice, order, pad decision, length and level are seeded. v5-CAL keeps the
+  anchors' code path unchanged (no np seed), so the comparison is like-for-like.
+
+**Everything else unchanged.** v5b.sh plus one flag:
+`S2MIX=<s2tail mls/cv/vp/fleurs/yg/yg6 at 0.1964/0.1684/0.1122/0.0842/0.1885/0.2503> INIT=plain-it-c250-36k
+TAG=it-s2v5cal-c250-36k S2EXTRA="--lr 2e-5 --eou-min-tail 0.5 --eou-amb-keep 0.5" PROBE=1 M1=0 s2_mix.sh`
+- seed 0, top-4 encoder 3e-5, dec / joint 2e-5, bs 16, 1500 steps, eval every 250;
+- pad p 0.5 U(1, 3), max-dur 20, FastEmit 0;
+- selection rule: min WER among evals with EOU >= 80 % and <= 10 % empty.
+
+**Evaluation (identical to b202980; DEV harness only, FINAL-IT sealed).**
+- `s2_reset.py --post-pad-s 2.0` on 730 clips, with the reset.
+- Metrics: FE, FE_any (diag), R, L p50 / p90, reset-WER, CER, empty.
+- Anchors re-measured on this box (section B):
+
+| anchor | FE | R | L p50 / p90 | reset-WER | empty |
+|---|---|---|---|---|---|
+| v4 (q = 1) | 8.36 % | 94.38 % | 0.72 / 1.92 | 22.54 | 0 |
+| v5-B (q = 0) | 0.82 % | 92.47 % | 1.84 / 3.04 | 22.08 | 3 |
+| production v3 | 5.89 % | 94.66 % | 0.64 / 1.92 | 36.07 | 4 |
+
+**Expectation (stated, NOT a gate).** If FE and L were linear in the positive share (0.65 -> 1.0), q = 0.5 (0.82) would
+sit near FE ~4.5 %, L ~1.3 s. That is above the latency bar, so LATENCY-BOUND is a plausible outcome. A non-linear
+response (most false endpoints from a minority of short tails) is exactly what this arm measures.
+
+**Gates (fixed now; L(v3)/R(v3) enter because v3 is what a candidate must replace):**
+- **PASS** (EOU release candidate): FE <= 4.18 % (0.5 x v4) AND FE <= FE(v3) 5.89 % AND L p50 <= 1.04 s
+  (L(v3) + 0.40; tighter than L(v4) + 0.40 = 1.12) AND R >= 92.66 % (R(v3) - 2.0) AND reset-WER <= 22.58
+  (W(v5-B) + 0.5) AND empty <= 5.
+- **PARTIAL**: safety holds and exactly one primary misses by a bounded amount. Either FE <= 4.18 % with
+  1.04 < L p50 <= 1.28 s (the v4 / v5-B midpoint) -- latency-leaning; or L p50 <= 1.04 s with 4.18 < FE <= 5.89 %
+  -- precision-leaning. Recorded as one point of the dose-response; no promotion.
+- **NULL** (no dose effect at the midpoint): within 1.0 pt FE AND 0.20 s L p50 of either anchor.
+- **FAIL**: R < 90 %, or reset-WER > 23.08 (W(v5-B) + 1.0), or empty > 10, or FE > 5.89 % AND L p50 > 1.28 s
+  (worse than v3 on precision and slower than the midpoint).
+- Diagnostic, NOT a gate (Pareto reading): the chord v4 -> v5-B in the (FE, L p50) plane,
+  L_chord(FE) = 0.72 + (8.36 - FE) / 7.54 x 1.12 s. CAL at (FE_c, L_c): L_c < L_chord(FE_c) - 0.10 s = better than
+  interpolation (the dose buys latency back cheaper than linearly: improves the frontier); within +-0.10 s =
+  interpolation (the positive share alone sets the trade-off); above = worse than the chord. Same for p90 and FE_any.
+- Precedence FAIL > PASS > PARTIAL > NULL; any other outcome = BOUND (between the anchors but outside the bands):
+  reported, not promoted.
+- Always reported: the q = 0 / 0.5 / 1 table (FE, FE_any, R, L, W) and per-set FE (FLEURS is the hard set: v4 17 %,
+  v5-B 2 %, v3 14.5 %).
+- No second q, no threshold change, no runtime-policy tuning in response.
+- Only a PASS continues: the standard probes (plain -> EOU delta), then Mynah m1 (FLEURS-it EOU p50, CPU / CUDA
+  parity), then a recipe-freeze record, then FINAL-IT once.
+- PARTIAL / NULL / FAIL stop the label-dose axis; the next decision (runtime debounce / commit policy as a separate
+  layer, or ship v5-B / v4 behind a runtime policy) gets its own pre-registration.
+
+Cost: ~30-40 min GPU (stage 2 + probes) + ~25 min CPU EOU protocol.
+
+## F. FR on the frozen IT pipeline -- operational gap analysis (2026-10-19; no FR GPU until the IT EOU recipe freezes)
+
+### Old FR recipe (2026-10-09, frozen kit `.work/lightweight-asr/`) vs the IT recipe being frozen
+| axis | old FR | IT now (frozen or freezing) | directly replicable? |
+|---|---|---|---|
+| data | MLS-fr 6 / 34 shards, 38.6 h, 37 speakers, 1 domain | C250: MLS 40 h + CV17 + VP t50 + FLEURS train + Granary agree<=15 (~357 h, 6 sources) | yes for MLS / CV / VP / FLEURS (`prepare_mix.py --lang fr` accepted); Granary-fr needs the teacher pass (Nemotron fr validated) + dir-layout check |
+| labels | human only | human + Nemotron pseudo-labels (VP filter t50, Granary agree<=15, digit clips dropped) | yes (teacher_ws.py --lang fr), GPU teacher pass |
+| stage 1 | top-4 encoder 3e-5, dec/joint 3e-4, 4k steps cosine | whole encoder 2e-4 (E3) / 4e-4 (W4 WSD), dec/joint 3e-4, 8k-36k steps, max-dur 30 | yes (flags) |
+| exposure | ~4k x 16 on 38.6 h (several passes of one domain) | ~50 processed h / 1k steps over 357 h | yes |
+| stage 2 | dec/joint 1e-4 (pre-djlr), stage-1 manifest, every target + <EOU> | dec/joint 2e-5, parent's own mix, label policy = the frozen IT one (v4 / v5-B / v5-CAL) | yes (annotate_tail.py language-agnostic) |
+| eval | MLS-fr val + Mynah FLEURS-fr, raw EOF | 4-set harness + clean, raw + 0.5 s flush, greedy / beam-8 / oracle-8, s2_reset EOU protocol, sealed FINAL | needs FR manifests + FINAL-FR |
+| text | de-accented [a-z' ], stock English SPE | same | NOT as is: oe / ae ligatures (NFKD keeps them -> "c ur") and the curly apostrophe in training targets (frequent French elisions) must be normalised; FR-only change so IT numbers do not move; stock-SPE coverage audit on FR text first |
+
+Missing diversity for FR = everything except MLS read speech: crowd-sourced read speech (CV), parliamentary
+spontaneous-ish speech (VP), FLEURS-style read Wikipedia, and web / YouTube speech (Granary-fr). On IT the move from
+MLS-only (P40, FLEURS-it Mynah 55.1) to multi-domain (v3 30.9) was the single biggest gain; the old FR shows the same
+symptom (MLS-fr 49 vs Mynah FLEURS-fr 73-79).
+
+### Order of work (CPU first, while the IT GPU closes)
+1. FR-0 code: `LANG` through the job scripts; MLS-fr all shards in prepare_it.py; shared FR text normaliser
+   (oe / ae, curly apostrophe, hyphen policy); stock-SPE coverage audit; Granary-fr dir layout. Unit tests.
+2. FR-1 eval before any FR training number: FINAL-FR built and sealed (MLS-fr dev, CV17-fr validation, VP-fr
+   validation speakers outside our pool, FLEURS-fr dev, mTEDx-fr train talks outside Granary-fr; an SLU-style
+   bank only if licence-clean); harness-fr (MLS / FLEURS / CV / VP test, 200 each) + clean-fr (mTEDx-fr test/valid).
+   Baselines on harness-fr, same protocol as IT: stock EOU-120M (never measured), old plain-fr-p40, old s2-eou.
+3. Data A2-fr: MLS-fr ~40 h cut (all speakers), CV17-fr ~40 h (<= 20 per speaker), VP-fr teacher-t50, FLEURS-fr
+   train (the teacher pass on VP-fr is the only GPU step before the run).
+
+### The single high-information FR plain run (PROPOSED, not pre-registered)
+FR-P1 = A2-fr with the frozen IT stage-1 recipe at the screening horizon: W4 (whole encoder 4e-4, dec/joint 3e-4,
+WSD 5 % warm-up, decay last 20 %), 8k steps, bs 16, max-dur 30, seed 0 (~70 min L40S). Judged on harness-fr greedy /
+beam-8 / oracle-8 (+ flush) against stock and old plain-fr-p40 on the SAME harness. It answers the question of the
+week with one run: how much of the old FR gap is recipe + diversity (no Granary, no new labels beyond VP filtering).
+IT reference for reading it: W4-8k on C250 = 26.12 / 23.67 / 19.43; on the A2-era IT mix the 8k E3 family was ~31-32 macro greedy (E3G-8k 31.71).
+Then, by a pre-registered rule: Granary-fr agree<=15 to C250 scale and the long schedule (E3 36k or W4 16k), then
+stage 2 with the frozen IT EOU recipe, Mynah export, FINAL-FR once. No FR < 20 promise (Nemotron itself: FR ~2x IT).

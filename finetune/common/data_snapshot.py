@@ -19,11 +19,14 @@ index.json (written last) lists every shard with its file count, size and sha256
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import glob
 import hashlib
 import io
 import json
+import multiprocessing
 import os
+import signal
 import sys
 import tarfile
 import tempfile
@@ -195,7 +198,11 @@ def restore(a, api):
             raise RuntimeError(f"shard {r['name']} size/sha256 mismatch")
         return p, r
 
-    with ThreadPoolExecutor(a.workers) as dl, ProcessPoolExecutor(a.workers) as ex:
+    # --mp-context spawn (default): with fork, the extraction workers are forked while the download threads run;
+    # 2026-10-18 (Singapore) and 2026-10-19 (Japan) the pool never shut down after every shard was extracted
+    # (defunct + sleeping workers, all files on disk). tests/snapshot_pool_smoke.sh reproduces / checks it.
+    with ThreadPoolExecutor(a.workers) as dl, \
+            ProcessPoolExecutor(a.workers, mp_context=multiprocessing.get_context(a.mp_context)) as ex:
         futs = [dl.submit(fetch, r) for r in index["shards"]]
         ext = []
         for f in as_completed(futs):
@@ -224,8 +231,11 @@ def main():
     ap.add_argument("--shard-gb", type=float, default=1.5)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--tmp", default="/root", help="where shards are staged (root disk, not tmpfs)")
+    ap.add_argument("--mp-context", default="spawn", choices=["spawn", "fork", "forkserver"],
+                    help="restore: start method of the extraction pool (fork only to reproduce the 2026-10 hang)")
     ap.add_argument("--root", default="/", help="restore: prefix for the stored absolute paths (tests)")
     a = ap.parse_args()
+    faulthandler.register(signal.SIGUSR1, all_threads=True)   # kill -USR1 <pid>: every thread's stack to stderr (hangs)
     from huggingface_hub import HfApi
     api = HfApi(token=Path(a.token_file).read_text().strip())
     pack(a, api) if a.cmd == "pack" else restore(a, api)
