@@ -1047,3 +1047,47 @@ turn-taking the splits are the failure. Per the pre-registration: **IT EOU resea
 - FR-0 coverage complete:
   - every FR source has 0 % <unk> and 100 % round trip with the stock SPE;
   - curly apostrophes occur in 8.9 % of CV-fr and 20 % of FLEURS-fr sentences, so the fr pre-map is required.
+
+### Result: FR-P1 (W4 8k on A2-fr) -- pre-registered class LEVER (OBSERVED, 2026-10-19, Japan L40S, one seed)
+
+- Run: 8000 steps in 2,367 s, final.nemo = step 8000 (sha256 1ec3fec4); Hub `runs/jp-fr-p1-w4-8k`.
+- VP-fr teacher filter (<= 50, frozen): kept 15,997 / 16,191 utts, 39.66 / 40.02 h, 236 / 236 speakers.
+  VP-it kept 80.7 %: VP-fr labels are far cleaner.
+- Harness-fr frozen (sha256 recorded) before the baselines.
+
+| harness-fr macro (MLS / FLEURS / CV / VP test, 200 each), 0.5 s flush | greedy | beam-8 | oracle-8 | CER (greedy) |
+|---|---|---|---|---|
+| stock parakeet_realtime_eou_120m-v1 (English) | 94.90 | 95.61 | 94.45 | 73.81 |
+| old plain-fr-p40 (2026-10-09 recipe, MLS-only) | 65.85 | 64.88 | 61.65 | 40.78 |
+| old plain-fr-s2-eou | 65.02 | 63.68 | 60.29 | 40.52 |
+| **FR-P1** | **27.66** | **25.91** | **21.76** | **11.34** |
+
+Per source, FR-P1 vs old p40 (greedy, flushed):
+- MLS 25.13 vs 50.93;
+- FLEURS 33.51 vs 76.30;
+- CV 29.53 vs 67.92;
+- VP 22.46 vs 68.24.
+
+FR-P1 per source, beam-8 / oracle-8:
+- MLS 23.49 / 21.20;
+- FLEURS 31.08 / 27.84;
+- CV 27.65 / 20.50;
+- VP 21.41 / 17.50.
+
+Raw EOF: 27.84 / 26.06 / 21.83 (flush ~ -0.2).
+Empties: in-run final eval 3 / 730 (MLS 1, FLEURS 1, VP 1); lm_fusion_probe does not report empties.
+Sanity: old p40 MLS 50.97 raw = its 2026-10-09 number 50.99.
+
+**Class:**
+- delta macro greedy flushed = 27.66 - 65.85 = **-38.19 -> LEVER** (<= -10).
+- Recipe + diversity + encoder adaptation explains most of the old FR gap: every source drops 26-46 points,
+  out-of-domain FLEURS from 76.3 to 33.5.
+
+**Diagnostic gaps:**
+- greedy -> beam 1.75, beam -> oracle 4.15.
+- IT W4-8k on C250 was 26.12 / 23.67 / 19.43, so this FR result without Granary is close to IT with Granary at
+  the same horizon.
+- The remaining gap is mostly not ranking (beam gains little): exposure / data scale is the next lever (HYPOTHESIS).
+
+Per the decision rule: LEVER does NOT authorise stage 2. Next = ONE pre-registered decision on how to scale plain FR
+(Granary-fr pools, MLS-fr hours, schedule). Stopped here.
