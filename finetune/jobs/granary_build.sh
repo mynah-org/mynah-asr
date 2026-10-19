@@ -15,7 +15,9 @@
 . "$(dirname "$0")/gpu_lock.sh"
 # YG_OUT / YG_AUDIO: build a new pool next to the one a running arm reads (the FLAC mode deletes the
 # .wav copy of every clip it rewrites)
-SPREAD=${YG_SPREAD:-70}; MAXS=${YG_MAX_S:-30}; O=${YG_OUT:-$FT_ROOT/mix/it-yg}; AUD=${YG_AUDIO:-/dev/shm/mix/it-yg}; L=$FT_ROOT/logs
+# LANG_ (default it): the language of the Granary dirs, the teacher and the default pool paths (it = unchanged)
+LG=${LANG_:-it}
+SPREAD=${YG_SPREAD:-70}; MAXS=${YG_MAX_S:-30}; O=${YG_OUT:-$FT_ROOT/mix/$LG-yg}; AUD=${YG_AUDIO:-/dev/shm/mix/$LG-yg}; L=$FT_ROOT/logs
 cd "$FINETUNE/.." || exit 2; ulimit -n 65536
 NEW=; X=(); TPY=python3
 [ -n "$YG_DIRS" ] && { NEW=1; X+=(--yg-dirs "$YG_DIRS"); }
@@ -25,7 +27,7 @@ NEW=; X=(); TPY=python3
 [ -n "$YG_EXCLUDE" ] && { NEW=1; X+=(--yg-exclude-spread "$YG_EXCLUDE"); }
 [ -n "$NEW" ] && { X+=(--yg-min-free-gb "${YG_MIN_FREE_GB:-4}"); TPY=$PY; }   # $PY has soundfile (FLAC)
 echo "== granary build: $SPREAD spread shards, clips <= $MAXS s ${X[*]:+${X[*]} }$(date +%T)"
-timeout "${YG_TIMEOUT:-10800}" "$PY" "$FINETUNE/eou/prepare_mix.py" --lang it --out $O --audio $AUD --cv-hours 0 --vp-hours 0 \
+timeout "${YG_TIMEOUT:-10800}" "$PY" "$FINETUNE/eou/prepare_mix.py" --lang $LG --out $O --audio $AUD --cv-hours 0 --vp-hours 0 \
     --no-fleurs --yg-spread $SPREAD --yg-max-s $MAXS --yg-keep-all --workers "${YG_WORKERS:-6}" "${X[@]}" 2>&1 | grep -E "^== yg|DATA-MIX|Traceback|Error"
 RUN=; [ ! -s $O/train_yg.teacher.json ] && RUN=1   # resume_it.sh puts the archived pool scores there
 if [ -n "$NEW" ]; then   # score only the clips no previous output covers
@@ -49,10 +51,10 @@ if [ -n "$RUN" ]; then
 gpu_lock
 ./mynah-asr-server-cuda -m models/nemotron-3.5-asr-streaming-0.6b -p 8295 > $L/teacher_srv4.log 2>&1 & SP=$!
 for i in $(seq 120); do curl -sf localhost:8295/v1/health >/dev/null && break; sleep 1; done
-timeout "${TEACHER_TIMEOUT:-7200}" $TPY finetune/eou/diag/teacher_ws.py --manifest $O/train_yg.json --out $O/train_yg.teacher.json --lang it --conc 128 \
+timeout "${TEACHER_TIMEOUT:-7200}" $TPY finetune/eou/diag/teacher_ws.py --manifest $O/train_yg.json --out $O/train_yg.teacher.json --lang $LG --conc 128 \
     ${REUSE:+--reuse $REUSE} | tail -1 | cut -c1-220
 kill $SP; wait $SP 2>/dev/null; flock -u 9
 fi
-python3 finetune/eou/diag/pseudo_stats.py --manifest $O/train_yg.teacher.json --json $O/stats_yg.json | head -60
+python3 finetune/eou/diag/pseudo_stats.py --manifest $O/train_yg.teacher.json --json $O/stats_yg.json --lang $LG | head -60
 df -h / /dev/shm | tail -2
 echo "== GRANARY-BUILD-DONE $(date +%T)"
