@@ -715,3 +715,13 @@ Oracle is diagnostic.
 - LEVER / CLEAR: STOP. The next experiment (more Granary vs more exposure) gets its own pre-registration; no
   automatic 16k or 200-260 h pool.
 - NULL / HARM: no compensation by hours or steps. First per source and greedy -> beam -> oracle.
+
+**FR-G1 launch record (before any output).**
+- Run: git 232cd40, utc 2026-10-19T16:45:41Z, train set 97,675 utts / 216.3 h (= A2-fr 56,260 + Granary 41,415),
+  MIX as pre-registered, tmux `frg1`.
+- Aborted earlier attempt (16:43 UTC):
+  - the box checkout was stale (an untracked hand-copied granary_audit.py blocked `git pull`), so fr_p1.sh lacked
+    the MIX override;
+  - it started on A2-fr only (56,260 utts) and was killed within ~2 min, before any eval; its run dir and logs
+    were deleted;
+  - the launcher now refuses a dirty tree, a fr_p1.sh without MIX=, and a train set other than 97,675 utts.
