@@ -33,6 +33,13 @@ ap.add_argument("--threads", type=int, default=8)
 ap.add_argument("--post-pad-s", type=float, default=0.0, help="quiet (-75 dB noise, as the in-run stage-2 eval) appended "
                 "so a true end-of-utterance <EOU> can fire; endpoints are measured on the ORIGINAL clip")
 ap.add_argument("--models", default="parent,s2,s2_reset", help="subset of protocols to run")
+ap.add_argument("--eou-bias", type=float, default=0.0, help="decision-layer calibration of the stage-2 model (s2 / s2_reset "
+                "only): z_EOU' = z_EOU + b on the joint output before the greedy argmax, at every symbol step; blank, text, "
+                "decoder state, encoder and reset semantics unchanged (the parent never sees it)")
+ap.add_argument("--margin-rule", type=float, default=0.0, help="scale rule only (no biased decode): on the UNBIASED s2_reset "
+                "path, M_t = max over the frame's symbol steps of z_EOU - max(other outputs); per clip need = -max M_t over "
+                "frames in [speech end, speech end + W s); prints need p10/p50/p90 and b = max(0, median need) rounded UP "
+                "to 0.05, then exits (no FE / latency / WER is computed)")
 ap.add_argument("--out", default="")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
@@ -89,13 +96,19 @@ def encode(m, x):
 
 
 @torch.no_grad()
-def greedy(m, enc, reset=False, max_symbols=10):
+def greedy(m, enc, reset=False, max_symbols=10, bias=0.0, margins=None):
     ys, frames = [], []
     g, state = m.decoder.predict(None, state=None, add_sos=False, batch_size=1)[:2]
     for t in range(enc.shape[0]):
         f = enc[t][None, None, :]
         for _ in range(max_symbols):
-            k = int(m.joint.joint(f, g)[0, 0, 0].argmax())
+            z = m.joint.joint(f, g)[0, 0, 0]
+            if margins is not None:   # z_EOU - max(other outputs), max over the frame's symbol steps
+                oth = torch.cat([z[:EOU], z[EOU + 1:]]).max()
+                margins[t] = max(margins.get(t, -1e9), float(z[EOU] - oth))
+            if bias:
+                z = z.clone(); z[EOU] += bias
+            k = int(z.argmax())
             if k == BLANK:
                 break
             ys.append(k); frames.append(t)
@@ -118,6 +131,28 @@ def speech_end(x):
     return (on[-1] + 1) * FR if len(on) else len(x) / 16000
 
 
+if a.margin_rule:   # scale rule for --eou-bias (pre-registered): no biased decode, no outcome metric
+    need = []
+    for spec in a.vals.split(","):
+        sname, p = spec.split("=", 1)
+        rows = [json.loads(l) for l in open(p)]
+        rows = rows[:: max(1, len(rows) // a.per_set)][: a.per_set]
+        for r in rows:
+            x, _ = sf.read(r["audio_filepath"], dtype="float32")
+            x = x.mean(1) if x.ndim > 1 else x
+            end = speech_end(x)
+            if a.post_pad_s:
+                x = np.concatenate([x, (np.random.RandomState(len(x)).randn(int(a.post_pad_s * 16000)) * 10 ** (-75 / 20)).astype(np.float32)])
+            mg = {}
+            greedy(S, encode(S, x), reset=True, margins=mg)
+            w = [v for t, v in mg.items() if end <= t * FR < end + a.margin_rule]
+            if w:
+                need.append(-max(w))
+    q = [round(float(np.percentile(need, v)), 3) for v in (10, 50, 90)]
+    b = max(0.0, float(np.ceil(np.median(need) / 0.05) * 0.05))
+    print("== MARGIN-RULE " + json.dumps({"W_s": a.margin_rule, "clips": len(need), "need_p10_p50_p90": q, "b": round(b, 2)}), flush=True)
+    raise SystemExit(0)
+
 res = {}
 for spec in a.vals.split(","):
     sname, p = spec.split("=", 1)
@@ -139,7 +174,7 @@ for spec in a.vals.split(","):
         for k, (m, e, rs) in {"parent": (P, eP, False), "s2": (S, eS, False), "s2_reset": (S, eS, True)}.items():
             if k not in want:
                 continue
-            ys, fr = greedy(m, e, reset=rs)
+            ys, fr = greedy(m, e, reset=rs, bias=a.eou_bias if k != "parent" else 0.0)
             hyp = norm(tk.ids_to_text([t for t in ys if t < 1024])).split()
             o = ops(ref, hyp)
             c = acc[k]

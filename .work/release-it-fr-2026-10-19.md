@@ -293,3 +293,49 @@ which also carry its false endpoints. The selected step differs (500 vs 1000; th
 the latency comparison, not acted on. Per the pre-registration: **the stage-2 label-dose axis is CLOSED** (no
 v5-C, no q grid, no threshold change on this DEV). A decision-layer knob (EOU posterior bias / threshold or a
 runtime commit policy on v5-B) would be a NEW, separately pre-registered axis -- not opened today.
+
+## G. EOU decision-layer calibration on v5-B -- PRE-REGISTERED rule + gates (2026-10-19 ~09:50 UTC; b not yet computed, no biased decode run)
+
+Last IT EOU axis, inference only: after it the IT EOU research stops whatever the result. No training, v5-B weights
+frozen (sha ab84cd3b), FINAL-IT sealed and unused. CAL is NOT used to choose anything.
+
+**Intervention.** In the frame-synchronous greedy RNNT decode of the protocol (`s2_reset.py`, Mynah reset), at every
+symbol step the joint output z (log-probabilities on CPU; argmax-equivalent to logits since the normaliser is
+common) is replaced by z' with z'_EOU = z_EOU + b and every other entry unchanged; k = argmax z'. Blank, text, <EOB>,
+decoder state, encoder, reset after <EOU>, the +2 s quiet, the energy endpoint and every metric are unchanged.
+The parent is never biased. `s2_reset.py --eou-bias b`.
+
+**Rule for the single b (fixed now, before any margin is seen).**
+1. Run the UNBIASED v5-B on DEV730 with the protocol (reset, +2 s).
+2. Per frame t, take M_t = max over the frame's symbol steps of z_EOU - max(other outputs).
+3. For each clip, need_i = -max M_t over frames in [speech end, speech end + W) with W = 0.64 s. This is the
+   smallest bias that makes <EOU> win somewhere within W of the energy speech end.
+4. b = max(0, median_i need_i), rounded UP to 0.05.
+
+Reading: the bias at which the median clip would fire within production v3's p50 latency (0.64 s, an existing
+anchor), on the unbiased path. Only the true-end window enters; internal pauses / FE never enter the rule.
+`s2_reset.py --margin-rule 0.64` prints ONLY need p10/p50/p90 and b (no FE / latency / WER).
+
+Disclosure: the unbiased trace would make the first-fire FE / latency computable for ANY b (the path is identical
+up to the first <EOU>). That curve is deliberately NOT computed: one b, one decode.
+
+**Baseline (frozen, this box):**
+- v5-B: FE 0.82 %, FE_any 1.64 %, R 92.47 %, L p50 / p90 1.84 / 3.04 s, reset-WER 22.08, empty 3;
+- v3: FE 5.89 %, L p50 0.64 s;
+- v4: FE 8.36 %, L 0.72 s.
+
+**Gates (biased v5-B vs these baselines):**
+- **PASS:** L p50 <= 1.04 s (L(v3) + 0.40) AND FE <= 2.95 % (0.5 x FE(v3)) AND R >= 92.47 % AND
+  reset-WER <= 22.58 (W(v5-B) + 0.5) AND empty <= 5.
+- **PARTIAL:** FE <= 2.95 %, safety holds, 1.04 < L p50 <= 1.44 s (>= 0.40 s recovered). No RC.
+- **NOT-SEPARABLE:** FE > 2.95 % (safety holds). Calibration buys latency only by buying back false endpoints: the
+  EOU-vs-blank ranking does not separate true ends from pauses at that operating point.
+- **NULL:** L p50 > 1.64 s (within 0.20 s of v5-B: b ineffective).
+- **FAIL (safety):** R < 90 % or reset-WER > 23.08 or empty > 10.
+- Precedence: FAIL > PASS > PARTIAL > NOT-SEPARABLE > NULL; anything else = BOUND.
+- Diagnostic: the point vs the v4 -> v5-B chord and vs v3; FE_any; per set (FLEURS).
+
+**After the result.**
+- PASS: Mynah parity of the bias (runtime implementation, CPU / CUDA), freeze v5-B weights + runtime policy, then
+  FINAL-IT once, then RC.
+- Otherwise: STOP IT EOU research (no sweep, no second b, no threshold search) and choose v5-B / v3 on product grounds.
