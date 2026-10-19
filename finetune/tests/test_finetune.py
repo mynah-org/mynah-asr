@@ -6,7 +6,8 @@
 Covers manifest rows/round trip and the voiced-span trim, nested + deterministic
 subset selection, replay mixing ratio, run.json serialisation, the EOU/EOB/blank
 id contract, a tiny SentencePiece round trip with <EOU>/<EOB> appended (skipped
-with a message when sentencepiece is not installed), and the plain-ASR CLI presets.
+with a message when sentencepiece is not installed), the plain-ASR CLI presets, and the shared
+stock-SPE text normaliser (common/textnorm.py: IT == the frozen scorer rule, FR oe/ae + typographic apostrophes).
 """
 from __future__ import annotations
 
@@ -78,6 +79,39 @@ class Manifests(unittest.TestCase):
     def test_plain_norm_and_eou_norm(self):
         self.assertEqual(plain_asr.norm("Perché È COSÌ, l'acqua!"), "perche e cosi l'acqua")
         self.assertEqual(tokenizer_eou.norm_text("Perché È così, l’acqua 3!"), "perché è così l'acqua")
+
+
+class TextNorm(unittest.TestCase):
+    """common/textnorm.py: lang="it" is the frozen scorer rule, lang="fr" adds oe/ae + typographic apostrophes."""
+    IT = ["Perché È COSÌ, l'acqua!", "dell’anno «più» bello", "c'è-un po' di città 3 volte", "  ŒUVRE  ", "Ærøskøbing",
+          "‘ciao’ ʼx", "ﬁne ¼ Ⅻ ß ı İ ø ł đ", "é́ é", "a\tb\nc", ""]
+
+    def test_it_is_the_frozen_rule(self):
+        import textnorm
+        for t in self.IT + [chr(c) for c in range(0x20, 0x3000) if not 0xD800 <= c <= 0xDFFF]:
+            self.assertEqual(textnorm.norm(t, "it"), plain_asr.norm(t), repr(t))   # plain_asr.norm == two_stage.norm
+        self.assertEqual(textnorm.norm("dell’anno", "it"), "dell anno")   # the IT word break on ’ stays frozen
+
+    def test_fr(self):
+        import textnorm
+        cases = {"L’œuvre d’art, peut-être.": "l'oeuvre d'art peut etre",
+                 "Cœur, ŒUVRE, Lætitia, Æsope": "coeur oeuvre laetitia aesope",
+                 "aujourd’hui c‘est ʼla": "aujourd'hui c'est 'la", "c'est-à-dire « oui » — non": "c'est a dire oui non",
+                 "Noël à l'hôpital, où ça ?": "noel a l'hopital ou ca", "Il a 3 ans": "il a ans"}
+        for t, want in cases.items():
+            self.assertEqual(textnorm.norm(t, "fr"), want, t)
+        for t in ("Perché È COSÌ, l'acqua!", "c'è-un po' di città"):   # no ligature / curly apostrophe: same as IT
+            self.assertEqual(textnorm.norm(t, "fr"), textnorm.norm(t, "it"))
+        with self.assertRaises(KeyError):
+            textnorm.norm("x", "xx")
+
+    def test_text_ok(self):
+        import textnorm
+        self.assertFalse(textnorm.text_ok("le cœur", "it"))   # prepare_mix.text_ok drops every oe / ae row ...
+        self.assertTrue(textnorm.text_ok("le cœur", "fr"))    # ... the FR filter keeps them
+        for t, ok in (("città è più", True), ("l’acqua", True), ("3 volte", False), ("Москва", False), ("", False),
+                      ("ñandú", True), ("straße", False), ("...", False)):
+            self.assertEqual((textnorm.text_ok(t, "it"), textnorm.text_ok(t, "fr")), (ok, ok), t)
 
 
 class Subsets(unittest.TestCase):
