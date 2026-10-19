@@ -136,7 +136,7 @@ label policy, harness + flush + beam/oracle evaluation are all missing (section 
 - [ ] reproducibility: public selection scripts for eval sets (no ND audio), SHA256 of eval manifests
 - [ ] private archive keeps everything else (raw outputs, logs, pools)
 
-## E. Stage2-v5-CAL -- PROPOSED pre-registration (2026-10-19 ~08:30 UTC; shown before launch, NOT launched)
+## E. Stage2-v5-CAL -- PRE-REGISTERED (2026-10-19 ~08:45 UTC, GO given; frozen before launch)
 
 Question: is the precision / latency trade-off controlled by the DOSE of positive <EOU> supervision on acoustically
 ambiguous ends, with a usable operating point between v4 (q = 1) and v5-B (q = 0)?
@@ -165,7 +165,8 @@ draw-weighted credible share (~0.30): q = 0 -> ~0.65, q = 0.5 -> ~0.83, q = 1 ->
 - Caveat (pre-existing, applies equally to the anchors): `np.random` is never seeded in training, so the sample-level
   realisation of the -90..-60 dB pad noise floor differs run to run (v4 and v5-B differed in it too). The audit seeds
   np only to make X hashable. Clip choice, order, pad decision, length and level are seeded. v5-CAL keeps the
-  anchors' code path unchanged (no np seed), so the comparison is like-for-like.
+  anchors' code path unchanged (no np seed), so the comparison is like-for-like. Hence "one variable" means the
+  INTENDED TREATMENT VARIABLE (q); the stochastic padding-noise realisation remains uncontrolled, as in both anchors.
 
 **Everything else unchanged.** v5b.sh plus one flag:
 `S2MIX=<s2tail mls/cv/vp/fleurs/yg/yg6 at 0.1964/0.1684/0.1122/0.0842/0.1885/0.2503> INIT=plain-it-c250-36k
@@ -214,6 +215,12 @@ response (most false endpoints from a minority of short tails) is exactly what t
   layer, or ship v5-B / v4 behind a runtime policy) gets its own pre-registration.
 
 Cost: ~30-40 min GPU (stage 2 + probes) + ~25 min CPU EOU protocol.
+During the run: health only (NaN / OOM / stall); no intermediate metric changes recipe, q, gates or the selection
+rule. After: exactly the probes above (s2_mix.sh PROBE=1 harness + clean, raw + 0.5 s, s2 + parent) and the
+s2_reset EOU protocol; report q = 0 / 0.5 / 1 + v3, per set, the chord position, the class. PASS -> plain -> EOU
+delta + Mynah m1 parity, stop before FINAL-IT. PARTIAL / NULL / FAIL / BOUND -> close the stage-2 IT axis (no v5-C,
+no grid).
+Launch record: see "v5-CAL launch record" below (commit SHA, exact command, UTC time, written before any output).
 
 ## F. FR on the frozen IT pipeline -- operational gap analysis (2026-10-19; no FR GPU until the IT EOU recipe freezes)
 

@@ -962,3 +962,16 @@ Why v4 fails: premature <EOU> at internal pauses (ambiguous positive labels) + a
 Why v5-B fails: the label fix over-shoots the endpoint timing (latency gate). Next decision: pre-register v5-CAL (q),
 or keep v3 in production; plain 1-best < 20 remains a separate axis (oracle 16.25 vs 1-best 22.27: ranking /
 candidate conversion, not encoder KD). E2 (S4 -> T5) parked.
+
+## 2026-10-19 -- Japan L40S (new host 61.206.39.5:26451)
+
+Qualification, restore / parity (identical to Singapore), FINAL-IT completed + sealed (1,826 clips, 6 banks, SEAL
+8d023737; never decoded), the snapshot-hang fix, the release checklist / licensing audit and the FR gap analysis:
+`.work/release-it-fr-2026-10-19.md`.
+
+### Stage2-v5-CAL -- PRE-REGISTERED (2026-10-19 ~08:45 UTC, before launch)
+Full text (definition, q = 0.5, batch audit, anchors v4 / v5-B / v3 re-measured on this box, gates, diagnostic):
+`.work/release-it-fr-2026-10-19.md` section E. Summary: ambiguous unpadded ends keep <EOU> with probability 0.5
+(dedicated RNG); positive share 0.8213 measured; audio batches hash-identical to v4 / v5-B; PASS = FE <= 4.18 % AND
+FE <= 5.89 % AND L p50 <= 1.04 s AND R >= 92.66 % AND reset-WER <= 22.58 AND empty <= 5. After this arm the stage-2 IT
+axis closes unless PASS.
