@@ -167,7 +167,7 @@ class Bank:
         return rows
 
     def write(self, uid, grp, text, x):
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", uid)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(uid))   # ITALIC ids are ints
         p = Path(self.a.audio) / self.name / f"{safe}.wav"
         p.parent.mkdir(parents=True, exist_ok=True)
         sf.write(p, x, 16000, subtype="PCM_16")
