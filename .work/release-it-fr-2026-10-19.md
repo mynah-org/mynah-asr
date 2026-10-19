@@ -558,3 +558,16 @@ IT equivalence of the wiring (c6cfe56):
 - the IT VP t50 manifest reproduced byte-identically.
 
 FR-P1 is FINAL with A1; no further change.
+
+**FINAL-FR builder choices (model-free, fixed before the build; no FR audio decoded by any model):**
+- `prepare_final_it.py --lang fr`. The IT path is byte-identical to HEAD on an offline fake-Hub replay of all 6
+  banks: manifests, trims, final_all, stats, SHA256SUMS, every wav, request log and stdout.
+- VP: the pre-registered rule, speakers outside OUR VP-fr pool (`--vp-exclude mix/fr/train_vp.json,eval_vp.json`).
+- Speech-MASSIVE fr-FR validation:
+  - group = speaker; speakers of train / train_115 dropped; `is_validated == False` dropped;
+  - test-split speakers NOT excluded (gated repo, 403 for this token): stated limitation;
+  - CC BY-NC-SA 4.0, private.
+- mTEDx-fr: TRAIN shards 0-1 of 41; talks in fr test / valid and in every Granary-fr original_audio_id dropped.
+  - FR ending rule also accepts a spaced closing guillemet (`. »`).
+  - Granary-fr ids (5 dirs, 4,432 shards) were listed from the dev machine because the box IP was rate-limited.
+    Same logic as `granary_ids`; the cache is copied to `/root/final-fr-dl/granary_fr_ids.json`.

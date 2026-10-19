@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""FINAL-IT: the one-shot Italian final test set (pre-registered 2026-10-18; selection is model-free).
+"""FINAL-IT / FINAL-FR: the one-shot final test sets (IT pre-registered 2026-10-18; selection is model-free).
 
     python3 prepare_final_it.py --out /root/ft/final-it --audio /root/disk/final-it [--n 400] \
         --exclude-texts "/root/ft/manifests/*.json,/root/ft/mix/it/*.json,/root/ft/mix/it-yg*/subsets/*.json"
+    python3 prepare_final_it.py --lang fr --out /root/ft/final-fr --audio /root/disk/final-fr \
+        --exclude-texts "/root/ft/manifests/*fr*.json,/root/ft/mix/fr/*.json" --vp-exclude <our FR VP manifests>
+    ... --plan-only: metadata only (column projection, no audio download / decode, nothing sealed): per-bank
+        candidate counts, drops and the selection order -> $OUT/plan_<bank>.json (duration filter unchecked where the
+        source has no duration column: cv, vp, smassive; FLEURS audio presence not checked)
 
-Six sub-banks, each from a split that no run of ours has trained on, selected on or scored with:
+--lang it (default) is the frozen FINAL-IT build, byte for byte (sources, paths, norm(), regexes unchanged).
+
+IT: six sub-banks, each from a split that no run of ours has trained on, selected on or scored with:
   mls     MLS-it dev (facebook/multilingual_librispeech italian/dev); speakers asserted absent from train + test
   cv      Common Voice 17 it validation (fixie-ai/common_voice_17_0); client_ids in train / test dropped
   vp      VoxPopuli it validation (facebook/voxpopuli); speaker_ids in train / test dropped (--vp-exclude: only the
@@ -14,6 +21,13 @@ Six sub-banks, each from a split that no run of ours has trained on, selected on
   tedx    Multilingual TEDx it TRAIN shards 0-1 (deepdml/mtedx): talks absent from the mTEDx test / valid talks
           (= the clean-it dev bank) AND from every Granary-it original_audio_id (espnet/yodas-granary data/it*)
   italic  ITALIC hard_speaker VALIDATION (Zenodo 8040649): speakers asserted absent from hard_speaker test (dev)
+FR (--lang fr, same rules; release doc 2026-10-19 sections F / I): mls = MLS-fr dev (french/), cv = CV17 fr validation,
+  vp = VoxPopuli fr validation, fleurs = FLEURS fr_fr dev, tedx = mTEDx fr TRAIN shards 0-1 (of the listed shards, 41
+  for fr) minus fr test / valid talks and every Granary-fr original_audio_id (data/fr\\d: fr000, fr100-fr103), and
+  smassive = Speech-MASSIVE fr-FR VALIDATION (FBK-MT/Speech-MASSIVE; group = speaker): speakers of fr-FR train /
+          train_115 (and of the gated FBK-MT/Speech-MASSIVE-test when readable) dropped, recordings not human-validated
+          (is_validated false) dropped. The text norm is common/textnorm.norm(t, "fr") (oe / ae, typographic
+          apostrophes); tedx natural ending also accepts the French spaced closing quote ("... . »").
 Common rules (identical for every bank, fixed before any clip is seen):
   - 1.0 <= duration <= 20 s; no digit and none of []()&<> in the text; >= 2 words after the scorer's norm()
     (>= 3 for tedx); the curly apostrophe -> ';
@@ -27,7 +41,9 @@ No ASR model, teacher, student or WER is involved; the only signal measured on t
 Outputs ($OUT): final_<bank>.json, final_all.json, the EOF variant final_trim_<bank>.json (same clips cut at the
 energy endpoint + 50 ms: the finalisation / flush probe), stats.md, SHA256SUMS (manifests + every wav).
 Licences: mTEDx CC BY-NC-ND 4.0 (private evaluation only, never redistribute), ITALIC CC BY 4.0, MLS / FLEURS
-CC BY 4.0, CV / VP CC0. Needs /root/.hf_token (Granary listing).
+CC BY 4.0, CV / VP CC0, Speech-MASSIVE CC BY-NC-SA 4.0 (private evaluation only, never redistribute).
+Uses /root/.hf_token when present (anonymous Hub reads otherwise: every source is public; only the optional
+Speech-MASSIVE-test speaker list is gated).
 """
 import argparse
 import collections
@@ -39,7 +55,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
+import time
 import unicodedata
 import urllib.request
 import zipfile
@@ -51,6 +69,12 @@ import soundfile as sf
 
 HF = "https://huggingface.co/datasets"
 BAD = re.compile(r"\d|[\[\]()&<>]")
+# per-language sources; "it" = the frozen 2026-10-18 strings. hf = the language dir of CV / VP / mTEDx / Granary
+SRC = {"it": {"mls": "italian", "hf": "it", "fleurs": "it_it", "banks": "mls,cv,vp,fleurs,tedx,italic", "tag": "FINAL-IT"},
+       "fr": {"mls": "french", "hf": "fr", "fleurs": "fr_fr", "smassive": "fr-FR", "banks": "mls,cv,vp,fleurs,tedx,smassive",
+              "tag": "FINAL-FR"}}
+# tedx natural ending. fr: French typography puts a (no-break) space before the closing guillemet ("merci. »")
+ENDING = {"it": r"([.?!]|\.\.\.|…)[\"'»”]?$", "fr": r"([.?!]|\.\.\.|…)(\s*[\"'»”])?$"}
 
 
 def norm(t):   # = two_stage.norm (the scorer)
@@ -58,6 +82,15 @@ def norm(t):   # = two_stage.norm (the scorer)
     t = "".join(c for c in t if not unicodedata.combining(c))
     t = re.sub(r"[^a-z' ]", " ", t)
     return " ".join(t.split())
+
+
+def normf(lang):
+    """the text norm of a language: "it" = norm() above (== textnorm.norm(t, "it"), frozen), else common/textnorm."""
+    if lang == "it":
+        return norm
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+    import textnorm
+    return lambda t: textnorm.norm(t, lang)
 
 
 def sha1(x):
@@ -79,20 +112,32 @@ def fetch(url, dst, tries=20):
 class Hub:
     def __init__(self):
         from huggingface_hub import HfFileSystem
-        self.tok = open("/root/.hf_token").read().strip()
+        tf = "/root/.hf_token"   # optional: anonymous reads when absent
+        self.tok = open(tf).read().strip() if os.path.exists(tf) else None
         self.fs = HfFileSystem(token=self.tok)
+        self.cap = 0   # --hub-workers: cap on parallel column reads (0 = the frozen defaults 16 / 24)
+        self.block = 0   # --hub-block-kb: read-ahead per range request (0 = the library default, several MB)
 
     def tree(self, repo, p):
         req = urllib.request.Request(f"https://huggingface.co/api/datasets/{repo}/tree/main/{p}",
-                                     headers={"Authorization": f"Bearer {self.tok}"})
+                                     headers={"Authorization": f"Bearer {self.tok}"} if self.tok else {})
         return json.load(urllib.request.urlopen(req, timeout=120))
 
     def column(self, repo, path, cols):   # column projection: only these column chunks are read
         import pyarrow.parquet as pq
-        with self.fs.open(f"datasets/{repo}/{path}") as f:
-            return pq.ParquetFile(f).read(columns=cols).to_pylist()
+        for k in range(6):   # HTTP 429 (rate limit): back off and retry; any other error is raised
+            try:
+                kw = {"block_size": self.block} if self.block else {}   # I/O only: same rows either way
+                with self.fs.open(f"datasets/{repo}/{path}", **kw) as f:
+                    return pq.ParquetFile(f).read(columns=cols).to_pylist()
+            except Exception as e:  # noqa: BLE001
+                if "429" not in str(e) or k == 5:
+                    raise
+                print(f"== HTTP 429 on {repo}/{path}: retry in {30 * 2 ** k} s", flush=True)
+                time.sleep(30 * 2 ** k)
 
     def columns(self, repo, paths, cols, workers=16):
+        workers = min(workers, self.cap) if self.cap else workers
         with ThreadPoolExecutor(workers) as ex:
             return [r for rs in ex.map(lambda p: self.column(repo, p, cols), paths) for r in rs]
 
@@ -126,11 +171,13 @@ class Bank:
     """collect candidates, then select round-robin over groups in sha1 order; audio is decoded only when kept."""
     def __init__(self, name, a, seen_texts):
         self.name, self.a, self.seen, self.cand, self.drop = name, a, seen_texts, [], collections.Counter()
+        self.norm, self.plan, self.unchecked = normf(a.lang), getattr(a, "plan_only", False), 0
 
     def offer(self, uid, group, text, dur, load, min_words=2, ending=None):
+        """dur None = unknown (--plan-only on a source without a duration column): the duration rule is skipped."""
         text = text.replace("’", "'").strip()
-        nt = norm(text)
-        if not (1.0 <= dur <= 20.0):
+        nt = self.norm(text)
+        if dur is not None and not (1.0 <= dur <= 20.0):
             self.drop["duration"] += 1
         elif BAD.search(text):
             self.drop["digit/markup"] += 1
@@ -141,6 +188,7 @@ class Bank:
         elif nt in self.seen["exclude"]:
             self.drop["text in train/dev"] += 1
         else:
+            self.unchecked += dur is None
             self.cand.append((sha1(f"{self.name}:{uid}"), uid, str(group), text, nt, load))
 
     def select(self, n, per_group=10 ** 9):
@@ -155,6 +203,10 @@ class Bank:
                     if nt in self.seen["final"] or used[grp] >= per_group:
                         self.drop["dup text in FINAL" if nt in self.seen["final"] else "group cap"] += 1
                         continue
+                    if self.plan:   # metadata only: nothing is downloaded, decoded or written
+                        self.seen["final"].add(nt); used[grp] += 1
+                        rows.append({"utt_id": uid, "group": grp, "text": text, "bank": self.name})
+                        break
                     x = load()
                     if x is None or not (1.0 <= len(x) / 16000 <= 20.0):
                         self.drop["audio"] += 1
@@ -162,8 +214,9 @@ class Bank:
                     self.seen["final"].add(nt); used[grp] += 1
                     rows.append(self.write(uid, grp, text, x))
                     break
-        print(f"== {self.name}: {len(rows)} clips from {len(self.cand)} candidates, {len(used)} groups; dropped "
-              f"{dict(self.drop)}", flush=True)
+        print(f"== {self.name}{' (plan)' if self.plan else ''}: {len(rows)} clips from {len(self.cand)} candidates, "
+              f"{len(used)} groups; dropped {dict(self.drop)}"
+              + (f"; duration unchecked on {self.unchecked} candidates" if self.unchecked else ""), flush=True)
         return rows
 
     def write(self, uid, grp, text, x):
@@ -192,10 +245,12 @@ def decode(b):
 
 
 def mls(a, hub, seen):
-    R = "facebook/multilingual_librispeech"
-    spk = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, "italian", "train") + hub.files(R, "italian", "test"),
+    R, L = "facebook/multilingual_librispeech", SRC[a.lang]["mls"]
+    spk = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, L, "train") + hub.files(R, L, "test"),
                                                      ["speaker_id"])}
-    rows = parquet_audio(fetch(f"{HF}/{R}/resolve/main/italian/dev-00000-of-00001.parquet", f"{a.tmp}/mls_dev.parquet"))
+    dev = f"{L}/dev-00000-of-00001.parquet"
+    rows = (hub.column(R, dev, ["id", "speaker_id", "transcript", "audio_duration"]) if a.plan_only else
+            parquet_audio(fetch(f"{HF}/{R}/resolve/main/{dev}", f"{a.tmp}/mls_dev.parquet")))
     leak = {str(r["speaker_id"]) for r in rows} & spk
     assert not leak, f"MLS dev speakers in train/test: {leak}"
     b = Bank("mls", a, seen)
@@ -206,41 +261,44 @@ def mls(a, hub, seen):
 
 
 def cv(a, hub, seen):
-    R = "fixie-ai/common_voice_17_0"
-    ex = {r["client_id"] for r in hub.columns(R, hub.files(R, "it", "train") + hub.files(R, "it", "test"), ["client_id"])}
+    R, L = "fixie-ai/common_voice_17_0", SRC[a.lang]["hf"]
+    ex = {r["client_id"] for r in hub.columns(R, hub.files(R, L, "train") + hub.files(R, L, "test"), ["client_id"])}
     b = Bank("cv", a, seen)
-    for i, p in enumerate(hub.files(R, "it", "validation")):
-        for r in parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/cv_val_{i}.parquet")):
+    for i, p in enumerate(hub.files(R, L, "validation")):
+        for r in (hub.column(R, p, ["client_id", "path", "sentence"]) if a.plan_only else
+                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/cv_val_{i}.parquet"))):
             if r["client_id"] in ex:
                 b.drop["speaker in train/test"] += 1
                 continue
-            ab = r["audio"]["bytes"]   # no duration column: read from the container header, decoded only when kept
-            b.offer(Path(r["path"]).stem, r["client_id"], r["sentence"], sf.info(io.BytesIO(ab)).duration,
-                    lambda ab=ab: decode(ab))
+            ab = None if a.plan_only else r["audio"]["bytes"]   # no duration column: read from the container header
+            b.offer(Path(r["path"]).stem, r["client_id"], r["sentence"],         # (decoded only when kept)
+                    None if ab is None else sf.info(io.BytesIO(ab)).duration, lambda ab=ab: decode(ab))
     return b.select(a.n)
 
 
 def vp(a, hub, seen):
-    R = "facebook/voxpopuli"
+    R, L = "facebook/voxpopuli", SRC[a.lang]["hf"]
     if a.vp_exclude:   # amendment 2026-10-18: speakers of OUR VP pools / bank (VP splits are not speaker-disjoint)
         ex = {r["speaker"].split(":", 1)[-1] for p in a.vp_exclude.split(",") for r in map(json.loads, open(p)) if r.get("speaker")}
         print(f"== vp: {len(ex)} excluded speakers from our VP manifests", flush=True)
     else:
-        ex = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, "it", "train") + hub.files(R, "it", "test"), ["speaker_id"])}
-    rows = parquet_audio(fetch(f"{HF}/{R}/resolve/main/it/validation-00000-of-00001.parquet", f"{a.tmp}/vp_val.parquet"))
+        ex = {str(r["speaker_id"]) for r in hub.columns(R, hub.files(R, L, "train") + hub.files(R, L, "test"), ["speaker_id"])}
+    val = f"{L}/validation-00000-of-00001.parquet"
+    rows = (hub.column(R, val, ["audio_id", "speaker_id", "normalized_text"]) if a.plan_only else
+            parquet_audio(fetch(f"{HF}/{R}/resolve/main/{val}", f"{a.tmp}/vp_val.parquet")))
     b = Bank("vp", a, seen)
     for r in rows:
         if str(r["speaker_id"]) in ex:
             b.drop["speaker in train/test"] += 1
             continue
-        ab = r["audio"]["bytes"]
-        b.offer(str(r["audio_id"]), r["speaker_id"], r["normalized_text"], sf.info(io.BytesIO(ab)).duration,
-                lambda ab=ab: decode(ab))
+        ab = None if a.plan_only else r["audio"]["bytes"]
+        b.offer(str(r["audio_id"]), r["speaker_id"], r["normalized_text"],
+                None if ab is None else sf.info(io.BytesIO(ab)).duration, lambda ab=ab: decode(ab))
     return b.select(a.n)
 
 
 def fleurs(a, hub, seen):
-    base = f"{HF}/google/fleurs/resolve/main/data/it_it"
+    base = f"{HF}/google/fleurs/resolve/main/data/{SRC[a.lang]['fleurs']}"
 
     def tsv(split):
         p = fetch(f"{base}/{split}.tsv", f"{a.tmp}/fleurs_{split}.tsv")
@@ -250,20 +308,27 @@ def fleurs(a, hub, seen):
     leak = {int(r[0]) for r in dev} & other
     assert not leak, f"FLEURS dev sentence ids in train/test: {sorted(leak)[:5]}"
     audio = {}
-    with urllib.request.urlopen(f"{base}/audio/dev.tar.gz", timeout=300) as resp, tarfile.open(fileobj=resp, mode="r|gz") as t:
-        for m in t:
-            if m.isfile():
-                audio[m.name.rsplit("/", 1)[-1]] = t.extractfile(m).read()
+    if not a.plan_only:   # plan: the audio tarball is not fetched (every dev row counted as present)
+        with urllib.request.urlopen(f"{base}/audio/dev.tar.gz", timeout=300) as resp, tarfile.open(fileobj=resp, mode="r|gz") as t:
+            for m in t:
+                if m.isfile():
+                    audio[m.name.rsplit("/", 1)[-1]] = t.extractfile(m).read()
     b = Bank("fleurs", a, seen)
     for r in dev:
-        if r[1] in audio:
+        if a.plan_only or r[1] in audio:
             b.offer(r[1].rsplit(".", 1)[0], r[0], r[2], int(r[5]) / 16000, lambda f=r[1]: decode(audio[f]))
     return b.select(a.n, per_group=1)
 
 
-def granary_ids(hub):
+def granary_ids(hub, lang="it", cache=None):
+    """every Granary-<lang> original_audio_id (+ its 11-char YouTube-like tokens); cached as JSON when `cache` is set
+    (the listing reads one column of every shard: ~2.4k shards for it, ~4.4k for fr)."""
+    if cache and os.path.exists(cache):
+        out = set(json.load(open(cache)))
+        print(f"== granary-{lang}: {len(out)} ids from {cache}", flush=True)
+        return out
     R = "espnet/yodas-granary"
-    dirs = [d["path"] for d in hub.tree(R, "data") if d["type"] == "directory" and re.match(r"data/it\d", d["path"])]
+    dirs = [d["path"] for d in hub.tree(R, "data") if d["type"] == "directory" and re.match(rf"data/{lang}\d", d["path"])]
     paths = []
     for d in dirs:
         for kind in ("asr_only", "ast"):
@@ -273,32 +338,47 @@ def granary_ids(hub):
                 pass
     ids = {str(r["original_audio_id"]) for r in hub.columns(R, paths, ["original_audio_id"], workers=24)}
     toks = {t for i in ids for t in re.findall(r"[A-Za-z0-9_-]{11}", i)}
-    print(f"== granary-it: {len(dirs)} dirs, {len(paths)} shards, {len(ids)} videos", flush=True)
+    print(f"== granary-{lang}: {len(dirs)} dirs, {len(paths)} shards, {len(ids)} videos", flush=True)
+    if cache:
+        with open(cache, "w") as f:
+            json.dump(sorted(ids | toks), f)
     return ids | toks
 
 
+def tedx_shards(a, hub, R):
+    """mTEDx TRAIN shards 0-1: it = the frozen 2026-10-18 paths (30 shards); other languages are listed (fr: 41)."""
+    if a.lang == "it":
+        return [f"it/train-{i:05d}-of-00030.parquet" for i in (0, 1)]
+    tr = hub.files(R, SRC[a.lang]["hf"], "train")
+    assert len(tr) >= 2 and "/train-00000-of-" in tr[0] and "/train-00001-of-" in tr[1], tr[:3]
+    return tr[:2]
+
+
 def tedx(a, hub, seen):
-    R = "deepdml/mtedx"
-    dev_talks = {r["talk_id"] for p in ("it/test-00000-of-00001.parquet", "it/valid-00000-of-00001.parquet")
+    R, L = "deepdml/mtedx", SRC[a.lang]["hf"]
+    dev_talks = {r["talk_id"] for p in (f"{L}/test-00000-of-00001.parquet", f"{L}/valid-00000-of-00001.parquet")
                  for r in hub.column(R, p, ["talk_id"])}
-    gran = granary_ids(hub)
-    b = Bank("tedx", a, seen)
-    for i in (0, 1):
-        p = f"it/train-{i:05d}-of-00030.parquet"
-        for r in parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/mtedx_train_{i}.parquet")):
+    gran = granary_ids(hub, a.lang, f"{a.tmp}/granary_{a.lang}_ids.json")
+    b, end = Bank("tedx", a, seen), ENDING[a.lang]
+    for i, p in enumerate(tedx_shards(a, hub, R)):
+        for r in (hub.column(R, p, ["id", "talk_id", "transcript", "duration"]) if a.plan_only else
+                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/mtedx_train_{i}.parquet"))):
             if r["talk_id"] in dev_talks:
                 b.drop["dev talk"] += 1
                 continue
             if r["talk_id"] in gran:
-                b.drop["talk in Granary-it"] += 1
+                b.drop[f"talk in Granary-{a.lang}"] += 1
                 continue
             b.offer(r["id"], r["talk_id"], r["transcript"], float(r["duration"]),
                     lambda r=r: decode(r["audio"]["bytes"]), min_words=3,
-                    ending=lambda t: bool(re.search(r"([.?!]|\.\.\.|…)[\"'»”]?$", t)))
+                    ending=lambda t: bool(re.search(end, t)))
     return b.select(a.n, per_group=a.tedx_per_talk)
 
 
 def italic(a, hub, seen):
+    if a.plan_only:
+        print("== italic (plan): skipped (needs the full Zenodo zip)", flush=True)
+        return []
     z = zipfile.ZipFile(fetch("https://zenodo.org/records/8040649/files/italic.zip", f"{a.tmp}/italic.zip"))
     js = lambda n: [json.loads(l) for l in z.read(f"zenodo_dataset/{n}").decode().splitlines() if l.strip()]  # noqa: E731
     names = [n.split("/")[-1] for n in z.namelist()]
@@ -313,22 +393,77 @@ def italic(a, hub, seen):
     return b.select(a.n)
 
 
+def smassive(a, hub, seen):
+    """Speech-MASSIVE fr-FR VALIDATION (FBK-MT/Speech-MASSIVE, CC BY-NC-SA 4.0: private evaluation only, never
+    redistribute); group = speaker_id; speakers of train / train_115 (+ the gated test repo when readable) dropped."""
+    R, L = "FBK-MT/Speech-MASSIVE", SRC[a.lang]["smassive"]
+    tr = hub.files(R, L, "train")   # train-* and train_115-*
+    assert any("/train-" in p for p in tr) and any("/train_115-" in p for p in tr), tr
+    ex = {str(r["speaker_id"]) for r in hub.columns(R, tr, ["speaker_id"])}
+    T = "FBK-MT/Speech-MASSIVE-test"
+    try:
+        te = {str(r["speaker_id"]) for r in hub.columns(T, hub.files(T, L, "test"), ["speaker_id"])}
+        print(f"== smassive: {len(ex)} train + {len(te)} test speakers excluded", flush=True)
+        ex |= te
+    except Exception as e:  # noqa: BLE001  (gated: needs an accepted licence on the token's account)
+        print(f"== smassive: {len(ex)} train speakers excluded; {T} not readable ({type(e).__name__}): test speakers "
+              f"NOT excluded", flush=True)
+    b = Bank("smassive", a, seen)
+    for i, p in enumerate(hub.files(R, L, "validation")):
+        for r in (hub.column(R, p, ["path", "speaker_id", "utt", "is_validated"]) if a.plan_only else
+                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/smassive_val_{i}.parquet"))):
+            if str(r["speaker_id"]) in ex:
+                b.drop["speaker in train/test"] += 1
+                continue
+            if not r["is_validated"]:
+                b.drop["not validated"] += 1
+                continue
+            ab = None if a.plan_only else r["audio"]["bytes"]
+            b.offer(Path(r["path"]).stem, r["speaker_id"], r["utt"],
+                    None if ab is None else sf.info(io.BytesIO(ab)).duration, lambda ab=ab: decode(ab))
+    return b.select(a.n)
+
+
+BANKS = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic, "smassive": smassive}
+ONLY = {"italic": "it", "smassive": "fr"}   # language-specific banks
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--lang", default="it", choices=sorted(SRC), help="it = the frozen FINAL-IT build")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--audio", required=True)
-    ap.add_argument("--tmp", default="/root/final-it-dl")
+    ap.add_argument("--audio", help="wav root (required unless --plan-only)")
+    ap.add_argument("--tmp", default=None, help="download dir (default /root/final-<lang>-dl)")
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--tedx-per-talk", type=int, default=25)
     ap.add_argument("--exclude-texts", required=True, help="comma-separated globs of training / dev manifests")
-    ap.add_argument("--banks", default="mls,cv,vp,fleurs,tedx,italic")
+    ap.add_argument("--banks", default=None, help="default per language: " +
+                    "; ".join(f"{k}: {v['banks']}" for k, v in SRC.items()))
     ap.add_argument("--vp-exclude", default="", help="VP: exclude the speakers of these manifests (ours) instead of every "
                     "VP train / test speaker (amendment 2026-10-18: the latter left 3 speakers)")
     ap.add_argument("--seed-final", default="", help="comma-separated globs of ALREADY-BUILT FINAL banks (final_<bank>.json): "
                     "their texts seed the cross-bank dedup, as if built in the same run (completing a bank later)")
+    ap.add_argument("--plan-only", action="store_true", help="metadata only: candidate counts, drops and the selection "
+                    "order -> $OUT/plan_<bank>.json; no audio download / decode, no final_* / SHA256SUMS written")
+    ap.add_argument("--hub-workers", type=int, default=0, help="cap on parallel Hub column reads (rate-limited IPs); "
+                    "0 = the frozen defaults")
+    ap.add_argument("--hub-block-kb", type=int, default=0, help="read-ahead (KiB) of Hub column reads: small = only the "
+                    "projected column chunks cross the network (audio parquets have MB-sized row groups); 0 = default")
     a = ap.parse_args()
-    for d in (a.out, a.audio, a.tmp):
+    a.tmp = a.tmp or f"/root/final-{a.lang}-dl"
+    a.banks = a.banks or SRC[a.lang]["banks"]
+    bad = [b for b in a.banks.split(",") if b not in BANKS or ONLY.get(b, a.lang) != a.lang]
+    if bad:
+        ap.error(f"banks {bad} not available for --lang {a.lang}")
+    if a.plan_only:
+        if os.path.exists(f"{a.out}/SHA256SUMS"):
+            ap.error(f"--plan-only refuses a sealed --out ({a.out}/SHA256SUMS exists)")
+        os.makedirs(a.out, exist_ok=True)
+    elif not a.audio:
+        ap.error("--audio is required unless --plan-only")
+    for d in ((a.out, a.audio, a.tmp) if not a.plan_only else (a.tmp,)):   # plan: tmp holds the small FLEURS TSVs
         os.makedirs(d, exist_ok=True)
+    nf = normf(a.lang)
     ex, nman, nskip = set(), 0, 0
     for g in a.exclude_texts.split(","):
         for p in sorted(glob.glob(g)):
@@ -339,22 +474,30 @@ def main():
                 nskip += 1
                 continue
             nman += 1
-            ex.update(norm(t) for t in txt)
+            ex.update(nf(t) for t in txt)
     print(f"== exclusion texts: {len(ex)} from {nman} manifests ({nskip} non-manifest files skipped)", flush=True)
     seen, hub, allr = {"exclude": ex, "final": set()}, Hub(), []
+    hub.cap, hub.block = a.hub_workers, a.hub_block_kb * 1024
     for g in filter(None, a.seed_final.split(",")):
         for p in sorted(glob.glob(g)):
-            seen["final"].update(norm(json.loads(l)["text"]) for l in open(p) if l.strip())
+            seen["final"].update(nf(json.loads(l)["text"]) for l in open(p) if l.strip())
     if a.seed_final:
         print(f"== seeded FINAL dedup with {len(seen['final'])} texts of already-built banks", flush=True)
-    fns = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic}
     for name in a.banks.split(","):
-        rows = fns[name](a, hub, seen)
+        rows = BANKS[name](a, hub, seen)
         allr += rows
+        if a.plan_only:
+            with open(f"{a.out}/plan_{name}.json", "w") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            continue
         for tag, key, dk in (("final", "audio_filepath", "duration"), ("final_trim", "trim_filepath", "trim_duration")):
             with open(f"{a.out}/{tag}_{name}.json", "w") as f:
                 for r in rows:
                     f.write(json.dumps({**r, "audio_filepath": r[key], "duration": r[dk]}, ensure_ascii=False) + "\n")
+    if a.plan_only:
+        print(f"== PLAN-ONLY {SRC[a.lang]['tag']}: {len(allr)} clips would be selected; nothing downloaded / sealed")
+        return
     # final_all / stats / SHA256SUMS always cover EVERY bank in --out (a bank completed later included)
     built = sorted(p for p in glob.glob(f"{a.out}/final_*.json") if not re.search(r"/final_(trim_|all)", p))
     allr = [json.loads(l) for p in built for l in open(p) if l.strip()]
@@ -369,7 +512,7 @@ def main():
             if not rs:
                 continue
             d, t = np.array([r["duration"] for r in rs]), np.array([r["trail_s"] for r in rs])
-            w = np.median([len(norm(r["text"]).split()) for r in rs])
+            w = np.median([len(nf(r["text"]).split()) for r in rs])
             f.write(f"| {name} | {len(rs)} | {d.sum() / 3600:.2f} | {len({r['group'] for r in rs})} | "
                     f"{'/'.join(f'{v:.1f}' for v in np.percentile(d, [10, 50, 90]))} | "
                     f"{'/'.join(f'{v:.2f}' for v in np.percentile(t, [10, 50, 90]))} | {(t < 0.2).mean() * 100:.0f} % | {w:.0f} |\n")
@@ -378,7 +521,7 @@ def main():
     with open(f"{a.out}/SHA256SUMS", "w") as f:
         for p in sorted(glob.glob(f"{a.out}/final*.json")) + wavs:
             f.write(f"{hashlib.sha256(open(p, 'rb').read()).hexdigest()}  {p}\n")
-    print(f"== FINAL-IT-DONE {len(allr)} clips, {len(wavs)} wavs hashed")
+    print(f"== {SRC[a.lang]['tag']}-DONE {len(allr)} clips, {len(wavs)} wavs hashed")
 
 
 if __name__ == "__main__":
