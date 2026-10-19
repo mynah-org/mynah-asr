@@ -571,3 +571,30 @@ FR-P1 is FINAL with A1; no further change.
   - FR ending rule also accepts a spaced closing guillemet (`. »`).
   - Granary-fr ids (5 dirs, 4,432 shards) were listed from the dev machine because the box IP was rate-limited.
     Same logic as `granary_ids`; the cache is copied to `/root/final-fr-dl/granary_fr_ids.json`.
+
+### FINAL-FR -- SEALED (2026-10-19 14:21 UTC, builder 847af09; BEFORE any FR model / teacher / baseline score)
+
+- SHA256SUMS sha256 **8b0ebba088b5e6de1aa31a70341ed4b20c4058a4dd2fb190eff76a08766fd41c**;
+  2,113 clips, 4,226 wavs (natural + trim).
+- Granary-fr id cache sha256 ae4dea92 (86,238 videos).
+- Archived: Hub `data/final-fr/` (bundle, SHA256SUMS, stats, SEAL, ids, logs) + `data/a2-fr/` (manifests), 19 files
+  size-verified.
+- Never decoded.
+
+| bank | source | clips | h | groups | disjointness / exclusions |
+|---|---|---|---|---|---|
+| mls | MLS-fr dev | 400 | 1.68 | 18 speakers | dev speakers asserted absent from train + test; 2 texts in train / dev dropped |
+| cv | CV17-fr validation | 400 | 0.65 | 400 speakers | client_ids of train / test dropped (none occurred); 18 texts in train / dev dropped |
+| vp | VoxPopuli-fr validation | 400 | 1.06 | 17 speakers | 290 speakers of our VP-fr pool excluded (pre-registered rule) |
+| fleurs | FLEURS fr_fr dev | 113 | 0.31 | 113 sentences | sentence ids asserted absent from train / test; 131 dup texts inside FINAL |
+| tedx | mTEDx-fr TRAIN shards 0-1 (of 41) | 400 | 0.56 | 44 talks | talks of fr test / valid and all 86,238 Granary-fr videos dropped; <= 25 / talk |
+| smassive | Speech-MASSIVE fr-FR validation | 400 | 0.43 | 55 speakers | 103 train / train_115 speakers excluded; **test-split speakers NOT excluded (gated, 403): speaker-disjointness from the test split is NOT shown**; 2 not validated dropped |
+
+Text exclusions: 58,240 texts from 11 FR train / dev manifests.
+
+**Granary-fr id source.** The espnet/yodas-granary column scan was too slow from the box (~1 s per shard: range reads on
+600 MB parquets). The ids come from the original_source_id of nvidia/Granary fr/yodas/{fr_asr, fr_ast-en}.jsonl:
+558,848 + 4,766,239 rows, 86,238 videos. Equivalence check: 150 random espnet shards (of 4,432) -> 4,752 videos, all
+present in the NVIDIA manifests (0 missing). The cache is the union.
+
+Licences: mTEDx CC BY-NC-ND, Speech-MASSIVE CC BY-NC-SA -> private evaluation only.
