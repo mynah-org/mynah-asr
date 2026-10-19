@@ -370,3 +370,43 @@ large enough for that fires at internal pauses in 15 % of clips (2.5 x v3, 1.8 x
 on v5-B the <EOU>-vs-blank score does not separate true ends from pauses at fast operating points; it is dominated
 by v4 and v3 there. Reset-WER is preserved only because the reset makes split segments transcribe correctly; for
 turn-taking the splits are the failure. Per the pre-registration: **IT EOU research STOPS** (no sweep, no second b).
+
+## H. RC-IT freeze (2026-10-19 ~10:30 UTC, BEFORE any FINAL-IT decode)
+
+**Choice (DEV + product criteria only, made before FINAL-IT is opened): RC-IT = Stage2-v4 on C250-36k.**
+- Hub `runs/sg-it-s2v4-c250-36k/final.nemo`, sha256
+  0a4d1b103297e169af74b6673ff97864747bb2c54b70a7ec91253d9583c003ff.
+- Why, on DEV730 with the reset protocol:
+  - v4 vs v3: -13.5 reset-WER (22.54 vs 36.07) for +0.08 s p50 (0.72 vs 0.64) and +2.47 pt FE (8.36 vs 5.89);
+  - v4 vs v5-B: v5-B is only 0.46 WER better but +1.12 s p50, which is unacceptable for a realtime EOU model.
+- Known limitations, to be declared: FE 8.36 % on DEV, FLEURS 17 %; false endpoints are mostly at internal pauses
+  (ambiguous positive labels, b202980 / fbcdfbb).
+- v5-B (ab84cd3b) = documented precision-first research checkpoint; NOT decoded on FINAL-IT, NOT a selection
+  alternative after FINAL. v5-CAL and the bias arm are closed results.
+
+**Frozen runtime / protocol (= the DEV protocol on which v4 was chosen):**
+- Decode: frame-synchronous greedy RNNT, max 10 symbols per frame, no beam, no LM.
+- Mynah reset after <EOU>: decoder state zero and last token SOS; encoder untouched; the transcript is the
+  concatenation of segments.
+- EOF / finalisation: 2.0 s of -75 dB quiet appended (`--post-pad-s 2.0`; it includes the DEV-chosen >= 0.5 s
+  trailing flush). No debounce, threshold or bias.
+- Implementation: `finetune/eou/diag/s2_reset.py` at the commit recorded in the launch line, `--models s2_reset`.
+  The parent is loaded but not reported.
+- Normalisation: s2_reset.norm (NFKD, lowercase, [^a-z' ] -> space).
+- Endpoint: energy (80 ms frames, last within 35 dB of the peak) of the ORIGINAL clip.
+- Not covered here: Mynah streaming (cache-aware chunked); that is the separate parity step after FINAL, on the DEV
+  bank. This offline protocol is the frozen characterisation.
+
+**FINAL-IT:**
+- Seal SHA256SUMS sha256 8d02373775b548ec32bc1d8632665e0835b01adc87ecf0a0ecfe7a53f4ce42f2, re-verified file by file
+  (`sha256sum -c`) right before the decode; 6 banks, 1,826 clips, all clips (--per-set 100000).
+
+**Reported (and only this):**
+- Natural clips, primary: macro over the 6 banks of greedy reset-WER, CER, empty, FE, FE_any, R, L p50 / p90;
+  per bank the same.
+- Trim variant (`final_trim_*`, cut at the energy endpoint + 50 ms), secondary: the same table.
+- Bands from the 2026-10-18 pre-registration: < 20 macro greedy = success; 15-18 strong.
+- Caveat: Nemotron labels / training data overlap MLS / CV / VP / FLEURS train, not these splits.
+
+One run. No change to checkpoint, runtime, normalisation or reporting in response to FINAL-IT. FINAL-IT is
+characterisation, not selection; after this decode it is spent for IT development.
