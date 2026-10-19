@@ -1091,3 +1091,44 @@ Sanity: old p40 MLS 50.97 raw = its 2026-10-09 number 50.99.
 
 Per the decision rule: LEVER does NOT authorise stage 2. Next = ONE pre-registered decision on how to scale plain FR
 (Granary-fr pools, MLS-fr hours, schedule). Stopped here.
+
+### Result: FR-G1 (stock -> A2-fr + Granary-fr agree <= 20, W4 8k) -- pre-registered class HARM (OBSERVED, one seed)
+
+- final.nemo sha256 de457d0b; Hub `runs/jp-fr-g1-w4-8k` + `results/jp-2026-10-19/fr-g1` (7 files OK).
+- Peak GPU memory 39.5 GB (30 s Granary clips).
+
+| harness-fr macro, 0.5 s flush | greedy | beam-8 | oracle-8 | CER |
+|---|---|---|---|---|
+| FR-P1 (A2-fr) | 27.66 | 25.91 | 21.76 | 11.34 |
+| **FR-G1 (A2-fr + Granary 89 h)** | **29.41** | **26.54** | **22.74** | **12.22** |
+| delta | **+1.75** | +0.63 | +0.98 | +0.88 |
+
+Per source, greedy / beam-8 / oracle-8, FR-G1 vs FR-P1:
+
+| source | FR-G1 | FR-P1 |
+|---|---|---|
+| MLS | 27.41 / 24.82 / 22.38 | 25.13 / 23.49 / 21.20 |
+| FLEURS | 33.73 / 31.16 / 28.14 | 33.51 / 31.08 / 27.84 |
+| CV | 32.97 / 28.64 / 22.22 | 29.53 / 27.65 / 20.50 |
+| VP | 23.54 / 21.55 / 18.23 | 22.46 / 21.41 / 17.50 |
+
+- Raw EOF: 29.51 / 26.67 / 22.86.
+- Empties: in-run final eval 4 / 730 (FR-P1 3).
+
+**Class:** +1.75 > +0.5, so **HARM**. Per the pre-registration: stop; no G2 (16k), no larger pool, no compensation.
+
+**Diagnosis (HYPOTHESES, from the observed numbers only):**
+1. Exposure was reallocated, not added. At fixed 8k steps the A2 draws fall 33 % (MLS 4.7 -> 3.1 passes, CV
+   1.4 -> 0.9) and the total processed audio falls 8 % (335 vs 364 h). The harness is the four A2 domains; the
+   largest losses are CV (+3.4) and MLS (+2.3), the domains whose exposure fell most. FLEURS (+0.2) and VP (+1.1)
+   move least.
+2. Label quality: agree <= 20 admits clips whose teacher text disagrees with the Granary reference on up to 1 in
+   5 words (pool median 18.2). Greedy -> beam widens from 1.75 to 2.87, which reads as less confident or
+   less calibrated 1-best decisions, consistent with noisier targets.
+3. Domain: Granary is YouTube speech; no harness source is.
+   (1) and (2) are not separable with this run. The IT analogue (W4-C250-8k) also traded A2 draws for external
+   audio, but its external pool was cleaner (median agree 8.7) and twice as large.
+
+Not run (would need their own pre-registration): an exposure-preserving additive design (A2 held at FR-P1 draws,
+Granary on top, i.e. longer steps), a stricter label threshold with a larger pool, or a clean-fr / out-of-domain
+bank where Granary diversity could show (harness-fr is in-domain for A2).
