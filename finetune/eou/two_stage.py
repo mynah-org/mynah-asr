@@ -91,6 +91,9 @@ ap.add_argument("--pad-prob", type=float, default=0.0, help="stage 2: prob of tr
 ap.add_argument("--eou-min-tail", type=float, default=0.0, help="stage 2 v5-B: an UNPADDED sample gets <EOU> only if its "
                 "manifest trail_s (natural trailing non-speech, diag/annotate_tail.py) is >= S s, otherwise text only; "
                 "padded samples keep <EOU> (0 = every target ends in <EOU>, v4)")
+ap.add_argument("--eou-amb-keep", type=float, default=0.0, help="stage 2 v5-CAL: with --eou-min-tail, an ambiguous "
+                "unpadded end KEEPS its <EOU> with this probability per draw (0 = v5-B, 1 = v4); drawn from its own RNG, "
+                "so the audio batches stay those of v4 / v5-B")
 ap.add_argument("--pre-pad-prob", type=float, default=0.0, help="stage 2: prob of LEADING quiet U(0, --pre-pad-max) s "
                 "(NVIDIA's EOU dataset pads before the speech too; VP clips start at frame 0)")
 ap.add_argument("--pre-pad-max", type=float, default=4.0)
@@ -121,6 +124,7 @@ ap.add_argument("--accented", type=int, default=-1, help="accented targets (defa
 a = ap.parse_args()
 a.accented = bool(a.tokenizer) if a.accented < 0 else bool(a.accented)
 random.seed(a.seed); torch.manual_seed(a.seed)
+CAL_RNG = random.Random(a.seed + 7919)   # v5-CAL label draws only: never touches the global stream of the batches
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
 dev = "cuda"
 
@@ -399,6 +403,8 @@ def batch(rs, train=False):
     if train and a.eou_append and a.eou_min_tail > 0:   # v5-B: no <EOU> on an acoustically ambiguous (unpadded) end
         for i, r in enumerate(rs):
             if not padded[i] and r["trail_s"] < a.eou_min_tail and ids[i] and ids[i][-1] == EOU_ID:
+                if a.eou_amb_keep > 0 and CAL_RNG.random() < a.eou_amb_keep:   # v5-CAL: keep a fraction q
+                    continue
                 ids[i] = ids[i][:-1]
     if train and (a.aug_speed or a.aug_noise or a.aug_gain):
         xs = [augment(x) for x in xs]

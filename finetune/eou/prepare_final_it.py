@@ -324,6 +324,8 @@ def main():
     ap.add_argument("--banks", default="mls,cv,vp,fleurs,tedx,italic")
     ap.add_argument("--vp-exclude", default="", help="VP: exclude the speakers of these manifests (ours) instead of every "
                     "VP train / test speaker (amendment 2026-10-18: the latter left 3 speakers)")
+    ap.add_argument("--seed-final", default="", help="comma-separated globs of ALREADY-BUILT FINAL banks (final_<bank>.json): "
+                    "their texts seed the cross-bank dedup, as if built in the same run (completing a bank later)")
     a = ap.parse_args()
     for d in (a.out, a.audio, a.tmp):
         os.makedirs(d, exist_ok=True)
@@ -340,6 +342,11 @@ def main():
             ex.update(norm(t) for t in txt)
     print(f"== exclusion texts: {len(ex)} from {nman} manifests ({nskip} non-manifest files skipped)", flush=True)
     seen, hub, allr = {"exclude": ex, "final": set()}, Hub(), []
+    for g in filter(None, a.seed_final.split(",")):
+        for p in sorted(glob.glob(g)):
+            seen["final"].update(norm(json.loads(l)["text"]) for l in open(p) if l.strip())
+    if a.seed_final:
+        print(f"== seeded FINAL dedup with {len(seen['final'])} texts of already-built banks", flush=True)
     fns = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic}
     for name in a.banks.split(","):
         rows = fns[name](a, hub, seen)
@@ -348,12 +355,16 @@ def main():
             with open(f"{a.out}/{tag}_{name}.json", "w") as f:
                 for r in rows:
                     f.write(json.dumps({**r, "audio_filepath": r[key], "duration": r[dk]}, ensure_ascii=False) + "\n")
+    # final_all / stats / SHA256SUMS always cover EVERY bank in --out (a bank completed later included)
+    built = sorted(p for p in glob.glob(f"{a.out}/final_*.json") if not re.search(r"/final_(trim_|all)", p))
+    allr = [json.loads(l) for p in built for l in open(p) if l.strip()]
+    banks = [re.search(r"final_(.+)\.json$", p).group(1) for p in built]
     with open(f"{a.out}/final_all.json", "w") as f:
         for r in allr:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     with open(f"{a.out}/stats.md", "w") as f:
         f.write("| bank | clips | h | groups | dur p10/p50/p90 s | trail_s p10/p50/p90 | trail < 0.2 s | words p50 |\n|---|---|---|---|---|---|---|---|\n")
-        for name in a.banks.split(","):
+        for name in banks:
             rs = [r for r in allr if r["bank"] == name]
             if not rs:
                 continue
