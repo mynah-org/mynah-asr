@@ -258,3 +258,11 @@ week with one run: how much of the old FR gap is recipe + diversity (no Granary,
 IT reference for reading it: W4-8k on C250 = 26.12 / 23.67 / 19.43; on the A2-era IT mix the 8k E3 family was ~31-32 macro greedy (E3G-8k 31.71).
 Then, by a pre-registered rule: Granary-fr agree<=15 to C250 scale and the long schedule (E3 36k or W4 16k), then
 stage 2 with the frozen IT EOU recipe, Mynah export, FINAL-FR once. No FR < 20 promise (Nemotron itself: FR ~2x IT).
+
+### v5-CAL launch record (written before any output)
+- git 6df2d476703402280cc471159e84fec3f882dab1 (pre-registration commit)
+- utc 2026-10-19T09:01:20Z, box Japan L40S, tmux `v5cal`, GPU lock
+- cmd `S2MIX="<s2tail>/mls.json:0.1964,<s2tail>/cv.json:0.1684,<s2tail>/vp.json:0.1122,<s2tail>/fleurs.json:0.0842,<s2tail>/yg.json:0.1885,<s2tail>/yg6.json:0.2503"
+  FT_ROOT=/root/ft INIT=/root/ft/runs/plain-it-c250-36k/final.nemo TAG=it-s2v5cal-c250-36k
+  S2EXTRA="--lr 2e-5 --eou-min-tail 0.5 --eou-amb-keep 0.5" PROBE=1 M1=0 timeout 7200 bash finetune/jobs/s2_mix.sh`
+  (<s2tail> = /root/ft/mix/s2tail), then `s2_reset.py --post-pad-s 2.0 --models s2_reset,s2` on the 730 harness clips.
