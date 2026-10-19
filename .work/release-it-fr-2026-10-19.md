@@ -431,54 +431,74 @@ per bank WER within 0.2 of natural (FLEURS FE 14.7 %).
 Band (2026-10-18 pre-registration): < 20 = success -> **20.49 misses the success band by 0.49**; not "strong".
 FINAL-IT is now spent for IT development. Nothing changes in response.
 
-## I. FR-P1 -- PROPOSED pre-registration (draft 2026-10-19; NOT frozen, no FR GPU until approved)
+## I. FR-P1 -- PRE-REGISTERED (2026-10-19 ~12:00 UTC, frozen BEFORE any FR baseline or model score)
 
-Question: how much of the old FR gap is recipe + data diversity? One plain run, the frozen IT methodology, no
-Granary-fr, no new label source beyond the IT-style VP teacher filter.
+Question: how much of the old FR gap is recipe + data diversity + encoder adaptation? One plain run replicating
+the IT A2+ methodology; NOT an attempt to maximise FR. Tokenizer axis closed for FR-P1: stock SPE, 0 % <unk> and
+100 % round trip on every FR source.
 
-**Prerequisites (CPU / network, before any FR number is seen):**
-1. FR-0 wiring: `--lang fr` through prepare_mix (textnorm.text_ok: keeps the 3.4 % oe rows), two_stage /
-   lm_fusion_probe / s2_reset / teacher_ws norm. IT default byte-identical (proven on 389,564 texts).
-2. FINAL-FR built and sealed before any FR training output. Banks:
-   - MLS-fr dev (18 speakers), CV17-fr validation, VP-fr validation (speakers outside our pool), FLEURS fr_fr dev;
-   - mTEDx-fr train talks outside clean-fr and every Granary-fr original_audio_id;
-   - Speech-MASSIVE fr-FR validation (CC BY-NC-SA: private only), or PxSLU if its CC BY licence is confirmed.
-   Same model-free rules as FINAL-IT.
-3. Dev banks: harness-fr = MLS-fr / FLEURS-fr / CV17-fr / VP-fr test, 200 each; clean-fr = mTEDx-fr test + valid.
-4. Data A2-fr, mirroring IT A2+:
+**Order:** FR wiring -> FINAL-FR built + sealed (never decoded until a FR candidate is frozen) -> DEV harness-fr
+frozen -> baselines -> VP-fr teacher pass -> FR-P1. Stop after FR-P1 before opening any new axis; no stage 2.
+
+**Text policy (FR):**
+- `textnorm.norm(t, "fr")`: oe / ae ligatures -> oe / ae, curly / modifier apostrophes -> ', then the IT rule
+  (NFKD, drop marks, [^a-z' ] -> space). Hyphens are word breaks.
+- `textnorm.text_ok(t, "fr")` replaces prepare_mix's text_ok for fr.
+- IT output byte-identical (proven on 389,564 texts + every code point), with unit tests before any manifest.
+
+**A2-fr (replica of IT A2+, weights unchanged):**
 
 | source | cut | weight |
 |---|---|---|
-| MLS-fr | 40 h, <= 120 min / speaker spread over all 142 train speakers, all 34 shards | 0.35 |
-| CV17-fr | 40 h, <= 20 clips / speaker | 0.30 |
-| VP-fr | <= 60 / speaker, teacher-WER <= 50 % (Nemotron `--lang fr` on VP-fr train) | 0.20 |
+| MLS-fr train | 40 h cut spread over all 142 speakers (equal-share cap, speakers in sha1 order, clips 1-20 s), from all 34 shards | 0.35 |
+| CV17-fr train | 40 h, <= 20 clips / speaker (prepare_mix defaults) | 0.30 |
+| VP-fr train | <= 60 / speaker, 40 h pool (prepare_mix defaults), then the teacher filter below | 0.20 |
 | FLEURS fr_fr train | all | 0.15 |
 
-   1-20 s, digit clips dropped. The VP teacher pass is the only GPU step before the run (~20-30 min, GPU lock).
+Common to all sources: digit / markup rows dropped (text_ok) and durations 1-20 s, as IT.
 
-**Baselines on harness-fr (same box, same protocol; GPU probe, minutes):** stock parakeet_realtime_eou_120m-v1
-(never measured on FR), old `runs/plain-fr-p40`, old `runs/plain-fr-s2-eou`.
+**VP-fr teacher filter (frozen now, before the teacher pass):**
+- Teacher: nvidia/nemotron-3.5-asr-streaming-0.6b in mynah-asr-server-cuda, `teacher_ws.py --lang fr`, after the
+  same 300-clip server-vs-CLI agreement gate as IT.
+- teacher_wer = 100 x word Levenshtein(norm_fr(ref), norm_fr(teacher)) / len(ref words).
+- An empty teacher transcript gives 100 (dropped); a missing / empty reference gives None (dropped).
+- keep iff teacher_wer <= 50 (inclusive); durations as the pool (1-20 s); no extra dedup beyond prepare_mix's.
+- The threshold is NOT changed after seeing the yield. If < 10 h survive: the run still goes ahead with the
+  same weight, and the yield is reported as a finding.
 
-**Arm FR-P1 (one variable set = the IT recipe, NOT tuned for FR):**
-- recipe W4: stock init, whole encoder 4e-4, dec / joint 3e-4, WSD 5 % warm-up, decay last 20 %;
-- 8k steps, bs 16, max-dur 30, seed 0, evals as the IT W4 runs; `--abort-wer 1000:85`;
-- ~70 min L40S.
+**DEV harness-fr (frozen once built):**
+- MLS-fr test, FLEURS fr_fr test, CV17-fr test and VP-fr test, 200 clips each, deterministic selection as IT;
+- clean-fr = mTEDx-fr test + valid (post hoc).
 
-**Readout:** harness-fr greedy / beam-8 / oracle-8, raw EOF + 0.5 s flush, per set + macro; clean-fr post hoc.
-Bands vs old plain-fr-p40 on the same harness, macro greedy flushed:
-- LEVER <= -10 WER;
-- CLEAR -5..-10;
-- WEAK -2..-5;
-- NULL within +-2;
-- HARM > +2.
+**Baselines on the same harness, same protocol:**
+1. stock parakeet_realtime_eou_120m-v1;
+2. old `runs/plain-fr-p40`;
+3. old `runs/plain-fr-s2-eou`.
 
-**Decision rule:**
-- LEVER / CLEAR: scale as IT did (Granary-fr agree <= 15 pools to ~C250 size + the long schedule, its own
-  pre-registration), then stage 2 = the frozen IT EOU recipe (v4), Mynah, FINAL-FR once.
-- WEAK / NULL: diagnose text / tokenizer / labels on the dev banks before scaling (no recipe tuning).
+**Arm FR-P1 = the IT W4 recipe, unchanged:**
+- stock init, whole encoder 4e-4, dec / joint 3e-4, WSD (5 % warm-up, decay last 20 %);
+- 8k steps, bs 16, max-dur 30, seed 0, `--abort-wer 1000:85`;
+- no CTC / KD / tokenizer change / stage 2.
+
+**Reporting (mandatory, macro + per source):** greedy WER, beam-8 WER, oracle-8 WER, CER, empty rate, raw EOF and
+0.5 s flush (`lm_fusion_probe.py --lang fr`). Beam / oracle are diagnostic: they do not change the class.
+
+**A. Causal lever class** (FR-P1 vs old plain-fr-p40, same harness, macro greedy, 0.5 s flush):
+
+| class | delta WER |
+|---|---|
+| LEVER | <= -10 |
+| CLEAR | -5 .. -10 |
+| WEAK | -2 .. -5 |
+| NULL | within +-2 |
+| HARM | > +2 |
+
+**B. Decision rule:**
+- LEVER / CLEAR shows that recipe + diversity is a lever; it does NOT authorise stage 2. Next, ONE decision on how
+  to scale plain FR (Granary-fr pools, MLS-fr hours, schedule), taken from the absolute WER and the greedy ->
+  beam -> oracle gaps, with its own pre-registration.
+- WEAK / NULL: audit labels / text / data before any more training.
 - HARM: stop and audit.
-
-No FR < 20 promise (Nemotron itself is ~2x worse on FR than on IT).
 
 ### RC-IT v4 -- FROZEN (2026-10-19 ~11:45 UTC). IT model development CLOSED.
 - **Artifact reproduction** (NOT a second FINAL evaluation):
