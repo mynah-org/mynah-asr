@@ -35,7 +35,7 @@ Multi-domain extensions (2026-10-10; every default reproduces the 2026-10-09 run
                                       model that already carries such an SPE (stage 2 from a
                                       --tokenizer run), 0 with a --deaccent SPE (vocabulary-only arm)
 """
-import argparse, json, math, os, random, re, time, unicodedata
+import argparse, hashlib, json, math, os, random, re, time, unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +76,9 @@ ap.add_argument("--final-eof", type=int, default=0, help="1 = final.nemo is the 
 ap.add_argument("--profile-steps", type=int, default=0,
                 help="throughput profile only: run this many training steps (+20 skipped as warm-up), print where the step "
                      "time goes (host batch build vs GPU spans from CUDA events, no extra syncs) and exit; nothing saved")
+ap.add_argument("--batch-audit", type=int, default=0, help="build this many TRAINING batches with the run's sampler, print "
+                "per-batch sha256 of the audio (X, lens) and of the targets (Y, ylens) plus the share of targets ending in "
+                "<EOU>, and exit (no step, nothing saved); np.random is seeded for the audit so the noise floor is hashable")
 ap.add_argument("--stop-at", type=int, default=0, help="stop after this step, LR schedule still over --steps "
                 "(early-curve sweeps that share a longer run's schedule and batches)")
 ap.add_argument("--abort-wer", default="", help="STEP:WER -- stop (rc 5) if the macro val WER at STEP is above WER (collapse gate)")
@@ -530,6 +533,22 @@ def is_eval(s):
     return s > 0 and (s % dec == 0 if s >= d0 else s % flat == 0)
 
 
+if a.batch_audit:   # label-policy audit: same seed => X identical across --eou-min-tail / --eou-amb-keep, only Y differs
+    np.random.seed(a.seed)
+    hx, hy, pos, tot = hashlib.sha256(), hashlib.sha256(), 0, 0
+    for k in range(a.batch_audit):
+        X, lens, Y, ylens = batch([pick_row() for _ in range(a.bs)], train=True)
+        bx = hashlib.sha256(X.float().cpu().numpy().tobytes() + lens.cpu().numpy().tobytes()).hexdigest()
+        by = hashlib.sha256(Y.cpu().numpy().tobytes() + ylens.cpu().numpy().tobytes()).hexdigest()
+        hx.update(bx.encode()); hy.update(by.encode())
+        last = [int(Y[i, int(ylens[i]) - 1]) for i in range(len(ylens))]
+        pos += sum(t == EOU_ID for t in last); tot += len(last)
+        if k < 3 or k == a.batch_audit - 1:
+            print(f"  audit batch {k}: X {bx[:16]} Y {by[:16]}", flush=True)
+    print("== BATCH-AUDIT " + json.dumps({"batches": a.batch_audit, "X_sha256": hx.hexdigest(), "Y_sha256": hy.hexdigest(),
+          "eou_target_share": round(pos / tot, 4), "samples": tot, "eou_min_tail": a.eou_min_tail,
+          "eou_amb_keep": a.eou_amb_keep}), flush=True)
+    raise SystemExit(0)
 prof_host, prof_ev, prof_wall = [], [], []
 calib = []; acc_r = acc_k = None
 log = []; best = None; t0 = time.time(); step = 0; seen_s = 0.0; max_clip_s = 0.0
