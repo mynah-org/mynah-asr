@@ -1002,3 +1002,21 @@ which also carry its false endpoints. The selected step differs (500 vs 1000; th
 the latency comparison, not acted on. Per the pre-registration: **the stage-2 label-dose axis is CLOSED** (no
 v5-C, no q grid, no threshold change on this DEV). A decision-layer knob (EOU posterior bias / threshold or a
 runtime commit policy on v5-B) would be a NEW, separately pre-registered axis -- not opened today.
+
+### Result: EOU logit bias b = 110.3 on v5-B -- pre-registered class NOT-SEPARABLE (OBSERVED, one decode)
+
+| DEV730, reset, +2 s | FE | FE_any | R | L p50 / p90 s | reset-WER | empty | <EOU> / clip |
+|---|---|---|---|---|---|---|---|
+| v5-B (b = 0) | 0.82 % | 1.64 % | 92.47 % | 1.84 / 3.04 | 22.08 | 3 | ~1.0 |
+| **v5-B, b = 110.3** | **14.79 %** | **15.34 %** | **94.79 %** | **0.64 / 1.20** | **22.02** | **3** | MLS 2.40, FLEURS 1.65, CV 1.31, VP 1.75 |
+| v4 | 8.36 % | 8.90 % | 94.38 % | 0.72 / 1.92 | 22.54 | 0 | |
+| v3 | 5.89 % | 6.58 % | 94.66 % | 0.64 / 1.92 | 36.07 | 4 | |
+
+Per set (FE / R / L p50; clips split into >= 2 segments): MLS 13.0 % / 100 / 0.56 s (164 / 200 split); FLEURS 18.5 % /
+85.5 / 0.64 s (64); CV 6.0 % / 97.0 / 0.72 s (60); VP 25.4 % / 97.7 / 0.72 s (70 / 130). No-reset WER 29.67 (50 empty).
+Gates: FAIL no (R 94.79, W 22.02, empty 3); PASS no (FE 14.79 > 2.95 though L 0.64 <= 1.04); PARTIAL no;
+**NOT-SEPARABLE yes**. Reading: the rule hit its latency target exactly (p50 0.64 s = v3), but a global <EOU> offset
+large enough for that fires at internal pauses in 15 % of clips (2.5 x v3, 1.8 x v4) and splits most MLS / VP clips:
+on v5-B the <EOU>-vs-blank score does not separate true ends from pauses at fast operating points; it is dominated
+by v4 and v3 there. Reset-WER is preserved only because the reset makes split segments transcribe correctly; for
+turn-taking the splits are the failure. Per the pre-registration: **IT EOU research STOPS** (no sweep, no second b).
