@@ -859,6 +859,54 @@ This is a longer-horizon result, not proof that the extra passes alone cause the
 
 FR-E1 is the new best plain FR (harness-fr 25.41 / 23.63 / 19.84).
 
+## L. FR-G1E -- PRE-REGISTERED (2026-10-20 ~15:45 CEST, before launch; same RTX 6000 Ada box)
+
+Question: does the mix contrast seen at 8k (G1 - P1 = +1.75) replicate at the long horizon? Together with P1, G1
+and E1 this completes an incomplete 2 x 2 (mix x horizon):
+
+| run | A2 share | Granary | horizon | harness-fr greedy 0.5 s |
+|---|---|---|---|---|
+| FR-P1 | 100 % | no | 8,000 | 27.66 |
+| FR-G1 | 67.33 % | 32.67 % | 8,000 | 29.41 |
+| FR-E1 | 100 % | no | 11,881 | 25.41 |
+| **FR-G1E** | 67.33 % | 32.67 % | 11,881 | ? |
+
+**Arm FR-G1E = FR-E1 with FR-G1's mix; the train mix is the only variable vs E1:**
+- stock init, seed 0, bs 16, AdamW, W4 (enc 4e-4, dec / joint 3e-4), WSD on 11,881 steps (warm-up 594, decay from
+  ~9,505), max-dur 30, `--abort-wer 1000:85`, `--final-eof 1`, `--lang fr`, stock tokenizer, same harness-fr evals;
+- mix = exactly FR-G1's manifests and weights: MLS-fr 40 h 0.2356, CV-fr 0.2020, VP-fr t50 0.1347, FLEURS-fr 0.1010,
+  Granary-fr agree <= 20 (`yg_agree20.json` sha256 158cb9cd, 41,415 utts / 88.97 h, teacher text) 0.3267;
+  train set 97,675 utts / 216.3 h; no new filtering, threshold, pool or download beyond rebuilding the same audio;
+- launch `MIX=<FR-G1 mix> STEPS=11881 TAG=fr-g1e-w4-11881 bash finetune/jobs/fr_p1.sh`.
+
+Note: at 11,881 steps G1E's A2 draws equal FR-P1's (8000 x 16); vs E1 it has 33 % fewer A2 draws, replaced by
+Granary. That substitution at an equal training budget is the treatment.
+
+**Gates before the first step (else stop):** Granary-fr pool rebuilt with the 2026-10-19 parameters (fr000,
+fr100-fr103, 8 spread shards each, flac, clips <= 30 s) and its `train_yg.json` sha256 equal to the archived copy;
+the archived subset installed with sha256 158cb9cd, 41,415 utts / 88.97 h, 0 missing audio; A2-fr manifests as
+verified for E1; checkout contains this commit and is clean; train set = 97,675 utts.
+
+**Primary contrast:** G1E - E1 (25.41), harness-fr macro greedy, 0.5 s flush.
+
+| class | G1E - E1 |
+|---|---|
+| BENEFIT | <= -0.5 |
+| NULL | -0.5 .. +0.5 |
+| HARM | > +0.5 |
+| STRONG HARM | >= +1.5 (a subclass of HARM) |
+
+**Secondary (reported, no class):** interaction = (G1E - E1) - (G1 - P1), with the frozen 8k contrast
+G1 - P1 = 29.41 - 27.66 = +1.75.
+
+**Not a primary threshold:** G1E vs P1. They differ in mix AND horizon / schedule; P1 and G1 enter only through the
+interaction.
+
+**Reporting:** macro + per source (MLS / FLEURS / CV / VP) greedy / beam-8 / oracle-8 / CER / empty, raw EOF and
+0.5 s flush. Oracle is diagnostic. FINAL-FR stays sealed.
+
+**After:** nothing automatic (no E2 / 16k, no new Granary pool). One seed per cell, seed spread unmeasured.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
