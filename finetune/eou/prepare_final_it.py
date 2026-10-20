@@ -11,6 +11,9 @@
 
 --lang it (default) is the frozen FINAL-IT build, byte for byte (sources, paths, norm(), regexes unchanged).
 
+FR-OOD1 (2026-10-20, a DEV bank, not FINAL): --banks tedxdev,smtrain --seed-final <FINAL-FR final_*.json> with the same
+  rules: tedxdev = mTEDx fr test + valid talks (asserted absent from mTEDx train; Granary-fr ids dropped), smtrain =
+  Speech-MASSIVE fr-FR train-* (FINAL's validation speakers dropped).
 IT: six sub-banks, each from a split that no run of ours has trained on, selected on or scored with:
   mls     MLS-it dev (facebook/multilingual_librispeech italian/dev); speakers asserted absent from train + test
   cv      Common Voice 17 it validation (fixie-ai/common_voice_17_0); client_ids in train / test dropped
@@ -354,16 +357,21 @@ def tedx_shards(a, hub, R):
     return tr[:2]
 
 
-def tedx(a, hub, seen):
+def tedx(a, hub, seen, name="tedx"):
+    """name "tedx" = FINAL (train shards 0-1 minus the test / valid talks); "tedxdev" (fr, FR-OOD1) = the test + valid
+    talks themselves (all of them, no train talk); both drop every Granary-<lang> original_audio_id (= YouTube id)."""
     R, L = "deepdml/mtedx", SRC[a.lang]["hf"]
-    dev_talks = {r["talk_id"] for p in (f"{L}/test-00000-of-00001.parquet", f"{L}/valid-00000-of-00001.parquet")
-                 for r in hub.column(R, p, ["talk_id"])}
+    devp = [f"{L}/test-00000-of-00001.parquet", f"{L}/valid-00000-of-00001.parquet"]
+    dev_talks = {r["talk_id"] for p in devp for r in hub.column(R, p, ["talk_id"])}
     gran = granary_ids(hub, a.lang, f"{a.tmp}/granary_{a.lang}_ids.json")
-    b, end = Bank("tedx", a, seen), ENDING[a.lang]
-    for i, p in enumerate(tedx_shards(a, hub, R)):
+    b, end = Bank(name, a, seen), ENDING[a.lang]
+    if name == "tedxdev":
+        tr_talks = {r["talk_id"] for r in hub.columns(R, hub.files(R, L, "train"), ["talk_id"])}
+        assert not (dev_talks & tr_talks), f"mTEDx dev talks in train: {sorted(dev_talks & tr_talks)[:5]}"
+    for i, p in enumerate(tedx_shards(a, hub, R) if name == "tedx" else devp):
         for r in (hub.column(R, p, ["id", "talk_id", "transcript", "duration"]) if a.plan_only else
-                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/mtedx_train_{i}.parquet"))):
-            if r["talk_id"] in dev_talks:
+                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/mtedx_{'train' if name == 'tedx' else 'dev'}_{i}.parquet"))):
+            if name == "tedx" and r["talk_id"] in dev_talks:
                 b.drop["dev talk"] += 1
                 continue
             if r["talk_id"] in gran:
@@ -373,6 +381,10 @@ def tedx(a, hub, seen):
                     lambda r=r: decode(r["audio"]["bytes"]), min_words=3,
                     ending=lambda t: bool(re.search(end, t)))
     return b.select(a.n, per_group=a.tedx_per_talk)
+
+
+def tedxdev(a, hub, seen):
+    return tedx(a, hub, seen, "tedxdev")
 
 
 def italic(a, hub, seen):
@@ -393,14 +405,23 @@ def italic(a, hub, seen):
     return b.select(a.n)
 
 
-def smassive(a, hub, seen):
-    """Speech-MASSIVE fr-FR VALIDATION (FBK-MT/Speech-MASSIVE, CC BY-NC-SA 4.0: private evaluation only, never
+def smassive(a, hub, seen, name="smassive"):
+    """name "smassive" = FINAL: Speech-MASSIVE fr-FR VALIDATION; "smtrain" (FR-OOD1) = the fr-FR train split (train-*
+    only, not train_115), whose speakers FINAL excluded, so the two are speaker-disjoint; FINAL's validation speakers are
+    dropped here too. Speech-MASSIVE fr-FR VALIDATION (FBK-MT/Speech-MASSIVE, CC BY-NC-SA 4.0: private evaluation only, never
     redistribute); group = speaker_id; speakers of train / train_115 (+ the gated test repo when readable) dropped."""
     R, L = "FBK-MT/Speech-MASSIVE", SRC[a.lang]["smassive"]
     tr = hub.files(R, L, "train")   # train-* and train_115-*
     assert any("/train-" in p for p in tr) and any("/train_115-" in p for p in tr), tr
-    ex = {str(r["speaker_id"]) for r in hub.columns(R, tr, ["speaker_id"])}
-    T = "FBK-MT/Speech-MASSIVE-test"
+    if name == "smtrain":
+        val = hub.files(R, L, "validation")
+        ex = {str(r["speaker_id"]) for r in hub.columns(R, val, ["speaker_id"])}
+        src = [p for p in tr if "/train-" in p]
+        print(f"== smtrain: {len(ex)} validation (FINAL) speakers excluded", flush=True)
+    else:
+        ex = {str(r["speaker_id"]) for r in hub.columns(R, tr, ["speaker_id"])}
+        src = hub.files(R, L, "validation")
+    T = "FBK-MT/Speech-MASSIVE-test"   # smtrain: also drop the gated test speakers when readable
     try:
         te = {str(r["speaker_id"]) for r in hub.columns(T, hub.files(T, L, "test"), ["speaker_id"])}
         print(f"== smassive: {len(ex)} train + {len(te)} test speakers excluded", flush=True)
@@ -408,10 +429,10 @@ def smassive(a, hub, seen):
     except Exception as e:  # noqa: BLE001  (gated: needs an accepted licence on the token's account)
         print(f"== smassive: {len(ex)} train speakers excluded; {T} not readable ({type(e).__name__}): test speakers "
               f"NOT excluded", flush=True)
-    b = Bank("smassive", a, seen)
-    for i, p in enumerate(hub.files(R, L, "validation")):
+    b = Bank(name, a, seen)
+    for i, p in enumerate(src):
         for r in (hub.column(R, p, ["path", "speaker_id", "utt", "is_validated"]) if a.plan_only else
-                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/smassive_val_{i}.parquet"))):
+                  parquet_audio(fetch(f"{HF}/{R}/resolve/main/{p}", f"{a.tmp}/{name}_{i}.parquet"))):
             if str(r["speaker_id"]) in ex:
                 b.drop["speaker in train/test"] += 1
                 continue
@@ -424,8 +445,13 @@ def smassive(a, hub, seen):
     return b.select(a.n)
 
 
-BANKS = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic, "smassive": smassive}
-ONLY = {"italic": "it", "smassive": "fr"}   # language-specific banks
+def smtrain(a, hub, seen):
+    return smassive(a, hub, seen, "smtrain")
+
+
+BANKS = {"mls": mls, "cv": cv, "vp": vp, "fleurs": fleurs, "tedx": tedx, "italic": italic, "smassive": smassive,
+         "tedxdev": tedxdev, "smtrain": smtrain}   # tedxdev / smtrain: the FR-OOD1 dev bank (2026-10-20)
+ONLY = {"italic": "it", "smassive": "fr", "tedxdev": "fr", "smtrain": "fr"}   # language-specific banks
 
 
 def main():
