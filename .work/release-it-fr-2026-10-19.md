@@ -1100,6 +1100,44 @@ Launch: `LANG_=fr INIT=<G1E> TAG=fr-s2v4-g1e S2MIX=<G1E mix> S2EXTRA="--lr 2e-5"
 - OOD1 EOU numbers are reported (no gate: its tedxdev segments are cut tight, 98 % with < 0.2 s trailing audio).
 - One seed. Nothing is launched after this run (no v5 / sweep / second recipe); a next arm needs its own pre-registration.
 
+### Result: FR-S2 (stage 2 v4 on FR-G1E) -- pre-registered class RC-FR CANDIDATE (OBSERVED, 2026-10-20, one seed)
+
+- Run 859 s; the v4 rule picked **step 250** (in-run harness 27.74, EOU 99.5 %, 0 empty; later evals 30.01 / 31.84 /
+  30.28 / 31.48 / 31.36, as in IT). final.nemo sha256 **7814141d**515ca347004a862435fc5029d553d885252c8ac5e5b23ce793d48105;
+  Hub `runs/jp-fr-s2v4-g1e` + `results/jp-2026-10-20/fr-s2` (15 files OK). Parent re-probe on the same box reproduces
+  G1E exactly (25.54 / 23.56 / 19.84).
+- Ops: the CPU s2_reset passes took 52 min (DEV) and 31 min (OOD1); two waiter alarms during them were false (a
+  log-age threshold, then an ssh reset); the chain itself ran once, uninterrupted.
+
+**Serving protocol (s2_reset --lang fr, decoder reset after <EOU>, 2 s quiet), stage 2 vs parent, same tool:**
+
+| set | parent WER | s2_reset WER | delta | FE | FE_any | recall | latency p50 / p90 s | empty s2 / parent |
+|---|---|---|---|---|---|---|---|---|
+| DEV MLS | 23.49 | 23.62 | +0.13 | **18.0 %** | 18.0 % | 97.5 % | 0.72 / 1.17 | 0 / 1 |
+| DEV FLEURS | 30.72 | 30.26 | -0.46 | 4.5 % | 4.5 % | 97.0 % | 0.80 / 1.12 | 0 / 1 |
+| DEV CV | 26.81 | 26.81 | 0.00 | 3.5 % | 5.0 % | 96.5 % | 0.96 / 1.74 | 0 / 0 |
+| DEV VP | 21.12 | 21.88 | +0.76 | 3.0 % | 3.0 % | 99.0 % | 0.48 / 0.90 | 0 / 0 |
+| **DEV macro / pooled** | **25.54** | **25.64** | **+0.10** | **7.25 %** | 7.62 % | **97.5 %** | **0.72 / 1.20** | 0 / 2 |
+| OOD1 tedxdev | 25.11 | 25.21 | +0.10 | 6.5 % | 6.8 % | 98.2 % | 0.80 / 1.60 | 2 / 5 |
+| OOD1 smtrain | 34.15 | 33.85 | -0.30 | 2.2 % | 3.0 % | 95.2 % | 0.96 / 2.00 | 2 / 12 |
+| **OOD1 macro / pooled** | **29.63** | **29.53** | **-0.10** | 4.38 % | 4.88 % | 96.75 % | 0.88 / 1.92 | 4 / 17 |
+
+**Gates:** DEV delta +0.10 <= +1.0; worst DEV source VP +0.76 <= +2.0; DEV empty 0 <= parent + 1 %; OOD1 delta -0.10
+<= +1.0; recall 97.5 % >= 94 %; FE 7.25 % <= 10 %; p50 0.72 s <= 1.0 s -> **RC-FR CANDIDATE**.
+The OOD advantage of G1E over E1 is kept in full (stage 2 OOD1 29.53 vs E1 34.21 plain).
+
+Diagnostics (offline NeMo, no reset, <EOU> dropped; NOT the serving protocol): DEV greedy / beam-8 / oracle-8
+27.84 / 26.25 / 21.88 (0.5 s) vs parent 25.54 / 23.56 / 19.84; OOD1 31.34 / 29.42 / 22.46. As in IT, the no-reset
+decode pays for premature <EOU> with end deletions (s2 no-reset D_end MLS 5.11 % vs 0.35 % with reset).
+
+**Reading:**
+- OBSERVED: under the serving protocol, stage 2 costs nothing in ASR on DEV (+0.10) or OOD1 (-0.10) and adds a
+  usable <EOU>: recall 97.5 %, p50 0.72 s, FE 7.25 % on DEV (IT v4 on its DEV: 94.38 % / 0.72 s / 8.36 %).
+- Known limitation: false endpoints concentrate on MLS (18 %, 32 / 200 clips split at internal pauses: long read
+  audiobook sentences), as FLEURS did in IT (17 %); the other sources are 2-6.5 %. The endpoint is acoustic.
+- Next steps need their own decision: Mynah FR export / streaming parity on the DEV bank, then the RC-FR freeze,
+  then one FINAL-FR decode. Nothing launched.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
@@ -1111,6 +1149,7 @@ Launch: `LANG_=fr INIT=<G1E> TAG=fr-s2v4-g1e S2MIX=<G1E mix> S2EXTRA="--lr 2e-5"
 | best plain FR | **FR-P1** (stock -> A2-fr, W4 8k; Hub runs/jp-fr-p1-w4-8k, 1ec3fec4) | harness-fr 27.66 / 25.91 / 21.76 vs old p40 65.85 (LEVER) |
 | FR-G1 | HARM | +89 h Granary-fr agree <= 20 at fixed 8k: 29.41 / 26.54 / 22.74 |
 | FR-E1 (2026-10-20) | **CLEAR / LEVER, new best plain FR** (Hub runs/jp-fr-e1-w4-11881, 3a2ebe31) | A2-fr W4 11,881: 25.41 / 23.63 / 19.84 (-2.25 vs FR-P1) |
+| FR-S2 (2026-10-20) | **RC-FR CANDIDATE** (Hub runs/jp-fr-s2v4-g1e, 7814141d) | serving protocol DEV 25.64 (+0.10 vs G1E), OOD1 29.53 (-0.10); FE 7.25 %, recall 97.5 %, p50 0.72 s; MLS FE 18 % |
 | FR-G1E (2026-10-20) | NULL vs E1 in-domain; **FR-OOD1 BENEFIT -4.55 -> plain FR candidate / stage-2 parent** (Hub runs/jp-fr-g1e-w4-11881, 1271deff) | G1 mix at 11,881: 25.54 / 23.56 / 19.84; interaction -1.62 (the 8k Granary harm does not replicate) |
 | release | model-card draft finetune/release/it/README.md; licence NVOML; token to rotate | |
 
