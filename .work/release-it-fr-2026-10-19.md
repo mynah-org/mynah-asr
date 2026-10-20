@@ -1159,3 +1159,21 @@ Next (each its own pre-registration):
 2. Then FR stage 2 with the frozen IT recipe.
 3. Then RC-FR and FINAL-FR once.
 4. IT release: LICENSE / NOTICE files and usage examples.
+
+## State map (end of 2026-10-20, RTX 6000 Ada box, Kyoto)
+
+| item | state | key numbers |
+|---|---|---|
+| RC-FR | **candidate = FR-S2** (stage 2 v4 on FR-G1E; Hub runs/jp-fr-s2v4-g1e, 7814141d); NOT frozen yet | serving protocol DEV 25.64 (+0.10 vs parent), OOD1 29.53 (-0.10); FE 7.25 %, recall 97.5 %, p50 0.72 s; MLS FE 18 % |
+| FR plain parent | **FR-G1E** (A2-fr + Granary-fr agree <= 20, W4 11,881; runs/jp-fr-g1e-w4-11881, 1271deff) | harness-fr 25.54; FR-OOD1 29.66 vs E1 34.21 (OOD BENEFIT) |
+| FR-E1 | A2-only W4 11,881 (runs/jp-fr-e1-w4-11881, 3a2ebe31) | harness-fr 25.41 (CLEAR vs P1 27.66) |
+| FR-OOD1 | sealed cc9ba4c8 (Hub data/ood-fr1); spent for E1 vs G1E and once for the FR-S2 retention check | tedxdev 400 + smtrain 400 |
+| FINAL-FR | SEALED 8b0ebba0, never decoded | |
+| FR data | **snapshot `data/snapshots/fr-g1e`** (A2-fr + VP t50 + Granary-fr agree <= 20 audio, harness-fr evals, all FR manifests / teacher scores in meta) | restore: `data_snapshot.py restore --repo gabrione/mynah-asr-canary-it-experiments --name fr-g1e --token-file /root/.hf_token` (then the FINAL-FR manifests come from data/final-fr, OOD1 from data/ood-fr1) |
+| open data issue | MLS-fr transcripts with deleted accented letters ("no zlandais"), up to ~6 % of MLS-40h clips | its own axis, not touched |
+
+Next (each with its own pre-registration / decision):
+1. Mynah FR export + streaming / CUDA parity of FR-S2 on the DEV bank (m1.sh is FLEURS-it specific: needs a FR path).
+2. RC-FR freeze (DEV + product criteria only), then FINAL-FR once.
+3. Optional research: G1E-16k (plain ceiling on the promoted mix), MLS-fr accent repair, FR EOU precision on long reads.
+4. HF token pasted in chat on 2026-10-20: revoke on HF (deleting it from the box is not a revocation).
