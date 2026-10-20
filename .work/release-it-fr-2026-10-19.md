@@ -999,6 +999,24 @@ Oracle is diagnostic. One seed per model; seed spread unmeasured.
 candidate and the parent for FR stage 2; NULL or HARM -> E1 (simpler, slightly better in-domain), then E2 (~16k)
 before stage 2. Each next run gets its own pre-registration. No E2 / stage 2 / training is launched after the probe.
 
+**FR-OOD1 seal record (2026-10-20 16:24 UTC, before any decode).**
+- SHA256SUMS sha256 **cc9ba4c8**209c97d6ced699af026c86f4bf6f371486c0e4b050111963f33663f5 (manifests + 1,600 wavs);
+  Hub data/ood-fr1 (10 files OK, incl. ood-fr1-sealed-2026-10-20.tgz). Built from git 1b654e3.
+
+| bank | clips | h | groups | dur p10/p50/p90 s | words p50 |
+|---|---|---|---|---|---|
+| tedxdev | 400 | 0.60 | 22 talks | 1.6 / 4.2 / 10.5 | 13 |
+| smtrain | 400 | 0.46 | 103 speakers | 2.3 / 3.8 / 6.1 | 8 |
+
+- Drops: tedxdev digit / markup 249, duration 179, short 7, text in train / dev 2, Granary talks 0; smtrain short 124,
+  not validated 32, text in train / dev 13, duration 6, FINAL speakers 0 (train and validation speakers are disjoint).
+- Audio dedup (decoded PCM int16 sha1, pool_sanity --xhash): 0 within the bank; 0 vs MLS-fr 40 h, CV-fr, VP-fr (all
+  16,191), FLEURS-fr train, the whole Granary-fr pool (78,246); 0 wav sha256 in FINAL-FR's SHA256SUMS. No clip dropped.
+- Log wording: in smtrain mode the shared line "smassive: 55 train speakers excluded" counts the 55 VALIDATION
+  speakers (the set held in `ex`); the gated test list stayed unreadable, as stated in the pre-registration.
+- Scope: "OOD" = held out from our A2-fr and Granary-fr fine-tuning pools (a fine-tuning OOD evaluation), not
+  proven unseen by the NVIDIA pre-training.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
