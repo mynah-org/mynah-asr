@@ -23,6 +23,10 @@ import unicodedata
 import numpy as np
 import soundfile as sf
 import torch
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "common"))
+import textnorm  # noqa: E402
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--parent", required=True)
@@ -43,12 +47,16 @@ ap.add_argument("--margin-rule", type=float, default=0.0, help="scale rule only 
 ap.add_argument("--dump", default="", help="also write one JSON line per (clip, protocol): audio, ref, hyp, token ids, "
                 "<EOU> frames, speech end and per-clip flags (artifact only; no computation changes)")
 ap.add_argument("--out", default="")
+ap.add_argument("--lang", default="it", help="it = the frozen s2_reset.norm (RC-IT protocol); other languages use "
+                "common/textnorm.norm(t, lang) (fr: oe / ae and typographic apostrophes, then the same rule)")
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
 FR = 0.08
 
 
 def norm(t):
+    if a.lang != "it":
+        return textnorm.norm(t, a.lang)
     t = unicodedata.normalize("NFKD", t.lower())
     t = "".join(c for c in t if not unicodedata.combining(c))
     return " ".join(re.sub(r"[^a-z' ]", " ", t).split())

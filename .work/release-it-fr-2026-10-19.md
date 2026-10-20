@@ -1055,6 +1055,51 @@ Per source (descriptive; the verdict is the macro), greedy / beam-8 / oracle-8 /
 **Decision rule (pre-registered):** BENEFIT -> **FR-G1E becomes the general-purpose plain FR candidate and the parent
 for FR stage 2.** Nothing is launched automatically; stage 2 gets its own pre-registration.
 
+## N. FR-S2 (stage 2 <EOU> on FR-G1E) -- PRE-REGISTERED (2026-10-20 ~19:00 CEST, before launch)
+
+**Parent, frozen:** FR-G1E = Hub `runs/jp-fr-g1e-w4-11881/final.nemo`, sha256 1271deff6a833805b5dc9fb021fba43c058782e686842a49718f4e362b030973
+(stock -> A2-fr + Granary-fr agree <= 20, W4 11,881, git 6a9df01). Chosen by the pre-registered FR-OOD1 rule.
+
+**Recipe = RC-IT stage 2 v4, unchanged** (flags read back from the archived v4 metrics.json, sg-2026-10-18):
+`two_stage.py --init <G1E> --freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 2e-5 (decoder + joint: the low djlr
+lesson) --bs 16 --steps 1500 --lr-shape cosine --eou-append 1 --pad-prob 0.5 --pad-min 1 --pad-max 3
+--pad-noise-db -90,-60 --fastemit 0 --max-dur 20 --eval-every 250 --val-n 200 --seed 0`; final.nemo = min in-run
+harness WER among the evals with EOU >= 80 % and <= 10 % empty (v4 rule).
+
+**FR deviations from the IT recipe (all required by the language, nothing tuned):**
+1. mix = the parent's own mix (the v4 principle): exactly FR-G1E's manifests and weights (MLS-fr 0.2356, CV-fr 0.2020,
+   VP-fr t50 0.1347, FLEURS-fr 0.1010, Granary-fr agree <= 20 0.3267);
+2. `--lang fr` (targets and scorer through textnorm fr); in-run evals = harness-fr;
+3. `s2_mix.sh` LANG_=fr and `s2_reset.py --lang fr` (textnorm fr) are added in this commit; IT paths unchanged;
+4. no Mynah m1.sh (it is FLEURS-it specific): M1=0; Mynah FR parity is a later step on the frozen candidate.
+Launch: `LANG_=fr INIT=<G1E> TAG=fr-s2v4-g1e S2MIX=<G1E mix> S2EXTRA="--lr 2e-5" PROBE=1 M1=0 bash finetune/jobs/s2_mix.sh`.
+
+**Evaluation, all against the exact parent G1E with the same tool:**
+1. DEV-fr harness (selection set): in-run evals (selection only, by the v4 rule); then `s2_reset.py --lang fr
+   --post-pad-s 2.0 --per-set 200` (the frozen RC-IT protocol: frame-synchronous greedy, max 10 symbols, decoder
+   reset after <EOU>, 2 s of -75 dB quiet, energy endpoint of the original clip): reset-WER, CER, empty, FE (<EOU>
+   with >= 0.5 s speech left), FE_any (>= 0.16 s), EOU recall, endpoint latency p50 / p90; parent and no-reset s2
+   reported; plus lm_fusion_probe greedy / beam-8 / oracle-8, raw and 0.5 s (offline, <EOU> dropped: diagnostic).
+2. FR-OOD1 (retention set, sealed cc9ba4c8): decoded ONCE, on the single checkpoint the DEV rule selected, after
+   the selection; same s2_reset protocol (parent + s2_reset, all 800 clips) and the offline probes. The parent's
+   s2_reset decode of OOD1 is the same-tool reference (G1E is frozen, no selection follows from it). OOD1 is never
+   decoded on any other stage-2 checkpoint and never used to choose between them.
+3. FINAL-FR stays sealed until an RC-FR is frozen.
+
+**Gates** (delta = stage 2 s2_reset - parent, s2_reset protocol, macro greedy WER):
+
+| class | rule |
+|---|---|
+| **RC-FR CANDIDATE** | DEV delta <= +1.0 AND no DEV source > +2.0 AND DEV empty <= parent + 1 % abs AND OOD1 delta <= +1.0 AND (DEV, pooled) EOU recall >= 94 % AND FE <= 10 % AND latency p50 <= 1.0 s |
+| **DIAGNOSE** (no promotion) | not CANDIDATE and not FAIL |
+| **FAIL** | DEV delta > +2.0 OR OOD1 delta > +2.0 OR recall < 90 % OR FE > 15 % OR p50 > 1.5 s |
+
+- The EOU bars are the RC-IT acceptance level (v4 on DEV: R 94.38 %, FE 8.36 %, p50 0.72 s).
+- OOD1 delta <= +1.0 keeps at least ~3.5 of G1E's 4.55-point OOD advantage over E1. A candidate must not buy EOU by
+  giving it back.
+- OOD1 EOU numbers are reported (no gate: its tedxdev segments are cut tight, 98 % with < 0.2 s trailing audio).
+- One seed. Nothing is launched after this run (no v5 / sweep / second recipe); a next arm needs its own pre-registration.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
