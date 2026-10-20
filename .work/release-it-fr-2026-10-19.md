@@ -1017,6 +1017,44 @@ before stage 2. Each next run gets its own pre-registration. No E2 / stage 2 / t
 - Scope: "OOD" = held out from our A2-fr and Granary-fr fine-tuning pools (a fine-tuning OOD evaluation), not
   proven unseen by the NVIDIA pre-training.
 
+### Result: FR-OOD1 (E1 vs G1E, one decode each) -- pre-registered class OOD BENEFIT (OBSERVED, 2026-10-20)
+
+- Seal re-verified file by file (cc9ba4c8) and model hashes (E1 3a2ebe31, G1E 1271deff) before the decode; Hub
+  `results/jp-2026-10-20/ood-fr1` (8 files OK). A first attempt (16:28 UTC) died in gpu_lock.sh (FT_ROOT unset)
+  before any probe ran; its result dir was empty and its log is archived as ood1eval-ftroot-abort.log.
+
+| FR-OOD1 macro, 0.5 s flush | greedy | beam-8 | oracle-8 | CER | empty |
+|---|---|---|---|---|---|
+| FR-E1 (A2-fr) | 34.21 | 30.14 | 23.71 | 17.32 | 30 / 800 |
+| **FR-G1E (A2-fr + Granary-fr)** | **29.66** | **26.79** | **20.46** | **13.17** | 17 / 800 |
+| G1E - E1 | **-4.55** | -3.35 | -3.25 | -4.15 | |
+
+Per source (descriptive; the verdict is the macro), greedy / beam-8 / oracle-8 / CER, 0.5 s flush:
+
+| source | FR-G1E | FR-E1 | G1E - E1 greedy | hyp / ref words G1E vs E1 |
+|---|---|---|---|---|
+| tedxdev (22 talks) | 25.17 / 22.78 / 18.02 / 11.61 | 30.92 / 27.22 / 21.99 / 15.67 | -5.75 | 0.98 vs 0.91 |
+| smtrain (103 speakers) | 34.15 / 30.80 / 22.90 / 14.73 | 37.50 / 33.06 / 25.43 / 18.98 | -3.35 | 0.93 vs 0.88 |
+
+- Raw EOF macro greedy / beam-8 / oracle-8: G1E 30.91 / 27.98 / 21.24, E1 35.49 / 31.33 / 24.84 (delta -4.58).
+- Empties (greedy, 0.5 s): tedxdev 5 vs 10, smtrain 12 vs 20.
+
+**Class:** G1E - E1 = -4.55 <= -1.0, so **OOD BENEFIT**.
+
+**Reading (OBSERVED vs HYPOTHESIS):**
+- OBSERVED: both sources move the same way and by a lot (tedxdev -5.75, smtrain -3.35), greedy, beam and oracle
+  together. On harness-fr the same two models are equal (+0.13). The Granary-fr diversity buys robustness that the
+  A2-domain harness cannot see.
+- OBSERVED: part of E1's OOD deficit is deletions: fewer hypothesis words per reference word (0.91 / 0.88 vs
+  0.98 / 0.93) and more empty outputs (30 vs 17).
+- HYPOTHESIS: the larger gain on mTEDx fits Granary being web / YouTube speech closer to talks than read A2 speech;
+  smtrain (short read commands) still gains 3.35.
+- Scope: a fine-tuning OOD evaluation (held out from our A2-fr and Granary-fr pools), not proven unseen by the
+  NVIDIA pre-training. One seed per model; seed spread unmeasured, but -4.55 is ~9x the NULL half-band.
+
+**Decision rule (pre-registered):** BENEFIT -> **FR-G1E becomes the general-purpose plain FR candidate and the parent
+for FR stage 2.** Nothing is launched automatically; stage 2 gets its own pre-registration.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
@@ -1028,7 +1066,7 @@ before stage 2. Each next run gets its own pre-registration. No E2 / stage 2 / t
 | best plain FR | **FR-P1** (stock -> A2-fr, W4 8k; Hub runs/jp-fr-p1-w4-8k, 1ec3fec4) | harness-fr 27.66 / 25.91 / 21.76 vs old p40 65.85 (LEVER) |
 | FR-G1 | HARM | +89 h Granary-fr agree <= 20 at fixed 8k: 29.41 / 26.54 / 22.74 |
 | FR-E1 (2026-10-20) | **CLEAR / LEVER, new best plain FR** (Hub runs/jp-fr-e1-w4-11881, 3a2ebe31) | A2-fr W4 11,881: 25.41 / 23.63 / 19.84 (-2.25 vs FR-P1) |
-| FR-G1E (2026-10-20) | NULL vs E1 (Hub runs/jp-fr-g1e-w4-11881, 1271deff) | G1 mix at 11,881: 25.54 / 23.56 / 19.84; interaction -1.62 (the 8k Granary harm does not replicate) |
+| FR-G1E (2026-10-20) | NULL vs E1 in-domain; **FR-OOD1 BENEFIT -4.55 -> plain FR candidate / stage-2 parent** (Hub runs/jp-fr-g1e-w4-11881, 1271deff) | G1 mix at 11,881: 25.54 / 23.56 / 19.84; interaction -1.62 (the 8k Granary harm does not replicate) |
 | release | model-card draft finetune/release/it/README.md; licence NVOML; token to rotate | |
 
 Next (each its own pre-registration):
