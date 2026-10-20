@@ -954,6 +954,51 @@ Per source, greedy / beam-8 / oracle-8 (0.5 s flush):
 FR-E1 stays the best plain FR on harness-fr greedy (25.41); FR-G1E is equivalent within noise (25.54, beam 23.56).
 Nothing after G1E is authorised.
 
+## M. FR-OOD1 -- PRE-REGISTERED (2026-10-20 ~18:30 CEST, before the bank is built and before any decode)
+
+Question: on French speech outside the four A2 training domains, does FR-G1E (A2 + Granary-fr, 25.54 on
+harness-fr) beat its matched A2-only twin FR-E1 (25.41)? The two differ only in the train mix (section L).
+
+**Bank FR-OOD1 (a DEV bank; FINAL-FR stays sealed and is not decoded):** `prepare_final_it.py --lang fr --banks
+tedxdev,smtrain --n 400` (code 9d243d1), FINAL's rules unchanged (model-free; 1-20 s; no digit / markup; >= 2 words,
+>= 3 and a natural ending for tedx; per-talk cap 25; sha1 order, round-robin over groups):
+- **tedxdev**: Multilingual TEDx fr test + valid talks (deepdml/mtedx), lecture-style spontaneous speech; talks asserted
+  absent from mTEDx train (FINAL-FR's tedx bank uses train talks only); every talk whose id is among the 86,238
+  Granary-fr original_audio_ids (all dirs, not only the G1 pool; data/final-fr/granary_fr_ids.json ae4dea92) dropped.
+  Plan: 400 clips from 1,629 candidates, 22 talks, 0 Granary talks.
+- **smtrain**: Speech-MASSIVE fr-FR train-* (FBK-MT/Speech-MASSIVE), short read virtual-assistant commands; FINAL-FR's
+  smassive speakers (validation, 55) dropped. Plan: 400 clips from 11,341 candidates, 103 speakers. Limitation: the
+  gated Speech-MASSIVE-test speaker list is not readable, so its speakers are not excluded (no run of ours used it).
+- Text dedup: normalised text absent from every training manifest (A2-fr, the Granary-fr pool and subset: 165,375
+  texts) and from FINAL-FR (2,113 texts, seeded from the sealed manifests, seal hashes verified); unique in the bank.
+- No E1 / G1E / teacher output is used to select clips.
+
+**Seal (before any decode):** manifests (final_tedxdev / final_smtrain / final_all, + the trim variants) and every
+wav sha256 -> SHA256SUMS; counts, hours, groups per source; decoded-audio duplicates checked with pool_sanity.py
+--xhash against the training manifests (A2-fr train + Granary subset), and wav sha256 against FINAL-FR's SHA256SUMS;
+any duplicate -> that clip dropped by rule (listed) before the seal. Archived to Hub data/ood-fr1; seal hash
+committed and pushed before the first decode.
+
+**Decode (once per model, identical decoder):** E1 (runs/jp-fr-e1-w4-11881, 3a2ebe31) and G1E (runs/jp-fr-g1e-w4-11881,
+1271deff), lm_fusion_probe.py --lang fr, all clips, greedy / beam-8 / oracle-8, raw EOF and 0.5 s flush; empties
+counted (probe change in this commit, metric-neutral).
+
+**Primary contrast:** G1E - E1, macro (unweighted mean of tedxdev and smtrain) greedy WER, 0.5 s flush.
+
+| class | G1E - E1 |
+|---|---|
+| OOD BENEFIT | <= -1.0 |
+| WEAK BENEFIT | -1.0 .. -0.5 |
+| NULL | -0.5 .. +0.5 |
+| HARM | > +0.5 |
+
+Per-source results are reported, but the verdict is the macro only (no post-hoc pick of a favourable source).
+Oracle is diagnostic. One seed per model; seed spread unmeasured.
+
+**After (decision rule agreed 2026-10-20, nothing automatic):** BENEFIT -> G1E becomes the general-purpose plain FR
+candidate and the parent for FR stage 2; NULL or HARM -> E1 (simpler, slightly better in-domain), then E2 (~16k)
+before stage 2. Each next run gets its own pre-registration. No E2 / stage 2 / training is launched after the probe.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |

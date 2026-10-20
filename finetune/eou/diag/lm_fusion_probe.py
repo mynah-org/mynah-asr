@@ -159,8 +159,8 @@ def run(tag, dump=None):
                 texts = [text_of(x) for x in nb]
                 rw = ref.split()
                 errs = [lev(rw, t.split()) for t in texts]
-                s = per.setdefault(n, {"we": 0, "wn": 0, "ce": 0, "cn": 0, "oracle_we": 0, "hw": 0})
-                s["hw"] += len(texts[0].split())
+                s = per.setdefault(n, {"we": 0, "wn": 0, "ce": 0, "cn": 0, "oracle_we": 0, "hw": 0, "empty": 0, "n": 0})
+                s["hw"] += len(texts[0].split()); s["empty"] += not texts[0].strip(); s["n"] += 1
                 s["we"] += errs[0]; s["wn"] += len(rw); s["ce"] += lev(ref, texts[0]); s["cn"] += len(ref)
                 s["oracle_we"] += min(errs)
                 if fd:
@@ -172,6 +172,7 @@ def run(tag, dump=None):
         rec[f"{n}_wer"] = round(100 * s["we"] / s["wn"], 2); rec[f"{n}_cer"] = round(100 * s["ce"] / s["cn"], 2)
         rec[f"{n}_oracle_wer"] = round(100 * s["oracle_we"] / s["wn"], 2)
         rec[f"{n}_len_ratio"] = round(s["hw"] / s["wn"], 3)   # hypothesis words / reference words
+        rec[f"{n}_empty"] = s["empty"]; rec[f"{n}_n"] = s["n"]   # empty 1-best hypotheses / clips (2026-10-20)
     if fd:
         fd.close()
     rec["macro_wer"] = round(float(np.mean([rec[f"{n}_wer"] for n, _ in sets])), 2)
