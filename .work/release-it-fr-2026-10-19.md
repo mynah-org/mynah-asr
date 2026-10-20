@@ -907,6 +907,53 @@ interaction.
 
 **After:** nothing automatic (no E2 / 16k, no new Granary pool). One seed per cell, seed spread unmeasured.
 
+### Result: FR-G1E (FR-G1 mix at 11,881) -- pre-registered class NULL (OBSERVED, 2026-10-20, one seed)
+
+- Gates: Granary-fr pool rebuilt (78,246 utts / 156.53 h, train_yg.json = archive 89d0b06c), subset 158cb9cd
+  41,415 utts / 88.97 h, 0 missing audio; A2 manifests = E1's; train set 97,675 utts; git 6a9df01.
+  A first launcher attempt stopped before training on a false hash mismatch (a bash substitution bug in the gate
+  itself, `${#f##*:}`; the files were identical); fixed and relaunched at 14:40 UTC, its log kept as g1e-gatebug.log.
+- final.nemo = step 11881 (EOF), sha256 1271deff; Hub `runs/jp-fr-g1e-w4-11881` + `results/jp-2026-10-20/fr-g1e`
+  (9 files OK). 3,929 s, peak 39.2 GB.
+
+| harness-fr macro, 0.5 s flush | greedy | beam-8 | oracle-8 | CER |
+|---|---|---|---|---|
+| FR-P1 (A2, 8k) | 27.66 | 25.91 | 21.76 | 11.34 |
+| FR-G1 (A2 + G, 8k) | 29.41 | 26.54 | 22.74 | 12.22 |
+| FR-E1 (A2, 11,881) | 25.41 | 23.63 | 19.84 | 10.39 |
+| **FR-G1E (A2 + G, 11,881)** | **25.54** | **23.56** | **19.84** | **10.45** |
+| G1E - E1 | **+0.13** | -0.07 | 0.00 | +0.06 |
+
+Per source, greedy / beam-8 / oracle-8 (0.5 s flush):
+
+| source | FR-G1E | FR-E1 | G1E - E1 greedy | G1 - P1 greedy |
+|---|---|---|---|---|
+| MLS | 23.52 / 21.72 / 19.29 | 23.12 / 21.46 / 19.06 | +0.40 | +2.28 |
+| FLEURS | 30.72 / 28.66 / 24.88 | 30.66 / 28.76 / 25.12 | +0.06 | +0.22 |
+| CV | 26.81 / 24.73 / 19.20 | 26.86 / 25.67 / 19.56 | -0.05 | +3.44 |
+| VP | 21.10 / 19.14 / 16.00 | 20.98 / 18.62 / 15.64 | +0.12 | +1.08 |
+
+- Raw EOF: 25.72 / 23.67 / 19.94 (E1 25.61 / 23.84 / 19.90).
+- Empties: in-run final eval 2 / 730 (E1 1).
+
+**Class:** G1E - E1 = +0.13, within +-0.5, so **NULL**.
+**Interaction (secondary):** (G1E - E1) - (G1 - P1) = +0.13 - 1.75 = **-1.62**.
+
+**Reading (OBSERVED vs HYPOTHESIS):**
+- OBSERVED: at 11,881 steps, replacing a third of the A2 draws with Granary-fr agree <= 20 costs nothing measurable
+  on harness-fr (greedy +0.13, beam -0.07, oracle equal; every source within +-0.4). The 8k harm (+1.75) does not
+  replicate at the long horizon: the mix effect depends on the horizon.
+- OBSERVED: G1E has FR-P1's A2 draws and is 2.12 better than P1; E1, with 1.49 x the A2 draws, is 2.25 better.
+  On this in-domain harness a Granary draw is worth about as much as an extra A2 draw at this horizon.
+- HYPOTHESIS: at 8k the model was still under-trained on the A2 domains, so diverting a third of the draws hurt;
+  with enough steps the A2 domains saturate and the substitution becomes free. Label noise (agree <= 20) is not
+  visibly harmful at 11,881.
+- Limit: harness-fr is the four A2 domains, so it cannot show a Granary diversity benefit; an out-of-domain FR dev
+  bank would be needed for that. One seed per cell, seed spread unmeasured: +0.13 is not distinguishable from 0.
+
+FR-E1 stays the best plain FR on harness-fr greedy (25.41); FR-G1E is equivalent within noise (25.54, beam 23.56).
+Nothing after G1E is authorised.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
@@ -918,6 +965,7 @@ interaction.
 | best plain FR | **FR-P1** (stock -> A2-fr, W4 8k; Hub runs/jp-fr-p1-w4-8k, 1ec3fec4) | harness-fr 27.66 / 25.91 / 21.76 vs old p40 65.85 (LEVER) |
 | FR-G1 | HARM | +89 h Granary-fr agree <= 20 at fixed 8k: 29.41 / 26.54 / 22.74 |
 | FR-E1 (2026-10-20) | **CLEAR / LEVER, new best plain FR** (Hub runs/jp-fr-e1-w4-11881, 3a2ebe31) | A2-fr W4 11,881: 25.41 / 23.63 / 19.84 (-2.25 vs FR-P1) |
+| FR-G1E (2026-10-20) | NULL vs E1 (Hub runs/jp-fr-g1e-w4-11881, 1271deff) | G1 mix at 11,881: 25.54 / 23.56 / 19.84; interaction -1.62 (the 8k Granary harm does not replicate) |
 | release | model-card draft finetune/release/it/README.md; licence NVOML; token to rotate | |
 
 Next (each its own pre-registration):
