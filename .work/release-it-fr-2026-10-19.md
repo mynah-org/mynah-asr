@@ -817,6 +817,48 @@ Oracle is diagnostic.
 - One seed, and a different GPU model from FR-P1 (RTX 6000 Ada vs L40S); gate 3 covers decode, not training
   nondeterminism. Seed-to-seed spread on FR is unmeasured, so a delta inside the NULL band is not separable from noise.
 
+### Result: FR-E1 (stock -> A2-fr, W4 11,881) -- pre-registered class CLEAR / LEVER (OBSERVED, 2026-10-20, one seed)
+
+- Gates: 10 / 10 A2-fr manifests = archive sha256, 0 missing audio; VP t50 re-derived 15,997 utts / 39.66 h
+  (now archived as data/a2-fr/train_vp_t50.json); FR-P1 re-decoded on the RTX 6000 Ada = 27.66 / 27.84 (identical);
+  train set 56,260 utts / 127.37 h; git a0b225b, utc 2026-10-20T12:21:57Z.
+- final.nemo = step 11881 (EOF), sha256 3a2ebe31; Hub `runs/jp-fr-e1-w4-11881` + `results/jp-2026-10-20/fr-e1`
+  (13 files OK). ~210 steps / min, peak 21.9 GB.
+
+| harness-fr macro, 0.5 s flush | greedy | beam-8 | oracle-8 | CER |
+|---|---|---|---|---|
+| FR-P1 (8k) | 27.66 | 25.91 | 21.76 | 11.34 |
+| **FR-E1 (11,881)** | **25.41** | **23.63** | **19.84** | **10.39** |
+| delta | **-2.25** | -2.28 | -1.92 | -0.95 |
+
+Per source, greedy / beam-8 / oracle-8 (0.5 s flush), delta greedy vs FR-P1 and FR-G1 vs FR-P1:
+
+| source | FR-E1 | FR-P1 | E1 - P1 | G1 - P1 |
+|---|---|---|---|---|
+| MLS | 23.12 / 21.46 / 19.06 | 25.13 / 23.49 / 21.20 | -2.01 | +2.28 |
+| FLEURS | 30.66 / 28.76 / 25.12 | 33.51 / 31.08 / 27.84 | -2.85 | +0.22 |
+| CV | 26.86 / 25.67 / 19.56 | 29.53 / 27.65 / 20.50 | -2.67 | +3.44 |
+| VP | 20.98 / 18.62 / 15.64 | 22.46 / 21.41 / 17.50 | -1.48 | +1.08 |
+
+- Raw EOF: 25.61 / 23.84 / 19.90 (FR-P1 27.84 / 26.06 / 21.83).
+- Empties: in-run final eval 1 / 730 (FR-P1 3, FR-G1 4).
+
+**Class:** -2.25 <= -1.5, so **CLEAR / LEVER**: strong evidence that FR-P1 at 8k was still limited by its
+optimisation / exposure horizon (W4 rescaled to 11,881: warm-up 594, decay from ~9,505; ~541 vs 364 processed h).
+This is a longer-horizon result, not proof that the extra passes alone cause the gain.
+
+**Reading (OBSERVED vs HYPOTHESIS):**
+- OBSERVED: the gain is broad, every source improves 1.5-2.9 and greedy, beam and oracle move together (ranking
+  and coverage both improve).
+- The CV / MLS triangulation is only partial: CV (-2.67) and MLS (-2.01) recover by about as much as G1 lost there
+  (+3.44 / +2.28), but FLEURS gains the most (-2.85) although G1 barely moved it (+0.22). So "G1 = dilution only"
+  is not established. HYPOTHESIS: dilution explains part of G1's HARM; the rest is Granary label / domain or
+  noise (one seed per arm, seed spread unmeasured).
+- E1 does not identify G1's cause. The exposure-matched test (A2 + Granary at 11,881, A2 draws = FR-P1) is the
+  natural next A/B; it is NOT authorised by this pre-registration.
+
+FR-E1 is the new best plain FR (harness-fr 25.41 / 23.63 / 19.84).
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
@@ -827,6 +869,7 @@ Oracle is diagnostic.
 | FINAL-FR | SEALED 8b0ebba0, never decoded | 6 banks, 2,113 clips |
 | best plain FR | **FR-P1** (stock -> A2-fr, W4 8k; Hub runs/jp-fr-p1-w4-8k, 1ec3fec4) | harness-fr 27.66 / 25.91 / 21.76 vs old p40 65.85 (LEVER) |
 | FR-G1 | HARM | +89 h Granary-fr agree <= 20 at fixed 8k: 29.41 / 26.54 / 22.74 |
+| FR-E1 (2026-10-20) | **CLEAR / LEVER, new best plain FR** (Hub runs/jp-fr-e1-w4-11881, 3a2ebe31) | A2-fr W4 11,881: 25.41 / 23.63 / 19.84 (-2.25 vs FR-P1) |
 | release | model-card draft finetune/release/it/README.md; licence NVOML; token to rotate | |
 
 Next (each its own pre-registration):
