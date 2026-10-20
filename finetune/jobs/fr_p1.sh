@@ -9,6 +9,7 @@
 # Needs: data_mix.sh fr (MLS-fr + mix/fr) and LANG_=fr FILTER_ONLY=1 a2_vpfilter.sh (mix/fr/train_vp_t50.json).
 #   FT_ROOT=/root/ft tmux new -d -s frp1 'FT_ROOT=/root/ft bash finetune/jobs/fr_p1.sh 2>&1 | tee -a /root/ft/logs/fr_p1.log'
 # NEMO=<model.nemo> OUT=<dir>: probes only (baselines on the same harness / protocol), no training.
+# STEPS= (default 8000) sets the horizon; warm-up and decay scale with it (FR-E1: 11881).
 # HARNESS= / CLEAN= override the probe banks (name=path,...), e.g. once the frozen DEV harness-fr has its own manifests.
 . "$(dirname "$0")/gpu_lock.sh"
 export LANG_=fr
@@ -19,7 +20,7 @@ if [ -z "${NEMO:-}" ]; then
     MIX=${MIX:-"$MF/train_40h_fr.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp_t50.json:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides (FR-G1)
     for p in ${MIX//,/ }; do [ -s "${p%:*}" ] || { echo "== missing ${p%:*}"; exit 2; }; done
     echo "== fr_p1 $TAG $(date +%T)"; echo "   MIX=$MIX"
-    MIX="$MIX" VALS="$HARNESS" POL="--freeze-enc 0 --enc-lr 4e-4 --lr 3e-4 --bs 16" STEPS=8000 SMOKE=1 \
+    MIX="$MIX" VALS="$HARNESS" POL="--freeze-enc 0 --enc-lr 4e-4 --lr 3e-4 --bs 16" STEPS=${STEPS:-8000} SMOKE=1 \
         bash "$FINETUNE/jobs/mix_arm.sh" $TAG --max-dur 30 --eval-steps 100,250,1000 --abort-wer 1000:85 \
         --lr-shape wsd --decay-frac 0.2 --eval-sparse 2000,500 --final-eof 1 --seed 0
     rm -f $R/plain-$TAG/last.ckpt

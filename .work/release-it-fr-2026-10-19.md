@@ -767,6 +767,56 @@ Not run (would need their own pre-registration): an exposure-preserving additive
 Granary on top, i.e. longer steps), a stricter label threshold with a larger pool, or a clean-fr / out-of-domain
 bank where Granary diversity could show (harness-fr is in-domain for A2).
 
+## K. FR-E1 -- PRE-REGISTERED (2026-10-20 ~13:20 CEST, before launch; RTX 6000 Ada box, Kyoto)
+
+Question: was FR-P1 (A2-fr, W4 8k) still exposure / optimisation limited at 8k? One variable changes: the horizon.
+11,881 = 8000 / (1 - 0.3267) is the horizon at which a G1-weighted mix would give A2 the same draws as FR-P1; E1
+asks only what that extra A2 exposure is worth on its own.
+
+**Arm FR-E1 = FR-P1 with STEPS = 11881, everything else identical:**
+- stock parakeet_realtime_eou_120m-v1 init (NOT a continuation of the FR-P1 checkpoint);
+- data = exactly FR-P1's A2-fr: MLS-fr 40 h 0.35, CV-fr 0.30, VP-fr t50 0.20, FLEURS-fr 0.15; no Granary;
+  train set 56,260 utts / 127.37 h;
+- W4: whole encoder 4e-4, decoder / joint 3e-4, AdamW, WSD parametrised on the 11,881-step horizon (warm-up
+  steps / 20 = 594, decay over the last 20 % = from step 9,505), bs 16, max-dur 30, seed 0, `--abort-wer 1000:85`,
+  `--final-eof 1` (final.nemo = the last step), `--lang fr`, stock tokenizer;
+- no stage 2 / KD / CTC / LM;
+- launch `STEPS=11881 TAG=fr-e1-w4-11881 bash finetune/jobs/fr_p1.sh` (STEPS= override added in this commit; the
+  default stays 8000, so FR-P1's command is unchanged).
+
+Expected exposure (16 x 11,881 draws): MLS ~277 h (6.9 passes), CV ~81 h (2.0), VP ~94 h (2.4), FLEURS ~89 h
+(11.5); total ~541 h processed vs FR-P1 364 h (x 1.49).
+
+**Gates before the first training step (else stop, no launch):**
+1. A2-fr rebuilt on this box; every manifest sha256 equal to the archived data/a2-fr copy (eval_mls_fr,
+   eval_fleurs_fr, train_5/20/40h_fr, eval_cv, eval_vp, train_cv, train_vp, train_fleurs); 0 missing audio files.
+   The harness hashes equal harness-fr.sha256 of 2026-10-19.
+2. VP t50 is re-derived with the teacher (its manifest was not archived): must give 15,997 utts / 39.66 h as in FR-P1.
+3. Decode parity on this GPU: FR-P1's archived final.nemo (Hub runs/jp-fr-p1-w4-8k) re-probed here must reproduce
+   harness-fr greedy 0.5 s flush 27.66 within +-0.05 macro.
+
+**Primary comparison:** E1 vs FR-P1 on the same harness-fr DEV (mls / fleurs / cv / vp, 200 / set).
+**Reporting:** macro + per source greedy / beam-8 / oracle-8 / CER / empty, raw EOF and 0.5 s flush.
+**FINAL-FR** stays sealed (8b0ebba0) and is not decoded.
+
+**Class** (macro greedy, 0.5 s flush, E1 - FR-P1 = 27.66), frozen now:
+
+| class | delta | pre-registered reading |
+|---|---|---|
+| CLEAR / LEVER | <= -1.5 | strong evidence that A2 at 8k was still exposure / optimisation limited |
+| WEAK | -1.5 .. -0.5 | exposure contributes, modestly |
+| NULL | within +-0.5 | A2 essentially saturated between 8k and 11,881 |
+| HARM | > +0.5 | more exposure hurts |
+
+Oracle is diagnostic.
+
+**Limits stated in advance:**
+- E1 alone does NOT identify the cause of G1's HARM. If E1 shows a benefit, an A2 + Granary run at 11,881 (A2
+  draws matched to FR-P1) is the exposure-matched test that separates dilution from Granary label / domain quality.
+  It is NOT authorised by this pre-registration; nothing after E1 is automatic.
+- One seed, and a different GPU model from FR-P1 (RTX 6000 Ada vs L40S); gate 3 covers decode, not training
+  nondeterminism. Seed-to-seed spread on FR is unmeasured, so a delta inside the NULL band is not separable from noise.
+
 ## State map (end of 2026-10-19)
 
 | item | state | key numbers |
