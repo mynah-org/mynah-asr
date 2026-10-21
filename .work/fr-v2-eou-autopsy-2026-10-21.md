@@ -118,3 +118,14 @@ and no DEV-fr source > +1.5; FR-OOD1 reset-WER <= +0.5. Reported by pause stratu
 > 2.5). Diagnostic after the verdict: v4 native vs v4 + confirmation window W (W from DEV-EOU-v2 only) vs v2 native.
 **PASS** -> freeze an RC-FR-v2 candidate, then FINAL-EOU-FR-v2 once. **FAIL** -> STOP (no v2b, no probability
 change, no threshold, no extra steps, FINAL-EOU-FR-v2 untouched).
+
+### Seal record (2026-10-21 17:28 UTC, after the v2 training, BEFORE any checkpoint is decoded on these banks)
+- MLS-fr train: 142 / 142 speakers are in our pools -> by the rule above the banks are **mTEDx-fr only** (talk-
+  disjoint from everything; single-domain limitation declared: no audiobook reads in DEV/FINAL-EOU-v2).
+- DEV-EOU-FR-v2: 274 clips (internal 50 / 50 / 50 / 24 by stratum 0.8-1.04 / 1.04-1.6 / 1.6-2.5 / >2.5 s, endpoint
+  100), SHA256SUMS sha256 851084f2918c3d77e9945f4599524dc865027b3a3721c552994fde2dd083a1f0. Hub data/eou-fr-v2-dev.
+- FINAL-EOU-FR-v2: 268 clips (168 internal + 100 endpoint), SEAL.sha256 sha256
+  70776709d422250250e7389f8f9fd80528ca64a3bdc74c1d259a148c8974cf9f (SHA256SUMS a474f449 + tarball); local audio
+  removed; Hub data/eou-fr-v2-final. Never decoded.
+- Decoded-PCM duplicates: 0 within the new banks, 0 against the 6,415 existing FR eval clips (DEV-fr, OOD1, FINAL-FR).
+- FR-v2 training (782a7f6, p = 0.2): selected step 250 (v4: 250), in-run val WER 27.61, EOU 99.5 %, 1 empty.
