@@ -10,6 +10,8 @@
              (CPU engine, `mynah-asr stream --deltas`, f32)
     ws:      mynah_parity.py ws --work W --port 8291 [--conc 16] [--realtime 0] --out W/ws.jsonl
              (the CUDA server's /v1/audio/stream, 100 ms s16le frames; --realtime 1 paces them at 1x)
+    score:   mynah_parity.py score --work W --runs name=W/run.jsonl --lang fr --out R.json
+             (the same metric function on Mynah runs alone, no NeMo dump: per set + MACRO)
     compare: mynah_parity.py compare --work W --nemo-dump D.jsonl --runs cli=W/cli.jsonl,ws=W/ws.jsonl --lang fr
              --out R.json
 
@@ -331,8 +333,23 @@ def compare(a):
     json.dump(report, open(a.out, "w"), indent=1, ensure_ascii=False)
 
 
+def score_only(a):
+    cs = clips(a.work)
+    rep = {}
+    for spec in a.runs.split(","):
+        name, p = spec.split("=", 1)
+        mr = {d["wav"]: d for d in map(json.loads, open(p))}
+        rows = [{"set": c["set"], **score(c, textnorm.norm(mr[c["wav"]]["text"], a.lang),
+                                          [int(round((t - 0.01) / FR)) for t in mr[c["wav"]]["eou_t"]], a.lang)} for c in cs]
+        rep[name] = agg(rows)
+        rep[name]["errors_runtime"] = sum(mr[c["wav"]].get("err") is not None for c in cs)
+        for s_ in sorted(rep[name]):
+            print(f"== {name} {s_} {json.dumps(rep[name][s_])}", flush=True)
+    json.dump(rep, open(a.out, "w"), indent=1)
+
+
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("cmd", choices=["prep", "cli", "ws", "compare"])
+ap.add_argument("cmd", choices=["prep", "cli", "ws", "compare", "score"])
 ap.add_argument("--work", required=True)
 ap.add_argument("--vals", default="")
 ap.add_argument("--per-set", type=int, default=200)
@@ -349,4 +366,4 @@ ap.add_argument("--runs", default="")
 ap.add_argument("--lang", default="fr")
 ap.add_argument("--out", default="")
 a = ap.parse_args()
-{"prep": prep, "cli": cli, "ws": ws, "compare": compare}[a.cmd](a)
+{"prep": prep, "cli": cli, "ws": ws, "compare": compare, "score": score_only}[a.cmd](a)
