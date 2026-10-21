@@ -75,3 +75,12 @@ enough to wait; finding 4 says the cue exists in the text for most cases.
    - retention: FR-OOD1 reset-WER <= v4 + 0.5 (retention only, never selection);
    - classes PASS (all) / PARTIAL (primary met, one secondary missed by <= 2x its margin) / FAIL.
    Then RC-FR-v2 freeze and FINAL-FR-v2 once.
+
+## 5. Probability choice rule (fixed 2026-10-21 ~17:05 UTC, BEFORE any silence-audit result is read)
+Candidates p in {0.1, 0.2, 0.3} (`--pause-stretch-prob`, `--pause-stretch-s 1.0,2.5`). From `--silence-audit 400`
+on the frozen v4 sampler (seed 0) at each p: N(p) = internal continuation pauses per hour of stage-2 audio in the
+1.04-2.5 s band (bins 1.04-1.6 + 1.6-2.5), P(p) = terminal silences before <EOU> per hour in the same band.
+**Choose the smallest p with N(p) >= 0.5 * P(p)** (negatives at least half as frequent as positives in the regime
+where the false endpoints live); if no candidate reaches it, choose 0.3 (the largest candidate). No model run, no
+DEV / FINAL result is involved. The audit at p = 0 must show the v4 baseline (and the explicit
+`--pause-stretch-prob 0` batch audit must equal the frozen v4 hashes X 14abd104 / Y 5f8b73b6).
