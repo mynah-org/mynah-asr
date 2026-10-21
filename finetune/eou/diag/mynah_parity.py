@@ -94,19 +94,19 @@ def clips(work):
 def cli(a):
     def one(c):
         p = subprocess.run([a.bin, "stream", "-m", a.pack, "-i", c["wav"], "--quant", "f32", "--deltas"],
-                           capture_output=True, text=True, timeout=600)
-        text, eous, final = "", [], None
+                           capture_output=True, text=True, timeout=600, env={**os.environ, "MYNAH_ASR_THREADS": "1"})
+        text, eous, final, segs = "", [], None, [""]
         for l in p.stdout.splitlines():
             if not l.startswith("{"):
                 continue
             o = json.loads(l)
             if o.get("type") == "delta":
-                text += o.get("text", "")
+                text += o.get("text", ""); segs[-1] += o.get("text", "")
             elif o.get("type") == "eou" and o.get("source") == "model":
-                eous.append(o["t"])
+                eous.append(o["t"]); segs.append("")
             elif o.get("type") == "final":
                 final = o
-        return {"wav": c["wav"], "text": text, "eou_t": eous, "rc": p.returncode,
+        return {"wav": c["wav"], "text": text, "eou_t": eous, "segs": segs, "rc": p.returncode,
                 "final_eq": final is not None and final.get("text") == text}
     t0 = time.time()
     with cf.ThreadPoolExecutor(a.jobs) as ex:
@@ -155,19 +155,19 @@ def ws_one(c, port, realtime):
     while b"\r\n\r\n" not in resp:
         resp += s.recv(4096)
     assert b"101" in resp.split(b"\r\n")[0], resp[:120]
-    text, eous, lags, err, msgs = "", [], [], None, []
+    text, eous, lags, err, segs = "", [], [], None, [""]
 
     def handle(op, pl):
-        nonlocal text, err
+        nonlocal text, err, segs
         if op == 0x8:
             return False
         if op != 0x1:
             return True
         m = json.loads(pl); k = m.get("type")
         if k == "delta":
-            text += m.get("text", ""); lags.append(m.get("lag_ms", 0.0))
+            text += m.get("text", ""); segs[-1] += m.get("text", ""); lags.append(m.get("lag_ms", 0.0))
         elif k == "eou" and m.get("source") == "model":
-            eous.append(m["t"])
+            eous.append(m["t"]); segs.append("")
         elif k == "error":
             err = m.get("code"); return False
         elif k == "done" or m.get("done"):
@@ -194,7 +194,7 @@ def ws_one(c, port, realtime):
     except ConnectionError:
         pass
     s.close()
-    return {"wav": c["wav"], "text": text, "eou_t": eous, "err": err, "lag_ms_p50": float(np.median(lags)) if lags else None,
+    return {"wav": c["wav"], "text": text, "eou_t": eous, "segs": segs, "err": err, "lag_ms_p50": float(np.median(lags)) if lags else None,
             "lag_ms_max": float(max(lags)) if lags else None, "wall_s": round(time.time() - t0, 3)}
 
 
@@ -247,8 +247,36 @@ def agg(rows):
     return out
 
 
+def nemo_segs(ids, pieces):
+    """s2_reset ids -> segment texts split at <EOU> (1024): SentencePiece pieces joined, U+2581 -> space."""
+    segs, cur = [], []
+    for t in ids:
+        if t == 1024:
+            segs.append(cur); cur = []
+        elif t < 1024:
+            cur.append(pieces[t])
+    segs.append(cur)
+    return ["".join(p).replace("\u2581", " ") for p in segs]
+
+
+def divergence_class(d, m, mf, lang, pieces):
+    """PRE_EOU: the clips differ before / at the first <EOU> (first-segment text, or first <EOU> frame, or one side has
+    no <EOU> where the other has one): encoder / decoder numerics, independent of the reset semantics.
+    POST_RESET: first segment and first <EOU> frame identical, the difference is after the first reset (where Mynah
+    also empties the encoder cache and s2_reset.py does not). NO_EOU: neither side emitted an <EOU>."""
+    ns = [textnorm.norm(x, lang) for x in nemo_segs(d["ids"], pieces)]
+    ms = [textnorm.norm(x, lang) for x in m.get("segs", [m["text"]])]
+    nf = d["eou_frames"]
+    if not nf and not mf:
+        return "NO_EOU", ns, ms
+    if not nf or not mf or nf[0] != mf[0] or ns[0] != ms[0]:
+        return "PRE_EOU", ns, ms
+    return "POST_RESET", ns, ms
+
+
 def compare(a):
     cs = {c["wav"]: c for c in clips(a.work)}
+    pieces = json.load(open(Path(a.pack) / "tokens.json"))
     nemo = {}
     for l in open(a.nemo_dump):
         d = json.loads(l)
@@ -279,7 +307,8 @@ def compare(a):
             eq_txt += t_ok; eq_n += n_ok; eq_f += f_ok
             hh_err += lev(d["hyp"].split(), hyp.split()); hh_N += max(1, len(d["hyp"].split()))
             if not (t_ok and f_ok):
-                div.append({"set": c["set"], "wav": w, "nemo_hyp": d["hyp"], "mynah_hyp": hyp, "nemo_eou_f": d["eou_frames"],
+                cls, ns, ms = divergence_class(d, m, mf, a.lang, pieces)
+                div.append({"class": cls, "nemo_segs": ns, "mynah_segs": ms,"set": c["set"], "wav": w, "nemo_hyp": d["hyp"], "mynah_hyp": hyp, "nemo_eou_f": d["eou_frames"],
                             "mynah_eou_f": mf, "mynah_eou_t": m["eou_t"], "speech_end_s": c["speech_end_s"],
                             "nemo_premature": d["premature"], "text_equal": t_ok, "eou_frames_equal": f_ok})
         n = len(cs)
@@ -287,10 +316,13 @@ def compare(a):
              "hyp_vs_hyp_wer%": round(100 * hh_err / hh_N, 3),
              "eou_t_over_frame_minus_nemo_frame": {str(k): int(v) for k, v in
                                                    zip(*np.unique(np.round(offs, 3), return_counts=True))} if offs else {},
+             "divergent_by_class": {k: sum(x["class"] == k for x in div) for k in ("PRE_EOU", "POST_RESET", "NO_EOU")},
+             "divergent_with_nemo_premature": sum(bool(x["nemo_premature"]) for x in div),
              "divergent": div}
         report["runs"][name] = r
         print(f"== {name}: text equal {eq_txt}/{n}, eou count equal {eq_n}/{n}, eou frames equal {eq_f}/{n}, "
-              f"hyp-vs-hyp WER {r['hyp_vs_hyp_wer%']} %, t/0.08 - f {r['eou_t_over_frame_minus_nemo_frame']}", flush=True)
+              f"hyp-vs-hyp WER {r['hyp_vs_hyp_wer%']} %, t/0.08 - f {r['eou_t_over_frame_minus_nemo_frame']}, "
+              f"divergent by class {r['divergent_by_class']} (with a NeMo premature <EOU>: {r['divergent_with_nemo_premature']})", flush=True)
         print(f"== {name} metrics MACRO", json.dumps(r["metrics"]["MACRO"]), flush=True)
         for s in sorted(r["metrics"]):
             if s != "MACRO":
