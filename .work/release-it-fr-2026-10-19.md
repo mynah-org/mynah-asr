@@ -1258,3 +1258,48 @@ Script `fr21final.sh <this commit>` (archived): freeze commit present, no FINAL-
 No FR success band was pre-registered: FINAL-FR is reported as characterisation against the DEV anchor (25.64 /
 runtime 25.68) and the OOD1 retention value (29.53). Nothing changes in response to FINAL-FR; after this run it is
 spent for FR development.
+
+### Result: FINAL-FR one-shot of RC-FR (OBSERVED, 2026-10-21 12:34-12:46 UTC, git 6f00ac3, seal verified 4,239 files)
+
+Primary: frozen characterisation protocol (`s2_reset.py`, decoder reset, natural clips, +2 s quiet, greedy), and the
+frozen runtime (Mynah CUDA server bf16, same bytes as PCM16, same scorer definitions):
+
+| bank | clips | WER | CER | FE | FE_any | R | L p50 / p90 s | empty | split | Mynah WER / FE / R / L p50 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cv | 400 | 27.42 | 10.45 | 4.0 % | 5.5 % | 95.2 % | 0.96 / 1.92 | 1 | 1 | 27.42 / 4.0 % / 95.25 % / 0.96 |
+| fleurs | 113 | 28.57 | 11.26 | 6.2 % | 5.3 % | 92.9 % | 0.80 / 1.12 | 0 | 1 | 28.76 / 6.19 % / 92.92 % / 0.80 |
+| mls | 400 | 26.90 | 11.08 | 25.2 % | 25.2 % | 96.8 % | 0.72 / 1.36 | 3 | 94 | 27.12 / 25.25 % / 97.25 % / 0.80 |
+| smassive | 400 | 31.01 | 12.14 | 0.5 % | 2.8 % | 97.5 % | 0.96 / 2.00 | 5 | 2 | 31.05 / 0.5 % / 97.5 % / 0.96 |
+| tedx | 400 | 31.52 | 15.45 | 4.8 % | 4.8 % | 98.0 % | 0.88 / 1.60 | 1 | 19 | 31.78 / 4.5 % / 97.75 % / 0.88 |
+| vp | 400 | 21.13 | 9.36 | 3.8 % | 3.8 % | 97.2 % | 0.48 / 0.88 | 0 | 16 | 21.25 / 3.75 % / 97.5 % / 0.48 |
+| **macro / pooled** | 2,113 | **27.76** | **11.62** | **7.57 %** | **8.23 %** | **96.73 %** | **0.80 / 1.60** | **10** | | **27.90 / 7.52 % / 96.83 % / 0.80** (CER 11.69, FE_any 8.23 %, L p90 1.68, empty 10, runtime errors 0) |
+
+(WER / CER = unweighted macro over the 6 banks; FE / FE_any / R / L / empty pooled over clips.)
+Trim variant (secondary): macro WER 27.77, CER 11.61, FE 7.57 %, FE_any 8.09 %, R 96.92 %, L 0.72 / 1.46 s, empty 10.
+
+Reading (OBSERVED unless marked):
+- FINAL-FR 27.76 vs DEV 25.64 (+2.12) and OOD1 29.53: between the in-domain DEV and the out-of-domain retention
+  set. The two banks without a DEV counterpart (Speech-MASSIVE 31.01, mTEDx 31.52) are the hardest; VP 21.13 the
+  easiest. HYPOTHESIS: the gap to DEV is mostly the two new domains (macro of the four DEV-like banks 26.01).
+- Runtime vs characterisation protocol: +0.14 macro WER (27.90 vs 27.76), FE / R / p50 equal within 0.1 pt: the
+  DEV parity finding (+0.06, encoder reset after a premature <EOU>) holds on FINAL.
+- EOU: pooled FE 7.57 % / R 96.73 % / p50 0.80 s, in line with DEV (7.25 / 97.5 / 0.72). The declared MLS
+  limitation is larger on FINAL: FE 25.2 % (DEV 18 %), 94 of 400 clips split; every other bank <= 6.2 %.
+- vs RC-IT on FINAL-IT (20.49 / FE 3.50 % / R 96.2 % / p50 0.88 s): FR is +7.3 WER behind IT, same recall and
+  latency class; FE x2, carried by MLS.
+FINAL-FR is now spent for FR development. Nothing changes in response.
+Artifacts: Hub `results/l40s-2026-10-21/final-fr-results/` (per-clip dumps, both variants, Mynah run, launch
+record, logs, script, journal).
+
+## State map (end of 2026-10-21, L40S Taichung)
+
+| item | state | key numbers |
+|---|---|---|
+| RC-FR | **FROZEN 6f00ac3 = FR-S2 (7814141d), Mynah pack Hub rc/fr-s2v4** | FINAL-FR macro 27.76 (runtime 27.90), FE 7.57 %, R 96.73 %, p50 0.80 s; DEV 25.64 / runtime 25.68; OOD1 29.53 |
+| FINAL-FR | spent (one decode, 2026-10-21) | |
+| Mynah FR | parity CPU f32 == CUDA f32 800 / 800; no NeMo-vs-Mynah text divergence before the first <EOU>; post-<EOU> = encoder reset semantics | VRAM 1.9 GB flat to 128 streams |
+| RC-IT | FROZEN (section H) | FINAL-IT 20.49 |
+| open | MLS-fr long-read false endpoints (FINAL FE 25 %); s2_reset.py vs runtime reset semantics (documented, not changed); MLS-fr accent-deleted transcripts | |
+
+Next: decision on the release (IT + FR) or a new FR generation, each with its own pre-registration. Rotate the HF
+token used on 2026-10-20 / 21 (created 2026-10-13, pasted in chat).
