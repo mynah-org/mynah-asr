@@ -129,3 +129,33 @@ change, no threshold, no extra steps, FINAL-EOU-FR-v2 untouched).
   removed; Hub data/eou-fr-v2-final. Never decoded.
 - Decoded-PCM duplicates: 0 within the new banks, 0 against the 6,415 existing FR eval clips (DEV-fr, OOD1, FINAL-FR).
 - FR-v2 training (782a7f6, p = 0.2): selected step 250 (v4: 250), in-run val WER 27.61, EOU 99.5 %, 1 empty.
+
+### Result: FR-v2 (OBSERVED, 2026-10-21 17:28-17:35 UTC, eval git 8c96725) -- **FAIL (primary gate)**
+
+DEV-EOU-FR-v2 (mTEDx-fr, 274 clips), frozen s2_reset protocol, v4 (7814141d) vs v2 (p = 0.2, selected step 250):
+
+| | v4 | v2 | change |
+|---|---|---|---|
+| internal-class FE (primary) | 55.17 % | 59.77 % | **+8.3 % relative (worse; gate: >= 40 % reduction)** |
+| internal 0.8-1.04 / 1.04-1.6 / 1.6-2.5 / >2.5 s | 24.0 / 52.0 / 70.0 / 95.8 % | 28.0 / 54.0 / 80.0 / 95.8 % | +16.7 / +3.8 / +14.3 / 0 % rel |
+| <EOU> inside the target pause | 44.3 % | 48.9 % | |
+| endpoint recall / p50 / p90 | 98.0 % / 0.80 / 1.68 s | 98.0 % / 0.80 / 1.62 s | 0 pp / 0 / -0.06 s |
+| endpoint FE | 3.0 % | 2.0 % | |
+| WER internal / endpoint | 25.02 / 32.26 | 25.54 / 32.84 | |
+
+Retention (all PASS): DEV-fr reset-WER 25.48 vs 25.64 (-0.16; MLS -0.53, FLEURS +0.04, CV -0.15, VP -0.02);
+DEV-fr harness FE 6.62 % vs 7.25 %, R 97.75 % vs 97.5 %, L 0.72 / 1.12 vs 0.72 / 1.20 s; FR-OOD1 29.62 vs 29.53 (+0.09).
+Window frontier (diagnostic): v4 + W = 0.32 s reaches internal FE 33.3 % at p50 1.12 s; v2 does not move the frontier
+(v2 + W = 0.32 s: 42.5 %).
+
+Verdict: **FAIL** -> STOP as pre-registered (no v2b, no probability change, no threshold, no extra steps;
+FINAL-EOU-FR-v2 stays sealed, never decoded). RC-FR v1 unchanged.
+Reading (HYPOTHESIS, not tested today):
+- the v4 selection rule picks step 250 for both runs, so v2 had seen ~800 stretched samples (250 x 16 x 0.2) when
+  selected: the intervention may be under-exposed at the chosen checkpoint rather than ineffective;
+- room-tone stretched pauses may be acoustically distinguishable from natural long pauses (the model can learn the
+  artefact, not the rule);
+- the mTEDx internal pauses are very hard for v4 too (55 % FE, 24 % already at 0.8-1.04 s): the long-pause regime
+  may need lexical / prosodic context beyond a 120M causal encoder with 80 ms look-ahead.
+Artifacts: Hub `runs/l40s-fr-s2v2-ps/` (final.nemo, metrics.json), `results/l40s-2026-10-21/fr-v2/` (dumps, scores,
+gates, logs, scripts), `data/eou-fr-v2-dev`, `data/eou-fr-v2-final` (sealed).
