@@ -37,7 +37,7 @@ Multi-domain extensions (2026-10-10; every default reproduces the 2026-10-09 run
                                       model that already carries such an SPE (stage 2 from a
                                       --tokenizer run), 0 with a --deaccent SPE (vocabulary-only arm)
 """
-import argparse, hashlib, json, math, os, random, re, sys, time, unicodedata
+import argparse, collections, hashlib, json, math, os, random, re, sys, time, unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
@@ -62,6 +62,15 @@ ap.add_argument("--enc-lr-mid", type=float, default=0.0, help="lr of encoder blo
 ap.add_argument("--enc-lr-low", type=float, default=0.0, help="lr of the lower blocks + pre-encode (default = --enc-lr)")
 ap.add_argument("--concat-prob", type=float, default=0.0)
 ap.add_argument("--concat-gap", default="0.15,0.6")
+ap.add_argument("--pause-stretch-prob", type=float, default=0.0, help="stage 2 FR-v2: per training sample, prob of stretching "
+                "ONE genuine internal pause (silence run >= 0.16 s, >= 0.5 s after the first speech frame, >= 0.5 s of speech "
+                "after it; 80 ms frames, speech = within 35 dB of the clip peak) to U(--pause-stretch-s) s with the clip's own "
+                "room tone; the target is unchanged (<EOU> only at the real end). Drawn from its OWN RNG: with 0 (default) "
+                "the batches are those of v4 bit for bit, and with p > 0 every other sample is unchanged")
+ap.add_argument("--pause-stretch-s", default="1.0,2.5")
+ap.add_argument("--silence-audit", type=int, default=0, help="build this many TRAINING batches with the run's sampler and "
+                "report the silence the model is shown (internal continuation pauses vs terminal silence before <EOU>, "
+                "by duration bin), then exit (no step, nothing saved)")
 ap.add_argument("--pad-noise-db", default="-90,-60")
 ap.add_argument("--eval-only", type=int, default=0, help="1 = evaluate --init/--stock on the val sets once, no training")
 ap.add_argument("--n", type=int, default=0, help="first N utterances (0 = all)")
@@ -135,6 +144,8 @@ a = ap.parse_args()
 a.accented = bool(a.tokenizer) if a.accented < 0 else bool(a.accented)
 random.seed(a.seed); torch.manual_seed(a.seed)
 CAL_RNG = random.Random(a.seed + 7919)   # v5-CAL label draws only: never touches the global stream of the batches
+PS_RNG = random.Random(a.seed + 104729)   # FR-v2 pause stretching only: own stream, the v4 draws are untouched
+PS_NP = np.random.RandomState(a.seed + 104729)
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
 dev = "cuda"
 
@@ -372,6 +383,65 @@ def quiet(sec):
     return (np.random.randn(int(16000 * sec)) * 10 ** (rng2(a.pad_noise_db) / 20)).astype(np.float32)
 
 
+def speech_runs(x):
+    """80 ms frames, speech = within 35 dB of the clip peak (the eval endpoint rule): (mask, first, last speech frame)"""
+    n = 1280
+    f = x[: len(x) // n * n].reshape(-1, n)
+    db = 10 * np.log10((f ** 2).mean(1) + 1e-10)
+    sm = db > db.max() - 35
+    on = np.nonzero(sm)[0]
+    return sm, (int(on[0]) if len(on) else -1), (int(on[-1]) if len(on) else -1)
+
+
+def internal_pauses(sm, first, last, min_after=0.5, min_start=0.5, min_len=2):
+    """silence runs (j, k) inside [first, last]: >= min_len frames, starting >= min_start s after the first speech frame,
+    with >= min_after s of speech after them"""
+    out, j = [], first
+    while 0 <= j <= last:
+        if not sm[j]:
+            k = j
+            while not sm[k]:
+                k += 1
+            if k - j >= min_len and (j - first) * 0.08 >= min_start and sm[k:].sum() * 0.08 >= min_after:
+                out.append((j, k))
+            j = k
+        else:
+            j += 1
+    return out
+
+
+def stretch_pause(x):
+    """FR-v2: one internal pause stretched to U(--pause-stretch-s) s with the clip's own room tone (random 80 ms
+    non-speech frames, 10 ms crossfades); the speech before / after is untouched. Returns (x, stretched length or 0)."""
+    if PS_RNG.random() >= a.pause_stretch_prob:
+        return x, 0.0
+    sm, first, last = speech_runs(x)
+    ps = internal_pauses(sm, first, last)
+    quiet_frames = np.nonzero(~sm)[0]
+    if not ps or len(quiet_frames) < 2:
+        return x, 0.0
+    j, k = ps[PS_RNG.randrange(len(ps))]
+    lo, hi = (float(v) for v in a.pause_stretch_s.split(","))
+    target = PS_RNG.uniform(lo, hi)
+    need = target - (k - j) * 0.08
+    if need <= 0:
+        return x, 0.0
+    n, xf = 1280, 160
+    pieces, total = [], 0
+    while total < int(need * 16000) + xf:
+        q = int(quiet_frames[PS_NP.randint(len(quiet_frames))])
+        pieces.append(x[q * n:(q + 1) * n].copy()); total += n - xf
+    ramp = np.linspace(0, 1, xf, dtype=np.float32)
+    fill = pieces[0]
+    for p in pieces[1:]:
+        fill = np.concatenate([fill[:-xf], fill[-xf:] * (1 - ramp) + p[:xf] * ramp, p[xf:]])
+    fill = fill[: int(need * 16000) + xf]
+    cut = (j + k) // 2 * n
+    a_, b_ = x[:cut], x[cut:]
+    mid = np.concatenate([a_[-xf:] * (1 - ramp) + fill[:xf] * ramp, fill[xf:-xf], fill[-xf:] * (1 - ramp) + b_[:xf] * ramp])
+    return np.concatenate([a_[:-xf], mid, b_[xf:]]).astype(np.float32), round(target, 2)
+
+
 def augment(x):
     """speed (resampled: pitch + tempo), additive white/brown noise at an SNR, gain + clip."""
     if a.aug_speed and random.random() < a.aug_speed:
@@ -391,6 +461,9 @@ def augment(x):
 def batch(rs, train=False):
     xs = [audio(r) for r in rs]
     ids = [r.get("ids") or [0] for r in rs]   # validation rows carry no ids (targets unused there)
+    if train and a.pause_stretch_prob > 0:   # FR-v2 hard negatives: a long internal pause, speech continues, no <EOU> there
+        for i in range(len(xs)):
+            xs[i], _ = stretch_pause(xs[i])
     if train and a.concat_prob > 0:   # stage 2 negatives: A + short pause + B, one turn, EOU only at the end
         for i, r in enumerate(rs):
             if random.random() < a.concat_prob:
@@ -552,6 +625,33 @@ if a.batch_audit:   # label-policy audit: same seed => X identical across --eou-
     print("== BATCH-AUDIT " + json.dumps({"batches": a.batch_audit, "X_sha256": hx.hexdigest(), "Y_sha256": hy.hexdigest(),
           "eou_target_share": round(pos / tot, 4), "samples": tot, "eou_min_tail": a.eou_min_tail,
           "eou_amb_keep": a.eou_amb_keep}), flush=True)
+    raise SystemExit(0)
+if a.silence_audit:   # FR-v2 exposure: the silences the model is SHOWN, from the run's own batches (no step, nothing saved)
+    np.random.seed(a.seed)
+    B = [0.0, 0.8, 1.04, 1.6, 2.5, 1e9]
+    lab = ["<0.8", "0.8-1.04", "1.04-1.6", "1.6-2.5", ">2.5"]
+    neg_draw = collections.Counter(); neg_n = collections.Counter(); pos = collections.Counter(); hours = 0.0; tot = 0
+    for k in range(a.silence_audit):
+        X, lens, Y, ylens = batch([pick_row() for _ in range(a.bs)], train=True)
+        for i in range(len(lens)):
+            x = X[i, : int(lens[i])].float().cpu().numpy(); hours += len(x) / 16000 / 3600; tot += 1
+            sm, first, last = speech_runs(x)
+            if last < 0:
+                continue
+            ps = [(kk - jj) * 0.08 for jj, kk in internal_pauses(sm, first, last, min_start=0.0)]
+            for d in ps:
+                neg_n[lab[np.searchsorted(B, d, side="right") - 1]] += 1
+            if ps:
+                neg_draw[lab[np.searchsorted(B, max(ps), side="right") - 1]] += 1
+            if int(Y[i, int(ylens[i]) - 1]) == EOU_ID:
+                pos[lab[np.searchsorted(B, (len(sm) - 1 - last) * 0.08, side="right") - 1]] += 1
+    r = {"batches": a.silence_audit, "draws": tot, "audio_h": round(hours, 2), "pause_stretch_prob": a.pause_stretch_prob,
+         "pause_stretch_s": a.pause_stretch_s,
+         "draws_with_longest_internal_pause_in_bin_%": {b: round(100 * neg_draw[b] / tot, 2) for b in lab},
+         "internal_pauses_per_h": {b: round(neg_n[b] / hours, 1) for b in lab},
+         "eou_draws_terminal_silence_in_bin_%": {b: round(100 * pos[b] / tot, 2) for b in lab},
+         "eou_terminal_silences_per_h": {b: round(pos[b] / hours, 1) for b in lab}}
+    print("== SILENCE-AUDIT " + json.dumps(r), flush=True)
     raise SystemExit(0)
 prof_host, prof_ev, prof_wall = [], [], []
 calib = []; acc_r = acc_k = None
