@@ -116,9 +116,12 @@ def main():
     excl = set()
     for g in a.exclude_texts.split(","):
         for p in glob.glob(g):
-            for l in open(p):
-                if l.strip():
-                    excl.add(nf(json.loads(l)["text"]))
+            try:
+                rows = [json.loads(l) for l in open(p) if l.strip()]
+            except json.JSONDecodeError:   # a JSON (not JSONL) file in the glob, e.g. mix/*/hours.json: no texts
+                print(f"== skip non-manifest {p}", flush=True)
+                continue
+            excl |= {nf(r["text"]) for r in rows if isinstance(r, dict) and r.get("text")}
     spk = set()
     for g in a.exclude_speakers.split(","):
         for p in glob.glob(g):
