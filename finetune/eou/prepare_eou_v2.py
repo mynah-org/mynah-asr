@@ -82,6 +82,13 @@ def classify(info):
     return None
 
 
+def one_thread():
+    """worker initializer: torch (the 48 kHz -> 16 kHz resample of mTEDx) on ONE thread per worker; the default (every
+    core) oversubscribed the 23-CPU cgroup quota 20-fold on 2026-10-21 and the build hit its 3 h timeout"""
+    import torch
+    torch.set_num_threads(1)
+
+
 def analyse(item):
     uid, group, text, b = item
     try:
@@ -110,6 +117,8 @@ def main():
     ap.add_argument("--workers", type=int, default=20)
     a = ap.parse_args()
     a.lang = "fr"
+    import torch
+    torch.set_num_threads(1)   # the parent decodes the selected clips again: same rule
     os.makedirs(a.tmp, exist_ok=True)
     hub = P.Hub()
     nf = lambda t: textnorm.norm(t.replace("’", "'"), "fr")  # noqa: E731
@@ -187,7 +196,7 @@ def main():
                 seen.add(n); keep.append((uid, g, text, b))
         cands[src] = keep
     pool = {}
-    with ProcessPoolExecutor(a.workers) as ex:
+    with ProcessPoolExecutor(a.workers, initializer=one_thread) as ex:
         for src in cands:
             byid = {c[0]: c for c in cands[src]}
             for uid, cl, info in ex.map(analyse, cands[src], chunksize=64):
