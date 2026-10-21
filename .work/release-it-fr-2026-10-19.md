@@ -1177,3 +1177,84 @@ Next (each with its own pre-registration / decision):
 2. RC-FR freeze (DEV + product criteria only), then FINAL-FR once.
 3. Optional research: G1E-16k (plain ceiling on the promoted mix), MLS-fr accent repair, FR EOU precision on long reads.
 4. HF token pasted in chat on 2026-10-20: revoke on HF (deleting it from the box is not a revocation).
+
+## O. 2026-10-21 RC-FR: fresh-box restore, Mynah parity, streaming validation, FREEZE (before any FINAL-FR decode)
+
+Box: Vast L40S 46 GB (Taichung, C.57033913), driver 570.211.01 / CUDA 12.8, Xeon Platinum 8558, **cgroup CPU quota
+23 CPUs** (192 visible), 2 TB RAM, Ubuntu 24.04, Python 3.12. TLS issuers public, no proxy. Built by prov.sh at
+eb82333 (NeMo venv torch 2.11.0+cu128; Mynah `make` + `make -C gpu CUDA_ARCH=sm_89`). Journal, logs, scripts and all
+artifacts below: Hub `results/l40s-2026-10-21/parity-fr/`.
+
+### Gates (OBSERVED)
+1. **Restore: PASS.** Every artifact from the Hub, hash-verified (`restore_report.md`): FR-G1E 1271deff, FR-S2
+   7814141d, G1E mix manifests (4 / 4), snapshot fr-g1e (101,177 files, index-verified), DEV-fr 800 / 800 clips,
+   FR-OOD1 seal cc9ba4c8 + every file, FINAL-FR seal 8b0ebba0 (SHA256SUMS + Granary ids) and tarball member list
+   vs SHA256SUMS (0 absent): **tarball NOT extracted, nothing decoded**. (The first gate run false-failed on its own
+   grep, which matched "0 missing |"; every row was OK; log kept.)
+2. **Reference reproduction: PASS, exact.** `s2_reset.py --lang fr --post-pad-s 2.0 --per-set 200` on this box:
+   per-set error counts identical to 2026-10-20 for parent / s2 / s2_reset; macro s2_reset 25.64, CER 10.31,
+   FE 7.25 %, FE_any 7.62 %, R 97.5 %, L p50 / p90 0.72 / 1.20 s, empty 0; parent 25.54.
+3. **Same bytes:** the 800 DEV clips with the protocol's 2 s of -75 dB quiet, written as PCM16 (Mynah reads PCM16
+   only): NeMo float-pad vs PCM16-pad 800 / 800 identical (hyp + <EOU> frames).
+4. **Mynah pack** (`export_to_mynah.sh` of 7814141d; stock SPE, <EOU> 1024, <EOB> 1025, blank 1026, preset [70, 1]):
+   model.safetensors 9e0e6b50a20f3e4f, mynah.json c3669ef09cf94711, tokens.json 70a5a46e6dd0e53c; Hub `rc/fr-s2v4`.
+   Language-specific code needed for FR: none in export / runtime / tokenizer (same SPE and arch as IT); FR is only
+   in the scorer (`textnorm.norm(t, "fr")`) and the bank.
+5. **Parity matrix (`mynah_parity.py`, 800 DEV clips, the same bytes)**; clip class = where the two first differ:
+
+| comparison | identical (text + <EOU> frames) | PRE_EOU divergent (1st-segment text identical) | POST_RESET divergent | word edits all / PRE / POST | pooled WER delta | empty diff |
+|---|---|---|---|---|---|---|
+| NeMo f32 vs Mynah CPU f32 | 752 / 800 | 5 (5) | 43 | 113 / 0 / 113 | +0.08 | 0 |
+| NeMo f32 vs Mynah CUDA f32 | 752 / 800 | 5 (5) | 43 | 113 / 0 / 113 | +0.08 | 0 |
+| Mynah CPU f32 vs CUDA f32 | **800 / 800** (and identical <EOU> t) | 0 | 0 | 0 | 0.00 | 0 |
+| Mynah CUDA f32 vs CUDA bf16 | 729 / 800 | 69 (16) | 2 | 93 / 92 / 1 | -0.01 | 0 |
+
+   - **No transcript divergence before the first <EOU> between NeMo and Mynah f32** (0 word edits). The 5 PRE_EOU
+     clips have identical text; their only <EOU> is the end-of-stream one and Mynah places it one frame earlier.
+   - Time convention found on the way: Mynah reports an <EOU> at t = f * 0.08 + 0.01 s for NeMo frame f (785 / 800);
+     the scorer's first conversion was off by one frame (fixed b28dc52 before any interpretation).
+   - **POST_RESET = reset semantics, not a port defect.** All 43 follow a <EOU> before the clip end (42 premature by
+     the FE rule; 32 MLS, 6 VP, 5 FLEURS). Mynah (src/mynah_asr.c stream_model_eou, = NeMo voice-agent
+     streaming_asr.py reset_state) resets the ENCODER caches and the decoder after the chunk holding the <EOU>;
+     `s2_reset.py` (and the RC-IT freeze text, section H) resets the decoder only. `enc_reset_probe.py` (NeMo's own
+     cache-aware streaming encoder, same bytes): decoder-only reset = the offline dump 43 / 43 (and = Mynah 5 / 43);
+     encoder + decoder reset after the chunk = Mynah 30 / 43 transcripts, 38 / 43 <EOU> frames; 60 / 60 controls equal
+     everywhere. The 13-clip residual is the emulation of the post-reset chunk (pre-encode cache handling), not
+     resolved here. Cost of Mynah's semantics on DEV: +0.06 macro WER (25.70 vs 25.64), FE / R / p50 unchanged.
+   - bf16 (the server default) vs f32: precision divergence, metric-neutral (-0.01 WER).
+6. **Streaming validation on a quiet box** (no NeMo / CPU job; GPU P8 34 C at start; server default bf16
+   own-tc-bf16-rowstable, lookahead 1, cap 128), realtime 1x WebSocket feed:
+   - DEV 800 clips at 16 streams: macro WER 25.68 / CER 10.34, FE 7.50 %, FE_any 7.75 %, R 97.38 %, L p50 / p90
+     0.72 / 1.30 s, empty 0, runtime errors 0 (FLEURS 30.18, MLS 23.77 with FE 18.5 %, CV 26.71, VP 22.07);
+   - realtime vs fast feed: identical text + <EOU> t on 800 / 800 (c16), 256 / 256 (c64), 256 / 256 (c128);
+   - VRAM 1,941 MiB with the model loaded and flat at 128 concurrent streams (weights 635 MB, arena 799 MB);
+     GPU util <= 15 %; delta lag max p99 109 / 47 / 48 ms at 16 / 64 / 128 streams. Performance caveat: the host
+     load average reached 106 during the c16 pass (shared host, not our jobs): lag numbers are a functional smoke
+     check, not a benchmark.
+   - CUDA engine gate tests/test_cuda_stream on 4 FR clips: batch identity, repeat, slot independence all OK.
+
+### RC-FR FREEZE (2026-10-21 ~12:40 UTC; DEV + product criteria only; FINAL-FR sealed, not extracted)
+- **Model:** FR-S2 = stage 2 v4 on FR-G1E, Hub `runs/jp-fr-s2v4-g1e/final.nemo`,
+  sha256 7814141d (parent FR-G1E 1271deff). No change of checkpoint, recipe, data, normalisation or threshold.
+- **Runtime:** Mynah pack Hub `rc/fr-s2v4` (hashes above); `mynah-asr-server-cuda` v0.9.1-646-geb82333 (source git
+  eb82333; binary sha256 2b1c5777, CLI 692cec6c), default flags: precision bf16, gemm own-tc-bf16-rowstable,
+  lookahead 1, model <EOU> -> event + encoder / decoder reset after the chunk, PCM16 16 kHz input.
+- **Tokenizer / text:** stock EOU-120M SPE (tokens.json 70a5a46e); scorer `finetune/common/textnorm.py`
+  (sha256 19ebfd07, lang fr).
+- **Known limitations (declared now):** FE 7.25 % on DEV (MLS 18 %: false endpoints at internal pauses of long
+  reads); the offline characterisation protocol (s2_reset.py) resets the decoder only while the runtime also resets
+  the encoder (+0.06 DEV WER, 43 / 800 clips); MLS-fr transcripts with deleted accented letters (data); stock SPE
+  has no accented letters (scored accent-insensitive).
+
+### FINAL-FR one-shot -- PRE-REGISTERED (this commit, before the tarball is extracted)
+Script `fr21final.sh <this commit>` (archived): freeze commit present, no FINAL-FR output locally or on the Hub,
+7814141d + pack hashes, seal 8b0ebba0 and `sha256sum -c` of every file right after extraction, then ONE run of:
+1. **Primary (characterisation, = the protocol of the DEV selection and of FINAL-IT):** `s2_reset.py --lang fr
+   --post-pad-s 2.0 --models s2_reset --per-set 100000` on the natural banks (cv, fleurs, mls, smassive, tedx, vp;
+   2,113 clips): per bank WER, CER, empty, FE, FE_any, R, L p50 / p90, split; macro WER / CER over the 6 banks,
+   FE / FE_any / R / L / empty pooled. Trim variant (`final_trim_*`) secondary, same table.
+2. **Product (the frozen runtime):** Mynah CUDA server bf16 on the natural banks (same 2 s quiet, PCM16), scored with
+   `mynah_parity.py score` (the same definitions): the same table.
+No FR success band was pre-registered: FINAL-FR is reported as characterisation against the DEV anchor (25.64 /
+runtime 25.68) and the OOD1 retention value (29.53). Nothing changes in response to FINAL-FR; after this run it is
+spent for FR development.
