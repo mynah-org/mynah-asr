@@ -16,8 +16,9 @@
 Every protocol is scored by ONE function with the s2_reset.py definitions on the ORIGINAL clip (energy speech end,
 80 ms frames): reset-WER / CER / empty, FE = an <EOU> with >= 0.5 s of speech left, FE_any = an <EOU> followed by
 >= 2 speech frames, recall = a first <EOU> at / after speech end - 0.5 s, latency = that <EOU> - speech end.
-Time convention: NeMo <EOU> frame f -> f * 0.08 s (s2_reset.py); Mynah reports the END of the emitting encoder frame,
-(f + 1) * 0.08 s, so f = round(t / 0.08) - 1; the observed offset is printed, not assumed.
+Time convention: NeMo <EOU> frame f -> f * 0.08 s (s2_reset.py); Mynah reports t = f * 0.08 + 0.01 s for the same
+frame (observed 2026-10-21: t / 0.08 - f = 0.125 on 785 / 800 DEV-fr clips; the stream's mel_end bookkeeping), so
+f = round((t - 0.01) / 0.08); the residual histogram is printed, not assumed.
 Parity is clip level: normalised transcript equal, <EOU> count equal, <EOU> frames equal; divergent clips are listed.
 """
 import argparse
@@ -299,10 +300,10 @@ def compare(a):
         for w, c in cs.items():
             m, d = mr[w], nemo[w]
             hyp = textnorm.norm(m["text"], a.lang)
-            mf = [int(round(t / FR)) - 1 for t in m["eou_t"]]
+            mf = [int(round((t - 0.01) / FR)) for t in m["eou_t"]]
             rows.append({"set": c["set"], **score(c, hyp, mf, a.lang)})
             if len(mf) == len(d["eou_frames"]):
-                offs += [t / FR - f for t, f in zip(m["eou_t"], d["eou_frames"])]
+                offs += [round((t - 0.01) / FR - f, 3) for t, f in zip(m["eou_t"], d["eou_frames"])]
             t_ok, n_ok, f_ok = hyp == d["hyp"], len(mf) == len(d["eou_frames"]), mf == d["eou_frames"]
             eq_txt += t_ok; eq_n += n_ok; eq_f += f_ok
             hh_err += lev(d["hyp"].split(), hyp.split()); hh_N += max(1, len(d["hyp"].split()))
@@ -314,14 +315,14 @@ def compare(a):
         n = len(cs)
         r = {"metrics": agg(rows), "clips": n, "text_equal": eq_txt, "eou_count_equal": eq_n, "eou_frames_equal": eq_f,
              "hyp_vs_hyp_wer%": round(100 * hh_err / hh_N, 3),
-             "eou_t_over_frame_minus_nemo_frame": {str(k): int(v) for k, v in
+             "mynah_frame_minus_nemo_frame": {str(k): int(v) for k, v in
                                                    zip(*np.unique(np.round(offs, 3), return_counts=True))} if offs else {},
              "divergent_by_class": {k: sum(x["class"] == k for x in div) for k in ("PRE_EOU", "POST_RESET", "NO_EOU")},
              "divergent_with_nemo_premature": sum(bool(x["nemo_premature"]) for x in div),
              "divergent": div}
         report["runs"][name] = r
         print(f"== {name}: text equal {eq_txt}/{n}, eou count equal {eq_n}/{n}, eou frames equal {eq_f}/{n}, "
-              f"hyp-vs-hyp WER {r['hyp_vs_hyp_wer%']} %, t/0.08 - f {r['eou_t_over_frame_minus_nemo_frame']}, "
+              f"hyp-vs-hyp WER {r['hyp_vs_hyp_wer%']} %, mynah f - nemo f {r['mynah_frame_minus_nemo_frame']}, "
               f"divergent by class {r['divergent_by_class']} (with a NeMo premature <EOU>: {r['divergent_with_nemo_premature']})", flush=True)
         print(f"== {name} metrics MACRO", json.dumps(r["metrics"]["MACRO"]), flush=True)
         for s in sorted(r["metrics"]):
