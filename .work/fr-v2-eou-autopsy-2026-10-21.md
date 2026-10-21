@@ -84,3 +84,37 @@ on the frozen v4 sampler (seed 0) at each p: N(p) = internal continuation pauses
 where the false endpoints live); if no candidate reaches it, choose 0.3 (the largest candidate). No model run, no
 DEV / FINAL result is involved. The audit at p = 0 must show the v4 baseline (and the explicit
 `--pause-stretch-prob 0` batch audit must equal the frozen v4 hashes X 14abd104 / Y 5f8b73b6).
+
+## 6. FR-v2 -- PRE-REGISTERED (2026-10-21 ~17:35 UTC, before launch; no v2 model result exists)
+
+**Preflight (OBSERVED):**
+- OFF identity: `--batch-audit 300` on ed01891 with the flag absent AND with `--pause-stretch-prob 0` = the frozen
+  v4 sampler on e71fe7f: X 14abd1047c66d1df, Y 5f8b73b686b48e15 (4,800 samples), identical.
+- Exposure (`--silence-audit 400`, 6,400 draws, ~17.8 h each), per hour of stage-2 audio, 1.04-2.5 s band:
+  p = 0: negatives N 38.8 vs positives P 126.7; p = 0.1: N 56.5 vs P 125.6; **p = 0.2: N 74.0 vs P 124.9**;
+  p = 0.3: N 89.5 vs P 123.7. The section-5 rule (smallest p with N >= 0.5 P) gives **p = 0.2**. Positives are
+  unchanged by p (own RNG). Per bin at p = 0.2: internal pauses /h <0.8 540.3, 0.8-1.04 37.2, 1.04-1.6 41.2,
+  1.6-2.5 32.8, >2.5 0.4; terminal silences before <EOU> /h 151.0 / 12.7 / 42.3 / 82.6 / 68.7.
+- Banks: mTEDx part of DEV-EOU-FR-v2 / FINAL-EOU-FR-v2 built (DEV 174 internal by stratum 50 / 50 / 50 / 24 +
+  100 endpoint; FINAL 168 + 100; talk-disjoint). MLS part: the last 8 MLS-fr train shards hold only speakers of our
+  pools (0 rows kept). Rule fixed now: MLS-fr train speakers absent from all our MLS manifests are added with the same
+  class / stratum / selection rules if >= 10 such speakers exist; otherwise the banks are mTEDx only (declared
+  single-domain limitation). Both banks are sealed BEFORE any checkpoint (v4 or v2) is decoded on them; FINAL is
+  tarred and its local audio removed. Order deviation from the steer, declared: the training is launched before the
+  banks are sealed (the training does not read them; no decision depends on them until the seal exists).
+
+**Run:** `LANG_=fr INIT=<G1E 1271deff> TAG=fr-s2v2-ps S2MIX=<G1E mix> S2EXTRA="--lr 2e-5 --pause-stretch-prob 0.2
+--pause-stretch-s 1.0,2.5" PROBE=0 M1=0 bash finetune/jobs/s2_mix.sh` = the frozen v4 command (33a202f) plus the one
+variable. Selection rule unchanged (v4: min in-run harness WER among evals with EOU >= 80 % and <= 10 % empty).
+PROBE=0: the offline lm_fusion probes are diagnostics, not gates (can be run later).
+
+**Evaluation (frozen s2_reset protocol, `--post-pad-s 2.0`, `--models s2_reset`):** v4 (7814141d) and v2 on DEV-EOU-FR-v2
+(`eou_v2_score.py`); v2 on harness DEV-fr 4 x 200 against the reproduced v4 reference (25.64); FR-OOD1 retention once
+on the selected v2 (v4 29.53).
+
+**Gates (all required for PASS), v2 vs v4:** DEV-EOU-v2 internal-class FE (frozen FE rule) relative reduction >= 40 %;
+endpoint-class recall loss <= 1.0 pp; endpoint latency p50 <= +0.16 s and p90 <= +0.32 s; DEV-fr reset-WER <= +0.3
+and no DEV-fr source > +1.5; FR-OOD1 reset-WER <= +0.5. Reported by pause stratum (0.8-1.04 / 1.04-1.6 / 1.6-2.5 /
+> 2.5). Diagnostic after the verdict: v4 native vs v4 + confirmation window W (W from DEV-EOU-v2 only) vs v2 native.
+**PASS** -> freeze an RC-FR-v2 candidate, then FINAL-EOU-FR-v2 once. **FAIL** -> STOP (no v2b, no probability
+change, no threshold, no extra steps, FINAL-EOU-FR-v2 untouched).
