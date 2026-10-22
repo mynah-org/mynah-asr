@@ -10,7 +10,7 @@
   "flags": "as RC-IT stage 2 v4 (read back from hub runs/jp-fr-s2v4-g1e/metrics.json)",
   "mix": "the G1E mix: MLS-fr 40 h 0.2356, CV17-fr 0.2020, VP-fr t50 0.1347, FLEURS-fr 0.1010, Granary-fr agree<=20 0.3267",
   "selection": "v4 rule -> step 250",
-  "run": "Kyoto RTX 6000 Ada 2026-10-20, 859 s, git 6a9df01 lineage"
+  "run": "Kyoto RTX 6000 Ada 2026-10-20, 859 s"
  },
  "stage1": {
   "run": "FR-G1E: stock init, W4 (enc 4e-4, dec/joint 3e-4), WSD 11,881 steps (5 % warm-up, last 20 % decay), bs 16, max 30 s, seed 0, final = last step; 3,929 s RTX 6000 Ada",
