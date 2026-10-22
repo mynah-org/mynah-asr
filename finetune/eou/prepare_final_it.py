@@ -354,7 +354,18 @@ def tedx_shards(a, hub, R):
         return [f"it/train-{i:05d}-of-00030.parquet" for i in (0, 1)]
     tr = hub.files(R, SRC[a.lang]["hf"], "train")
     assert len(tr) >= 2 and "/train-00000-of-" in tr[0] and "/train-00001-of-" in tr[1], tr[:3]
+    if a.tedx_shards:   # FINAL-FR-v2 (2026-10-22): other train shards than FINAL-FR's 0-1
+        return [tr[i] for i in rng(a.tedx_shards)]
     return tr[:2]
+
+
+def rng(spec):
+    """"10,11" / "0-9" -> list of ints"""
+    out = []
+    for x in spec.split(","):
+        lo, _, hi = x.partition("-")
+        out += list(range(int(lo), int(hi or lo) + 1))
+    return out
 
 
 def tedx(a, hub, seen, name="tedx"):
@@ -365,6 +376,11 @@ def tedx(a, hub, seen, name="tedx"):
     dev_talks = {r["talk_id"] for p in devp for r in hub.column(R, p, ["talk_id"])}
     gran = granary_ids(hub, a.lang, f"{a.tmp}/granary_{a.lang}_ids.json")
     b, end = Bank(name, a, seen), ENDING[a.lang]
+    if name == "tedx" and a.tedx_exclude_shards:   # every talk with a row in these train shards (earlier banks' shards)
+        tr = hub.files(R, L, "train")
+        ex_talks = {r["talk_id"] for r in hub.columns(R, [tr[i] for i in rng(a.tedx_exclude_shards)], ["talk_id"])}
+        dev_talks = dev_talks | ex_talks
+        print(f"== tedx: {len(ex_talks)} talks of train shards {a.tedx_exclude_shards} excluded", flush=True)
     if name == "tedxdev":
         tr_talks = {r["talk_id"] for r in hub.columns(R, hub.files(R, L, "train"), ["talk_id"])}
         assert not (dev_talks & tr_talks), f"mTEDx dev talks in train: {sorted(dev_talks & tr_talks)[:5]}"
@@ -469,6 +485,8 @@ def main():
                     "VP train / test speaker (amendment 2026-10-18: the latter left 3 speakers)")
     ap.add_argument("--seed-final", default="", help="comma-separated globs of ALREADY-BUILT FINAL banks (final_<bank>.json): "
                     "their texts seed the cross-bank dedup, as if built in the same run (completing a bank later)")
+    ap.add_argument("--tedx-shards", default="", help="tedx: mTEDx train shard indices instead of 0-1 (e.g. 10,11; FINAL-FR-v2)")
+    ap.add_argument("--tedx-exclude-shards", default="", help="tedx: drop every talk present in these train shards (e.g. 0-9)")
     ap.add_argument("--plan-only", action="store_true", help="metadata only: candidate counts, drops and the selection "
                     "order -> $OUT/plan_<bank>.json; no audio download / decode, no final_* / SHA256SUMS written")
     ap.add_argument("--hub-workers", type=int, default=0, help="cap on parallel Hub column reads (rate-limited IPs); "

@@ -206,3 +206,64 @@ run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-
 **SAFE TO DESTROY VAST INSTANCE.** The HF token used today was pasted in chat: revoke it before any public release.
 Open decision (user): publish RC-FR v1 (FINAL 27.76) and / or the v1.1 candidate (DEV 22.08, OOD1 24.97, no FINAL;
 a fresh FINAL-FR-v2 bank would be needed for a held-out number).
+
+## 8. FINAL-FR-v2 -- PRE-REGISTERED (2026-10-22 ~15:20 UTC, before the bank is built; model-free)
+
+Purpose: a fresh held-out number for RC-FR v1.1 (3130534d). FINAL-FR (2026-10-19) is spent; FINAL-EOU-FR-v2 is an
+EOU bank and stays sealed and untouched.
+
+**Builder:** `prepare_final_it.py --lang fr` (the FINAL-FR builder, rules unchanged: model-free selection in sha1
+order, natural endings, >= 3 words for tedx, text dedup across banks, per-speaker / per-talk caps) with:
+- `--banks mls,cv,vp,tedx --n 400 --tedx-per-talk 25`;
+- `--seed-final <FINAL-FR final_*.json>`: every FINAL-FR text seeds the dedup, so no FINAL-FR clip / sentence is
+  re-selected (the selection order is deterministic: without it the same clips would come back);
+- `--exclude-texts`: every FR training manifest (G1E mix), the DEV-fr harness, FR-OOD1 (tedxdev + smtrain) and the
+  DEV-EOU-FR-v2 manifest;
+- `--vp-exclude` = our VP pools + the FINAL-FR VP bank (as FINAL-FR: speakers of our pools);
+- tedx: mTEDx fr TRAIN shards **10-11** (new flag `--tedx-shards`), dropping every talk with a row in train shards
+  **0-9** (`--tedx-exclude-shards`: FINAL-FR used 0-1, both EOU-v2 banks 2-9; this excludes them by construction
+  without opening FINAL-EOU-FR-v2), plus the mTEDx test / valid talks and every Granary-fr video id (as FINAL-FR).
+- Sources and splits: MLS-fr dev, CV17-fr validation, VoxPopuli-fr validation (the FINAL-FR splits, other clips;
+  speakers may overlap FINAL-FR, never training), mTEDx-fr train shards 10-11.
+- Not included (declared): FLEURS-fr (its dev sentences are FINAL-FR's), Speech-MASSIVE (validation spent, train in
+  FR-OOD1, test gated). Four banks instead of six: the macro is NOT comparable to FINAL-FR's six-bank macro.
+
+**Seal:** SHA256SUMS (manifests + every wav) and SEAL.sha256 = sha256 of SHA256SUMS, recorded in a commit BEFORE any
+decode; sealed tgz archived on the Hub.
+
+**One decode, after the seal commit, of RC-FR v1.1 only** (= the FINAL-FR protocol, section O):
+1. primary: `s2_reset.py --lang fr --post-pad-s 2.0 --models s2_reset --per-set 100000` on the natural banks:
+   per bank WER / CER / empty / FE / FE_any / R / L p50 / p90 / split; macro over the 4 banks, EOU pooled; trim
+   variant secondary;
+2. product: Mynah CUDA server bf16 on the same banks (2 s quiet, PCM16), `mynah_parity.py score`.
+No band, no comparison used for any decision; v1 is NOT decoded on it (no selection between v1 and v1.1 on FINAL-FR-v2).
+Nothing changes in response.
+
+## 9. ES-1 third-language replication -- PRE-REGISTERED (2026-10-22 ~15:20 UTC, before any ES data stat is seen)
+
+Question: does the frozen IT / FR plain recipe give a useful Spanish 120M model on the first attempt? One run, one
+number, no tuning.
+
+- **Data (A2-style, frozen definitions):** `data_mix.sh es` = MLS-es 40 h cut over all speakers (prepare_it.py, the
+  FR rules), CV17-es 40 h (<= 20 clips / speaker), VoxPopuli-es 40 h (<= 60 / speaker), FLEURS es_419 train; text rule
+  textnorm es (NFKD, typographic apostrophes; digit clips dropped).
+  - VP teacher filter (t50, Nemotron 0.6B, `a2_vpfilter.sh LANG_=es FILTER_ONLY=1`) ONLY if the teacher and its
+    300-clip CLI gate are ready by **15:45 UTC**; otherwise VoxPopuli-es unfiltered (`train_vp.json`). Either way the
+    choice is recorded before training.
+  - No Granary-es (pool + teacher scoring would be the critical path): declared limitation; the recipe analogue is
+    FR-E1 (A2 only), not G1E / H2.
+- **Weights:** the A2 weights (MLS 0.35, CV 0.30, VP 0.20, FLEURS 0.15), fr_p1.sh's default.
+- **Recipe:** fr_p1.sh with `LANG_=es` = the H2 / G1E recipe: stock init + stock tokenizer, whole encoder 4e-4,
+  decoder / joint 3e-4, W4, WSD fractional (5 % warm-up, last 20 % decay), bs 16, max-dur 30, seed 0, final = last
+  step, `--abort-wer 1000:85`; no CTC / KD / tokenizer / stage 2 / LM.
+- **Horizon rule (the H2 exposure lesson):** H2 consumed 995.9 audio-hours over 216.3 physical hours = 4.60 passes.
+  ES steps = round(4.60 x H_phys / h_step), h_step = 16 x the weight-averaged mean clip duration of the frozen mix
+  (hours per step), capped at 23,762. Reported: physical hours / clips / speakers per source, weights, steps, audio
+  hours consumed (metrics.json), passes, wall, GPU time, peak VRAM, xRT.
+- **Evaluation (sealed before training, model-free):** the harness-es = MLS-es test eval (prepare_it), FLEURS es_419
+  eval, CV17-es test 200, VP-es test 200 (prepare_mix); SHA256SUMS recorded before the launch. fr_p1.sh probes:
+  greedy / beam-8 / oracle-8 / CER, raw EOF and 0.5 s flush, per source + macro; primary = macro greedy 0.5 s.
+  Stock EOU-120M (English) probed on the same harness as the zero-shot reference.
+- **Reading bands (descriptive, set now):** <= 25 strong transfer; 25-30 transfers; 30-40 weak; > 40 or abort =
+  failure of an IT / FR assumption. No ES v2 today; stage 2 ES only if the plain run ends with >= 45 min of box time
+  left AND macro greedy <= 30, with the v4 recipe unchanged.
