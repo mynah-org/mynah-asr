@@ -128,3 +128,25 @@ run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-
   load average up to 8.6 (functional smoke, not a benchmark).
 - Mynah CPU CLI: 730 clips in 845 s (16 x 1 thread), 0 errors, final == concatenated deltas on 730 / 730.
 - NeMo release example (`examples/transcribe_nemo.py`) vs the frozen s2_reset dump: text 40 / 40, <EOU> frames 40 / 40.
+
+### Result: stage 2 v4 on FR-H2 (`fr-s2v4-h2`) -- FR-S2 gates: RC-FR CANDIDATE (OBSERVED, 2026-10-22, one seed)
+- Unchanged FR-S2 command with INIT = H2 (d2062aca); 816 s; the v4 rule selected **step 1250** (in-run 24.27,
+  EOU 99.5 %, 1 empty; FR-S2 had selected 250). final.nemo sha256 **3130534d**577e340df129fea9074a63a070aaa05292bcf3aadd96b4aa39fd969c;
+  Hub `runs/ada-fr-s2v4-h2` + `results/ada-2026-10-22/fr-s2v4-h2` (archive verified).
+- s2_reset protocol (`--lang fr --post-pad-s 2.0`, decoder reset, 2 s quiet), same tool as FR-S2:
+
+| set | parent H2 | s2_reset | delta | FE | FE_any | recall | latency p50 / p90 s | empty |
+|---|---|---|---|---|---|---|---|---|
+| DEV MLS | 19.90 | 20.11 | +0.21 | **18.0 %** | | 96.5 % | 0.64 / 1.20 | 1 |
+| DEV FLEURS | 26.30 | 26.22 | -0.08 | 4.5 % | | 98.0 % | 0.80 / 1.12 | 0 |
+| DEV CV | 24.05 | 23.94 | -0.11 | 5.5 % | | 95.0 % | 0.80 / 1.12 | 0 |
+| DEV VP | 18.04 | 18.06 | +0.02 | 3.0 % | | 99.0 % | 0.56 / 1.28 | 0 |
+| **DEV macro / pooled** | 22.07 | **22.08** | **+0.01** | **7.75 %** | 8.12 % | **97.12 %** | **0.72 / 1.12** | 1 / 1 |
+| **FR-OOD1** (800, once) | 25.64 | **24.97** | -0.67 | 8.5 % | 10.0 % | 96.75 % | 0.96 / 1.68 | 7 / 13 |
+
+- All seven FR-S2 gates PASS -> **RC-FR CANDIDATE**.
+- vs RC-FR v1 (same tool, archived): DEV 25.64 -> **22.08 (-3.56)**, OOD1 29.53 -> **24.97 (-4.56)**; EOU class
+  unchanged (FE 7.25 -> 7.75 %, R 97.5 -> 97.12 %, p50 0.72 = 0.72 s). The MLS long-read false endpoints are unchanged
+  (DEV MLS FE 18.0 %, as v1): the declared limitation carries over.
+- Not available: a FINAL number (FINAL-FR is spent; FINAL-EOU-FR-v2 is not an ASR FINAL). The candidate is
+  characterised on DEV / OOD1 / mTEDx dev only. Mynah qualification of 3130534d: `day22frq.sh` (parity-fr2).
