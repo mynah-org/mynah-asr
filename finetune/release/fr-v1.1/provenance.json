@@ -1,0 +1,31 @@
+{
+ "model": "mynah-eou-fr-120m-v1.1 (RC-FR v1.1 candidate)",
+ "checkpoint": {
+  "sha256": "3130534d577e340df129fea9074a63a070aaa05292bcf3aadd96b4aa39fd969c",
+  "hub": "runs/ada-fr-s2v4-h2/final.nemo"
+ },
+ "stage2": {
+  "init": "plain FR-H2 sha256 d2062aca28d8db0abff823fe4be8051665bdb4c7d3d15cc8ff929f32cf8bfda6 (hub runs/ada-fr-h2-g1e-w4-23762)",
+  "script": "LANG_=fr finetune/jobs/s2_mix.sh + finetune/eou/two_stage.py --lang fr",
+  "flags": "= RC-FR v1 stage 2 (FR-S2), INIT changed only",
+  "mix": "the G1E mix: MLS-fr 40 h 0.2356, CV17-fr 0.2020, VP-fr t50 0.1347, FLEURS-fr 0.1010, Granary-fr agree<=20 0.3267",
+  "selection": "v4 rule -> step 1250",
+  "run": "RTX 6000 Ada 2026-10-22, 816 s"
+ },
+ "stage1": {
+  "run": "FR-H2 = FR-G1E recipe at 23,762 steps (W4, WSD fractional: warm-up 1,188, decay from ~19,010), seed 0, final = last step; 7,774 s RTX 6000 Ada",
+  "launch": "MIX=<G1E mix> STEPS=23762 TAG=fr-h2-g1e-w4-23762 bash finetune/jobs/fr_p1.sh",
+  "prereg": "commit 180a05d",
+  "flags_record": "hub runs/ada-fr-h2-g1e-w4-23762/metrics.json"
+ },
+ "data_snapshot": "hub data/snapshots/fr-g1e (101,177 files; restore: data_snapshot.py restore --name fr-g1e)",
+ "freeze": "pending",
+ "final_eval": "none (FINAL-FR spent on RC-FR v1)",
+ "mynah_pack": {
+  "hub": "release/mynah-eou-fr-120m-v1.1/mynah (export_to_mynah.sh of 3130534d, 2026-10-22)"
+ },
+ "parity": "hub results/ada-2026-10-22/qual-fr-v1.1",
+ "code": "github mynah-org/mynah-asr branch lw-finetune-tooling",
+ "archive": "gabrione/mynah-asr-canary-it-experiments (private)",
+ "reproducibility": "one seed per stage; not re-executed"
+}

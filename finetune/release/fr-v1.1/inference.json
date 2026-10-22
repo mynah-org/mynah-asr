@@ -1,0 +1,46 @@
+{
+ "name": "mynah-eou-fr-120m-v1.1 (candidate)",
+ "language": "fr",
+ "base_model": "nvidia/parakeet_realtime_eou_120m-v1",
+ "architecture": {
+  "encoder": "cache-aware FastConformer, 17 layers, d_model 512",
+  "decoder": "RNNT (LSTM prediction network + joint)",
+  "params": "120M",
+  "frame_ms": 80,
+  "att_context": [
+   70,
+   1
+  ],
+  "lookahead_frames": 1
+ },
+ "tokenizer": {
+  "type": "SentencePiece (stock base-model vocabulary, 1024 pieces)",
+  "eou_id": 1024,
+  "eob_id": 1025,
+  "blank_id": 1026,
+  "files": [
+   "nemo/ (inside model.nemo)",
+   "mynah/tokens.json"
+  ]
+ },
+ "input": "16 kHz mono PCM16 (Mynah); float or PCM16 WAV at 16 kHz (NeMo)",
+ "precision": {
+  "mynah_cpu": "f32",
+  "mynah_cuda_server": "bf16 (default, own-tc-bf16-rowstable); f32 available, CPU f32 == CUDA f32",
+  "nemo": "f32"
+ },
+ "decode": "frame-synchronous greedy RNNT, max 10 symbols per frame, no beam, no LM",
+ "eou": {
+  "token": "<EOU>",
+  "runtime_reset": "Mynah: encoder caches + decoder state reset after the chunk holding the <EOU> (= NeMo voice-agent reset_state)",
+  "characterisation_reset": "decoder only (prediction network to zero, last token SOS), one encoder pass (finetune/eou/diag/s2_reset.py, examples/transcribe_nemo.py)",
+  "difference": "transcripts differ only after a premature <EOU>"
+ },
+ "finalisation": "results: 2.0 s of -75 dB quiet appended; Mynah stream flushes at end of input",
+ "text_normalisation_for_scoring": "finetune/common/textnorm.py norm(t, 'fr'): oe / ae and typographic apostrophes mapped, then NFKD, lowercase, [^a-z' ] -> space",
+ "checkpoint_sha256": "3130534d577e340df129fea9074a63a070aaa05292bcf3aadd96b4aa39fd969c",
+ "parent": "d2062aca (plain FR-H2)",
+ "freeze_commit": "pending (RC-FR v1.1 candidate, 2026-10-22)",
+ "final_eval": "none: FINAL-FR was spent on RC-FR v1; characterised on DEV-fr, FR-OOD1 and mTEDx dev only",
+ "runtime_tested": "mynah-asr v0.9.1 (runtime sources identical from 52e5271 through 6d485b5)"
+}
