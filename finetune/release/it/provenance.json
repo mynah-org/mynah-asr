@@ -1,0 +1,30 @@
+{
+ "model": "mynah-eou-it-120m (RC-IT v4)",
+ "checkpoint": {
+  "sha256": "0a4d1b103297e169af74b6673ff97864747bb2c54b70a7ec91253d9583c003ff",
+  "hub": "runs/sg-it-s2v4-c250-36k/final.nemo"
+ },
+ "stage2": {
+  "init": "plain C250-36k sha256 7e919281 (hub runs/plain-it-c250-36k)",
+  "script": "finetune/jobs/s2_mix.sh + finetune/eou/two_stage.py",
+  "flags": "--freeze-enc 1 --unfreeze-top 4 --enc-lr 3e-5 --lr 2e-5 --bs 16 --steps 1500 --lr-shape cosine --eou-append 1 --pad-prob 0.5 --pad-min 1 --pad-max 3 --pad-noise-db -90,-60 --fastemit 0 --max-dur 20 --eval-every 250 --val-n 200 --seed 0",
+  "mix": "C250: MLS-it 40 h 0.1964, CV17-it 0.1684, VP-it t50 0.1122, FLEURS-it 0.0842, Granary-it pool yg agree<=15 0.1885, pool yg6 agree<=15 0.2503",
+  "selection": "min in-run harness WER with EOU >= 80 % and <= 10 % empty -> step 250",
+  "run": "Singapore L40S 2026-10-18, 875 s"
+ },
+ "stage1": {
+  "run": "plain C250-36k: stock init, 36k steps, cosine, whole encoder 2e-4, decoder / joint 3e-4, bs 16, max 30 s, ~5 h L40S",
+  "flags_record": "hub runs/plain-it-c250-36k/metrics.json"
+ },
+ "data_snapshot": "hub data/snapshots/it-c250 (120,367 files, per-shard sha256 in index.json; restore: finetune/common/data_snapshot.py restore --name it-c250)",
+ "freeze": "commit 9f0bc8d (FINAL-IT pre-registration, section H of .work/release-it-fr-2026-10-19.md)",
+ "final_eval": "FINAL-IT, seal 8d02373775b548ec32bc1d8632665e0835b01adc87ecf0a0ecfe7a53f4ce42f2, one decode 2026-10-19; results hub results/jp-2026-10-19/final-it-v4",
+ "mynah_pack": {
+  "hub": "rc/it-v4/mynah-pack",
+  "model.safetensors": "2aa4783d566880a67e8694cd39ba4eeb84b8dc724ea047f2f82d5c78da3df79f",
+  "reexport_2026_10_22": "byte-identical weights / tokens / mel filters; mynah.json differs only in the name field"
+ },
+ "code": "github mynah-org/mynah-asr branch lw-finetune-tooling",
+ "archive": "gabrione/mynah-asr-canary-it-experiments (private)",
+ "reproducibility": "evaluation reproduced exactly on fresh boxes (2026-10-19, 2026-10-22 DEV730 macro 22.54); training runs not re-executed (one seed)"
+}

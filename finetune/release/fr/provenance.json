@@ -1,0 +1,31 @@
+{
+ "model": "mynah-eou-fr-120m (RC-FR v1)",
+ "checkpoint": {
+  "sha256": "7814141d515ca347004a862435fc5029d553d885252c8ac5e5b23ce793d48105",
+  "hub": "runs/jp-fr-s2v4-g1e/final.nemo"
+ },
+ "stage2": {
+  "init": "plain FR-G1E sha256 1271deff6a833805b5dc9fb021fba43c058782e686842a49718f4e362b030973 (hub runs/jp-fr-g1e-w4-11881)",
+  "script": "LANG_=fr finetune/jobs/s2_mix.sh + finetune/eou/two_stage.py --lang fr",
+  "flags": "as RC-IT stage 2 v4 (read back from hub runs/jp-fr-s2v4-g1e/metrics.json)",
+  "mix": "the G1E mix: MLS-fr 40 h 0.2356, CV17-fr 0.2020, VP-fr t50 0.1347, FLEURS-fr 0.1010, Granary-fr agree<=20 0.3267",
+  "selection": "v4 rule -> step 250",
+  "run": "Kyoto RTX 6000 Ada 2026-10-20, 859 s, git 6a9df01 lineage"
+ },
+ "stage1": {
+  "run": "FR-G1E: stock init, W4 (enc 4e-4, dec/joint 3e-4), WSD 11,881 steps (5 % warm-up, last 20 % decay), bs 16, max 30 s, seed 0, final = last step; 3,929 s RTX 6000 Ada",
+  "launch": "MIX=<G1E mix> STEPS=11881 TAG=fr-g1e-w4-11881 bash finetune/jobs/fr_p1.sh",
+  "flags_record": "hub runs/jp-fr-g1e-w4-11881/metrics.json"
+ },
+ "data_snapshot": "hub data/snapshots/fr-g1e (101,177 files; restore: data_snapshot.py restore --name fr-g1e)",
+ "freeze": "commit 6f00ac3 (RC-FR freeze + FINAL-FR pre-registration, section O)",
+ "final_eval": "FINAL-FR, seal 8b0ebba0, one decode 2026-10-21; results hub results/l40s-2026-10-21/final-fr-results",
+ "mynah_pack": {
+  "hub": "rc/fr-s2v4",
+  "model.safetensors": "9e0e6b50a20f3e4f (prefix)"
+ },
+ "parity": "hub results/l40s-2026-10-21/parity-fr",
+ "code": "github mynah-org/mynah-asr branch lw-finetune-tooling",
+ "archive": "gabrione/mynah-asr-canary-it-experiments (private)",
+ "reproducibility": "evaluation reproduced exactly on a fresh box (2026-10-21); training runs not re-executed (one seed)"
+}
