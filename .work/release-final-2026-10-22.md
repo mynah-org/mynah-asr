@@ -44,3 +44,43 @@ machine every 5 min.
 - Package load test: each staged package downloaded fresh from the Hub into an empty directory, SHA256SUMS checked,
   model.nemo loaded in NeMo (example script) and the Mynah pack in the CLI (CPU) and the CUDA server, on one public
   FLEURS clip; outputs compared with the package's expected output.
+
+## 4. FR-H2 -- PRE-REGISTERED (2026-10-22 ~11:05 UTC, before launch; GO given by the user)
+
+WER opportunity review (2026-10-22 ~10:55 UTC, from frozen results only): IT stays frozen at FINAL-IT 20.49 (closed
+null axes: encoder KD, CTC, soups, schedule = same ceiling, static selection, tokenizer; LM rescoring does not
+transfer; ranking / N-best KD = a multi-day engineering project). FR: the only high-prior axis is exposure.
+
+**Hypothesis:** the plain FR model is exposure-limited; doubling the horizon on the G1E mix lowers DEV WER without
+losing the OOD robustness that Granary-fr bought.
+Evidence: FR-P1 (8k) -> FR-E1 (11,881) = -2.25 on harness-fr; IT W4 8k -> 16k = -3.36 (16k -> 36k only -0.5); FR at
+11,881 is ~2 passes over its 216 h vs IT C250-36k ~5 passes. Against: IT saturation past 16k; MLS-fr (weight
+0.2356, 9,608 clips) is seen ~9x at 23,762 steps.
+
+**Run FR-H2 = FR-G1E with `STEPS=23762`.** Only experimental axis = training horizon. The W4 schedule is defined
+fractionally (two_stage.py: warm-up = steps / 20, WSD decay over the last `--decay-frac 0.2`), so it stretches
+proportionally with the horizon: warm-up 1,188 steps (G1E 594), decay from step ~19,010 (G1E ~9,505); peak LRs, the
+fractional shape, data and seed are identical; the LR schedule in absolute steps is NOT identical.
+Everything else = G1E (metrics.json args read back): stock init, enc 4e-4 / dec + joint 3e-4, bs 16, max-dur 30,
+seed 0, `--final-eof 1` (final.nemo = last step), `--abort-wer 1000:85`, the G1E mix (MLS-fr 40 h 0.2356, CV-fr
+0.2020, VP-fr t50 0.1347, FLEURS-fr 0.1010, Granary-fr agree <= 20 0.3267; 97,675 utts, manifest hashes as the
+2026-10-21 restore report). Launch: `MIX=<G1E mix> STEPS=23762 TAG=fr-h2-g1e-w4-23762 bash finetune/jobs/fr_p1.sh`.
+In-run evals are diagnostic only.
+
+**Primary:** harness-fr macro greedy, 0.5 s flush (lm_fusion_probe, fr_p1.sh's own probe) vs G1E 25.54 (archived,
+same tool). **Retention gate:** FR-OOD1 macro greedy 0.5 s (tedxdev + smtrain, all 800 clips, ood1eval.sh's call)
+vs G1E 29.66 (archived). **Secondary (no gate):** beam-8 / oracle-8 / CER / per source; the mTEDx DEV-EOU-FR-v2
+bank (274 clips, never used for WER) with G1E and H2 decoded by the same probe on this box.
+
+| class | rule (H2 - G1E, macro greedy 0.5 s) |
+|---|---|
+| LEVER | DEV <= -1.0 AND OOD1 <= 0.0 |
+| BENEFIT | DEV in (-1.0, -0.5] AND OOD1 <= +0.5 |
+| NULL | DEV within +-0.5 (and not HARM) |
+| HARM | DEV > +0.5 OR OOD1 > +1.0 |
+(DEV <= -0.5 with OOD1 in (+0.5, +1.0], or DEV <= -1.0 with OOD1 in (0, +0.5]: DIAGNOSE, no promotion.)
+
+**After:** only LEVER / BENEFIT -> stage 2 v4 unchanged on H2 (FR-S2's flags) with FR-S2's gates (DEV s2_reset, OOD1
+once, EOU bars); a passing stage 2 is RC-FR v1.1, characterised on DEV / OOD1 / mTEDx dev only (FINAL-FR is spent;
+FINAL-EOU-FR-v2 is not used as an ASR FINAL). No second horizon (18k / 30k / 36k), no other variant, no FINAL.
+Budget: one plain run, <= 2 h 30 GPU (G1E: 3,929 s on the same GPU type).
