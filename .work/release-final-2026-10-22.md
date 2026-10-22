@@ -236,6 +236,8 @@ decode; sealed tgz archived on the Hub.
    per bank WER / CER / empty / FE / FE_any / R / L p50 / p90 / split; macro over the 4 banks, EOU pooled; trim
    variant secondary;
 2. product: Mynah CUDA server bf16 on the same banks (2 s quiet, PCM16), `mynah_parity.py score`.
+Reporting wording (fixed now): FINAL-FR-v2 is a *fresh evaluation bank relative to our process* (disjoint from our
+training / DEV / OOD / earlier FINAL banks as far as verifiable), not a universally uncontaminated benchmark.
 No band, no comparison used for any decision; v1 is NOT decoded on it (no selection between v1 and v1.1 on FINAL-FR-v2).
 Nothing changes in response.
 
