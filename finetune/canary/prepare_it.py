@@ -67,7 +67,7 @@ MLS_TRAIN = [f"italian/train-{i:05d}-of-00008.parquet" for i in range(8)]
 MLS_TEST = ["italian/test-00000-of-00001.parquet"]
 MLS_META_COLS = ["id", "speaker_id", "chapter_id", "transcript", "audio_duration"]
 FLEURS = f"{HF}/google/fleurs/resolve/main/data"
-LANGS = {"it": ("italian", 8, "it_it"), "fr": ("french", 34, "fr_fr")}   # MLS config, train shards, FLEURS config
+LANGS = {"it": ("italian", 8, "it_it"), "fr": ("french", 34, "fr_fr"), "es": ("spanish", 30, "es_419")}   # MLS config, train shards, FLEURS config
 LANG, FL = "it", "it_it"
 
 

@@ -12,12 +12,13 @@
 # STEPS= (default 8000) sets the horizon; warm-up and decay scale with it (FR-E1: 11881).
 # HARNESS= / CLEAN= override the probe banks (name=path,...), e.g. once the frozen DEV harness-fr has its own manifests.
 . "$(dirname "$0")/gpu_lock.sh"
-export LANG_=fr
-MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/fr; R=$FT_ROOT/runs; TAG=${TAG:-fr-p1-w4-8k}
-HARNESS=${HARNESS:-"mls=$MF/eval_mls_fr.json,fleurs=$MF/eval_fleurs_fr.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"}
-CLEAN=${CLEAN:-"tedx=$MF/eval_tedx_fr.json"}
+# LANG_ (2026-10-22): fr unless set (es = the third-language replication); every path / flag follows it, fr unchanged
+export LANG_=${LANG_:-fr}; LG=$LANG_
+MF=$FT_ROOT/manifests; MX=$FT_ROOT/mix/$LG; R=$FT_ROOT/runs; TAG=${TAG:-fr-p1-w4-8k}
+HARNESS=${HARNESS:-"mls=$MF/eval_mls_$LG.json,fleurs=$MF/eval_fleurs_$LG.json,cv=$MX/eval_cv.json,vp=$MX/eval_vp.json"}
+CLEAN=${CLEAN:-"tedx=$MF/eval_tedx_$LG.json"}
 if [ -z "${NEMO:-}" ]; then
-    MIX=${MIX:-"$MF/train_40h_fr.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp_t50.json:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides (FR-G1)
+    MIX=${MIX:-"$MF/train_40h_$LG.json:0.35,$MX/train_cv.json:0.30,$MX/train_vp_t50.json:0.20,$MX/train_fleurs.json:0.15"}   # MIX= overrides (FR-G1)
     for p in ${MIX//,/ }; do [ -s "${p%:*}" ] || { echo "== missing ${p%:*}"; exit 2; }; done
     echo "== fr_p1 $TAG $(date +%T)"; echo "   MIX=$MIX"
     MIX="$MIX" VALS="$HARNESS" POL="--freeze-enc 0 --enc-lr 4e-4 --lr 3e-4 --bs 16" STEPS=${STEPS:-8000} SMOKE=1 \
@@ -37,7 +38,7 @@ for bank in harness clean; do
         clean) V=$CLEAN; N=100000 ;;
     esac
     for p in ${V//,/ }; do [ -s "${p#*=}" ] || { echo "== $bank: no ${p#*=}, skipped"; continue 2; }; done
-    timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" --lang fr --nemo "$NEMO" --vals "$V" --per-set $N \
+    timeout 3600 "$PY" "$FINETUNE/eou/diag/lm_fusion_probe.py" --lang $LG --nemo "$NEMO" --vals "$V" --per-set $N \
         --alphas 0 --beam-alphas 0 --beams 8 --threads 32 --post-pad-s $post --out $OUT/probe_$bank$sfx.json 2>&1 \
         | grep -E "^\{|Traceback|Error" | sed "s/^/post=$post /" | cut -c1-400
 done

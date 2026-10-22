@@ -20,7 +20,8 @@ import re
 import unicodedata
 
 _FR = str.maketrans({"œ": "oe", "æ": "ae", "Œ": "oe", "Æ": "ae", "’": "'", "‘": "'", "ʼ": "'"})
-PRE = {"it": None, "fr": _FR}   # per-language pre-map applied after lower(); None = the frozen IT rule only
+_ES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'"})   # es (2026-10-22): typographic apostrophes only; ñ / accents via NFKD
+PRE = {"it": None, "fr": _FR, "es": _ES}   # per-language pre-map applied after lower(); None = the frozen IT rule only
 _DROP = re.compile(r"[^a-z' ]")
 
 
