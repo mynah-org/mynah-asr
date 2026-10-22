@@ -34,6 +34,16 @@ dev bank. Its numbers are not directly comparable with v1's FINAL number.
 Per DEV source (v1.1): MLS 20.11 (false endpoint 18.0 %), FLEURS 26.22, CV 23.94, VP 18.06. Plain stage (no
 `<EOU>`, 0.5 s flush): DEV 22.06 vs 25.54, OOD1 25.66 vs 29.66, mTEDx dev 23.24 vs 27.15.
 
+## Mynah runtime qualification (2026-10-22, DEV-fr 800 clips, the same PCM16 bytes)
+- Mynah CPU f32 == Mynah CUDA f32 on 800 / 800 clips (text and `<EOU>` times).
+- NeMo f32 vs Mynah f32: 768 / 800 identical texts; no text difference before the first `<EOU>` (the 9 PRE_EOU
+  clips differ only in the placement of the end-of-stream `<EOU>`); the 105 POST_RESET clips follow an earlier
+  `<EOU>` (runtime encoder + decoder reset). Runtime macro WER 22.20 vs 22.08 (v1: +0.06), FE 7.75 %, recall 97.0 %,
+  p50 / p90 0.72 / 1.20 s.
+- CUDA bf16 (serving default): 22.24; realtime WebSocket at 16 / 64 / 128 streams identical to the fast feed, 0
+  errors, delta lag p99 47-54 ms, VRAM 1,966 MiB with the model loaded (flat at 64 / 128 streams).
+- CUDA engine gate (batch identity, repeat, slot independence): all OK.
+
 ## Known limitations
 - As v1: **long-form / audiobook internal pauses can trigger a premature `<EOU>`**, especially on MLS-like read
   speech (18 % false endpoints on DEV MLS); the endpoint is acoustic, not semantic.
