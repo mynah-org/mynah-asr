@@ -269,3 +269,30 @@ number, no tuning.
 - **Reading bands (descriptive, set now):** <= 25 strong transfer; 25-30 transfers; 30-40 weak; > 40 or abort =
   failure of an IT / FR assumption. No ES v2 today; stage 2 ES only if the plain run ends with >= 45 min of box time
   left AND macro greedy <= 30, with the v4 recipe unchanged.
+
+## 10. Late session (15:10-16:40 UTC): FINAL-FR-v2 and ES-1 ABORTED, no result seen
+
+- **FINAL-FR-v2: ABORTED BEFORE SEAL.** The build never left the metadata phase (speaker / text exclusions over the MLS /
+  CV / VP train + test splits); no bank, no SHA256SUMS, nothing decoded. It can be rebuilt on a new box from the
+  frozen pre-registration (a3b4563 + fca3074) without contamination. RC-FR v1.1 therefore still has no held-out
+  number.
+- **ES-1: ABORTED BEFORE TRAINING.** Only data download had started (MLS-es metadata, CV / VP shards); no Spanish
+  statistic was computed, no model trained or decoded. It restarts on a new box from its pre-registration (a3b4563),
+  unchanged. The es code support (textnorm, MLS / FLEURS configs, fr_p1.sh LANG_) is committed (00dcee2).
+- **Cause 1, ours, measured -- metadata read amplification.** `Hub.column` (prepare_final_it.py) with the library's
+  default read-ahead pulls MB-sized ranges of audio parquets to read a projected column. `--hub-block-kb 256` is
+  I/O-only, validated on two deterministic probes (`blockeq.py`, the builder's own reader):
+
+| parquet | rows (sha) | default read-ahead | 256 KiB |
+|---|---|---|---|
+| MLS-fr dev | 2,416 (2da6d609), identical | 302.2 MB, 184.2 s | **52.5 MB, 45.8 s** |
+| VP-fr test | 1,742 (2d3aa85f), identical | 40.5 MB, 31.1 s | **6.4 MB, 6.5 s** |
+
+  i.e. ~6x fewer bytes and 4-5x less wall time for the same rows. The first FINAL-FR-v2 attempt (default read-ahead)
+  had read ~14 GB in 38 min without finishing the metadata; logs kept (f2build-defaultreadahead.log).
+- **Cause 2, the host -- network degradation** (`network-2026-10-22.txt`): HF 7.4 MB/s single / 31.9 MB/s 8-way at
+  10:30 UTC; at 15:45 UTC every destination ~2-3 MB/s single stream (HF anonymous 1.9, authenticated 2.3, pytorch 3.0,
+  PyPI 2.6, GitHub 3.0); 0.3-0.9 MB/s aggregate during the restarted build. Box load < 1: not our CPU.
+- **Before the next FINAL-FR-v2 / ES-1 attempt:** apply the small-block metadata reads to every Hub parquet reader
+  (prepare_mix.py, canary/prepare_it.py, prepare_final_it.py default), re-validate row identity, network smoke test
+  at box start, then run both pre-registrations unchanged.
