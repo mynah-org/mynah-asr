@@ -186,3 +186,23 @@ run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-
 | 14:00-14:14 | s2_reset DEV + OOD1 (CPU); FR v1.1 Mynah GPU passes alongside | low (server) | 28 threads | **RC-FR CANDIDATE** |
 | 14:14-14:49 | v1.1 NeMo dumps, CLI, serving smoke | low | 22-28 | parity as v1 |
 | 14:19-15:00 | packages IT / FR v1 / FR v1.1: build, upload, verify, fresh-download load test | - | low | all PASS |
+
+## 7. Destructive-instance readiness audit (2026-10-22 15:05 UTC)
+- repo commits pushed: PASS (lw-finetune-tooling clean, = origin).
+- IT canonical model archived + hash: PASS (release/mynah-eou-it-120m/model.nemo 0a4d1b10, LFS sha256 = SHA256SUMS).
+- FR canonical model archived + hash: PASS (release/mynah-eou-fr-120m 7814141d; candidate release/mynah-eou-fr-120m-v1.1
+  3130534d; runs/ada-fr-h2-g1e-w4-23762 d2062aca, runs/ada-fr-s2v4-h2).
+- Mynah packages archived: PASS (mynah/ in each package; IT = the frozen rc/it-v4 bytes, FR v1 = rc/fr-s2v4 bytes).
+- configs / tokenizers archived: PASS (nemo/model_config.yaml + tokenizer files, inference.json, provenance.json).
+- evaluation results archived: PASS (results/ada-2026-10-22/{fr-h2, fr-s2v4-h2, qual-it, qual-fr-v1.1}).
+- serving results archived: PASS (qual-it, qual-fr-v1.1, results/serving.json in each package).
+- logs / journal archived: PASS (results/ada-2026-10-22/day: logs incl. heartbeat + alerts, scripts, inventory).
+- checksum verification against HF: PASS (close-out 258 files, 0 bad; each package verified file by file and
+  re-downloaded into an empty directory: SHA256SUMS OK, NeMo + Mynah 3 / 3 identical, CUDA gate 18 OK).
+- no unique required artifact only on Vast: PASS (left on the box: Hub copies, regenerable padded wavs, restored
+  snapshots).
+- token removed from box: PASS. GPU jobs: NONE. CPU jobs: NONE.
+
+**SAFE TO DESTROY VAST INSTANCE.** The HF token used today was pasted in chat: revoke it before any public release.
+Open decision (user): publish RC-FR v1 (FINAL 27.76) and / or the v1.1 candidate (DEV 22.08, OOD1 24.97, no FINAL;
+a fresh FINAL-FR-v2 bank would be needed for a held-out number).
