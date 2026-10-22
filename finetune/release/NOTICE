@@ -1,0 +1,10 @@
+Licensed by NVIDIA Corporation under the NVIDIA Open Model License.
+
+This model is a Derivative Model of NVIDIA Parakeet Realtime EOU 120M
+(https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1), fine-tuned (all weights; vocabulary unchanged).
+Modifications (c) 2026 Gabriele Mastrapasqua.
+
+Training data: Multilingual LibriSpeech (CC BY 4.0), Common Voice 17 (CC0), VoxPopuli (CC0), FLEURS (CC BY 4.0),
+YODAS-Granary (CC BY 3.0). Pseudo-labels / agreement filtering with nvidia/nemotron-3.5-asr-streaming-0.6b
+(OpenMDW-1.1). Evaluation-only data is not redistributed.
+"NVIDIA" and "Parakeet" are used only to describe the origin of the model.

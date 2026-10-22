@@ -9,7 +9,7 @@ Layout of <out> (= the root of a future Hub model repo):
     LICENSE, NOTICE           NVIDIA Open Model License + attribution (--license / --notice files)
     model.nemo                the NeMo checkpoint (byte copy; sha256 must equal --nemo-sha if given)
     nemo/model_config.yaml    extracted from model.nemo (read-only reference)
-    nemo/tokenizer.*          the SentencePiece files packed in model.nemo
+    nemo/tokenizer.model, tokenizer.vocab, vocab.txt   the SentencePiece files packed in model.nemo
     mynah/                    the Mynah pack: model.safetensors, mynah.json, tokens.json, mel_filters.safetensors
     inference.json            the frozen runtime / protocol (precision, chunking, reset semantics, normalisation)
     provenance.json           commits, parent / checkpoint hashes, recipe, data (from --provenance)
@@ -70,8 +70,9 @@ os.makedirs(f"{a.out}/nemo", exist_ok=True)
 with tarfile.open(a.nemo) as t:
     for m in t.getmembers():
         b = os.path.basename(m.name)
-        if m.isfile() and (b == "model_config.yaml" or "tokenizer" in b or b.endswith((".model", ".vocab")) or b == "vocab.txt"):
-            with t.extractfile(m) as src, open(f"{a.out}/nemo/{b}", "wb") as dst:
+        if m.isfile() and b.endswith(("model_config.yaml", "tokenizer.model", "tokenizer.vocab", "vocab.txt")):
+            n = b.split("_", 1)[1] if b != "model_config.yaml" else b   # NeMo prefixes packed files with a uuid
+            with t.extractfile(m) as src, open(f"{a.out}/nemo/{n}", "wb") as dst:
                 shutil.copyfileobj(src, dst)
 os.makedirs(f"{a.out}/mynah", exist_ok=True)
 for f in pack_files:
