@@ -1,5 +1,5 @@
 ---
-# DRAFT model card -- release candidate RC-IT v4 (2026-10-19). Not published. Name TBD (no NVIDIA / Parakeet branding).
+# DRAFT model card -- release candidate RC-IT v4 (2026-10-19, qualified 2026-10-22). Not published. Name TBD (no NVIDIA / Parakeet branding).
 license: other
 license_name: nvidia-open-model-license
 license_link: https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
@@ -102,6 +102,14 @@ on DEV; those are separate decodes, not this model's release numbers.
 - pseudo-labels by nvidia/nemotron-3.5-asr-streaming-0.6b (OpenMDW-1.1);
 - evaluation only: Multilingual TEDx (CC BY-NC-ND 4.0, numbers only, data not redistributed) and ITALIC (CC BY 4.0).
 
+## Release qualification (2026-10-22, DEV730, the same PCM16 bytes)
+- Mynah CPU f32 == Mynah CUDA f32 on 730 / 730 clips (text and `<EOU>` times).
+- NeMo f32 vs Mynah f32: no text difference before the first `<EOU>`; the clips that differ after it follow a
+  premature `<EOU>` (runtime reset semantics, see `inference.json`); macro WER 22.56 vs 22.54.
+- CUDA bf16 (serving default) vs f32: +0.04 macro WER.
+- CUDA server: VRAM 1,966 MiB with the model loaded, flat at 16 / 64 / 128 realtime streams, 0 errors, realtime ==
+  fast feed on every clip.
+
 ## Usage
-TODO before publication: NeMo cache-aware streaming example; Mynah `mynah-asr stream -m <pack>` and server
-example; export command (`finetune/eou/export_to_mynah.sh`); Mynah version tested (v0.9.1-607-g52e5271).
+See `examples/` (NeMo `transcribe_nemo.py`, validated against the frozen decode on 40 / 40 clips; Mynah CLI and
+server in `mynah.md`) and `inference.json`. Mynah runtime tested: v0.9.1 (sources identical from 52e5271 to 6d485b5).
