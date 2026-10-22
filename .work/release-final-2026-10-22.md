@@ -84,3 +84,47 @@ bank (274 clips, never used for WER) with G1E and H2 decoded by the same probe o
 once, EOU bars); a passing stage 2 is RC-FR v1.1, characterised on DEV / OOD1 / mTEDx dev only (FINAL-FR is spent;
 FINAL-EOU-FR-v2 is not used as an ASR FINAL). No second horizon (18k / 30k / 36k), no other variant, no FINAL.
 Budget: one plain run, <= 2 h 30 GPU (G1E: 3,929 s on the same GPU type).
+
+### Result: FR-H2 -- pre-registered class LEVER (OBSERVED, 2026-10-22, one seed, git 180a05d)
+- Train 7,774 s (23,762 steps, ~200 steps/min, 480-490x RT, peak 39.5 GB); final.nemo = step 23,762, sha256
+  **d2062aca**28d8db0abff823fe4be8051665bdb4c7d3d15cc8ff929f32cf8bfda6; Hub `runs/ada-fr-h2-g1e-w4-23762` +
+  `results/ada-2026-10-22/fr-h2` (archive verified by size).
+
+| macro, 0.5 s flush | greedy | beam-8 | oracle-8 |
+|---|---|---|---|
+| DEV harness-fr G1E | 25.54 | 23.56 | 19.84 |
+| **DEV harness-fr H2** | **22.06** (-3.48) | 20.51 | 16.81 |
+| FR-OOD1 G1E | 29.66 | | |
+| **FR-OOD1 H2** | **25.66** (-4.00) | | |
+| mTEDx dev (secondary) G1E / H2 | 27.15 / **23.24** (-3.91) | | |
+
+Per DEV source (greedy): MLS -3.62, FLEURS -4.42, CV -2.76, VP -3.10; OOD1 tedxdev 25.17 -> 21.03, smtrain
+34.15 -> 30.29. **Class LEVER** (DEV <= -1.0 and OOD1 <= 0.0). Reading: OBSERVED, the 11,881-step FR model was
+exposure-limited; doubling the horizon helps every in-domain source and the two out-of-domain sets by about the same
+amount (no sign that the longer horizon traded OOD robustness for in-domain fit). One seed; a third horizon is NOT
+run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-s2v4-h2`), FR-S2's gates.
+
+### Result: IT release qualification of RC-IT v4 (OBSERVED, 2026-10-22; DEV730, 2 s quiet as PCM16)
+- Re-export of 0a4d1b10 with today's export_to_mynah.sh: model.safetensors / tokens.json / mel_filters byte-identical
+  to the frozen pack (rc/it-v4); mynah.json differs only in its `name` field (taken from the output directory).
+- NeMo s2_reset on the PCM16 bytes: macro 22.54, FE 8.36 %, R 94.38 %, L 0.72 / 1.92 s = the frozen DEV730 values.
+- Matrix (`mynah_parity.py compare`):
+
+| comparison | identical text | <EOU> frames equal | PRE_EOU (1st-segment text identical) | POST_RESET | macro WER |
+|---|---|---|---|---|---|
+| NeMo f32 vs Mynah CPU f32 | 712 / 730 | 676 / 730 | 27 (27) | 28 | 22.56 vs 22.54 |
+| NeMo f32 vs Mynah CUDA f32 | 712 / 730 | 676 / 730 | 27 (27) | 28 | 22.56 |
+| Mynah CPU f32 vs CUDA f32 | **730 / 730** (text + <EOU> t) | | | | |
+| NeMo f32 vs CUDA bf16 (serving default) | 675 / 730 | 658 / 730 | 83 (46) | 24 | 22.60 |
+
+  As for FR: no text divergence before the first <EOU> in f32 (the 27 PRE_EOU clips differ only in the placement of
+  the end-of-stream <EOU>); POST_RESET = the runtime's encoder + decoder reset after a premature <EOU> (24 of the
+  divergent clips follow a premature NeMo <EOU>); bf16 = precision divergence, +0.04 macro WER. EOU metrics of the
+  runtime equal NeMo's (FE 8.36 %, R 94.66 %, p50 0.72 s).
+- CUDA engine gate (tests/test_cuda_stream, 4 IT clips): batch identity, repeat, slot independence all OK.
+- Serving (bf16 default, own-tc-bf16-rowstable, cap 128; weights 635 MB): VRAM 1,966 MiB with the model loaded, flat
+  at 16 / 64 / 128 realtime streams; GPU util p50 7-10 %; delta lag p99 45-46 ms; 0 errors; realtime == fast feed
+  730 / 730, 256 / 256, 256 / 256. Run while the FR-H2 job only waited on the GPU lock (no training running), host
+  load average up to 8.6 (functional smoke, not a benchmark).
+- Mynah CPU CLI: 730 clips in 845 s (16 x 1 thread), 0 errors, final == concatenated deltas on 730 / 730.
+- NeMo release example (`examples/transcribe_nemo.py`) vs the frozen s2_reset dump: text 40 / 40, <EOU> frames 40 / 40.
