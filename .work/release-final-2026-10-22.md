@@ -164,7 +164,7 @@ run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-
 | FINAL false endpoint / recall / p50 / p90 | 3.50 % / 96.17 % / 0.88 / 2.24 s | 7.57 % / 96.73 % / 0.80 / 1.60 s | n/a (DEV: 7.75 % / 97.12 % / 0.72 / 1.12 s) |
 | FINAL empty | 9 / 1,826 | 10 / 2,113 | n/a (DEV 1 / 800) |
 | retention / OOD | | FR-OOD1 29.53 | FR-OOD1 24.97 |
-| **Mynah runtime metric** | DEV730 CPU / CUDA f32 22.56, bf16 22.60 | FINAL-FR 27.90 (bf16); DEV 25.70 | DEV 22.20 (f32), 22.24 (bf16) |
+| **Mynah runtime metric** | DEV730 CPU / CUDA f32 22.56, bf16 22.60 | FINAL-FR 27.90 (bf16); DEV 25.68 (bf16 realtime) | DEV 22.20 (f32), 22.24 (bf16) |
 | Mynah parity | CPU f32 == CUDA f32 730 / 730; no pre-<EOU> text divergence | 800 / 800; idem | 800 / 800; idem |
 | **serving characterisation** | 1,966 MiB VRAM, 16 / 64 / 128 realtime streams, 0 errors | 1,941 MiB, 16 / 64 / 128, 0 errors | 1,966 MiB, 16 / 64 / 128, 0 errors |
 | known limitations | FLEURS-style internal pauses (FINAL FLEURS FE 16.4 %) | long-read internal pauses (FINAL MLS FE 25.2 %) | same as v1 (DEV MLS FE 18.0 %); no FINAL number |
