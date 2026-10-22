@@ -150,3 +150,39 @@ run (pre-registered). Per the pre-registration: stage 2 v4 unchanged on H2 (`fr-
   (DEV MLS FE 18.0 %, as v1): the declared limitation carries over.
 - Not available: a FINAL number (FINAL-FR is spent; FINAL-EOU-FR-v2 is not an ASR FINAL). The candidate is
   characterised on DEV / OOD1 / mTEDx dev only. Mynah qualification of 3130534d: `day22frq.sh` (parity-fr2).
+
+## 5. Release comparison (frozen numbers only; DEV numbers never in the FINAL column)
+
+| | IT: RC-IT v4 | FR: RC-FR v1 | FR: RC-FR v1.1 (candidate) |
+|---|---|---|---|
+| base / params | Parakeet Realtime EOU 120M, FastConformer cache-aware [70, 1] + RNNT, 120M | same | same |
+| plain parent | C250-36k (7e919281), 36k steps, ~357 h | FR-G1E (1271deff), 11,881 steps, 216 h | FR-H2 (d2062aca), 23,762 steps, 216 h |
+| stage 2 | v4, step 250 | v4, step 250 | v4 (unchanged), step 1250 |
+| checkpoint sha256 | 0a4d1b10 | 7814141d | 3130534d |
+| **research selection metric** (DEV, s2_reset, macro WER) | DEV730 22.54 | DEV-fr 25.64 | DEV-fr 22.08 |
+| **spent FINAL metric** macro WER / CER | **20.49 / 6.95** (FINAL-IT) | **27.76 / 11.62** (FINAL-FR) | none (FINAL-FR spent) |
+| FINAL false endpoint / recall / p50 / p90 | 3.50 % / 96.17 % / 0.88 / 2.24 s | 7.57 % / 96.73 % / 0.80 / 1.60 s | n/a (DEV: 7.75 % / 97.12 % / 0.72 / 1.12 s) |
+| FINAL empty | 9 / 1,826 | 10 / 2,113 | n/a (DEV 1 / 800) |
+| retention / OOD | | FR-OOD1 29.53 | FR-OOD1 24.97 |
+| **Mynah runtime metric** | DEV730 CPU / CUDA f32 22.56, bf16 22.60 | FINAL-FR 27.90 (bf16); DEV 25.70 | DEV 22.20 (f32), 22.24 (bf16) |
+| Mynah parity | CPU f32 == CUDA f32 730 / 730; no pre-<EOU> text divergence | 800 / 800; idem | 800 / 800; idem |
+| **serving characterisation** | 1,966 MiB VRAM, 16 / 64 / 128 realtime streams, 0 errors | 1,941 MiB, 16 / 64 / 128, 0 errors | 1,966 MiB, 16 / 64 / 128, 0 errors |
+| known limitations | FLEURS-style internal pauses (FINAL FLEURS FE 16.4 %) | long-read internal pauses (FINAL MLS FE 25.2 %) | same as v1 (DEV MLS FE 18.0 %); no FINAL number |
+| package (Hub, private) | release/mynah-eou-it-120m | release/mynah-eou-fr-120m | release/mynah-eou-fr-120m-v1.1 |
+
+## 6. Journal (UTC; CEST = UTC + 2)
+
+| time | stage | GPU | CPU | result / problem |
+|---|---|---|---|---|
+| 10:17-10:30 | box checks: 19230 rejected (HF 7 MB/s), 19325 accepted (32 MB/s) | idle | - | TLS public, no proxy |
+| 10:33-11:06 | prov.sh (venv 33 min: torch + CUDA wheels at ~6-8 MB/s) | idle | low | PROV-DONE 11:06 |
+| 10:35 | watchdog heartbeat every 300 s | - | ~0 | alerts.log read by the dev machine every 5 min |
+| 10:38-10:58 | Hub restore (132 files) + snapshots it-c250 / fr-g1e | idle | extract | fr-g1e stopped 10:45 on a premature no-train decision, restarted 10:50 (user correction) |
+| 10:55 | WER opportunity review -> FR-H2 (GO), IT frozen | | | prereg 180a05d |
+| 11:03 | H2 launcher stopped on its own seal-path bug (no training) | | | fixed, relaunched 11:03 |
+| 11:06-13:17 | **FR-H2 training** | 61-100 %, ~40 GB, ~250 W | IT NeMo dumps + CLI at nice | 23,762 steps in 7,774 s |
+| 13:17-13:40 | H2 probes; IT CUDA parity + serving smoke in the lock gap | low | probes | **H2 LEVER** (DEV -3.48, OOD1 -4.00) |
+| 13:42-14:00 | **stage 2 on H2** | ~80 % | - | step 1250 |
+| 14:00-14:14 | s2_reset DEV + OOD1 (CPU); FR v1.1 Mynah GPU passes alongside | low (server) | 28 threads | **RC-FR CANDIDATE** |
+| 14:14-14:49 | v1.1 NeMo dumps, CLI, serving smoke | low | 22-28 | parity as v1 |
+| 14:19-15:00 | packages IT / FR v1 / FR v1.1: build, upload, verify, fresh-download load test | - | low | all PASS |
