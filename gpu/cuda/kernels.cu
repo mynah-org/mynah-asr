@@ -164,8 +164,22 @@ __device__ __forceinline__ float kv_val(const kv_rowref &k, int i) {
     return (float)((const int8_t *)k.q)[i] * k.s;
 }
 
+/* Register blocks of the order-preserving loops (FAST = 1): the score loop
+ * gives one thread ATT_SC_QB query rows t of one key j, the P·V loop gives one
+ * thread ATT_PV_QB query rows t of one column i. Q larger than a block is
+ * walked in blocks, so no Q falls back. Neither changes an accumulator's
+ * sequence of fmaf: only which thread runs it and how often a K / V element
+ * and its window-row address are fetched. */
+#define ATT_SC_QB 4
+#define ATT_PV_QB 16
+
+/* tests: 1 = run the original t-outer loops (the reference the fast path is
+ * compared with byte for byte), 0 = the default */
+static int g_att_force_legacy = 0;
+void k_attention_force_legacy(int on) { g_att_force_legacy = on ? 1 : 0; }
+
 /* dynamic shared: qu[q][dk], qv[q][dk], sc[q][K] */
-template <int KVT>
+template <int KVT, int FAST>
 __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
                                  const float *__restrict__ relpos_tab, gpu_arena ar,
                                  const gpu_row *__restrict__ rows, const float *__restrict__ qs,
@@ -189,18 +203,49 @@ __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
 
     /* rk rows for this K: table row p = (kmax - K) + (K - 1 - valid - t + j) */
     const float *tab = relpos_tab + (size_t)li * (size_t)(2 * dm.kmax - 1) * (size_t)dm.d;
-    for (int e = threadIdx.x; e < Q * K; e += blockDim.x) {
-        const int t = e / K, j = e - t * K;
-        const kv_rowref key = kv_window_row(dm, ar, li, 0, r, m, kn, j, h);
-        const int p = (dm.kmax - K) + (K - 1 - m.valid - t + j);
-        const float *rk = tab + (size_t)p * dm.d + ho;
-        const float *qut = qu + (size_t)t * dk, *qvt = qv + (size_t)t * dk;
-        float ac = 0.0f, bd = 0.0f;
-        for (int i = 0; i < dk; i++) {
-            ac = fmaf(qut[i], kv_val<KVT>(key, i), ac);
-            bd = fmaf(qvt[i], rk[i], bd);
+    if (!FAST) {
+        for (int e = threadIdx.x; e < Q * K; e += blockDim.x) {
+            const int t = e / K, j = e - t * K;
+            const kv_rowref key = kv_window_row(dm, ar, li, 0, r, m, kn, j, h);
+            const int p = (dm.kmax - K) + (K - 1 - m.valid - t + j);
+            const float *rk = tab + (size_t)p * dm.d + ho;
+            const float *qut = qu + (size_t)t * dk, *qvt = qv + (size_t)t * dk;
+            float ac = 0.0f, bd = 0.0f;
+            for (int i = 0; i < dk; i++) {
+                ac = fmaf(qut[i], kv_val<KVT>(key, i), ac);
+                bd = fmaf(qvt[i], rk[i], bd);
+            }
+            sc[e] = (ac + bd) * scaling;
         }
-        sc[e] = (ac + bd) * scaling;
+    } else {
+        /* one thread per (block of ATT_SC_QB rows t, key j): K[j][i] is read
+         * (and decoded) once for the block; every (t, j) keeps its own ac / bd
+         * chains in ascending i, exactly the sequence above */
+        const int nb = (Q + ATT_SC_QB - 1) / ATT_SC_QB;
+        for (int e = threadIdx.x; e < nb * K; e += blockDim.x) {
+            const int b = e / K, j = e - b * K, t0 = b * ATT_SC_QB;
+            const int nq = Q - t0 < ATT_SC_QB ? Q - t0 : ATT_SC_QB;
+            const kv_rowref key = kv_window_row(dm, ar, li, 0, r, m, kn, j, h);
+            const int p0 = (dm.kmax - K) + (K - 1 - m.valid - t0 + j);
+            const float *rk0 = tab + (size_t)p0 * dm.d + ho;   /* row of t0; row of t0+u is u rows lower */
+            const float *qu0 = qu + (size_t)t0 * dk, *qv0 = qv + (size_t)t0 * dk;
+            float ac[ATT_SC_QB], bd[ATT_SC_QB];
+#pragma unroll
+            for (int u = 0; u < ATT_SC_QB; u++) { ac[u] = 0.0f; bd[u] = 0.0f; }
+            for (int i = 0; i < dk; i++) {
+                const float kvi = kv_val<KVT>(key, i);
+#pragma unroll
+                for (int u = 0; u < ATT_SC_QB; u++) {
+                    if (u < nq) {
+                        ac[u] = fmaf(qu0[(size_t)u * dk + i], kvi, ac[u]);
+                        bd[u] = fmaf(qv0[(size_t)u * dk + i], rk0[i - (ptrdiff_t)u * dm.d], bd[u]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < ATT_SC_QB; u++)
+                if (u < nq) sc[(size_t)(t0 + u) * K + j] = (ac[u] + bd[u]) * scaling;
+        }
     }
     __syncthreads();
 
@@ -220,17 +265,54 @@ __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
     __syncthreads();
 
     /* ctx[t][i] = sum_j P[t][j] * V[j][i], sequential in j */
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        for (int t = 0; t < Q; t++) {
-            const float *srow = sc + (size_t)t * K;
-            float acc = 0.0f;
-            for (int j = 0; j < K; j++) {
-                const kv_rowref v = kv_window_row(dm, ar, li, 1, r, m, vn, j, h);
-                acc = fmaf(srow[j], kv_val<KVT>(v, i), acc);
+    if (!FAST) {
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            for (int t = 0; t < Q; t++) {
+                const float *srow = sc + (size_t)t * K;
+                float acc = 0.0f;
+                for (int j = 0; j < K; j++) {
+                    const kv_rowref v = kv_window_row(dm, ar, li, 1, r, m, vn, j, h);
+                    acc = fmaf(srow[j], kv_val<KVT>(v, i), acc);
+                }
+                ctx[(size_t)(r.row_off + t) * dm.d + ho + i] = acc;
             }
-            ctx[(size_t)(r.row_off + t) * dm.d + ho + i] = acc;
+        }
+    } else {
+        /* j outer, ATT_PV_QB register accumulators: the window row of j is
+         * resolved and V[j][i] read (and decoded) once per block of rows t
+         * instead of once per t; each acc[t] still runs fmaf over j = 0..K-1
+         * in ascending order from 0.0f */
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            for (int t0 = 0; t0 < Q; t0 += ATT_PV_QB) {
+                const int nq = Q - t0 < ATT_PV_QB ? Q - t0 : ATT_PV_QB;
+                const float *s0 = sc + (size_t)t0 * K;
+                float acc[ATT_PV_QB];
+#pragma unroll
+                for (int u = 0; u < ATT_PV_QB; u++) acc[u] = 0.0f;
+                for (int j = 0; j < K; j++) {
+                    const kv_rowref v = kv_window_row(dm, ar, li, 1, r, m, vn, j, h);
+                    const float vij = kv_val<KVT>(v, i);
+#pragma unroll
+                    for (int u = 0; u < ATT_PV_QB; u++)
+                        if (u < nq) acc[u] = fmaf(s0[(size_t)u * K + j], vij, acc[u]);
+                }
+#pragma unroll
+                for (int u = 0; u < ATT_PV_QB; u++)
+                    if (u < nq) ctx[(size_t)(r.row_off + t0 + u) * dm.d + ho + i] = acc[u];
+            }
         }
     }
+}
+
+template <int KVT>
+static void attention_launch(dim3 grid, int threads, size_t shm, cudaStream_t s, int legacy,
+                             const gpu_model_dims &dm, const gpu_layer_w &L, int li,
+                             const float *relpos_tab, const gpu_arena &ar, const gpu_row *rows,
+                             const float *qs, const float *kn, const float *vn, float *ctx) {
+    if (legacy)
+        attention_kernel<KVT, 0><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+    else
+        attention_kernel<KVT, 1><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
 }
 
 cudaError_t k_attention(const gpu_model_dims dm, const gpu_layer_w L, int li,
@@ -246,12 +328,13 @@ cudaError_t k_attention(const gpu_model_dims dm, const gpu_layer_w L, int li,
     if (threads < 128) threads = 128;
     if (threads > 1024) return cudaErrorInvalidValue;
     dim3 grid((unsigned)B, (unsigned)dm.H);
+    const int legacy = g_att_force_legacy;
     if (ar.kv_dtype == GPU_KV_INT8)
-        attention_kernel<GPU_KV_INT8><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+        attention_launch<GPU_KV_INT8>(grid, threads, shm, s, legacy, dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
     else if (ar.kv_dtype == GPU_KV_BF16)
-        attention_kernel<GPU_KV_BF16><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+        attention_launch<GPU_KV_BF16>(grid, threads, shm, s, legacy, dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
     else
-        attention_kernel<GPU_KV_F32><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+        attention_launch<GPU_KV_F32>(grid, threads, shm, s, legacy, dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
     return cudaGetLastError();
 }
 
