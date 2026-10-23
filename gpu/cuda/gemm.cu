@@ -476,7 +476,8 @@ cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const floa
  *   core MMA computes each output element from its own row of A and column of
  *   B only, so the rows sharing a fragment cannot change it. Partials are
  *   added in split order ((P0 + P1) + P2) + ..., then bias, + C, activation
- *   -- the same reduce kernel as split-K.
+ *   -- the same reduce kernel as split-K, or the same sequence fused into the
+ *   GEMM launch (see "fused split reduce").
  *
  * The block tile (which warp computes an element, how many blocks there are)
  * changes no bit, so it is chosen per call from M and N for speed; the test
@@ -505,11 +506,19 @@ cudaError_t k_f32_to_bf16(const float *src, unsigned short *dst, size_t n, cudaS
 }
 
 /* WM x WN warps, each 32 x 32 outputs (2 x 2 fragments). */
-template <int WM, int WN, bool VEC>
+/* How the S split partials of an element meet (see "fused split reduce" below).
+ * TC_RED_TWO: split blocks write partials (or, S == 1, the epilogue directly)
+ * and gemm_reduce_kernel sums them. TC_RED_LAST: the split blocks of a tile
+ * count their arrivals, the last one sums the S partials of the tile.
+ * TC_RED_SERIAL: one block computes the S splits one after the other. */
+enum { TC_RED_TWO = 0, TC_RED_LAST = 1, TC_RED_SERIAL = 2, TC_RED__N };
+
+template <int WM, int WN, bool VEC, int MODE>
 __global__ void __launch_bounds__(WM * WN * 32)
 gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__restrict__ W,
                const float *__restrict__ bias, float *__restrict__ C, int ldc,
-               int M, int N, int K, int KC, float *__restrict__ P, int accumulate, int act) {
+               int M, int N, int K, int KC, int S, float *__restrict__ P, unsigned *__restrict__ ctr,
+               int accumulate, int act) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace nvcuda;
     constexpr int BM = WM * 32, BN = WN * 32, NT = WM * WN * 32;
@@ -522,14 +531,9 @@ gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__res
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wm = warp / WN, wn = warp % WN;
-    const int kbeg = blockIdx.z * KC, kend = min(K, kbeg + KC);
+    int kbeg = 0, kend = 0;    /* the split being computed; read by fetch() */
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
-#pragma unroll
-    for (int i = 0; i < 2; i++)
-#pragma unroll
-        for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.0f);
-
     float4 ra[LA];
     uint4 rw[LW];
     auto fetch = [&](int k0) {
@@ -580,29 +584,69 @@ gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__res
         }
     };
 
-    if (kbeg < kend) fetch(kbeg);
-    for (int k0 = kbeg; k0 < kend; k0 += TC_BK) {
-        stash();
-        __syncthreads();
-        if (k0 + TC_BK < kend) fetch(k0 + TC_BK);    /* in flight during the MMAs */
+    /* one split, [kbeg, kend), into acc from 0.0f: the chain every mode shares */
+    auto run_split = [&](int sp) {
+        kbeg = sp * KC;
+        kend = min(K, kbeg + KC);
 #pragma unroll
-        for (int kk = 0; kk < TC_BK; kk += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
+        for (int i = 0; i < 2; i++)
 #pragma unroll
-            for (int i = 0; i < 2; i++)
-                wmma::load_matrix_sync(a[i], reinterpret_cast<const __nv_bfloat16 *>(As + (wm * 32 + i * 16) * TC_LD + kk), TC_LD);
+            for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.0f);
+        if (kbeg < kend) fetch(kbeg);
+        for (int k0 = kbeg; k0 < kend; k0 += TC_BK) {
+            stash();
+            __syncthreads();
+            if (k0 + TC_BK < kend) fetch(k0 + TC_BK);    /* in flight during the MMAs */
 #pragma unroll
-            for (int j = 0; j < 2; j++)
-                wmma::load_matrix_sync(b[j], reinterpret_cast<const __nv_bfloat16 *>(Ws + (wn * 32 + j * 16) * TC_LD + kk), TC_LD);
+            for (int kk = 0; kk < TC_BK; kk += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[2];
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b[2];
 #pragma unroll
-            for (int i = 0; i < 2; i++)
+                for (int i = 0; i < 2; i++)
+                    wmma::load_matrix_sync(a[i], reinterpret_cast<const __nv_bfloat16 *>(As + (wm * 32 + i * 16) * TC_LD + kk), TC_LD);
 #pragma unroll
-                for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+                for (int j = 0; j < 2; j++)
+                    wmma::load_matrix_sync(b[j], reinterpret_cast<const __nv_bfloat16 *>(Ws + (wn * 32 + j * 16) * TC_LD + kk), TC_LD);
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+#pragma unroll
+                    for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
+    };
+
+    if (MODE == TC_RED_SERIAL) {
+        /* split 0 into acc, then each further split into acc from 0.0f again
+         * and added element by element: tot = ((P0 + P1) + P2) + ..., the
+         * reduce kernel's order. All accumulator fragments of one type share
+         * one element mapping, so x[t] + x[t] adds the same (m, n). */
+        run_split(0);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> tot[2][2];
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int j = 0; j < 2; j++) tot[i][j] = acc[i][j];
+        for (int sp = 1; sp < S; sp++) {
+            run_split(sp);
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+#pragma unroll
+                    for (int t = 0; t < tot[i][j].num_elements; t++) tot[i][j].x[t] = tot[i][j].x[t] + acc[i][j].x[t];
+        }
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int j = 0; j < 2; j++) acc[i][j] = tot[i][j];
+    } else {
+        run_split(blockIdx.z);
     }
 
+    /* S == 1 or serial: the epilogue straight from the registers; otherwise
+     * the partial of split blockIdx.z */
+    const bool direct = MODE == TC_RED_SERIAL || P == nullptr;
     float *st = St + warp * 16 * TC_SLD;
 #pragma unroll
     for (int i = 0; i < 2; i++)
@@ -615,7 +659,7 @@ gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__res
                 const int r = e >> 4, c = e & 15, m = rb + r, n = cb + c;
                 if (m >= M || n >= N) continue;
                 const float v = st[r * TC_SLD + c];
-                if (P) P[(size_t)blockIdx.z * (size_t)M * (size_t)N + (size_t)m * N + n] = v;
+                if (!direct) P[(size_t)blockIdx.z * (size_t)M * (size_t)N + (size_t)m * N + n] = v;
                 else {
                     float *crow = C + (size_t)m * (size_t)ldc;
                     crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
@@ -623,6 +667,35 @@ gemm_tc_kernel(const float *__restrict__ A, int lda, const unsigned short *__res
             }
             __syncwarp();
         }
+
+    if (MODE == TC_RED_LAST) {
+        /* last block finishes: publish the partial, count the arrival; the
+         * block that brings the tile's count to S sums the S partials in
+         * split order -- the reduce kernel's expression -- and runs the
+         * epilogue. atomicInc wraps S-1 back to 0, so the counter is reset
+         * for the next call without another store (graph-replay safe). */
+        __shared__ int s_last;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            const unsigned tile = blockIdx.y * gridDim.x + blockIdx.x;
+            s_last = atomicInc(ctr + tile, (unsigned)(S - 1)) == (unsigned)(S - 1);
+        }
+        __syncthreads();
+        if (s_last) {
+            __threadfence();
+            const size_t mn = (size_t)M * (size_t)N;
+            for (int e = tid; e < BM * BN; e += NT) {
+                const int m = m0 + e / BN, n = n0 + e % BN;
+                if (m >= M || n >= N) continue;
+                const size_t o = (size_t)m * N + n;
+                float v = __ldcg(P + o);
+                for (int sp = 1; sp < S; sp++) v += __ldcg(P + (size_t)sp * mn + o);    /* fixed order */
+                float *crow = C + (size_t)m * (size_t)ldc;
+                crow[n] = gemm_epilogue(v, bias, crow, n, accumulate, act);
+            }
+        }
+    }
 #endif
 }
 
@@ -637,13 +710,23 @@ static int tc_choose(int M, int N, int S) {
     return blocks >= 2L * TC_SPLIT_TARGET ? TC_64x128 : TC_64x64;
 }
 
+template <int WM, int WN, int MODE>
+static void tc_launch_m(bool vec, dim3 grid, const float *A, int lda, const unsigned short *W, const float *bias,
+                        float *C, int ldc, int M, int N, int K, int KC, int S, float *P, unsigned *ctr,
+                        int accumulate, int act, cudaStream_t s) {
+    if (vec) gemm_tc_kernel<WM, WN, true, MODE><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act);
+    else gemm_tc_kernel<WM, WN, false, MODE><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act);
+}
+
 template <int WM, int WN>
-static void tc_launch(bool vec, const float *A, int lda, const unsigned short *W, const float *bias,
-                      float *C, int ldc, int M, int N, int K, int KC, int S, float *P,
+static void tc_launch(int mode, bool vec, const float *A, int lda, const unsigned short *W, const float *bias,
+                      float *C, int ldc, int M, int N, int K, int KC, int S, float *P, unsigned *ctr,
                       int accumulate, int act, cudaStream_t s) {
-    dim3 grid((unsigned)((N + WN * 32 - 1) / (WN * 32)), (unsigned)((M + WM * 32 - 1) / (WM * 32)), (unsigned)S);
-    if (vec) gemm_tc_kernel<WM, WN, true><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, P, accumulate, act);
-    else gemm_tc_kernel<WM, WN, false><<<grid, WM * WN * 32, 0, s>>>(A, lda, W, bias, C, ldc, M, N, K, KC, P, accumulate, act);
+    dim3 grid((unsigned)((N + WN * 32 - 1) / (WN * 32)), (unsigned)((M + WM * 32 - 1) / (WM * 32)),
+              (unsigned)(mode == TC_RED_SERIAL ? 1 : S));
+    if (mode == TC_RED_SERIAL) tc_launch_m<WM, WN, TC_RED_SERIAL>(vec, grid, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s);
+    else if (mode == TC_RED_LAST) tc_launch_m<WM, WN, TC_RED_LAST>(vec, grid, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s);
+    else tc_launch_m<WM, WN, TC_RED_TWO>(vec, grid, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s);
 }
 
 /* S from the weight's shape and this file's two constants ONLY: enough
@@ -659,9 +742,55 @@ int k_gemm_tc_splits(int N, int K) {
     return S;
 }
 
+/* ------------------------------------------------ fused split reduce
+ * Two ways to drop the separate reduce launch, each the SAME floating-point
+ * sequence per output element as the two-kernel path, so the bytes do not
+ * move (the tests memcmp every mode against TC_RED_TWO):
+ *
+ *   every split partial is the run_split() chain from 0.0f over the same
+ *   [s*KC, min((s+1)*KC, K)), the same slabs in the same order;
+ *   the partials meet as v = P0; v += P1; v += P2 ... (plain fp32 adds,
+ *   nothing to contract into an FMA) -- in the reduce kernel, in the last
+ *   block of a tile (TC_RED_LAST, partials read back with __ldcg; an fp32
+ *   store and load is exact), or in registers (TC_RED_SERIAL, no partial
+ *   leaves the SM);
+ *   then the one gemm_epilogue(): + bias, + C, activation.
+ *
+ * The mode is chosen from (M, N, K) -- M now picks the execution path, never
+ * the arithmetic. SERIAL when M >= TC_SERIAL_MIN_M rows, otherwise TWO
+ * (measured on a GB10, Nemotron 0.6B bf16 pass, ABBA: serial -17 % of the pass
+ * at M = 512, -7 % at M = 256, +6 % at M = 128; LAST was slower than TWO at
+ * every M, so it is reachable by force only). LAST needs the tile counters at
+ * the end of the workspace (TC_CTR_SLOTS unsigned, zeroed once by
+ * k_gemm_tc_workspace_init; the last block wraps its counter back to 0, so
+ * graph replays find it zero) and falls back to TWO without counter room.
+ * k_gemm_tc_force_reduce() pins a mode for tests. */
+#define TC_SERIAL_MIN_M 256
+#define TC_CTR_SLOTS 4096
+static int g_tc_reduce_force = -1;
+
+void k_gemm_tc_force_reduce(int mode) { g_tc_reduce_force = mode >= 0 && mode < TC_RED__N ? mode : -1; }
+int k_gemm_tc_reduce_count(void) { return TC_RED__N; }
+const char *k_gemm_tc_reduce_name(int mode) {
+    static const char *const nm[TC_RED__N] = {"two-kernel", "last-block", "serial"};
+    return mode >= 0 && mode < TC_RED__N ? nm[mode] : "?";
+}
+
+/* the mode before the workspace check (LAST may still fall back to TWO) */
+static int tc_reduce_want(int M, int N) {
+    if (g_tc_reduce_force >= 0) return g_tc_reduce_force;
+    (void)N;
+    return M >= TC_SERIAL_MIN_M ? TC_RED_SERIAL : TC_RED_TWO;
+}
+
 size_t k_gemm_tc_workspace_floats(int Mmax, int N, int K) {
     const int S = k_gemm_tc_splits(N, K);
-    return S > 1 ? (size_t)S * (size_t)Mmax * (size_t)N : 0;
+    return S > 1 ? (size_t)S * (size_t)Mmax * (size_t)N + TC_CTR_SLOTS : 0;
+}
+
+cudaError_t k_gemm_tc_workspace_init(float *ws, size_t ws_floats, cudaStream_t s) {
+    if (!ws || ws_floats < TC_CTR_SLOTS) return cudaSuccess;
+    return cudaMemsetAsync(ws + (ws_floats - TC_CTR_SLOTS), 0, TC_CTR_SLOTS * sizeof(unsigned), s);
 }
 
 void k_gemm_tc_force_config(int cfg) { g_tc_force = cfg; }
@@ -682,13 +811,23 @@ cudaError_t k_gemm_wt_tc(const float *A, int lda, const unsigned short *W, const
     /* 16-byte loads need 16-byte rows in both operands; same arithmetic either way */
     const bool vec = (((size_t)A & 15u) == 0) && (((size_t)W & 15u) == 0) && (lda & 3) == 0 && (K & 7) == 0;
     float *P = S > 1 ? ws : nullptr;
-    switch (tc_choose(M, N, S)) {
-        case TC_64x128: tc_launch<2, 4>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
-        case TC_64x64: tc_launch<2, 2>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
-        default: tc_launch<1, 2>(vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, accumulate, act, s); break;
+    int mode = S > 1 ? tc_reduce_want(M, N) : TC_RED_TWO;
+    const int cfg = tc_choose(M, N, mode == TC_RED_SERIAL ? 1 : S);
+    unsigned *ctr = nullptr;
+    if (mode == TC_RED_LAST) {
+        const int bm = cfg == TC_32x64 ? 32 : 64, bn = cfg == TC_64x128 ? 128 : 64;
+        const long tiles = (long)((N + bn - 1) / bn) * (long)((M + bm - 1) / bm);
+        if (ws_floats >= (size_t)S * (size_t)M * (size_t)N + TC_CTR_SLOTS && tiles <= TC_CTR_SLOTS)
+            ctr = reinterpret_cast<unsigned *>(ws + (ws_floats - TC_CTR_SLOTS));
+        else mode = TC_RED_TWO;
+    }
+    switch (cfg) {
+        case TC_64x128: tc_launch<2, 4>(mode, vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s); break;
+        case TC_64x64: tc_launch<2, 2>(mode, vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s); break;
+        default: tc_launch<1, 2>(mode, vec, A, lda, W, bias, C, ldc, M, N, K, KC, S, P, ctr, accumulate, act, s); break;
     }
     cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess || S == 1) return e;
+    if (e != cudaSuccess || S == 1 || mode != TC_RED_TWO) return e;
     dim3 g2((unsigned)((N + 255) / 256), (unsigned)M);
     gemm_reduce_kernel<<<g2, 256, 0, s>>>(ws, S, M, N, bias, C, ldc, accumulate, act);
     return cudaGetLastError();

@@ -114,7 +114,17 @@ cudaError_t k_gemm_wt_tc(const float *A, int lda, const unsigned short *W, const
                          float *C, int ldc, int M, int N, int K, int accumulate, int act,
                          float *ws, size_t ws_floats, cudaStream_t s);
 int k_gemm_tc_splits(int N, int K);
+/* S*Mmax*N partial floats plus the fused reduce's tile counters at the end;
+ * k_gemm_tc_workspace_init() zeroes those counters once after the allocation
+ * (they return to zero after every call, graph replays included). */
 size_t k_gemm_tc_workspace_floats(int Mmax, int N, int K);
+cudaError_t k_gemm_tc_workspace_init(float *ws, size_t ws_floats, cudaStream_t s);
+/* tests / A-B: pin how the split partials meet (-1 = the dispatcher chooses;
+ * 0 two-kernel, 1 last-block, 2 serial in-register); every mode is byte-
+ * identical to two-kernel. */
+void k_gemm_tc_force_reduce(int mode);
+int k_gemm_tc_reduce_count(void);
+const char *k_gemm_tc_reduce_name(int mode);
 cudaError_t k_f32_to_bf16(const float *src, unsigned short *dst, size_t n, cudaStream_t s);
 /* tests: pin one own-tc block tile (-1 = the dispatcher chooses); bit-neutral */
 void k_gemm_tc_force_config(int cfg);

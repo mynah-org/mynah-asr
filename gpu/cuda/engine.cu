@@ -441,6 +441,7 @@ static int alloc_scratch(cuda_engine *e) {
         }
         if (e->sk_ws_floats && dmalloc(e, (void **)&e->sk_ws, e->sk_ws_floats * sizeof(float), acct, "split-K workspace") != 0) return -1;
         if (e->tc_ws_floats && dmalloc(e, (void **)&e->tc_ws, e->tc_ws_floats * sizeof(float), acct, "own-tc split workspace") != 0) return -1;
+        if (e->tc_ws) CK(e, "own-tc workspace init", k_gemm_tc_workspace_init(e->tc_ws, e->tc_ws_floats, e->stream));
     }
     if (dmalloc(e, (void **)&e->d_rows, B * sizeof(gpu_row), acct, "rows") != 0) return -1;
     if (dmalloc(e, (void **)&e->d_active, B * sizeof(int), acct, "active") != 0) return -1;
