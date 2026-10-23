@@ -377,3 +377,29 @@ Primary = NeMo s2_reset frozen protocol, natural endings (greedy, decoder reset 
   (long read speech) false endpoints 20.8 % and mTEDx 14.0 %, CV / VP <= 6 %.
 - The Mynah pack's `mynah.json` name field reads `mynah-eou-fr-120m-h2` (cosmetic; the pack files are the v1.1
   package's, sha-verified).
+
+## 12. FR next R&D: decision gate (2026-10-23, after FINAL-FR-v2; the R&D agents never saw FINAL-FR-v2)
+
+Four analysis-only agents (read-only, a pre-FINAL-FR-v2 snapshot of the reports + the archived DEV / OOD metrics):
+C1 EOU / false endpoints, C2 plain-parent WER, C3 prior art, D adversarial review (with a veto round on C1 / C3).
+
+| candidate | hypothesis | prior evidence | contradicting evidence | impl. | GPU (GB10) | expected effect | falsification gate | contamination | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| H2-R: LR restart from H2, 6k steps (C2) | H2 limited by schedule / exposure | H2 flat-phase slope -0.3 / 1k; E3-R1 restart -0.60 | H2's tail flat; the restart recovered ~12 % of a doubling; prediction -0.4 is inside the ~0.5 noise | 15 min | ~100 min | DEV -0.4 (0 to -0.8) | DEV >= -0.5 -> NULL | low | NOT RUN (EV inside the noise; C2 and D) |
+| H3 fresh ~47.5k (C2, D) | per-doubling return not yet falling for FR | G1E -> H2 -3.48 DEV / -4.0 OOD1 | none strong | 0 | ~13 h | -1 to -3 | pre-register vs H2 | low | DEFERRED (an Ada / L40S box; keep late checkpoints) |
+| soup (C2, D) | averaging helps | none | IT soups worse (23.20 / 23.86 vs 22.30) | - | - | - | - | - | REJECTED |
+| concat A + gap + B, no `<EOU>` (C1 falsifier) | continuation negatives teach "wait" | prior-art list | synthetic gap (= v2 artefact), skips MLS (> 20 s), contradicts the "A + 1 s + B: EOU in gap" acceptance test | 0.2 h | ~55 min | NULL (C1) | - | low | VETOED (D) |
+| truncated-prefix "hold" negatives (C3) | same terminal quiet, incomplete prefix, no `<EOU>`: completeness becomes the cue | Chang 2022, Smart Turn, Li & Shi 2609.04225 | the premature cuts may be at clause ends (C1: 1 / 33 MLS, 1 / 115 mTEDx after a function word); v5-B / CAL label conflict; AUC 0.60 | 1.5-2 h | ~55 min + on-box control | internal FE -25 to -45 % rel. | >= 40 % rel. internal-FE reduction | low | CONDITIONAL on FR-E0 |
+| confirmation window W (C1) | the false events are pauses where speech resumes within W | v4 + W 0.32: internal FE 55 -> 33 % at p50 1.12 s | 1:1 latency cost | 0.5 h | 0 | product trade-off | DEV-only characterisation | none | FR-E0 (diagnostic) |
+
+### FR-E0 -- PRE-REGISTERED (this commit, before any v1.1 decode on DEV-EOU-FR-v2)
+- One CPU decode of RC-FR v1.1 (3130534d, parent d2062aca) on DEV-EOU-FR-v2 (SHA256SUMS sha 851084f2...; 274 clips),
+  the s2_reset command of the 2026-10-21 v4 / v2 decodes; scored by `eou_v2_score.py` against the archived v4 dump
+  (per class / stratum FE, recall, latency, and the window frontier W in {0.16, 0.32, 0.48, 0.64, 0.8, 1.04} --
+  diagnostic, DEV-only, never a selection; FINAL-EOU-FR-v2 stays sealed).
+- `finetune/eou/diag/cut_class.py` (this commit; validated on the archived v4 dump: 115 cuts, 13.0 % mid-phrase vs a
+  56.1 % word-boundary control) classifies v1.1's premature cuts against the punctuated mTEDx references.
+- **Rule (D's veto round):** the truncated-prefix arm is admitted only if v1.1's premature cuts on DEV-EOU-FR-v2 are
+  >= 40 % mid-phrase AND >= +10 pp above the control (its 40 % FE-reduction gate is capped by the mid-phrase share).
+  Otherwise it is closed without training, and no FR training arm runs today ("parallelise thinking, not arms").
+- This is the second selection use of DEV-EOU-FR-v2.
