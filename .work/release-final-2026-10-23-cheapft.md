@@ -31,3 +31,10 @@ R with `--seed 1` (CF-E1 arm R's exact command otherwise), 1,500 steps, one eval
 -> single-seed 1,500-step screens cannot resolve <= 1 WER: CF-E1 B and CF-E2 S4 become UNRESOLVED (multi-seed or
 full horizon needed, no recipe claim either way); |R1 - R0| < 0.3 -> S4's FAIL and B's +0.99 stand as real; in
 between -> recorded, both stay as classified, with a noise caveat.
+
+### Result: CF-E3 (OBSERVED 2026-10-23 12:20-12:46 UTC, dgx1) -- seed noise floor 0.46
+R seed 1, 1,500 steps: macro **31.28** (MLS 26.59, FLEURS 30.57, CV 35.86) vs R seed 0 30.82: |delta| = **0.46**, in
+the pre-registered middle band (0.3-0.6): CF-E2 S4 stays FAIL and CF-E1 B stays STRONG, both with an explicit noise
+caveat (S4's +0.68 is ~1.5x and B's +0.99 ~2x the one-pair seed spread; one pair is a weak estimate of the spread).
+Consequence for the factory: a 1,500-step single-seed screen resolves ~1 WER at best; claims about <= 0.5 WER need
+two seeds per arm or the full horizon.
