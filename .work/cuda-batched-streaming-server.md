@@ -558,6 +558,76 @@ machine or pinned CPUs proven idle, or its result is DIAGNOSTIC.
    stage, 16-18 %) and choose the next lever: bf16 tensor cores on the FFN
    first (the registered plan), each GEMM family behind its own WER gate.
 
+## S14-8c own-tc: fixed-order bf16 tensor cores (2026-10-08, L4)
+
+`--precision bf16 --gemm own-tc`, default OFF. Ported from the TTS engine's
+fixed-order prefill tile. A NUMERICAL CHANGE against every f32 arm, stated
+before the numbers: bf16 resident weights (RNE, converted once at open on the
+device, the f32 copy stays resident: +~1.2 GB VRAM), activations rounded to
+bf16 when staged into shared memory, fp32 accumulation in WMMA 16x16x16.
+
+**Design.** Warps of 32x32 outputs; block tiles 64x128 (8 warps), 64x64 (4),
+32x64 (2), chosen per call from M and N -- bit-neutral, the gate pins each.
+K is walked in 32-wide slabs ascending (two 16-deep MMA steps each, ascending),
+the next slab prefetched into registers during the MMAs. The K split is
+`S = k_gemm_tc_splits(N, K)`: `ceil(128 / ceil(N/64))` clamped to
+`[1, K/256]`, a function of the weight shape and two file constants ONLY --
+never M, never the SM count, never the tile. Split ranges are multiples of 32;
+partials are reduced in split order by the split-K reduce kernel, then bias,
+accumulate, activation. Nemotron shapes: FFN1 S=2, FFN2 S=8, qkvo/pw2 S=4,
+pw1 S=4, ss-linear S=8, prompt-l1 S=4, prompt-l2 S=8, encproj S=4, head S=1,
+LSTM S=2, proj S=2, ss-pointwise S=1. All GEMMs of the pass (encoder,
+projector, label-loop head and LSTM) take the arm. sm_80+ only: an older card
+is refused at open, no fallback. S14-11 does not exist for this arm; split-K
+itself now uses the L4's 58 SMs as a constant (same bits on the L4 as
+qualified, the same split table on every other card).
+
+**Kernel gates** (`tests/test_cuda_kernels`, L4, 0 failures): on the 12 model
+shapes plus a ragged one (N=100, K=300, the scalar staging path), 12 cohort
+sizes x every tile (auto + 3 pinned) x relu/silu with bias + accumulate against
+the same rows inside M=257, and a repeated call: byte-identical everywhere.
+Against a double reference over the bf16-ROUNDED operands the error is at or
+below v1's f32 error (e.g. FFN2 1.34e-6); against the f32 operands it is the
+bf16 rounding, ~4e-3..8e-3 on |ref| up to ~3 (INFO). `--bench-tc`: own-tc is
+2.5-5x faster than split-K per GEMM in M=24..512 (FFN 22-33 TFLOP/s at
+M>=95; ss-pointwise and proj are launch-bound).
+
+**Transcript gates.** `test_cuda_stream --gemm own-tc --precision bf16`:
+gate A green (batch identity, a repeated run, slot independence) on the 5
+clips; gate B (CPU f32 == GPU) identical on 5/5 -- the change did not reach
+those transcripts. **Bank** (`tests/cuda_bank_transcribe`, offline, bank
+`04a7753aa1e80f9a`, 498 clips, lang auto, lookahead 3): f32 v1 vs own-tc bf16
+identical on 482/498 clips; WER corpus 0.14483 -> 0.14469, mean 0.10515 ->
+0.10500, CER mean 0.06737 -> 0.06733; on the 16 differing clips 4 better, 4
+worse, 8 same WER. `transcript_ab.py` registered bound +0.002: **PASS**
+(delta -0.00014).
+**Bank-wide batch identity:** the same 498 clips through own-tc in cohorts of
+64 and in cohorts of 7 give byte-identical transcript files (`cmp`).
+
+**Speed** (offline bank, cohort of 64 clips, all lanes stepped together, so
+rows per pass are higher than serving's C=128 at a 40 ms cohort, ~95):
+whole bank 42.5 s -> 21.5 s wall, step wall mean 68.2 -> 27.3 ms (f32 v1 ->
+own-tc).
+
+Device time per pass (`--profile 1`, DIAGNOSTIC, first 128 bank clips,
+same clips for every arm):
+
+| rows/pass (lanes) | f32 v1 | f32 split-K | bf16 own-tc | own-tc vs split-K |
+|---|---|---|---|---|
+| 167 (42), cohort 64 | 81.3 ms | 66.6 ms | **29.3 ms** | -56 % |
+| 262 (66), cohort 128 | - | 93.9 ms | **41.8 ms** | -55 % |
+
+FFN1+FFN2 at 167 rows: 28.1 ms (split-K) -> 8.9 ms; projections + O 8.9 ->
+3.0; conv 7.6 -> 3.3; decoder 5.1 -> 1.6. **The attention core (own f32
+kernel, untouched) is now the largest stage: 11.3 of 29.3 ms (39 %) at 167
+rows, 17.4 of 41.8 ms (42 %) at 262** -- the next device lever. Per the TTS
+lesson the host share of the engine loop grows as the pass shrinks: the
+serving A/B must carry the host-phase profile.
+
+**Not done here** (owner decision, as for split-K): a serving WAVE ladder and
+the 2x30-minute soaks with the arm, the new unloaded reference at C=4 from
+the server, dropping the resident f32 copies of the GEMM weights.
+
 ## Explicit non-goals and rejected shortcuts
 
 - No per-op offload of the CPU step (the 2026-07 `cuda_gemm.cu` seam stays
@@ -738,5 +808,7 @@ shared memory > 48 KB, `_exit` before the writers flush).
 ## Next action
 
 S14-8b: 2x30-minute split-K soaks at C=128 with the generator off the server's
-CPUs (see "Next, in order" above); S14-11 before split-K becomes the default;
-then S14-7 on the target instance class.
+CPUs (see "Next, in order" above); then S14-7 on the target instance class.
+S14-11 is closed (2026-10-08). S14-8c own-tc passed its kernel, transcript and
+bank WER gates; promoting it needs a serving ladder and soaks with the
+host-phase profile on, and an owner decision like split-K's.

@@ -10,3 +10,8 @@ asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err, size_t er
     snprintf(err, errcap, "the cuda engine is not compiled into this binary (built without nvcc: make -C gpu cpu)");
     return NULL;
 }
+
+int asr_engine_cuda_cc_major(int device) {
+    (void)device;
+    return -1;
+}

@@ -6,6 +6,7 @@
 #   make -C gpu test-kernels  tests/test_cuda_kernels (GPU) -- compile here,
 #                             run on a device
 #   make -C gpu test-stream   tests/test_cuda_stream (GPU + pack)
+#   make -C gpu bank-transcribe  tests/cuda_bank_transcribe (a bank offline, {clip: text})
 #
 # The library (../libmynah_asr.a, `make lib` at the top) and the two reusable
 # server modules (../server/http_util.c, ../server/stream_out.c) are used
@@ -39,10 +40,10 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 
 B := $(TOP)/build/gpu
 
-C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/http_util.o $(B)/stream_out.o
-CU_OBJ   := $(B)/gemm.o $(B)/kernels.o $(B)/engine.o
+C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
+CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
 
-.PHONY: all cpu clean test-kernels test-stream lib
+.PHONY: all cpu clean test-kernels test-stream bank-transcribe lib
 all: $(TOP)/mynah-asr-server-cuda
 cpu: $(TOP)/mynah-asr-server-cuda-cpuonly
 
@@ -59,6 +60,9 @@ $(B)/server_main.o: server/main.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/ws.o: server/ws.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/hostprof.o: server/hostprof.c server/hostprof.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/http_util.o: $(TOP)/server/http_util.c
@@ -88,7 +92,7 @@ $(B)/test_cuda_kernels.o: $(TOP)/tests/test_cuda_kernels.cu cuda/kernels.cuh
 	@mkdir -p $(@D)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 test-kernels: $(TOP)/tests/test_cuda_kernels
-$(TOP)/tests/test_cuda_kernels: $(B)/test_cuda_kernels.o $(B)/gemm.o $(B)/kernels.o
+$(TOP)/tests/test_cuda_kernels: $(B)/test_cuda_kernels.o $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o
 	$(NVCC) $(GENCODE) -o $@ $^ $(CUDA_LIBS)
 
 $(B)/test_cuda_stream.o: $(TOP)/tests/test_cuda_stream.c asr_engine.h
@@ -98,6 +102,13 @@ test-stream: $(TOP)/tests/test_cuda_stream
 $(TOP)/tests/test_cuda_stream: $(B)/test_cuda_stream.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
 	$(NVCC) $(GENCODE) -o $@ $(B)/test_cuda_stream.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
 
+$(B)/cuda_bank_transcribe.o: $(TOP)/tests/cuda_bank_transcribe.c asr_engine.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+bank-transcribe: $(TOP)/tests/cuda_bank_transcribe
+$(TOP)/tests/cuda_bank_transcribe: $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
+	$(NVCC) $(GENCODE) -o $@ $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
+
 clean:
 	rm -rf $(B) $(TOP)/mynah-asr-server-cuda $(TOP)/mynah-asr-server-cuda-cpuonly \
-	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream
+	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe

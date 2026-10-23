@@ -18,7 +18,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <cuda_bf16.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -285,7 +287,206 @@ static int test_splitk(int N, int K, const char *what, int bench) {
     return 0;
 }
 
+/* ------------------------------------------------ own-tc (bf16 tensor cores)
+ * The contract of --gemm own-tc, gated byte for byte: every row of every
+ * cohort size equals the same row inside M = 257, for every block tile the
+ * dispatcher may pick, with bias + accumulate and relu/silu epilogues, and a
+ * second identical call returns the same bytes. S comes from (N, K) only.
+ * Accuracy is sized against a double reference over the bf16-ROUNDED operands
+ * (what the kernel is asked to compute) and against the f32 operands (the
+ * numerical change vs the f32 arms, reported). */
+static float bf16_round_host(float x) {
+    unsigned u; memcpy(&u, &x, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);    /* round to nearest even; no NaN in these tests */
+    u &= 0xFFFF0000u;
+    float r; memcpy(&r, &u, 4);
+    return r;
+}
+
+static int test_gemm_tc(int N, int K, const char *what, int bench) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 2, 5, 16, 24, 33, 64, 95, 128, 163, 200, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N);
+    fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+    const size_t wsf = k_gemm_tc_workspace_floats(Mmax, N, K);
+    float *dA = dup_dev(A), *dW = dup_dev(W), *db = dup_dev(bias), *dR, *dC, *ws = nullptr;
+    unsigned short *dW16 = nullptr;
+    CU(cudaMalloc(&dW16, (size_t)N * K * sizeof(unsigned short)));
+    CU(k_f32_to_bf16(dW, dW16, (size_t)N * K, 0));
+    CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    if (wsf) CU(cudaMalloc(&ws, wsf * sizeof(float)));
+    int mism = 0, rep_mism = 0;
+    for (int act = 0; act <= 2; act += 2) {
+        CU(cudaMemcpy(dR, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_wt_tc(dA, K, dW16, db, dR, N, Mmax, N, K, 1, act, ws, wsf, 0));
+        CU(cudaDeviceSynchronize());
+        auto ref = to_host(dR, (size_t)Mmax * N);
+        /* the same call again: deterministic */
+        CU(cudaMemcpy(dC, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, Mmax, N, K, 1, act, ws, wsf, 0));
+        CU(cudaDeviceSynchronize());
+        if (memcmp(to_host(dC, (size_t)Mmax * N).data(), ref.data(), (size_t)Mmax * N * sizeof(float)) != 0) rep_mism++;
+        for (int cfg = -1; cfg < k_gemm_tc_config_count(); cfg++) {
+            k_gemm_tc_force_config(cfg);
+            for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+                const int M = Ms[mi];
+                CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, M, N, K, 1, act, ws, wsf, 0));
+                CU(cudaDeviceSynchronize());
+                auto c = to_host(dC, (size_t)M * N);
+                if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
+                    if (mism < 3) printf("     own-tc %s cfg %s M=%d act=%d differs from M=257\n", what, cfg < 0 ? "auto" : k_gemm_tc_config_name(cfg), M, act);
+                    mism++;
+                }
+            }
+        }
+        k_gemm_tc_force_config(-1);
+    }
+    CHECK(mism == 0 && rep_mism == 0, "own-tc row-stable %s [N=%d K=%d, S=%d]: 12 cohort sizes x %d tiles x relu/silu vs M=257, and a repeat, byte for byte (%d + %d mismatches)",
+          what, N, K, k_gemm_tc_splits(N, K), k_gemm_tc_config_count() + 1, mism, rep_mism);
+    /* accuracy: vs double over the bf16-rounded operands (the kernel's job) and
+     * vs double over the f32 operands (the numerical change, next to v1's) */
+    {
+        const int M = 64;
+        CU(k_gemm_wt_tc(dA, K, dW16, nullptr, dC, N, M, N, K, 0, 0, ws, wsf, 0));
+        CU(k_gemm_wt_v1(dA, K, dW, nullptr, dR, N, M, N, K, 0, 0, 0));
+        CU(cudaDeviceSynchronize());
+        auto ct = to_host(dC, (size_t)M * N), c1 = to_host(dR, (size_t)M * N);
+        double e16 = 0, e32 = 0, e1 = 0, scale = 0;
+        for (int m = 0; m < M; m += 7)
+            for (int n = 0; n < N; n += 31) {
+                double r16 = 0, r32 = 0;
+                for (int k = 0; k < K; k++) {
+                    const float a = A[(size_t)m * K + k], w = W[(size_t)n * K + k];
+                    r16 += (double)bf16_round_host(a) * (double)bf16_round_host(w);
+                    r32 += (double)a * (double)w;
+                }
+                e16 = fmax(e16, fabs(ct[(size_t)m * N + n] - r16));
+                e32 = fmax(e32, fabs(ct[(size_t)m * N + n] - r32));
+                e1 = fmax(e1, fabs(c1[(size_t)m * N + n] - r32));
+                scale = fmax(scale, fabs(r32));
+            }
+        CHECK(e16 <= 4.0 * e1 + 1e-5, "own-tc exact on bf16 operands %s: max|err| vs double(bf16 inputs) %.3g (f32 v1 vs double %.3g)", what, e16, e1);
+        printf("INFO own-tc numerical change %s: max|err| vs double(f32 inputs) %.3g, v1 %.3g, |ref| up to %.3g\n", what, e32, e1, scale);
+    }
+    if (bench) {
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        const int Mb[] = {24, 64, 95, 128, 163, 256, 512};
+        const size_t wsk = k_gemm_splitk_workspace_floats(512, N, K), wst = k_gemm_tc_workspace_floats(512, N, K);
+        float *wk = nullptr, *wt = nullptr, *dAb = nullptr, *dCb = nullptr;
+        std::vector<float> Ab((size_t)512 * K); fill(Ab, 1.0f);
+        dAb = dup_dev(Ab);
+        CU(cudaMalloc(&dCb, (size_t)512 * N * sizeof(float)));
+        if (wsk) CU(cudaMalloc(&wk, wsk * sizeof(float)));
+        if (wst) CU(cudaMalloc(&wt, wst * sizeof(float)));
+        for (size_t mi = 0; mi < sizeof(Mb) / sizeof(Mb[0]); mi++) {
+            const int M = Mb[mi];
+            float t[3], ms;
+            for (int arm = 0; arm < 3; arm++) {
+                for (int r = 0; r < 23; r++) {
+                    if (r == 3) cudaEventRecord(e0);
+                    if (arm == 0) (void)k_gemm_wt_v1(dAb, K, dW, nullptr, dCb, N, M, N, K, 0, 0, 0);
+                    else if (arm == 1) (void)k_gemm_wt_splitk(dAb, K, dW, nullptr, dCb, N, M, N, K, 0, 0, wk, wsk, 0);
+                    else (void)k_gemm_wt_tc(dAb, K, dW16, nullptr, dCb, N, M, N, K, 0, 0, wt, wst, 0);
+                }
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                t[arm] = ms / 20.0f;
+            }
+            printf("BENCHTC %-12s M=%3d S=%d  v1 %7.3f ms  splitk %7.3f ms  own-tc %7.3f ms (%.2fx splitk, %.1f TFLOP/s)\n",
+                   what, M, k_gemm_tc_splits(N, K), t[0], t[1], t[2], t[1] / t[2], 2.0 * M * N * (double)K / (t[2] * 1e9));
+        }
+        cudaFree(wk); cudaFree(wt); cudaFree(dAb); cudaFree(dCb);
+    }
+    cudaFree(dA); cudaFree(dW); cudaFree(dW16); cudaFree(db); cudaFree(dR); cudaFree(dC); if (ws) cudaFree(ws);
+    return 0;
+}
+
 /* -------------------------------------------------------------- argmax */
+/* ------------------------------------------- weight-only int8 (gemm_w8.cu)
+ * Row-stable over the cohort sweep, byte for byte, and as accurate as v1 on
+ * the decoded weights; the quantisation error itself is reported. */
+static int test_w8(int N, int K, const char *what, int bench) {
+    const int Mmax = 257;
+    const int Ms[] = {1, 2, 5, 16, 24, 33, 64, 95, 128, 163, 200, 256};
+    std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N), S(N), Wd((size_t)N * K);
+    std::vector<int8_t> Q((size_t)N * K);
+    fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+    for (int n = 0; n < N; n++) {   /* the CPU recipe: max|w| / 127, round half away */
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) amax = fmaxf(amax, fabsf(W[(size_t)n * K + k]));
+        const float sc = amax / 127.0f, inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+        S[n] = sc;
+        for (int k = 0; k < K; k++) {
+            const float v = W[(size_t)n * K + k] * inv;
+            Q[(size_t)n * K + k] = (int8_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+            Wd[(size_t)n * K + k] = (float)Q[(size_t)n * K + k] * sc;
+        }
+    }
+    float *dA = dup_dev(A), *db = dup_dev(bias), *dS = dup_dev(S), *dR, *dC;
+    int8_t *dQ = dup_dev(Q);
+    CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+    int mism = 0;
+    for (int act = 0; act <= 2; act += 2) {
+        CU(cudaMemcpy(dR, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
+        CU(k_gemm_w8(dA, K, dQ, dS, db, dR, N, Mmax, N, K, 1, act, 0));
+        CU(cudaDeviceSynchronize());
+        auto ref = to_host(dR, (size_t)Mmax * N);
+        for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+            const int M = Ms[mi];
+            CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+            CU(k_gemm_w8(dA, K, dQ, dS, db, dC, N, M, N, K, 1, act, 0));
+            CU(cudaDeviceSynchronize());
+            auto c = to_host(dC, (size_t)M * N);
+            if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) mism++;
+        }
+    }
+    CHECK(mism == 0, "w8 gemm row-stable %s [N=%d K=%d]: 12 cohort sizes vs M=257, byte for byte (%d mismatches)", what, N, K, mism);
+    {
+        const int M = 64;
+        float *dW = dup_dev(W);
+        CU(k_gemm_w8(dA, K, dQ, dS, nullptr, dC, N, M, N, K, 0, 0, 0));
+        CU(k_gemm_wt_v1(dA, K, dW, nullptr, dR, N, M, N, K, 0, 0, 0));
+        CU(cudaDeviceSynchronize());
+        auto c8 = to_host(dC, (size_t)M * N), c1 = to_host(dR, (size_t)M * N);
+        double ed = 0, eq = 0, e1 = 0, ref_scale = 0;
+        for (int m = 0; m < M; m += 7)
+            for (int n = 0; n < N; n += 31) {
+                double rd = 0, r = 0;
+                for (int k = 0; k < K; k++) {
+                    rd += (double)A[(size_t)m * K + k] * (double)Wd[(size_t)n * K + k];
+                    r += (double)A[(size_t)m * K + k] * (double)W[(size_t)n * K + k];
+                }
+                ed = fmax(ed, fabs(c8[(size_t)m * N + n] - rd));
+                eq = fmax(eq, fabs(c8[(size_t)m * N + n] - r));
+                e1 = fmax(e1, fabs(c1[(size_t)m * N + n] - r));
+                ref_scale = fmax(ref_scale, fabs(r));
+            }
+        CHECK(ed <= 2.0 * e1 + 1e-6, "w8 gemm arithmetic %s: max|err| vs double on the decoded weights %.3g (v1 f32 %.3g)", what, ed, e1);
+        printf("INFO w8 quantisation error %s: max|err| vs the f32 weights %.3g (|ref| up to %.3g)\n", what, eq, ref_scale);
+        if (bench) {
+            cudaEvent_t e0, e1_; cudaEventCreate(&e0); cudaEventCreate(&e1_);
+            const int Mb[] = {16, 128, 512};
+            for (int mb = 0; mb < 3; mb++) {
+                const int Mx = Mb[mb] < Mmax ? Mb[mb] : Mmax;
+                float t[2];
+                for (int arm = 0; arm < 2; arm++) {
+                    cudaEventRecord(e0);
+                    for (int it = 0; it < 20; it++) {
+                        if (arm == 0) (void)k_gemm_wt_v1(dA, K, dW, nullptr, dC, N, Mx, N, K, 0, 0, 0);
+                        else (void)k_gemm_w8(dA, K, dQ, dS, nullptr, dC, N, Mx, N, K, 0, 0, 0);
+                    }
+                    cudaEventRecord(e1_); cudaEventSynchronize(e1_);
+                    cudaEventElapsedTime(&t[arm], e0, e1_);
+                }
+                printf("BENCHW8 %-12s M=%3d  v1 %7.3f ms  w8 %7.3f ms (%.2fx)\n", what, Mx, t[0] / 20, t[1] / 20, t[0] / t[1]);
+            }
+        }
+        cudaFree(dW);
+    }
+    cudaFree(dA); cudaFree(db); cudaFree(dS); cudaFree(dR); cudaFree(dC); cudaFree(dQ);
+    return 0;
+}
+
 static int test_argmax(void) {
     const int V = 13088, n = 3;
     std::vector<float> lg((size_t)n * V);
@@ -339,7 +540,23 @@ static int test_layernorm(void) {
 }
 
 /* ------------------------------------------------ attention + kv ring */
-static int test_attention(void) {
+/* host twins of the ring codecs (kernels.cu kv_commit_kernel) */
+static void kv_quant_row_i8(const float *x, int H, int dk, int8_t *q, float *sc) {
+    for (int h = 0; h < H; h++) {
+        float amax = 0.0f;
+        for (int i = 0; i < dk; i++) amax = fmaxf(amax, fabsf(x[h * dk + i]));
+        const float s = amax / 127.0f;
+        sc[h] = s;
+        for (int i = 0; i < dk; i++) {
+            float c = s > 0.0f ? rintf(x[h * dk + i] / s) : 0.0f;
+            c = fminf(127.0f, fmaxf(-127.0f, c));
+            q[h * dk + i] = (int8_t)c;
+        }
+    }
+}
+
+static int test_attention_kv(int kvt) {
+    const char *kvn = kvt == GPU_KV_INT8 ? "int8" : kvt == GPU_KV_BF16 ? "bf16" : "f32";
     gpu_model_dims dm = {};
     dm.n_layers = 2; dm.d = 256; dm.H = 2; dm.dk = 128; dm.left = 8; dm.kmax = 8 + 4 + 2;
     const int li = 1, B = 3;
@@ -348,6 +565,21 @@ static int test_attention(void) {
     const int cap = 3;
     const size_t kv_n = (size_t)cap * dm.n_layers * 2 * dm.left * dm.d;
     std::vector<float> kv(kv_n); fill(kv, 1.0f);
+    /* the ring as stored: codes (+ scales); the reference reads it decoded */
+    std::vector<int8_t> kq8;
+    std::vector<float> ksc;
+    std::vector<__nv_bfloat16> kb16;
+    const size_t npos = kv_n / (size_t)dm.d;
+    if (kvt == GPU_KV_INT8) {
+        kq8.resize(kv_n); ksc.resize(npos * (size_t)dm.H);
+        for (size_t p = 0; p < npos; p++) {
+            kv_quant_row_i8(&kv[p * dm.d], dm.H, dm.dk, &kq8[p * dm.d], &ksc[p * dm.H]);
+            for (int c = 0; c < dm.d; c++) kv[p * dm.d + c] = (float)kq8[p * dm.d + c] * ksc[p * dm.H + c / dm.dk];
+        }
+    } else if (kvt == GPU_KV_BF16) {
+        kb16.resize(kv_n);
+        for (size_t i = 0; i < kv_n; i++) { kb16[i] = __float2bfloat16_rn(kv[i]); kv[i] = __bfloat162float(kb16[i]); }
+    }
     std::vector<gpu_slot_meta> meta(cap);
     for (int s = 0; s < cap; s++) { memset(&meta[s], 0, sizeof(meta[s])); meta[s].valid = valid_[s]; meta[s].head = head_[s]; }
     std::vector<gpu_row> rows(B);
@@ -398,7 +630,11 @@ static int test_attention(void) {
         }
     }
     gpu_arena ar = {};
-    ar.kv = dup_dev(kv); ar.meta = dup_dev(meta);
+    ar.kv_dtype = kvt;
+    if (kvt == GPU_KV_INT8) { ar.kvq = dup_dev(kq8); ar.kv_scale = dup_dev(ksc); }
+    else if (kvt == GPU_KV_BF16) ar.kvq = dup_dev(kb16);
+    else ar.kv = dup_dev(kv);
+    ar.meta = dup_dev(meta);
     gpu_layer_w L = {}; L.bias_u = dup_dev(bu); L.bias_v = dup_dev(bv);
     float *dtab = dup_dev(tab), *dq = dup_dev(qsv), *dkn = dup_dev(kn), *dvn = dup_dev(vn), *dctx;
     gpu_row *drows = dup_dev(rows);
@@ -406,7 +642,7 @@ static int test_attention(void) {
     CU(k_attention(dm, L, li, dtab, ar, drows, B, dq, dkn, dvn, dctx, 0));
     CU(cudaDeviceSynchronize());
     const double diff = max_abs_diff(to_host(dctx, (size_t)R * dm.d), ctx_ref);
-    CHECK(diff < 1e-4, "attention (ring window + table, mixed q and valid): max |diff| = %.3g", diff);
+    CHECK(diff < 1e-4, "attention kv=%s (ring window + table, mixed q and valid): max |diff| = %.3g", kvn, diff);
     /* lane identity: the same lane alone must give the same bytes */
     std::vector<gpu_row> one(1); one[0] = rows[2]; one[0].row_off = 0;
     gpu_row *done_ = dup_dev(one);
@@ -415,12 +651,44 @@ static int test_attention(void) {
     CU(cudaDeviceSynchronize());
     auto full = to_host(dctx, (size_t)R * dm.d), alone = to_host(dctx1, (size_t)4 * dm.d);
     CHECK(memcmp(alone.data(), full.data() + (size_t)rows[2].row_off * dm.d, (size_t)4 * dm.d * sizeof(float)) == 0,
-          "attention lane identity: lane alone == lane inside the cohort, byte for byte");
+          "attention kv=%s lane identity: lane alone == lane inside the cohort, byte for byte", kvn);
     /* commit + advance: the ring holds the last min(valid+q, left) rows */
     CU(k_kv_commit(dm, li, ar, drows, B, dkn, dvn, 0));
     CU(k_kv_advance(dm, ar, drows, B, 0));
     CU(cudaDeviceSynchronize());
-    auto kv2 = to_host(ar.kv, kv_n);
+    /* decode what the device stored, and check the fresh rows' codes against
+     * the host codec bit for bit */
+    std::vector<float> kv2(kv_n);
+    int codes_ok = 1;
+    if (kvt == GPU_KV_INT8) {
+        auto q2 = to_host((int8_t *)ar.kvq, kv_n);
+        auto s2 = to_host(ar.kv_scale, npos * (size_t)dm.H);
+        for (size_t i = 0; i < kv_n; i++) kv2[i] = (float)q2[i] * s2[(i / dm.d) * dm.H + (i % dm.d) / dm.dk];
+        std::vector<int8_t> qr(dm.d); std::vector<float> sr(dm.H);
+        for (int a = 0; a < B; a++)
+            for (int t = 0; t < qs_[a]; t++) {
+                const int phys = (head_[a] + valid_[a] + t) % dm.left;
+                const size_t pos = (((size_t)a * dm.n_layers + li) * 2 + 0) * dm.left + (size_t)phys;
+                kv_quant_row_i8(&kn[(size_t)(rows[a].row_off + t) * dm.d], dm.H, dm.dk, qr.data(), sr.data());
+                if (memcmp(qr.data(), &q2[pos * dm.d], (size_t)dm.d) != 0 ||
+                    memcmp(sr.data(), &s2[pos * dm.H], (size_t)dm.H * sizeof(float)) != 0) codes_ok = 0;
+            }
+        CHECK(codes_ok, "kv commit int8: fresh rows' codes and scales == the host codec, bit for bit");
+    } else if (kvt == GPU_KV_BF16) {
+        auto b2 = to_host((__nv_bfloat16 *)ar.kvq, kv_n);
+        for (size_t i = 0; i < kv_n; i++) kv2[i] = __bfloat162float(b2[i]);
+    } else kv2 = to_host(ar.kv, kv_n);
+    /* the expected fresh rows, as the codec stores them */
+    std::vector<float> knd = kn;
+    if (kvt == GPU_KV_INT8) {
+        std::vector<int8_t> qr(dm.d); std::vector<float> sr(dm.H);
+        for (int r = 0; r < R; r++) {
+            kv_quant_row_i8(&kn[(size_t)r * dm.d], dm.H, dm.dk, qr.data(), sr.data());
+            for (int c = 0; c < dm.d; c++) knd[(size_t)r * dm.d + c] = (float)qr[c] * sr[c / dm.dk];
+        }
+    } else if (kvt == GPU_KV_BF16) {
+        for (auto &x : knd) x = __bfloat162float(__float2bfloat16_rn(x));
+    }
     auto meta2 = to_host(ar.meta, (size_t)cap);
     int ok = 1;
     for (int a = 0; a < B; a++) {
@@ -430,12 +698,12 @@ static int test_attention(void) {
         for (int i = 0; i < nvalid && ok; i++) {
             const int wi = total - nvalid + i;
             const float *want = wi < valid ? &kv[((((size_t)a * dm.n_layers + li) * 2 + 0) * dm.left + (size_t)((head_[a] + wi) % dm.left)) * dm.d]
-                                           : &kn[(size_t)(rows[a].row_off + wi - valid) * dm.d];
+                                           : &knd[(size_t)(rows[a].row_off + wi - valid) * dm.d];
             const float *got = &kv2[((((size_t)a * dm.n_layers + li) * 2 + 0) * dm.left + (size_t)((meta2[a].head + i) % dm.left)) * dm.d];
             if (memcmp(want, got, (size_t)dm.d * sizeof(float)) != 0) ok = 0;
         }
     }
-    CHECK(ok, "kv commit + advance: the ring holds the last min(valid+q, left) rows, logically");
+    CHECK(ok, "kv=%s commit + advance: the ring holds the last min(valid+q, left) rows, logically", kvn);
     return 0;
 }
 
@@ -692,9 +960,24 @@ int main(int argc, char **argv) {
         if (test_gemm_v2(shapes[i][0], shapes[i][1], names[i], bench_v2) != 0) return 1;
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         if (test_splitk(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
+    {
+        const int bench_tc = argc > 1 && strcmp(argv[1], "--bench-tc") == 0;
+        if (p.major >= 8) {
+            for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+                if (test_gemm_tc(shapes[i][0], shapes[i][1], names[i], bench_tc) != 0) return 1;
+            /* off-model shape: K not a multiple of 8 (the scalar staging path), ragged N */
+            if (test_gemm_tc(100, 300, "ragged", 0) != 0) return 1;
+        } else {
+            printf("SKIP own-tc: %s is sm_%d%d, the arm needs sm_80+\n", p.name, p.major, p.minor);
+        }
+    }
     if (test_argmax() != 0) return 1;
     if (test_layernorm() != 0) return 1;
-    if (test_attention() != 0) return 1;
+    if (test_attention_kv(GPU_KV_F32) != 0) return 1;
+    if (test_attention_kv(GPU_KV_BF16) != 0) return 1;
+    if (test_attention_kv(GPU_KV_INT8) != 0) return 1;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
+        if (test_w8(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
     if (test_conv() != 0) return 1;
     if (test_subsampling() != 0) return 1;
     if (test_decode() != 0) return 1;

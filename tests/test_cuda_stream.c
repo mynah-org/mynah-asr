@@ -7,16 +7,42 @@
  *      text, byte for byte, as the same clip streamed alone on the same GPU.
  *      Idle lanes of the cohort are poisoned with a different clip so that a
  *      cross-lane read cannot go unnoticed.
+ *   C. SERVING-LOOP ARMS (byte identity, not a tolerance): the cohorts of gate A
+ *      re-run on engines opened with the serving-loop options -- the split
+ *      step with the next chunks fed between submit and finish (the server's
+ *      --stage-ahead), a feed team (--host-threads), the encoder pass from
+ *      CUDA graphs with padded lane/row buckets (--graphs buckets), the
+ *      start-up warm-up (--warmup) and all of them together -- must emit, per
+ *      clip, the same sequence of steps: same text, same t0/t1, same token
+ *      count, same finish, as the default engine.
  *   B. CPU <-> GPU: the same clips through the library's own f32 stream API
  *      (src/mynah_asr.h, the CPU path this tree never modifies) and through the
  *      cuda engine. Identity is EXPECTED and reported per clip; a difference is
  *      printed with both texts and exits 3 -- a finding to look at, never a
  *      silent pass and never a silent fail.
  *
- * usage: tests/test_cuda_stream <model_dir> [--gemm own|cublas] [clip.wav ...]
+ * usage: tests/test_cuda_stream <model_dir> [--gemm own|splitk|own-tc|cublas]
+ *            [--precision f32|bf16] [--pass-lanes N] [--graph-buckets 1,2,4]
+ *            [--no-gate-c] [clip.wav ...]
  *        (default clips: tests/audio/test_*.wav; the GEMM arm is an argument,
- *        not an environment flag, so the flag registry stays the library's)
- * exit 0 = both gates pass; 1 = gate A failed or a device error; 3 = gate A
+ *        not an environment flag, so the flag registry stays the library's;
+ *        bf16 goes with own-tc, and gate B then measures a numerical change).
+ *        --pass-lanes N below the clip count makes the mixed cohort of gate A
+ *        run as several encoder passes in one step (S14-12: the split path),
+ *        which must not change a byte either. Gate C runs every serving-loop
+ *        option on top of the chosen precision / GEMM / pass-lanes arm.
+ *        [--kv-dtype f32|bf16|int8] [--weights f32|int8]
+ *        [--list clips.txt] [--alone N] [--no-cpu] [--json out.json --key-root DIR]
+ *        [--bench C --steps S]
+ *   --list      one clip path per line (up to MAXC), added to the clips
+ *   --alone N   gate A compares only the first N clips alone vs in the cohort
+ *               (every clip is still checked on a shifted slot)
+ *   --json      writes {clip path relative to --key-root: cohort text}, the
+ *               reference.json form gpu/tools/transcript_ab.py reads
+ *   --bench C   no gates: C lanes (the clips cycled) stepped together with the
+ *               stage profile on; prints device ms per full pass (passes where
+ *               all C lanes stepped, after 2 warm steps) and the VRAM facts
+ * exit 0 = the gates pass; 1 = gate A or C failed or a device error; 3 = A and C
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
 
@@ -27,9 +53,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAXC 16
+#define MAXC 256
 
-typedef struct { char *text; } utt;
+typedef struct { char *text; char *log; } utt;
+
+/* the per-step record gate C compares: text, window, tokens, finish */
+static void log_step(utt *u, const asr_step_out *o) {
+    char rec[64];
+    snprintf(rec, sizeof(rec), "|%.6f,%.6f,%d,%d:", o->t0, o->t1, o->n_tokens, o->finished);
+    const char *parts[2] = {rec, o->text ? o->text : ""};
+    for (int k = 0; k < 2; k++) {
+        const size_t a = u->log ? strlen(u->log) : 0, b = strlen(parts[k]);
+        char *n = realloc(u->log, a + b + 1);
+        if (!n) return;
+        memcpy(n + a, parts[k], b + 1);
+        u->log = n;
+    }
+}
 
 static void cat_text(utt *u, const char *s) {
     if (!s || !s[0]) return;
@@ -42,6 +82,8 @@ static void cat_text(utt *u, const char *s) {
 
 /* stream `n` clips as one cohort on the cuda engine, in real-time-sized feeds,
  * finalizing each at its end; returns the per-slot concatenated text */
+static int g_split = 0;   /* gate C: submit, feed the next chunks, finish */
+
 static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char **langs, utt *out) {
     asr_step_req reqs[MAXC];
     asr_step_out outs[MAXC];
@@ -49,7 +91,7 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
     int done[MAXC];
     for (int i = 0; i < n; i++) {
         if (asr_engine_slot_reset(e, i, langs[i], 3) != 0) { printf("FAIL slot reset %d\n", i); return -1; }
-        off[i] = 0; done[i] = 0; out[i].text = NULL;
+        off[i] = 0; done[i] = 0; out[i].text = NULL; out[i].log = NULL;
     }
     for (int guard = 0; guard < 100000; guard++) {
         int nreq = 0, alive = 0;
@@ -71,8 +113,24 @@ static int run_cohort(asr_engine *e, float **pcm, size_t *ns, int n, const char 
         }
         if (!alive) break;
         if (nreq == 0) continue;
-        if (asr_engine_step(e, reqs, nreq, outs) != 0) { printf("FAIL step: %s\n", asr_engine_error(e)); return -1; }
+        if (g_split) {
+            /* the server's --stage-ahead: between submit and finish, every
+             * slot that is not finalizing gets its next WHOLE chunk, in one
+             * batch (the feed team's path) */
+            if (asr_engine_step_submit(e, reqs, nreq, outs) != 0) { printf("FAIL submit: %s\n", asr_engine_error(e)); return -1; }
+            int bs[MAXC]; const float *bp[MAXC]; size_t bn[MAXC]; int nb = 0;
+            for (int i = 0; i < n; i++) {
+                if (done[i] || off[i] >= ns[i]) continue;
+                const size_t need = asr_engine_slot_need_samples(e, i);
+                if (need == 0 || off[i] + need > ns[i]) continue;
+                bs[nb] = i; bp[nb] = pcm[i] + off[i]; bn[nb] = need; nb++;
+                off[i] += need;
+            }
+            if (nb && asr_engine_slot_feed_batch(e, nb, bs, bp, bn) != 0) { printf("FAIL feed batch\n"); return -1; }
+            if (asr_engine_step_finish(e, outs) != 0) { printf("FAIL finish: %s\n", asr_engine_error(e)); return -1; }
+        } else if (asr_engine_step(e, reqs, nreq, outs) != 0) { printf("FAIL step: %s\n", asr_engine_error(e)); return -1; }
         for (int k = 0; k < nreq; k++) {
+            if (outs[k].stepped || outs[k].finished) log_step(&out[reqs[k].slot], &outs[k]);
             cat_text(&out[reqs[k].slot], outs[k].text);
             if (outs[k].finished) done[reqs[k].slot] = 1;
         }
@@ -86,18 +144,106 @@ static void on_res(const mynah_asr_result *r, void *ud) {
     cat_text(((cb_ctx *)ud)->u, r->text);
 }
 
+static int bench(const char *model, const char *gemm, const char *kv_dtype, const char *weights, float **pcm, size_t *ns,
+                 int n, int C, int steps) {
+    char err[512] = "";
+    asr_engine_cfg cfg = {.model_dir = model, .cap = C, .device = 0, .precision = "f32", .gemm = gemm,
+                          .profile = 1, .kv_dtype = kv_dtype, .weights = weights};
+    asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
+    if (!e) { printf("FAIL open: %s\n", err); return 1; }
+    asr_engine_facts f; asr_engine_get_facts(e, &f);
+    char dm[4096];
+    const size_t dn = asr_engine_dispatch_map(e, dm, sizeof(dm));
+    fwrite(dm, 1, dn, stdout);
+    printf("BENCH ready C=%d precision=%s gemm=%s vram_weights_mib=%.1f vram_arena_mib=%.1f vram_used_mib=%.1f\n",
+           C, f.precision, f.gemm, f.vram_weights / 1048576.0, f.vram_arena / 1048576.0, f.vram_used / 1048576.0);
+    asr_step_req *reqs = calloc((size_t)C, sizeof(*reqs));
+    asr_step_out *outs = calloc((size_t)C, sizeof(*outs));
+    size_t *off = calloc((size_t)C, sizeof(size_t));
+    if (!reqs || !outs || !off) return 1;
+    for (int i = 0; i < C; i++)
+        if (asr_engine_slot_reset(e, i, "auto", 3) != 0) { printf("FAIL slot reset\n"); return 1; }
+    double prof[ASR_PROF_STAGES] = {0}, wall = 0.0;
+    unsigned long passes = 0, full = 0;
+    for (int st = 0; st < steps; st++) {
+        int nreq = 0;
+        for (int i = 0; i < C; i++) {
+            const int c = i % n;
+            const size_t need = asr_engine_slot_need_samples(e, i);
+            if (need > 0 && off[i] + need <= ns[c]) {
+                if (asr_engine_slot_feed(e, i, pcm[c] + off[i], need) != 0) return 1;
+                off[i] += need;
+            }
+            if (asr_engine_slot_ready(e, i)) { reqs[nreq].slot = i; reqs[nreq].finalize = 0; nreq++; }
+        }
+        if (nreq == 0) break;
+        asr_engine_stats a, b;
+        asr_engine_get_stats(e, &a);
+        if (asr_engine_step(e, reqs, nreq, outs) != 0) { printf("FAIL step: %s\n", asr_engine_error(e)); return 1; }
+        asr_engine_get_stats(e, &b);
+        if (st >= 2 && nreq == C) {
+            for (int k = 0; k < ASR_PROF_STAGES; k++) prof[k] += b.prof_ms[k] - a.prof_ms[k];
+            passes += b.prof_passes - a.prof_passes;
+            wall += b.step_wall_ms_sum - a.step_wall_ms_sum;
+            full++;
+        }
+    }
+    double tot = 0.0;
+    for (int k = 0; k < ASR_PROF_STAGES; k++) tot += prof[k];
+    printf("BENCH C=%d full_steps=%lu passes=%lu device_ms_per_pass=%.3f step_wall_ms=%.3f\n", C, full, passes,
+           passes ? tot / (double)passes : 0.0, full ? wall / (double)full : 0.0);
+    for (int k = 0; k < ASR_PROF_STAGES; k++)
+        printf("BENCH   %-10s %8.3f ms/pass\n", ASR_PROF_NAME[k], passes ? prof[k] / (double)passes : 0.0);
+    asr_engine_close(e);
+    return 0;
+}
+
+static void json_str(FILE *fp, const char *s) {
+    fputc('"', fp);
+    for (; s && *s; s++) {
+        const unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') fprintf(fp, "\\%c", c);
+        else if (c < 0x20) fprintf(fp, "\\u%04x", c);
+        else fputc(c, fp);
+    }
+    fputc('"', fp);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <model_dir> [clips...]\n", argv[0]); return 2; }
     const char *model = argv[1];
     const char *dflt[] = {"tests/audio/test_it.wav", "tests/audio/test_en.wav", "tests/audio/test_de.wav",
                           "tests/audio/test_fr.wav", "tests/audio/test_es.wav"};
-    const char *clips[MAXC], *gemm = "own";
-    int n = 0;
+    const char *clips[MAXC], *gemm = "own", *precision = "f32", *buckets = "1,2,4", *kv_dtype = NULL, *json = NULL, *key_root = NULL, *weights = NULL;
+    int n = 0, pass_lanes = 0, skip_c = 0, n_alone = -1, no_cpu = 0, bench_c = 0, bench_steps = 40;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--gemm") == 0 && i + 1 < argc) gemm = argv[++i];
+        else if (strcmp(argv[i], "--precision") == 0 && i + 1 < argc) precision = argv[++i];
+        else if (strcmp(argv[i], "--pass-lanes") == 0 && i + 1 < argc) pass_lanes = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--graph-buckets") == 0 && i + 1 < argc) buckets = argv[++i];
+        else if (strcmp(argv[i], "--no-gate-c") == 0) skip_c = 1;
+        else if (strcmp(argv[i], "--kv-dtype") == 0 && i + 1 < argc) kv_dtype = argv[++i];
+        else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) weights = argv[++i];
+        else if (strcmp(argv[i], "--json") == 0 && i + 1 < argc) json = argv[++i];
+        else if (strcmp(argv[i], "--key-root") == 0 && i + 1 < argc) key_root = argv[++i];
+        else if (strcmp(argv[i], "--alone") == 0 && i + 1 < argc) n_alone = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) bench_c = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) bench_steps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--no-cpu") == 0) no_cpu = 1;
+        else if (strcmp(argv[i], "--list") == 0 && i + 1 < argc) {
+            FILE *lf = fopen(argv[++i], "r");
+            if (!lf) { fprintf(stderr, "cannot open %s\n", argv[i]); return 2; }
+            char line[1024];
+            while (n < MAXC && fgets(line, sizeof(line), lf)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (line[0]) clips[n++] = strdup(line);
+            }
+            fclose(lf);
+        }
         else if (n < MAXC) clips[n++] = argv[i];
     }
     if (n == 0) for (int i = 0; i < 5; i++) clips[n++] = dflt[i];
+    if (n_alone < 0 || n_alone > n) n_alone = n;
     const char *langs[MAXC];
     for (int i = 0; i < n; i++) langs[i] = "auto";
 
@@ -107,31 +253,64 @@ int main(int argc, char **argv) {
         pcm[i] = mynah_asr_wav_load(clips[i], &ns[i], &sr);
         if (!pcm[i] || sr != 16000) { fprintf(stderr, "cannot load %s (16 kHz mono)\n", clips[i]); return 2; }
     }
+    if (bench_c > 0) return bench(model, gemm, kv_dtype, weights, pcm, ns, n, bench_c, bench_steps);
 
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = "f32", .gemm = gemm};
+    asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = precision, .gemm = gemm,
+                          .pass_lanes = pass_lanes, .kv_dtype = kv_dtype, .weights = weights};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) {
         if (strstr(err, "no CUDA device") || strstr(err, "not compiled")) { printf("SKIP test_cuda_stream: %s\n", err); return 77; }
         printf("FAIL open: %s\n", err); return 1;
     }
     asr_engine_facts f; asr_engine_get_facts(e, &f);
-    printf("test_cuda_stream on %s, gemm=%s, %d clip(s)\n", f.device, f.gemm, n);
+    printf("test_cuda_stream on %s, precision=%s gemm=%s, pass_lanes=%d, %d clip(s)\n", f.device, f.precision, f.gemm, f.pass_lanes, n);
 
     /* ---- gate A: each clip alone, then all together (mixed lanes) */
     utt alone[MAXC] = {{0}}, together[MAXC] = {{0}};
     int fail = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n_alone; i++) {
         float *p1[1] = {pcm[i]}; size_t n1[1] = {ns[i]}; const char *l1[1] = {langs[i]};
         if (run_cohort(e, p1, n1, 1, l1, &alone[i]) != 0) return 1;
     }
     if (run_cohort(e, pcm, ns, n, langs, together) != 0) return 1;
-    for (int i = 0; i < n; i++) {
+    /* clips not run alone are checked against their own cohort text on a shifted slot */
+    for (int i = n_alone; i < n; i++) alone[i].text = together[i].text ? strdup(together[i].text) : NULL;
+    if (json) {
+        FILE *jf = fopen(json, "w");
+        if (!jf) { printf("FAIL: cannot write %s\n", json); return 1; }
+        const size_t kr = key_root ? strlen(key_root) : 0;
+        fprintf(jf, "{\n");
+        for (int i = 0; i < n; i++) {
+            const char *k = clips[i];
+            if (kr && strncmp(k, key_root, kr) == 0) { k += kr; while (*k == '/') k++; }
+            fprintf(jf, "  ");
+            json_str(jf, k);
+            fprintf(jf, ": ");
+            json_str(jf, together[i].text ? together[i].text : "");
+            fprintf(jf, "%s\n", i + 1 < n ? "," : "");
+        }
+        fprintf(jf, "}\n");
+        fclose(jf);
+    }
+    for (int i = 0; i < n_alone; i++) {
         const char *a = alone[i].text ? alone[i].text : "", *b = together[i].text ? together[i].text : "";
         const int same = strcmp(a, b) == 0;
         if (!same) fail = 1;
         printf("%s A batch-identity %-28s %s\n", same ? "OK  " : "FAIL", clips[i], same ? "identical" : "DIFFERS");
         if (!same) printf("       alone   : %s\n       cohort  : %s\n", a, b);
+    }
+    /* the same cohort again: a run is deterministic */
+    {
+        utt again[MAXC] = {{0}};
+        if (run_cohort(e, pcm, ns, n, langs, again) != 0) return 1;
+        for (int i = 0; i < n; i++) {
+            const char *a = together[i].text ? together[i].text : "", *b = again[i].text ? again[i].text : "";
+            const int same = strcmp(a, b) == 0;
+            if (!same) fail = 1;
+            printf("%s A repeat %-36s %s\n", same ? "OK  " : "FAIL", clips[i], same ? "identical on a second run" : "DIFFERS");
+            free(again[i].text);
+        }
     }
     /* poisoned idle lanes: the same cohort with the clips shifted by one slot */
     {
@@ -147,6 +326,9 @@ int main(int argc, char **argv) {
         }
     }
     if (fail) { printf("FAIL gate A: a stream's text depends on its cohort or its slot\n"); return 1; }
+
+    printf("OK   A: %d clip(s) alone == cohort, %d clip(s) slot-independent\n", n_alone, n);
+    if (no_cpu) { asr_engine_close(e); printf("PASS: gate A (gate B skipped, --no-cpu)\n"); return 0; }
 
     /* ---- gate B: the library's f32 CPU stream API */
     mynah_asr_model *m = mynah_asr_load_quant(model, MYNAH_ASR_QUANT_F32);
@@ -175,7 +357,54 @@ int main(int argc, char **argv) {
     }
     mynah_asr_free(m);
     asr_engine_close(e);
+
+    /* ---- gate C: the serving-loop arms against the default engine's logs */
+    if (!skip_c) {
+        struct { const char *name; int split, graphs, warmup, threads; } arms[] = {
+            {"stage-ahead (split step + window feed)", 1, 0, 0, 1},
+            {"host-threads 4 (feed team)", 1, 0, 0, 4},
+            {"graphs buckets", 0, 1, 0, 1},
+            {"warmup", 0, 0, 1, 1},
+            {"all together", 1, 1, 1, 4},
+        };
+        int cfail = 0;
+        for (size_t a = 0; a < sizeof(arms) / sizeof(arms[0]); a++) {
+            if (arms[a].graphs && strcmp(gemm, "cublas") == 0) continue;   /* graphs serve the own GEMMs */
+            asr_engine_cfg c2 = cfg;
+            c2.graphs = arms[a].graphs; c2.graph_buckets = buckets; c2.warmup = arms[a].warmup; c2.host_threads = arms[a].threads;
+            asr_engine *e2 = asr_engine_open_cuda(&c2, err, sizeof(err));
+            if (!e2) { printf("FAIL C open (%s): %s\n", arms[a].name, err); return 1; }
+            asr_engine_facts f2; asr_engine_get_facts(e2, &f2);
+            g_split = arms[a].split;
+            utt al[MAXC] = {{0}}, tg[MAXC] = {{0}};
+            for (int i = 0; i < n; i++) {
+                float *p1[1] = {pcm[i]}; size_t n1[1] = {ns[i]}; const char *l1[1] = {langs[i]};
+                if (run_cohort(e2, p1, n1, 1, l1, &al[i]) != 0) return 1;
+            }
+            if (run_cohort(e2, pcm, ns, n, langs, tg) != 0) return 1;
+            asr_engine_stats st2; asr_engine_get_stats(e2, &st2);
+            int bad = 0;
+            for (int i = 0; i < n; i++) {
+                const char *ref = alone[i].log ? alone[i].log : "";
+                if (strcmp(ref, al[i].log ? al[i].log : "") != 0 || strcmp(ref, tg[i].log ? tg[i].log : "") != 0) {
+                    bad = 1;
+                    printf("FAIL C %s %s\n       default : %s\n       alone   : %s\n       cohort  : %s\n", arms[a].name, clips[i], ref,
+                           al[i].log ? al[i].log : "", tg[i].log ? tg[i].log : "");
+                }
+                free(al[i].text); free(al[i].log); free(tg[i].text); free(tg[i].log);
+            }
+            printf("%s C %-40s graphs=%d graph_passes=%lu eager_passes=%lu host_threads=%d capture_ms=%.0f warmup_ms=%.0f\n",
+                   bad ? "FAIL" : "OK  ", arms[a].name, f2.graphs, st2.graph_passes, st2.eager_passes, f2.host_threads,
+                   f2.graph_capture_ms, f2.warmup_ms);
+            if (arms[a].graphs && st2.graph_passes == 0) { printf("FAIL C %s: no pass ran from a graph\n", arms[a].name); bad = 1; }
+            cfail |= bad;
+            g_split = 0;
+            asr_engine_close(e2);
+        }
+        if (cfail) { printf("FAIL gate C: a serving-loop option changed a step's output\n"); return 1; }
+    }
     if (differs) { printf("gate B: %d of %d clip(s) differ between the CPU f32 path and the GPU -- a finding, see the note\n", differs, n); return 3; }
-    printf("PASS: gate A (batch identity, slot independence) and gate B (cpu f32 == gpu) on %d clip(s)\n", n);
+    printf("PASS: gate A (batch identity, slot independence), gate B (cpu f32 == gpu)%s on %d clip(s)\n",
+           skip_c ? "" : " and gate C (serving-loop arms)", n);
     return 0;
 }

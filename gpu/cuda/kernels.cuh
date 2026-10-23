@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define GPU_SS_STAGES 3
 #define GPU_QMAX_HARD 32      /* a bound on q for the shared-memory tiles */
@@ -57,9 +58,19 @@ struct gpu_model_dims {
     int V, Hdec, pred_layers, blank, max_symbols;
 };
 
+/* Storage of the K/V ring (--kv-dtype). f32 is the reference; bf16 halves the
+ * bytes; int8 stores symmetric codes with one f32 scale per (position, head),
+ * scale = max|x| / 127 (a quarter of the bytes plus H floats per position). */
+#define GPU_KV_F32  0
+#define GPU_KV_BF16 1
+#define GPU_KV_INT8 2
+
 /* The arena: one pointer per tensor, indexed by slot inside the kernels. */
 struct gpu_arena {
-    float *kv;                 /* [cap][L][2][left][d]                        */
+    int kv_dtype;              /* GPU_KV_*                                     */
+    float *kv;                 /* [cap][L][2][left][d], f32 ring (else null)  */
+    void *kvq;                 /* [cap][L][2][left][d], bf16/int8 ring        */
+    float *kv_scale;           /* [cap][L][2][left][H], int8 ring only        */
     float *conv_cache;         /* [cap][L][k-1][d]                            */
     float *ss_cache[GPU_SS_STAGES]; /* [cap][C_in_s][F_s]                     */
     float *dec_h, *dec_c;      /* [cap][pred_layers][Hdec]                    */
@@ -93,10 +104,33 @@ cudaError_t k_gemm_wt_splitk(const float *A, int lda, const float *W, const floa
                              float *ws, size_t ws_floats, cudaStream_t s);
 int k_gemm_splits(int N, int K);
 size_t k_gemm_splitk_workspace_floats(int Mmax, int N, int K);
+/* own-tc (--precision bf16 --gemm own-tc): bf16 weights resident, activations
+ * rounded to bf16 when staged, fp32 accumulation on the tensor cores (sm_80+).
+ * S = k_gemm_tc_splits(N, K): the weight's shape only -- never M, never the
+ * SM count -- so a row's bits depend neither on its cohort nor on the card.
+ * A numerical change against every f32 arm. ws: >= S*M*N floats when S > 1. */
+cudaError_t k_gemm_wt_tc(const float *A, int lda, const unsigned short *W, const float *bias,
+                         float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                         float *ws, size_t ws_floats, cudaStream_t s);
+int k_gemm_tc_splits(int N, int K);
+size_t k_gemm_tc_workspace_floats(int Mmax, int N, int K);
+cudaError_t k_f32_to_bf16(const float *src, unsigned short *dst, size_t n, cudaStream_t s);
+/* tests: pin one own-tc block tile (-1 = the dispatcher chooses); bit-neutral */
+void k_gemm_tc_force_config(int cfg);
+int k_gemm_tc_config_count(void);
+const char *k_gemm_tc_config_name(int cfg);
 /* tests: pin one v2 configuration (-1 = the dispatcher chooses) */
 void k_gemm_force_config(int cfg);
 int k_gemm_config_count(void);
 const char *k_gemm_config_name(int cfg);
+
+/* weight-only int8 (gemm_w8.cu, --weights int8): W[n][k] = S[n] * Q[n][k],
+ * the CPU's per-row symmetric codes; the v1 fixed-order chain over (float)Q,
+ * scaled once per output. Row-stable by construction, NOT bit-identical to
+ * the f32 kernels. Q must be 4-byte aligned. */
+cudaError_t k_gemm_w8(const float *A, int lda, const int8_t *Q, const float *S, const float *bias,
+                      float *C, int ldc, int M, int N, int K, int accumulate, int act,
+                      cudaStream_t s);
 
 /* ------------------------------------------------------------- elementwise */
 /* out[r] = LN(x[r]) * w + b over d, eps 1e-5, mean/var in double as the CPU;

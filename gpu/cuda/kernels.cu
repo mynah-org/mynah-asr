@@ -12,7 +12,9 @@
  * tanhf and the reduction orders are not the CPU's. */
 #include "kernels.cuh"
 
+#include <cuda_bf16.h>
 #include <math.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -122,21 +124,48 @@ cudaError_t k_prompt_cat(const float *x, const gpu_row *rows, int B, int d, int 
 
 /* -------------------------------------------------------------- attention */
 
-/* Row j of the [valid ++ fresh] window of layer li for this lane, K or V. */
-__device__ __forceinline__ const float *kv_window_row(const gpu_model_dims &dm,
-                                                      const gpu_arena &ar, int li, int which,
-                                                      const gpu_row &r, const gpu_slot_meta &m,
-                                                      const float *fresh, int j) {
+/* Row j of the [valid ++ fresh] window of layer li for this lane, K or V.
+ * The ring may be stored f32, bf16 or int8 (--kv-dtype); the fresh rows of
+ * this chunk are always the f32 projections. A quantised ring row is read as
+ * the committed codes times its (position, head) scale, so a lane reads the
+ * same values whatever else is in the cohort. */
+struct kv_rowref {
+    const float *f;            /* f32 row (ring when f32, or a fresh row)      */
+    const void *q;             /* bf16 / int8 ring row, when f == nullptr     */
+    float s;                   /* int8: the (position, head) scale             */
+};
+
+__device__ __forceinline__ kv_rowref kv_window_row(const gpu_model_dims &dm,
+                                                   const gpu_arena &ar, int li, int which,
+                                                   const gpu_row &r, const gpu_slot_meta &m,
+                                                   const float *fresh, int j, int h) {
+    kv_rowref o = {nullptr, nullptr, 0.0f};
+    const size_t ho = (size_t)h * (size_t)dm.dk;
     if (j < m.valid) {
         const int phys = (m.head + j) % dm.left;
-        const size_t base = (((size_t)r.slot * dm.n_layers + li) * 2 + which) *
-                            (size_t)dm.left * (size_t)dm.d;
-        return ar.kv + base + (size_t)phys * (size_t)dm.d;
+        const size_t plane = (((size_t)r.slot * dm.n_layers + li) * 2 + which) * (size_t)dm.left;
+        const size_t el = (plane + (size_t)phys) * (size_t)dm.d + ho;
+        if (ar.kv_dtype == GPU_KV_F32) o.f = ar.kv + el;
+        else if (ar.kv_dtype == GPU_KV_BF16) o.q = (const __nv_bfloat16 *)ar.kvq + el;
+        else {
+            o.q = (const int8_t *)ar.kvq + el;
+            o.s = ar.kv_scale[(plane + (size_t)phys) * (size_t)dm.H + h];
+        }
+        return o;
     }
-    return fresh + (size_t)(r.row_off + (j - m.valid)) * (size_t)dm.d;
+    o.f = fresh + (size_t)(r.row_off + (j - m.valid)) * (size_t)dm.d + ho;
+    return o;
+}
+
+template <int KVT>
+__device__ __forceinline__ float kv_val(const kv_rowref &k, int i) {
+    if (KVT == GPU_KV_F32 || k.f) return k.f[i];
+    if (KVT == GPU_KV_BF16) return __bfloat162float(((const __nv_bfloat16 *)k.q)[i]);
+    return (float)((const int8_t *)k.q)[i] * k.s;
 }
 
 /* dynamic shared: qu[q][dk], qv[q][dk], sc[q][K] */
+template <int KVT>
 __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
                                  const float *__restrict__ relpos_tab, gpu_arena ar,
                                  const gpu_row *__restrict__ rows, const float *__restrict__ qs,
@@ -162,13 +191,13 @@ __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
     const float *tab = relpos_tab + (size_t)li * (size_t)(2 * dm.kmax - 1) * (size_t)dm.d;
     for (int e = threadIdx.x; e < Q * K; e += blockDim.x) {
         const int t = e / K, j = e - t * K;
-        const float *key = kv_window_row(dm, ar, li, 0, r, m, kn, j) + ho;
+        const kv_rowref key = kv_window_row(dm, ar, li, 0, r, m, kn, j, h);
         const int p = (dm.kmax - K) + (K - 1 - m.valid - t + j);
         const float *rk = tab + (size_t)p * dm.d + ho;
         const float *qut = qu + (size_t)t * dk, *qvt = qv + (size_t)t * dk;
         float ac = 0.0f, bd = 0.0f;
         for (int i = 0; i < dk; i++) {
-            ac = fmaf(qut[i], key[i], ac);
+            ac = fmaf(qut[i], kv_val<KVT>(key, i), ac);
             bd = fmaf(qvt[i], rk[i], bd);
         }
         sc[e] = (ac + bd) * scaling;
@@ -196,8 +225,8 @@ __global__ void attention_kernel(gpu_model_dims dm, gpu_layer_w L, int li,
             const float *srow = sc + (size_t)t * K;
             float acc = 0.0f;
             for (int j = 0; j < K; j++) {
-                const float *v = kv_window_row(dm, ar, li, 1, r, m, vn, j) + ho;
-                acc = fmaf(srow[j], v[i], acc);
+                const kv_rowref v = kv_window_row(dm, ar, li, 1, r, m, vn, j, h);
+                acc = fmaf(srow[j], kv_val<KVT>(v, i), acc);
             }
             ctx[(size_t)(r.row_off + t) * dm.d + ho + i] = acc;
         }
@@ -215,24 +244,61 @@ cudaError_t k_attention(const gpu_model_dims dm, const gpu_layer_w L, int li,
     if (threads < 128) threads = 128;
     if (threads > 1024) return cudaErrorInvalidValue;
     dim3 grid((unsigned)B, (unsigned)dm.H);
-    attention_kernel<<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows,
-                                                          qs, kn, vn, ctx);
+    if (ar.kv_dtype == GPU_KV_INT8)
+        attention_kernel<GPU_KV_INT8><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+    else if (ar.kv_dtype == GPU_KV_BF16)
+        attention_kernel<GPU_KV_BF16><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
+    else
+        attention_kernel<GPU_KV_F32><<<grid, (unsigned)threads, shm, s>>>(dm, L, li, relpos_tab, ar, rows, qs, kn, vn, ctx);
     return cudaGetLastError();
 }
 
+/* f32 / bf16 ring: a plain copy (bf16 round-to-nearest-even). int8 ring: one
+ * warp per (fresh row, head), scale = max|x| / 127 over the head's dk values,
+ * code = rint(x / scale) clamped to [-127, 127]; a fixed-order warp max, so
+ * the codes of a row depend on that row only. */
 __global__ void kv_commit_kernel(gpu_model_dims dm, int li, gpu_arena ar,
                                  const gpu_row *__restrict__ rows, const float *__restrict__ kn,
                                  const float *__restrict__ vn) {
     const gpu_row r = rows[blockIdx.x];
     const gpu_slot_meta m = ar.meta[r.slot];
-    const size_t kbase = (((size_t)r.slot * dm.n_layers + li) * 2 + 0) * (size_t)dm.left * dm.d;
-    const size_t vbase = (((size_t)r.slot * dm.n_layers + li) * 2 + 1) * (size_t)dm.left * dm.d;
+    const size_t kplane = (((size_t)r.slot * dm.n_layers + li) * 2 + 0) * (size_t)dm.left;
+    const size_t vplane = (((size_t)r.slot * dm.n_layers + li) * 2 + 1) * (size_t)dm.left;
+    if (ar.kv_dtype == GPU_KV_INT8) {
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+        int8_t *q = (int8_t *)ar.kvq;
+        for (int w = warp; w < 2 * r.q * dm.H; w += nw) {
+            const int which = w / (r.q * dm.H), th = w - which * (r.q * dm.H);
+            const int t = th / dm.H, h = th - t * dm.H;
+            const int phys = (m.head + m.valid + t) % dm.left;
+            const float *src = (which ? vn : kn) + (size_t)(r.row_off + t) * dm.d + (size_t)h * dm.dk;
+            const size_t pos = (which ? vplane : kplane) + (size_t)phys;
+            float amax = 0.0f;
+            for (int i = lane; i < dm.dk; i += 32) amax = fmaxf(amax, fabsf(src[i]));
+            amax = warp_max(amax);
+            const float scale = amax / 127.0f;
+            int8_t *dst = q + pos * (size_t)dm.d + (size_t)h * dm.dk;
+            for (int i = lane; i < dm.dk; i += 32) {
+                float c = scale > 0.0f ? rintf(src[i] / scale) : 0.0f;
+                c = fminf(127.0f, fmaxf(-127.0f, c));
+                dst[i] = (int8_t)c;
+            }
+            if (lane == 0) ar.kv_scale[pos * (size_t)dm.H + h] = scale;
+        }
+        return;
+    }
     for (int t = 0; t < r.q; t++) {
         const int phys = (m.head + m.valid + t) % dm.left;
         const size_t src = (size_t)(r.row_off + t) * dm.d;
+        const size_t ko = (kplane + (size_t)phys) * dm.d, vo = (vplane + (size_t)phys) * dm.d;
         for (int c = threadIdx.x; c < dm.d; c += blockDim.x) {
-            ar.kv[kbase + (size_t)phys * dm.d + c] = kn[src + c];
-            ar.kv[vbase + (size_t)phys * dm.d + c] = vn[src + c];
+            if (ar.kv_dtype == GPU_KV_BF16) {
+                ((__nv_bfloat16 *)ar.kvq)[ko + c] = __float2bfloat16_rn(kn[src + c]);
+                ((__nv_bfloat16 *)ar.kvq)[vo + c] = __float2bfloat16_rn(vn[src + c]);
+            } else {
+                ar.kv[ko + c] = kn[src + c];
+                ar.kv[vo + c] = vn[src + c];
+            }
         }
     }
 }
