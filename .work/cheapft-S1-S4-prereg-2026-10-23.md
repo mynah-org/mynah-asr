@@ -167,3 +167,20 @@ e613e87 (flags off = bit-identical to the ES-1 trainer, Phase 0), `finetune/jobs
 = ES-1 (runs/dgx-es1-w4-12670: macro greedy 0.5 s 18.09, CER 7.43, wall_s 13,325.6). Context known before launch:
 CF-E3 measured a 1,500-step seed spread of 0.46 WER; S1 / S2 are single-seed, so a delta within ~0.5 of a gate edge
 is reported as such.
+
+## S2 result (dgx2, bucket-pool 32, full horizon 12,670 steps, seed 0; ended 17:09 CEST)
+- Pre-registered S gate (`cf_compare.py s`, post 0.5 probe): macro 18.68 vs ES-1 18.09 (+0.59), CER +0.14,
+  GPU time -41.0 % -> **STRONG** (within +1 WER, saving >= 30 %). Speed guard: 569 ms / step (limit 671).
+- Greedy probe (post 0), per domain, ES-1 -> S2 (WER / CER / empty):
+  MLS 15.12 / 5.22 / 0 -> 15.16 / 5.12 / 0; FLEURS 17.10 / 6.90 / 0 -> 18.02 / 7.20 / 0;
+  CV 21.13 / 7.70 / 1 -> 22.98 / 8.05 / 1; VP 19.48 / 10.30 / 1 -> 19.32 / 10.54 / 0; macro 18.21 -> 18.87 (+0.66).
+  Beam-8: MLS 13.31, FLEURS 16.82 (S2).
+- OBSERVED: the loss is concentrated on CV (+1.85) and FLEURS (+0.92); MLS and VP are flat. Within ES-1's
+  seed spread? Unknown for ES (the 0.46 seed spread was measured on CF-E3, a different setting).
+- Batch stats (bstats_cmp.py, whole run): domain shares 35.0 / 29.9 / 20.0 / 15.1 (mix 35 / 30 / 20 / 15), audio
+  165.4 s / step, encoder efficiency 0.968, joint 0.695, in-batch duration spread 0.55 s; pre-clip grad norm
+  p10 / 50 / 90 = 72 / 101 / 150, clip factor median 0.0099 (every step clipped); corr(log gn, duration) 0.68
+  (stable) / 0.70 (decay). S1 (unbucketed, partial): efficiency 0.56 / 0.35, corr 0.24.
+- HYPOTHESIS (not tested): with every step clipped, bucketing changes the per-sample weighting by duration; it
+  could explain a domain-specific loss (CV clips are short). The blend mode and a clip reweighting are candidate
+  arms to pre-register, not established remedies.
