@@ -48,7 +48,7 @@ import soundfile as sf
 import torch
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--stock", default="/root/ft/models/parakeet_realtime_eou_120m-v1.nemo")
+ap.add_argument("--stock", default=os.path.join(os.environ.get("FT_ROOT", os.path.expanduser("~/ft")), "models/parakeet_realtime_eou_120m-v1.nemo"))
 ap.add_argument("--manifest", default="")
 ap.add_argument("--mix", default="", help="path:weight,... domain-balanced sampling (replaces --manifest)")
 ap.add_argument("--vals", default="", help="name=path,... extra val sets (macro-mean WER selects)")
@@ -100,7 +100,7 @@ ap.add_argument("--val", default="")
 ap.add_argument("--val-n", type=int, default=200)
 ap.add_argument("--max-dur", type=float, default=20.0)
 ap.add_argument("--tag", required=True)
-ap.add_argument("--out", default="/root/ft/runs")
+ap.add_argument("--out", default=os.path.join(os.environ.get("FT_ROOT", os.path.expanduser("~/ft")), "runs"))
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--init", default="", help="start from this .nemo instead of --stock (stage 2 from the plain-IT best)")
 ap.add_argument("--eou-append", type=int, default=0, help="stage 2: target = text + <EOU> (NVIDIA EOU dataset semantics)")

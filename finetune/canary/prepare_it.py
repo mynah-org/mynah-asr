@@ -66,6 +66,9 @@ MLS_REPO = "facebook/multilingual_librispeech"
 MLS_TRAIN = [f"italian/train-{i:05d}-of-00008.parquet" for i in range(8)]
 MLS_TEST = ["italian/test-00000-of-00001.parquet"]
 MLS_META_COLS = ["id", "speaker_id", "chapter_id", "transcript", "audio_duration"]
+# read-ahead of the metadata range reads: 256 KiB fetches only the projected column chunks (8 MiB pulled audio pages
+# too); I/O only, same rows (validated 2026-10-22 on prepare_final_it.py's reader, report section 10)
+MLS_META_BLOCK = 256 << 10
 FLEURS = f"{HF}/google/fleurs/resolve/main/data"
 LANGS = {"it": ("italian", 8, "it_it"), "fr": ("french", 34, "fr_fr"), "es": ("spanish", 30, "es_419")}   # MLS config, train shards, FLEURS config
 LANG, FL = "it", "it_it"
@@ -166,7 +169,7 @@ def mls_meta_file(relpath):
         from huggingface_hub import HfFileSystem
 
         fs = HfFileSystem()
-        with fs.open(f"datasets/{MLS_REPO}/{relpath}", "rb", block_size=8 << 20) as f:
+        with fs.open(f"datasets/{MLS_REPO}/{relpath}", "rb", block_size=MLS_META_BLOCK) as f:
             t = pq.ParquetFile(f).read(columns=MLS_META_COLS)
         return t.to_pylist(), "range-read"
     except Exception as e:  # pragma: no cover - network dependent

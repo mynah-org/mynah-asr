@@ -115,7 +115,7 @@ def fetch(url, dst, tries=20):
 class Hub:
     def __init__(self):
         from huggingface_hub import HfFileSystem
-        tf = "/root/.hf_token"   # optional: anonymous reads when absent
+        tf = os.environ.get("HF_TOKEN_FILE", os.path.expanduser("~/.hf_token"))   # optional: anonymous reads when absent
         self.tok = open(tf).read().strip() if os.path.exists(tf) else None
         self.fs = HfFileSystem(token=self.tok)
         self.cap = 0   # --hub-workers: cap on parallel column reads (0 = the frozen defaults 16 / 24)
@@ -475,7 +475,7 @@ def main():
     ap.add_argument("--lang", default="it", choices=sorted(SRC), help="it = the frozen FINAL-IT build")
     ap.add_argument("--out", required=True)
     ap.add_argument("--audio", help="wav root (required unless --plan-only)")
-    ap.add_argument("--tmp", default=None, help="download dir (default /root/final-<lang>-dl)")
+    ap.add_argument("--tmp", default=None, help="download dir (default ~/final-<lang>-dl)")
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--tedx-per-talk", type=int, default=25)
     ap.add_argument("--exclude-texts", required=True, help="comma-separated globs of training / dev manifests")
@@ -491,10 +491,11 @@ def main():
                     "order -> $OUT/plan_<bank>.json; no audio download / decode, no final_* / SHA256SUMS written")
     ap.add_argument("--hub-workers", type=int, default=0, help="cap on parallel Hub column reads (rate-limited IPs); "
                     "0 = the frozen defaults")
-    ap.add_argument("--hub-block-kb", type=int, default=0, help="read-ahead (KiB) of Hub column reads: small = only the "
-                    "projected column chunks cross the network (audio parquets have MB-sized row groups); 0 = default")
+    ap.add_argument("--hub-block-kb", type=int, default=256, help="read-ahead (KiB) of Hub column reads: small = only the "
+                    "projected column chunks cross the network (audio parquets have MB-sized row groups); 0 = the "
+                    "library default (I/O only: same rows; default 256 since 2026-10-23)")
     a = ap.parse_args()
-    a.tmp = a.tmp or f"/root/final-{a.lang}-dl"
+    a.tmp = a.tmp or os.path.expanduser(f"~/final-{a.lang}-dl")
     a.banks = a.banks or SRC[a.lang]["banks"]
     bad = [b for b in a.banks.split(",") if b not in BANKS or ONLY.get(b, a.lang) != a.lang]
     if bad:

@@ -88,7 +88,7 @@ YG_EXTRA_COLS = {"original_audio_offset": "orig_offset", "lang": "lang_orig"}   
 
 def hf_token():
     try:
-        return open("/root/.hf_token").read().strip()
+        return open(os.environ.get("HF_TOKEN_FILE", os.path.expanduser("~/.hf_token"))).read().strip()
     except OSError:
         return ""
 
@@ -411,7 +411,7 @@ def main():
     ap.add_argument("--seed", type=int, default=20261010)
     a = ap.parse_args()
     audio = Path(a.audio or f"/dev/shm/mix/{a.lang}")
-    out = Path(a.out or f"/root/ft/mix/{a.lang}")
+    out = Path(a.out or D.FT / "mix" / a.lang)
     tmp = audio / "tmp"
     for d in (audio, out, tmp):
         d.mkdir(parents=True, exist_ok=True)

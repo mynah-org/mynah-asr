@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -85,7 +86,7 @@ def eval_steps_of(a):
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stock", default="/root/ft/models/parakeet_realtime_eou_120m-v1.nemo")
+    ap.add_argument("--stock", default=os.path.join(os.environ.get("FT_ROOT", os.path.expanduser("~/ft")), "models/parakeet_realtime_eou_120m-v1.nemo"))
     ap.add_argument("--base-model-id", default="nvidia/parakeet_realtime_eou_120m-v1")
     ap.add_argument("--base-model-revision", default=None)
     ap.add_argument("--manifest", required=True, help="NeMo manifest (audio_filepath, duration, text)")

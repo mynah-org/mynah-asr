@@ -28,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover - laptop fallback
     _re_u = re
 
-FT = Path(os.environ.get("FT_ROOT", "/root/ft"))
+FT = Path(os.environ.get("FT_ROOT", Path.home() / "ft"))
 SR = 16000
 SPECIAL_RE = re.compile(r"<\|[^|]*\|>|<pad>|<unk>|<s>|</s>")
 
