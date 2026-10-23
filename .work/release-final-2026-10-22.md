@@ -296,3 +296,38 @@ number, no tuning.
 - **Before the next FINAL-FR-v2 / ES-1 attempt:** apply the small-block metadata reads to every Hub parquet reader
   (prepare_mix.py, canary/prepare_it.py, prepare_final_it.py default), re-validate row identity, network smoke test
   at box start, then run both pre-registrations unchanged.
+
+## 11. 2026-10-23: FINAL-FR-v2 and ES-1 restarted on the DGX (pre-registrations unchanged)
+
+**Box (OBSERVED 07:20 UTC):** `ssh dgx` = DGX Spark GB10 (sm_121, aarch64, 20 cores, 121 GB unified, no cgroup CPU
+quota), 1.2 TB free, user account (no root). Network: HF / cdn-lfs TLS issuer Amazon RSA 2048 M01, PyPI GlobalSign
+(no MITM); a 100 MB LFS range read in 2.0 s (52 MB/s). Repo checkout synced to 81fc376 (the 2026-10-15 local edits
+stashed, not lost). Write token placed by the user in a 0600 file, read only from that file, never printed.
+NeMo 3.0.0 / torch 2.11.0+cu128; stock EOU-120M sha256 6603a22a = the Hub LFS sha. Mynah CLI + CUDA server built
+from 7eccdac for sm_121 (CUDA 13.3). GB10 is ~3x slower than an L40S for training (2026-10-15).
+
+**Code before the runs (I/O and paths only):**
+- 7eccdac: token file `HF_TOKEN_FILE` (default `~/.hf_token`), FT / --stock / --out / --tmp defaults home-relative
+  (identical on the root boxes); `prepare_final_it.py --hub-block-kb` default 256; `canary/prepare_it.py` MLS metadata
+  read-ahead 8 MiB -> 256 KiB. 2ac8abd: boxwatch home-relative. `test_finetune.py` 35 passed on the DGX.
+- MLS reader re-validated (`mlsblockeq.py`, prepare_it.mls_meta_file, 8 MiB vs 256 KiB):
+
+| parquet | rows (sha) | 8 MiB | 256 KiB |
+|---|---|---|---|
+| MLS-es test | 2,385 (f2f38418), identical | 102.0 MB, 8.6 s | 7.1 MB, 10.9 s |
+| MLS-es train 0 / 30 | 7,357 (0f31d733), identical | 318.4 MB, 20.0 s | 21.9 MB, 30.9 s |
+| MLS-fr dev | 2,416 (f716031b), identical | 104.2 MB, 6.8 s | 7.2 MB, 10.4 s |
+
+  On a fast link the small block costs ~1.5x wall time for ~14x fewer bytes; on a degraded link (2026-10-22) it wins.
+
+**FINAL-FR-v2 inputs:** the same builder flags as the 2026-10-22 attempt; the exclusion / seed manifests are the
+archived files (fr-g1e snapshot meta, eou-fr-v2-dev, ood-fr1, FINAL-FR sealed tgz, granary ids; FINAL-FR SHA256SUMS
+sha 8b0ebba0 checked) extracted under `~/vroot/<original absolute path>`; each input's sha256 is in f2build.log.
+Build started 07:30 UTC.
+
+**ES-1, one clock substitution (declared now, 07:45 UTC, before any ES data statistic):** the pre-registered VP rule
+"teacher filter only if the teacher and its 300-clip CLI gate are ready by 15:45 UTC" was a box-time deadline of
+2026-10-22. On the DGX it reads: **the filter runs only if the teacher and its CLI gate are ready before the ES data
+mix completes (DATA-MIX-JOB-DONE); otherwise VoxPopuli-es unfiltered.** Either way the choice is recorded before
+training. Everything else in section 9 unchanged (stage 2 rule: ">= 45 min of box time left" is moot on the DGX;
+the macro greedy <= 30 condition stands).
