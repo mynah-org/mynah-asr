@@ -403,3 +403,17 @@ C1 EOU / false endpoints, C2 plain-parent WER, C3 prior art, D adversarial revie
   >= 40 % mid-phrase AND >= +10 pp above the control (its 40 % FE-reduction gate is capped by the mid-phrase share).
   Otherwise it is closed without training, and no FR training arm runs today ("parallelise thinking, not arms").
 - This is the second selection use of DEV-EOU-FR-v2.
+
+### Result: FR-E0 (OBSERVED 2026-10-23 08:14 UTC, dgx1 CPU, git 7376f53) -- truncated-prefix arm CLOSED by its rule
+- v1.1 on DEV-EOU-FR-v2 (274 clips): reset-WER 23.90; internal class (174 clips) WER 22.22 (v4 25.02), **FE 68.4 %
+  (v4 55.2 %, +24 % relative)**, recall 99.4 %; endpoint class (100) WER 28.26, FE 4.0 %, recall 99.0 %, p50 / p90
+  0.88 / 1.76 s (v4 0.80 / 1.68). Per internal stratum (v11 / v4 FE): 0.8-1.04 s 32 / 24 %, 1.04-1.6 s 72 / 52 %,
+  1.6-2.5 s 90 / 70 %, >= 2.5 s 92 / 96 %. HYPOTHESIS: the longer plain stage (H2) made `<EOU>` at internal pauses of
+  >= 1 s more likely on mTEDx (+13 pp, ~2.5 SE at 174 clips); DEV-fr FE moved only 7.25 -> 7.75 % (inside noise).
+- **cut_class: 163 premature cuts, 16.0 % mid-phrase vs a 56.4 % control (excess -40.4 pp), 4.9 % at a
+  sentence-final mark.** The pre-registered rule (>= 40 % AND >= +10 pp) FAILS: v1.1's premature cuts sit at clause
+  punctuation far more often than chance, so a "complete vs incomplete prefix" cue has little to act on. The
+  truncated-prefix treatment is closed without training; no FR EOU training arm runs today.
+- Window frontier (diagnostic, DEV-only, never a selection), v1.1 internal FE / endpoint p50: W 0.16 52.9 % / 1.04 s,
+  0.32 43.1 % / 1.20 s, 0.48 37.4 % / 1.36 s, 0.64 32.8 % / 1.52 s, 0.8 21.8 % / 1.68 s, 1.04 14.9 % / 1.92 s (recall
+  99 % throughout). A product-side commit policy remains the lever, at an explicit latency price.
