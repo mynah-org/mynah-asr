@@ -42,6 +42,8 @@
  *   --bench C   no gates: C lanes (the clips cycled) stepped together with the
  *               stage profile on; prints device ms per full pass (passes where
  *               all C lanes stepped, after 2 warm steps) and the VRAM facts
+ *               (--precision / --gemm / --kv-dtype / --weights apply: f32 own by
+ *               default, `--precision bf16 --gemm own-tc` profiles the serving default)
  * exit 0 = the gates pass; 1 = gate A or C failed or a device error; 3 = A and C
  * passed and gate B found a difference; 77 = no CUDA device (SKIP). */
 #include "../gpu/asr_engine.h"
@@ -144,10 +146,10 @@ static void on_res(const mynah_asr_result *r, void *ud) {
     cat_text(((cb_ctx *)ud)->u, r->text);
 }
 
-static int bench(const char *model, const char *gemm, const char *kv_dtype, const char *weights, float **pcm, size_t *ns,
-                 int n, int C, int steps) {
+static int bench(const char *model, const char *precision, const char *gemm, const char *kv_dtype, const char *weights,
+                 float **pcm, size_t *ns, int n, int C, int steps) {
     char err[512] = "";
-    asr_engine_cfg cfg = {.model_dir = model, .cap = C, .device = 0, .precision = "f32", .gemm = gemm,
+    asr_engine_cfg cfg = {.model_dir = model, .cap = C, .device = 0, .precision = precision, .gemm = gemm,
                           .profile = 1, .kv_dtype = kv_dtype, .weights = weights};
     asr_engine *e = asr_engine_open_cuda(&cfg, err, sizeof(err));
     if (!e) { printf("FAIL open: %s\n", err); return 1; }
@@ -253,7 +255,7 @@ int main(int argc, char **argv) {
         pcm[i] = mynah_asr_wav_load(clips[i], &ns[i], &sr);
         if (!pcm[i] || sr != 16000) { fprintf(stderr, "cannot load %s (16 kHz mono)\n", clips[i]); return 2; }
     }
-    if (bench_c > 0) return bench(model, gemm, kv_dtype, weights, pcm, ns, n, bench_c, bench_steps);
+    if (bench_c > 0) return bench(model, precision, gemm, kv_dtype, weights, pcm, ns, n, bench_c, bench_steps);
 
     char err[512] = "";
     asr_engine_cfg cfg = {.model_dir = model, .cap = n + 1, .device = 0, .precision = precision, .gemm = gemm,
