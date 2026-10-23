@@ -475,3 +475,14 @@ A PASS / LEVER only licenses a full-horizon pre-registered replicate on another 
   change today.
 - W: the FR-H2 plain parent is a worse start for Spanish than the English stock model at this horizon (CV +4.05),
   consistent with arXiv 2606.24169's single-language pivot result. The "Romance warm start" lead is closed for now.
+
+### Result: ES-1 first result (OBSERVED 2026-10-23, dgx2 GB10, git d68c263 lineage of a3b4563, one seed) -- STRONG TRANSFER
+- Mix (frozen definitions): MLS-es 40.00 h (86 speakers) 0.35, CV17-es 40.02 h (3,566 speakers) 0.30, VoxPopuli-es
+  teacher t50 39.85 h (136 speakers; Nemotron CLI gate 298 / 300 identical at 07:39:48 UTC, before data done) 0.20,
+  FLEURS es_419 6.62 h 0.15 = 126.48 physical h; h_step 0.04592 -> **12,670 steps (4.60 passes, 581.3 audio-h seen)**.
+- Training 08:03-11:46 UTC on GB10 (~1.0 s / step, ~158x RT, peak 20.6 GB); final.nemo sha256 172b1539f592...;
+  archived first (runs/dgx-es1-w4-12670: final.nemo, metrics, launch, data stats, harness seal 8e9c226f...).
+- **Primary (pre-registered): macro greedy, 0.5 s flush, harness-es = 18.09** (CER 7.43): MLS 14.86, FLEURS 17.10,
+  CV 21.18, VP 19.20 (164 clips available); 2 empty. Trainer in-run final (raw EOF): 18.21. Reading band: **<= 25
+  strong transfer**. One plain run, no tuning, no stage 2 yet. Beam / oracle / stock zero-shot follow (fr_p1.sh probes).
+- Archive note: dgx2's ~/.cache/huggingface/xet is root-owned -> uploads use HF_HOME=~/ft/hfhome.
