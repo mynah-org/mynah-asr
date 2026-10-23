@@ -1391,6 +1391,12 @@ void mynah_asr_qmat_mul(const mynah_asr_qmat *m, const float *x, float *out, int
 #endif
         qc(MYNAH_ASR_QC_GENERIC);
         if (m->qtype == MYNAH_ASR_Q_INT8) {
+            /* This f32 x int8 loop IS the MYNAH_ASR_QK_SCALAR leaf (qmat.h): the
+             * one q8_leaf() resolves to in a build without __ARM_FEATURE_DOTPROD
+             * (e.g. GCC 13 -march=native on a core it does not know, which drops
+             * to plain armv8-a) or under MYNAH_ASR_CAPS=scalar. Uncounted, the
+             * stream-batch gate reported that the resolved kernel never ran. */
+            qk(MYNAH_ASR_QK_SCALAR);
             for (int t = 0; t < T; t++) {
                 const float *xr = x + (size_t)t * (size_t)m->k;
                 float *o = out + (size_t)t * (size_t)m->n;
