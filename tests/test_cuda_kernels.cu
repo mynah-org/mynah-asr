@@ -652,6 +652,15 @@ static int test_attention_kv(int kvt) {
     auto full = to_host(dctx, (size_t)R * dm.d), alone = to_host(dctx1, (size_t)4 * dm.d);
     CHECK(memcmp(alone.data(), full.data() + (size_t)rows[2].row_off * dm.d, (size_t)4 * dm.d * sizeof(float)) == 0,
           "attention kv=%s lane identity: lane alone == lane inside the cohort, byte for byte", kvn);
+    /* tiles sized from the largest q of this cohort (4) instead of GPU_QMAX_HARD: the same bytes */
+    gpu_model_dims dmq = dm; dmq.qmax = 4;
+    float *dctxq; CU(cudaMalloc(&dctxq, (size_t)R * dm.d * sizeof(float)));
+    CU(k_attention(dmq, L, li, dtab, ar, drows, B, dq, dkn, dvn, dctxq, 0));
+    CU(cudaDeviceSynchronize());
+    auto sized = to_host(dctxq, (size_t)R * dm.d);
+    CHECK(memcmp(sized.data(), full.data(), (size_t)R * dm.d * sizeof(float)) == 0,
+          "attention kv=%s tiles sized from qmax 4 == tiles sized from GPU_QMAX_HARD, byte for byte", kvn);
+    cudaFree(dctxq);
     /* commit + advance: the ring holds the last min(valid+q, left) rows */
     CU(k_kv_commit(dm, li, ar, drows, B, dkn, dvn, 0));
     CU(k_kv_advance(dm, ar, drows, B, 0));

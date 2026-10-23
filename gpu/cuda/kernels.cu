@@ -238,7 +238,9 @@ cudaError_t k_attention(const gpu_model_dims dm, const gpu_layer_w L, int li,
                         int B, const float *qs, const float *kn, const float *vn, float *ctx,
                         cudaStream_t s) {
     if (B <= 0) return cudaSuccess;
-    const int qmax = GPU_QMAX_HARD, kmax = dm.left + qmax;
+    /* the tiles hold Q rows of q / scores with Q <= the pack's qmax: sizing them from it (not the hard bound) is
+     * a launch-configuration change only (same threads, same arithmetic, same order), and lets more blocks reside */
+    const int qmax = dm.qmax > 0 && dm.qmax <= GPU_QMAX_HARD ? dm.qmax : GPU_QMAX_HARD, kmax = dm.left + qmax;
     const size_t shm = ((size_t)2 * qmax * dm.dk + (size_t)qmax * kmax) * sizeof(float);
     int threads = ((dm.dk + 31) / 32) * 32;
     if (threads < 128) threads = 128;
