@@ -456,3 +456,22 @@ speed). Gates (W vs R): W <= R - 3.0 -> LEVER (a head start worth a 0.5x-horizon
 W > R + 1.0 -> HARM. Declared limits: a 1,500-step screen is not the production horizon; one seed; the harness-es
 sets are ES-1's sealed eval sets used here as development (ES-1's own result is unaffected: it is already fixed).
 A PASS / LEVER only licenses a full-horizon pre-registered replicate on another day; nothing else changes today.
+
+### Result: CF-E1 (OBSERVED 2026-10-23 08:43-09:51 UTC, dgx1 GB10, git d68c263, one seed, 1,500 steps each)
+
+| arm | ms / step (steps 100-1500) | audio h seen | macro VAL | mls | fleurs | cv | vp | class |
+|---|---|---|---|---|---|---|---|---|
+| R stock, default sampler | 1,019 | 69.2 | 30.82 | 26.57 | 30.01 | 35.21 | 31.50 | reference |
+| B + `--bucket-pool 32` | **584 (-42.7 %)** | 69.2 | 31.81 (+0.99) | 27.62 | 31.27 | 35.96 | 32.40 | **STRONG** (on the +1.0 edge) |
+| W + `--init` FR-H2 | 1,006 | 69.2 | 32.69 (+1.87) | 28.26 | 30.81 | 39.26 | 32.42 | **HARM** |
+
+- B: same draws, same audio-hours, -42.7 % wall per step, peak memory unchanged; but +0.99 macro with every set
+  worse (+0.75 to +1.26): the quality cost may be real, not noise. Mechanism (HYPOTHESIS, no GPU): every step of both
+  arms is clipped (pre-clip encoder grad norm 81-338 >> 1.0); B widens the gn p10-p90 spread (81-187 vs 93-157), so
+  length-homogeneous batches are re-weighted relative to each other under clipping + AdamW, plus less domain mixing
+  per step. Not proven (57 log samples; batch composition is not logged). Licensed next step (another day, its own
+  pre-registration): a full-horizon replicate with a smaller pool (`--bucket-pool 8`: ~-50 % padding in simulation vs
+  -56 % at 32, more mixing) and per-step logging of batch duration, domain shares and total pre-clip norm. No recipe
+  change today.
+- W: the FR-H2 plain parent is a worse start for Spanish than the English stock model at this horizon (CV +4.05),
+  consistent with arXiv 2606.24169's single-language pivot result. The "Romance warm start" lead is closed for now.
