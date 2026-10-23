@@ -417,3 +417,42 @@ C1 EOU / false endpoints, C2 plain-parent WER, C3 prior art, D adversarial revie
 - Window frontier (diagnostic, DEV-only, never a selection), v1.1 internal FE / endpoint p50: W 0.16 52.9 % / 1.04 s,
   0.32 43.1 % / 1.20 s, 0.48 37.4 % / 1.36 s, 0.64 32.8 % / 1.52 s, 0.8 21.8 % / 1.68 s, 1.04 14.9 % / 1.92 s (recall
   99 % throughout). A product-side commit policy remains the lever, at an explicit latency price.
+
+## 13. Cheap specialist factory -- decision gate and CF-E1 PRE-REGISTRATION (2026-10-23, before any score)
+
+Question: fewer GPU-minutes per language specialist at a useful WER (not a better WER). Inputs (analysis-only agents):
+CF-C1 cost curves from our runs, CF-C2 literature / NeMo code, CF-C3 a measured profile of the plain recipe on GB10,
+NV the NVIDIA 2026 watch. FINAL banks unused.
+
+**Measured profile (CF-C3, GB10, the ES-1 recipe, bs 16, steady state, 1,019 ms / step, 155x RT):** encoder fwd + bwd
+56 %, decoder + joint + RNNT loss fwd + bwd 34 %, AdamW + clip 5 %, host batch build 2.1 %, GPU idle 2.2 %; evals 4.4 %
+of a 12,670-step run; bf16 autocast already on; bs 32 is 4.7 % SLOWER per audio second. **Padding waste of the random
+bs-16 mixture: only 55 % of encoder frames and 34 % of joint T x U cells are real**; a 32-batch duration-sorted pool
+gives 97 % / 73 %. Upper bound of bucketing: ~43 % of wall.
+**Cost curves (CF-C1, OBSERVED):** ~95 % of the gain from stock arrives at half the WSD horizon for ~50 % of the GPU
+(+3.4-3.5 WER, FR and IT); no passes-based rule holds (same steps, different passes -> same WER); mid-run WSD evals
+are not what a shorter run reaches (the decay bonus is 9-14 % relative).
+
+| candidate | mechanism | axis | expected saving | impl. | GPU test | risk | prior evidence | gate |
+|---|---|---|---|---|---|---|---|---|
+| **B: duration bucketing** (`--bucket-pool`) | same draws, sorted into length-homogeneous batches | speed | -30 to -43 % wall | 15 lines (done, default-off = old sampler) | ~18 min | gradient-noise change -> WER | measured padding waste; standard in NeMo / NVIDIA recipes | below |
+| **W: warm start from FR-H2** (`--init`) | a Romance plain parent instead of English | sample efficiency | -25 to -40 % steps (HYP) | 0 | ~26 min | a single-language pivot was worse than multilingual init in arXiv 2606.24169 | arXiv 2606.24169 (multilingual init 4-11 epochs sooner) | below |
+| NeMo >= 2026-09-03 (fused dw_striding Triton, pointwise -> matmul) | kernels | speed | ~1.3x / step (upstream, L size) | env upgrade, Triton on sm_121 unverified | - | env risk, non-deterministic | PR #16114 / #16052 | DEFERRED (a separate env A/B) |
+| sub-batched joint + loss | exact maths | speed | <= 34 % share, mostly absorbed by B | small | - | none | NeMo fused joint | DEFERRED (after B) |
+| torch.compile, fused AdamW, fewer evals, prefetch | speed | <= 2-5 % each (measured bounds) | small | - | - | profile | DEFERRED (low bound) |
+| larger batch, LoRA / freezing, consistency regularisation, soups, H3, CTC / KD / curriculum / teacher-hard | - | - | none or negative | - | - | - | measured / closed | REJECTED |
+
+### CF-E1 -- PRE-REGISTERED (this commit; dgx1 GB10; stock EOU-120M unless stated; the ES-1 data on dgx1)
+Three 1,500-step plain runs, the ES-1 recipe otherwise unchanged (ES mix MLS 0.35 / CV 0.30 / VP t50 0.20 / FLEURS
+0.15, whole encoder 4e-4, decoder / joint 3e-4, WSD 5 % warm-up + last-20 % decay, bs 16, max-dur 30, seed 0,
+`--final-eof 1`, no in-run eval before the end), each evaluated once at its last step on the four harness-es val sets
+(200 clips each, the in-run greedy eval; macro = the reported number):
+- **R** reference: stock init, the default sampler.
+- **B** = R + `--bucket-pool 32` (ONE variable: batch composition; the row draws are identical).
+- **W** = R + `--init` FR-H2 plain (d2062aca) (ONE variable: the init).
+Gates (B vs R): training wall per step (excluding the final eval) reduced by **>= 25 % AND macro WER <= R + 1.0 ->
+PASS**; >= 40 % and <= +1.0 -> STRONG; >= 50 % and <= +0.5 -> EXCEPTIONAL; macro > R + 1.0 -> FAIL (whatever the
+speed). Gates (W vs R): W <= R - 3.0 -> LEVER (a head start worth a 0.5x-horizon test); |W - R| < 1.0 -> NULL;
+W > R + 1.0 -> HARM. Declared limits: a 1,500-step screen is not the production horizon; one seed; the harness-es
+sets are ES-1's sealed eval sets used here as development (ES-1's own result is unaffected: it is already fixed).
+A PASS / LEVER only licenses a full-horizon pre-registered replicate on another day; nothing else changes today.

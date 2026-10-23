@@ -51,6 +51,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--stock", default=os.path.join(os.environ.get("FT_ROOT", os.path.expanduser("~/ft")), "models/parakeet_realtime_eou_120m-v1.nemo"))
 ap.add_argument("--manifest", default="")
 ap.add_argument("--mix", default="", help="path:weight,... domain-balanced sampling (replaces --manifest)")
+ap.add_argument("--bucket-pool", type=int, default=0, help="--mix only: draw bs x N rows with the same sampler (same "
+                "draws, same order of the global stream), sort them by duration, cut into N batches and serve them in "
+                "a shuffled order (own RNG): less padding, same exposure marginals; 0 = the unbucketed sampler, bit for bit")
 ap.add_argument("--vals", default="", help="name=path,... extra val sets (macro-mean WER selects)")
 ap.add_argument("--aug-gain", type=float, default=0.0)
 ap.add_argument("--gain-db", default="-20,10")
@@ -146,6 +149,8 @@ random.seed(a.seed); torch.manual_seed(a.seed)
 CAL_RNG = random.Random(a.seed + 7919)   # v5-CAL label draws only: never touches the global stream of the batches
 PS_RNG = random.Random(a.seed + 104729)   # FR-v2 pause stretching only: own stream, the v4 draws are untouched
 PS_NP = np.random.RandomState(a.seed + 104729)
+BUCKET_RNG = random.Random(a.seed + 15485863)   # --bucket-pool batch order only: the row draws stay on the global stream
+bucket_q = []
 out = Path(a.out) / f"plain-{a.tag}"; out.mkdir(parents=True, exist_ok=True)
 dev = "cuda"
 
@@ -669,7 +674,13 @@ while (not a.eval_only and step < (a.stop_at or a.steps)) or (a.eval_only and no
             cur_k = apply_unfreeze(step); set_train_mode()
             print(f"  step {step}: encoder top-K = {cur_k}", flush=True)
         t_h0 = time.perf_counter()
-        if a.mix:
+        if a.mix and a.bucket_pool:
+            if not bucket_q:
+                pool = sorted([pick_row() for _ in range(a.bs * a.bucket_pool)], key=lambda r: r["duration"])
+                bq = [pool[i:i + a.bs] for i in range(0, len(pool), a.bs)]
+                BUCKET_RNG.shuffle(bq); bucket_q.extend(bq)
+            rs = bucket_q.pop(0)
+        elif a.mix:
             rs = [pick_row() for _ in range(a.bs)]
         else:   # the 2026-10-09 sampler, bit for bit
             if not order:
