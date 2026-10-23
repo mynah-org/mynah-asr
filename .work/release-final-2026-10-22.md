@@ -325,9 +325,29 @@ archived files (fr-g1e snapshot meta, eou-fr-v2-dev, ood-fr1, FINAL-FR sealed tg
 sha 8b0ebba0 checked) extracted under `~/vroot/<original absolute path>`; each input's sha256 is in f2build.log.
 Build started 07:30 UTC.
 
-**ES-1, one clock substitution (declared now, 07:45 UTC, before any ES data statistic):** the pre-registered VP rule
+**ES-1, one clock substitution (declared in 8dc9562, before any ES data statistic was read):** the pre-registered VP rule
 "teacher filter only if the teacher and its 300-clip CLI gate are ready by 15:45 UTC" was a box-time deadline of
 2026-10-22. On the DGX it reads: **the filter runs only if the teacher and its CLI gate are ready before the ES data
 mix completes (DATA-MIX-JOB-DONE); otherwise VoxPopuli-es unfiltered.** Either way the choice is recorded before
 training. Everything else in section 9 unchanged (stage 2 rule: ">= 45 min of box time left" is moot on the DGX;
 the macro greedy <= 30 condition stands).
+
+### FINAL-FR-v2 SEALED (OBSERVED 2026-10-23 07:45 UTC, DGX, git 7eccdac; nothing decoded)
+- **SEAL.sha256 = bd2219e03bb045e2d5b6f952d32a2be3d637ae1710b989505e36dd22ae9931ac** (sha256 of SHA256SUMS: 2,623
+  files = manifests + 2,614 wavs, verified file by file after the build). Hub `data/final-fr-v2/`
+  (final-fr-v2-sealed-2026-10-23.tgz 566,650,963 B, SHA256SUMS, SEAL.sha256, stats.md, f2build.log).
+- Exclusions: 100,727 texts from 13 manifests; dedup seeded with the 2,113 FINAL-FR texts; 290 VP speakers of our
+  pools; 86,238 Granary-fr ids; 234 mTEDx talks of train shards 0-9 excluded.
+
+| bank | clips | h | groups | dur p50 s | trail < 0.2 s |
+|---|---|---|---|---|---|
+| cv (CV17-fr validation) | 400 | 0.65 | 400 | 5.7 | 11 % |
+| mls (MLS-fr dev) | 400 | 1.68 | 18 | 15.2 | 18 % |
+| tedx (mTEDx-fr train shards 10-11) | 400 | 0.62 | 46 | 4.6 | 95 % |
+| vp (VoxPopuli-fr validation) | **107** | 0.26 | 12 | 7.9 | 98 % |
+
+- **VP has 107 clips, not 400** (model-free, the frozen rules): of 507 candidates after the speaker exclusion, the 400
+  FINAL-FR texts were the dedup seeds; 1,150 rows dropped for speakers in our train / test pools. Declared before
+  the decode: VP is a small bank (wide CI); the 4-bank macro weights it equally as pre-registered.
+- Next, unchanged from section 8: ONE decode of RC-FR v1.1 (3130534d): s2_reset natural (primary) + trim
+  (secondary), Mynah CUDA bf16 server on the natural banks. v1 is not decoded.
