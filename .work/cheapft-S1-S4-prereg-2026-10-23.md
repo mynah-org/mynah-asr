@@ -197,3 +197,17 @@ Licensed by the S2 STRONG class (this file: "one replicate seed before adoption"
 cfs-s2-s1-es; only --seed changes, which also reseeds the bucket RNG). Same S gate. Reading: if seed 1 is also
 within +1.0, S2 is adopted for the ES recipe; the S2 - ES-1 gap (two S2 seeds vs one ES-1 seed) is reported with
 the S2 seed spread, not as a significance claim.
+
+## S2 replicate (seed 1) result (dgx1, ended 19:38 CEST)
+- S gate (post 0.5): macro 18.13 vs ES-1 18.09 (+0.04), CER -0.28, GPU time -41.1 % -> **STRONG** (speed 568 ms/step).
+- Greedy post 0, ES-1 -> S2 s0 -> S2 s1 (WER): MLS 15.12 -> 15.16 -> 14.20; FLEURS 17.10 -> 18.02 -> 17.68;
+  CV 21.13 -> 22.98 -> 22.18; VP 19.48 -> 19.32 -> 19.16; macro 18.21 -> 18.87 -> 18.30; empty 2 -> 1 -> 0.
+- Two S2 seeds: post 0.5 macro 18.68 / 18.13, mean 18.41 (+0.32 vs one ES-1 seed), seed spread 0.55 (CF-E3: 0.46).
+  The S2 - ES-1 gap is inside the seed spread: no significance claim, in either direction.
+- OBSERVED in both seeds: CV (+1.85 / +1.05) and FLEURS (+0.92 / +0.58) worse than ES-1, MLS / VP flat or better.
+  The clip-reweighting reading (short CV clips) stays a HYPOTHESIS; a test would be one pre-registered arm (blend or
+  a clip reweighting) against two S2 seeds, CV as the primary domain.
+- Batch stats seed 1: same as seed 0 (domains 34.9 / 30.0 / 20.0 / 15.0, encoder 0.968, joint 0.696, corr 0.49).
+- **Decision: bucket-pool 32 is ADOPTED** for the ES plain recipe (the pre-registered replicate passed): ~41 %
+  less GPU time at the full 12,670-step exposure. Hub: runs/dgx-cfs-s2-es, runs/dgx-cfs-s2-s1-es (final.nemo +
+  sha256 + evidence); S1 evidence only in results/dgx-2026-10-23/cfs-s1.
