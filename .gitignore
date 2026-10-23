@@ -95,3 +95,4 @@ mynah-asr-server-cuda-cpuonly
 tests/test_cuda_kernels
 tests/test_cuda_stream
 tests/cuda_bank_transcribe
+tests/gemm_shapes_bench
