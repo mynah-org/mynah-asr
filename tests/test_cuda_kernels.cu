@@ -716,6 +716,83 @@ static int test_attention_kv(int kvt) {
     return 0;
 }
 
+/* The register-blocked score and P·V loops (the default) against the
+ * original t-outer loops (k_attention_force_legacy), byte for byte: every K/V
+ * dtype, q in {1, 2, 4, 14, 20} (20 > ATT_PV_QB walks two P·V blocks), valid
+ * in {0, 5, left} with wrapping ring heads, tiles sized from qmax and from
+ * GPU_QMAX_HARD, dk = 128 (one column per thread) and dk = 64 (idle threads). */
+static int test_attention_fast_vs_legacy(int kvt, int dk) {
+    const char *kvn = kvt == GPU_KV_INT8 ? "int8" : kvt == GPU_KV_BF16 ? "bf16" : "f32";
+    gpu_model_dims dm = {};
+    dm.n_layers = 2; dm.d = 256; dm.dk = dk; dm.H = dm.d / dk; dm.left = 72; dm.kmax = dm.left + GPU_QMAX_HARD;
+    const int li = 1;
+    const int qv_[5] = {1, 2, 4, 14, 20}, vv_[3] = {0, 5, 72};
+    const int B = 5 * 3, cap = B;
+    std::vector<gpu_slot_meta> meta(cap);
+    std::vector<gpu_row> rows(B);
+    int R = 0;
+    for (int a = 0; a < B; a++) {
+        memset(&meta[a], 0, sizeof(meta[a])); memset(&rows[a], 0, sizeof(rows[a]));
+        meta[a].valid = vv_[a % 3]; meta[a].head = (a * 29) % dm.left;
+        rows[a].slot = a; rows[a].q = qv_[a / 3]; rows[a].row_off = R; R += rows[a].q;
+    }
+    const size_t kv_n = (size_t)cap * dm.n_layers * 2 * dm.left * dm.d, npos = kv_n / (size_t)dm.d;
+    std::vector<float> kv(kv_n); fill(kv, 1.0f);
+    std::vector<int8_t> kq8; std::vector<float> ksc; std::vector<__nv_bfloat16> kb16;
+    gpu_arena ar = {};
+    ar.kv_dtype = kvt;
+    if (kvt == GPU_KV_INT8) {
+        kq8.resize(kv_n); ksc.resize(npos * (size_t)dm.H);
+        for (size_t p = 0; p < npos; p++) kv_quant_row_i8(&kv[p * dm.d], dm.H, dm.dk, &kq8[p * dm.d], &ksc[p * dm.H]);
+        ar.kvq = dup_dev(kq8); ar.kv_scale = dup_dev(ksc);
+    } else if (kvt == GPU_KV_BF16) {
+        kb16.resize(kv_n);
+        for (size_t i = 0; i < kv_n; i++) kb16[i] = __float2bfloat16_rn(kv[i]);
+        ar.kvq = dup_dev(kb16);
+    } else ar.kv = dup_dev(kv);
+    ar.meta = dup_dev(meta);
+    std::vector<float> qsv((size_t)R * dm.d), kn((size_t)R * dm.d), vn((size_t)R * dm.d), bu(dm.d), bv(dm.d);
+    fill(qsv, 1.0f); fill(kn, 1.0f); fill(vn, 1.0f); fill(bu, 0.3f); fill(bv, 0.3f);
+    std::vector<float> tab((size_t)dm.n_layers * (2 * dm.kmax - 1) * dm.d); fill(tab, 0.5f);
+    gpu_layer_w L = {}; L.bias_u = dup_dev(bu); L.bias_v = dup_dev(bv);
+    float *dtab = dup_dev(tab), *dq = dup_dev(qsv), *dkn = dup_dev(kn), *dvn = dup_dev(vn), *dold, *dnew;
+    gpu_row *drows = dup_dev(rows);
+    const size_t n = (size_t)R * dm.d;
+    CU(cudaMalloc(&dold, n * sizeof(float)));
+    CU(cudaMalloc(&dnew, n * sizeof(float)));
+    const int qmaxes[2] = {0, 20};
+    for (int qi = 0; qi < 2; qi++) {
+        gpu_model_dims dmq = dm; dmq.qmax = qmaxes[qi];
+        CU(cudaMemset(dold, 0xFF, n * sizeof(float)));
+        CU(cudaMemset(dnew, 0xFF, n * sizeof(float)));   /* NaN: an unwritten output fails the finite check */
+        k_attention_force_legacy(1);
+        cudaError_t e1 = k_attention(dmq, L, li, dtab, ar, drows, B, dq, dkn, dvn, dold, 0);
+        k_attention_force_legacy(0);
+        CU(e1);
+        CU(k_attention(dmq, L, li, dtab, ar, drows, B, dq, dkn, dvn, dnew, 0));
+        CU(cudaDeviceSynchronize());
+        auto o = to_host(dold, n), w = to_host(dnew, n);
+        int bad_lane = -1;
+        for (int a = 0; a < B && bad_lane < 0; a++)
+            if (memcmp(o.data() + (size_t)rows[a].row_off * dm.d, w.data() + (size_t)rows[a].row_off * dm.d,
+                       (size_t)rows[a].q * dm.d * sizeof(float)) != 0) bad_lane = a;
+        int finite = 1;
+        for (size_t i = 0; i < n; i++) if (!isfinite(w[i])) { finite = 0; break; }
+        if (bad_lane >= 0)
+            CHECK(0, "attention kv=%s dk=%d qmax=%d: blocked loops == t-outer loops, first differing lane q=%d valid=%d",
+                  kvn, dk, qmaxes[qi], rows[bad_lane].q, meta[bad_lane].valid);
+        else
+            CHECK(finite, "attention kv=%s dk=%d qmax=%d: blocked score + P·V loops == t-outer loops, byte for byte (q 1/2/4/14/20 x valid 0/5/72)",
+                  kvn, dk, qmaxes[qi]);
+    }
+    cudaFree(dold); cudaFree(dnew); cudaFree(dtab); cudaFree(dq); cudaFree(dkn); cudaFree(dvn); cudaFree(drows);
+    cudaFree((void *)L.bias_u); cudaFree((void *)L.bias_v); cudaFree(ar.meta);
+    if (ar.kv) cudaFree(ar.kv);
+    if (ar.kvq) cudaFree(ar.kvq);
+    if (ar.kv_scale) cudaFree(ar.kv_scale);
+    return 0;
+}
+
 /* -------------------------------------------------------- glu + dwconv */
 static int test_conv(void) {
     gpu_model_dims dm = {}; dm.n_layers = 1; dm.d = 64; dm.conv_k = 9;
@@ -985,6 +1062,12 @@ int main(int argc, char **argv) {
     if (test_attention_kv(GPU_KV_F32) != 0) return 1;
     if (test_attention_kv(GPU_KV_BF16) != 0) return 1;
     if (test_attention_kv(GPU_KV_INT8) != 0) return 1;
+    {
+        const int kvts[3] = {GPU_KV_F32, GPU_KV_BF16, GPU_KV_INT8};
+        for (int k = 0; k < 3; k++)
+            for (int dk = 64; dk <= 128; dk += 64)
+                if (test_attention_fast_vs_legacy(kvts[k], dk) != 0) return 1;
+    }
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         if (test_w8(shapes[i][0], shapes[i][1], names[i], bench) != 0) return 1;
     if (test_conv() != 0) return 1;

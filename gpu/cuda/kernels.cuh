@@ -153,6 +153,9 @@ cudaError_t k_attention(const gpu_model_dims dm, const gpu_layer_w L, int li,
                         const float *relpos_tab, const gpu_arena ar,
                         const gpu_row *rows, int B, const float *qs, const float *kn,
                         const float *vn, float *ctx, cudaStream_t s);
+/* tests: 1 = the original t-outer score and P·V loops, 0 = the default
+ * register-blocked loops; the same fmaf sequence per output, so bit-neutral */
+void k_attention_force_legacy(int on);
 /* Appends the q fresh K and V rows of every lane into layer li's ring. */
 cudaError_t k_kv_commit(const gpu_model_dims dm, int li, const gpu_arena ar,
                         const gpu_row *rows, int B, const float *kn, const float *vn,
