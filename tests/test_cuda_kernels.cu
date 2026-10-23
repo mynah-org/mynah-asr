@@ -315,6 +315,7 @@ static int test_gemm_tc(int N, int K, const char *what, int bench) {
     CU(k_f32_to_bf16(dW, dW16, (size_t)N * K, 0));
     CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
     if (wsf) CU(cudaMalloc(&ws, wsf * sizeof(float)));
+    CU(k_gemm_tc_workspace_init(ws, wsf, 0));
     int mism = 0, rep_mism = 0;
     for (int act = 0; act <= 2; act += 2) {
         CU(cudaMemcpy(dR, C0.data(), (size_t)Mmax * N * sizeof(float), cudaMemcpyHostToDevice));
@@ -326,24 +327,31 @@ static int test_gemm_tc(int N, int K, const char *what, int bench) {
         CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, Mmax, N, K, 1, act, ws, wsf, 0));
         CU(cudaDeviceSynchronize());
         if (memcmp(to_host(dC, (size_t)Mmax * N).data(), ref.data(), (size_t)Mmax * N * sizeof(float)) != 0) rep_mism++;
-        for (int cfg = -1; cfg < k_gemm_tc_config_count(); cfg++) {
-            k_gemm_tc_force_config(cfg);
-            for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
-                const int M = Ms[mi];
-                CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
-                CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, M, N, K, 1, act, ws, wsf, 0));
-                CU(cudaDeviceSynchronize());
-                auto c = to_host(dC, (size_t)M * N);
-                if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
-                    if (mism < 3) printf("     own-tc %s cfg %s M=%d act=%d differs from M=257\n", what, cfg < 0 ? "auto" : k_gemm_tc_config_name(cfg), M, act);
-                    mism++;
+        /* every reduce mode the dispatcher may pick, and auto: M picks the
+         * mode, so row stability across M must hold across the modes too */
+        for (int rm = -1; rm < k_gemm_tc_reduce_count(); rm++) {
+            k_gemm_tc_force_reduce(rm);
+            for (int cfg = -1; cfg < k_gemm_tc_config_count(); cfg++) {
+                k_gemm_tc_force_config(cfg);
+                for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+                    const int M = Ms[mi];
+                    CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                    CU(k_gemm_wt_tc(dA, K, dW16, db, dC, N, M, N, K, 1, act, ws, wsf, 0));
+                    CU(cudaDeviceSynchronize());
+                    auto c = to_host(dC, (size_t)M * N);
+                    if (memcmp(c.data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
+                        if (mism < 3) printf("     own-tc %s reduce %s cfg %s M=%d act=%d differs from M=257\n", what,
+                                             rm < 0 ? "auto" : k_gemm_tc_reduce_name(rm), cfg < 0 ? "auto" : k_gemm_tc_config_name(cfg), M, act);
+                        mism++;
+                    }
                 }
             }
+            k_gemm_tc_force_config(-1);
         }
-        k_gemm_tc_force_config(-1);
+        k_gemm_tc_force_reduce(-1);
     }
-    CHECK(mism == 0 && rep_mism == 0, "own-tc row-stable %s [N=%d K=%d, S=%d]: 12 cohort sizes x %d tiles x relu/silu vs M=257, and a repeat, byte for byte (%d + %d mismatches)",
-          what, N, K, k_gemm_tc_splits(N, K), k_gemm_tc_config_count() + 1, mism, rep_mism);
+    CHECK(mism == 0 && rep_mism == 0, "own-tc row-stable %s [N=%d K=%d, S=%d]: 12 cohort sizes x %d tiles x %d reduce modes x relu/silu vs M=257, and a repeat, byte for byte (%d + %d mismatches)",
+          what, N, K, k_gemm_tc_splits(N, K), k_gemm_tc_config_count() + 1, k_gemm_tc_reduce_count() + 1, mism, rep_mism);
     /* accuracy: vs double over the bf16-rounded operands (the kernel's job) and
      * vs double over the f32 operands (the numerical change, next to v1's) */
     {
@@ -379,6 +387,7 @@ static int test_gemm_tc(int N, int K, const char *what, int bench) {
         CU(cudaMalloc(&dCb, (size_t)512 * N * sizeof(float)));
         if (wsk) CU(cudaMalloc(&wk, wsk * sizeof(float)));
         if (wst) CU(cudaMalloc(&wt, wst * sizeof(float)));
+        CU(k_gemm_tc_workspace_init(wt, wst, 0));
         for (size_t mi = 0; mi < sizeof(Mb) / sizeof(Mb[0]); mi++) {
             const int M = Mb[mi];
             float t[3], ms;
@@ -398,6 +407,69 @@ static int test_gemm_tc(int N, int K, const char *what, int bench) {
         cudaFree(wk); cudaFree(wt); cudaFree(dAb); cudaFree(dCb);
     }
     cudaFree(dA); cudaFree(dW); cudaFree(dW16); cudaFree(db); cudaFree(dR); cudaFree(dC); if (ws) cudaFree(ws);
+    return 0;
+}
+
+/* ------------------------------------------ own-tc fused split reduce
+ * Every fused mode (last-block, serial in-register) against the two-kernel
+ * path, byte for byte, on the Nemotron 0.6B shapes at the cohort sizes the
+ * serving loop issues (C x q up to 1024 rows), every activation, with and
+ * without the bias + accumulate epilogue, every block tile. Plus a ragged
+ * shape with S > 1 on the scalar staging path. */
+static int test_gemm_tc_fused(void) {
+    const int shp[][2] = {{4096, 1024}, {1024, 4096}, {1024, 1024}, {2048, 1024}, {1024, 4352},
+                          {13088, 640}, {2560, 640}, {640, 640}, {200, 1004}};
+    const int Ms[] = {8, 32, 128, 512, 1024};
+    const int Mmax = 1024;
+    int bad = 0, calls = 0;
+    for (size_t si = 0; si < sizeof(shp) / sizeof(shp[0]); si++) {
+        const int N = shp[si][0], K = shp[si][1];
+        std::vector<float> A((size_t)Mmax * K), W((size_t)N * K), bias(N), C0((size_t)Mmax * N);
+        fill(A, 1.0f); fill(W, 0.05f); fill(bias, 0.1f); fill(C0, 0.5f);
+        const size_t wsf = k_gemm_tc_workspace_floats(Mmax, N, K);
+        float *dA = dup_dev(A), *dW = dup_dev(W), *db = dup_dev(bias), *dR = nullptr, *dC = nullptr, *ws = nullptr;
+        unsigned short *dW16 = nullptr;
+        CU(cudaMalloc(&dW16, (size_t)N * K * sizeof(unsigned short)));
+        CU(k_f32_to_bf16(dW, dW16, (size_t)N * K, 0));
+        CU(cudaMalloc(&dR, (size_t)Mmax * N * sizeof(float))); CU(cudaMalloc(&dC, (size_t)Mmax * N * sizeof(float)));
+        if (wsf) CU(cudaMalloc(&ws, wsf * sizeof(float)));
+        CU(k_gemm_tc_workspace_init(ws, wsf, 0));
+        int bad_shape = 0;
+        for (size_t mi = 0; mi < sizeof(Ms) / sizeof(Ms[0]); mi++) {
+            const int M = Ms[mi];
+            for (int act = 0; act <= 2; act++)
+                for (int epi = 0; epi < 2; epi++)
+                    /* every tile up to M = 128; the dispatcher's tile above (host copies) */
+                    for (int cfg = -1; cfg < (M <= 128 ? k_gemm_tc_config_count() : 0); cfg++) {
+                        k_gemm_tc_force_config(cfg);
+                        const float *bp = epi ? db : nullptr;
+                        k_gemm_tc_force_reduce(0);
+                        CU(cudaMemcpy(dR, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                        CU(k_gemm_wt_tc(dA, K, dW16, bp, dR, N, M, N, K, epi, act, ws, wsf, 0));
+                        CU(cudaDeviceSynchronize());
+                        auto ref = to_host(dR, (size_t)M * N);
+                        /* auto, last-block, serial; last-block twice (the counter wrap) */
+                        const int modes[] = {-1, 1, 2, 1};
+                        for (int r = 0; r < 4; r++) {
+                            k_gemm_tc_force_reduce(modes[r]);
+                            CU(cudaMemcpy(dC, C0.data(), (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+                            CU(k_gemm_wt_tc(dA, K, dW16, bp, dC, N, M, N, K, epi, act, ws, wsf, 0));
+                            CU(cudaDeviceSynchronize());
+                            calls++;
+                            if (memcmp(to_host(dC, (size_t)M * N).data(), ref.data(), (size_t)M * N * sizeof(float)) != 0) {
+                                if (bad < 5) printf("     own-tc fused %dx%d M=%d act=%d epi=%d cfg %s reduce %s differs from two-kernel\n", N, K, M, act, epi,
+                                                    cfg < 0 ? "auto" : k_gemm_tc_config_name(cfg), modes[r] < 0 ? "auto" : k_gemm_tc_reduce_name(modes[r]));
+                                bad++; bad_shape++;
+                            }
+                        }
+                    }
+        }
+        k_gemm_tc_force_reduce(-1); k_gemm_tc_force_config(-1);
+        printf("INFO own-tc fused %5dx%-5d S=%2d: %d mismatches\n", N, K, k_gemm_tc_splits(N, K), bad_shape);
+        cudaFree(dA); cudaFree(dW); cudaFree(dW16); cudaFree(db); cudaFree(dR); cudaFree(dC); if (ws) cudaFree(ws);
+    }
+    CHECK(bad == 0, "own-tc fused split reduce (auto, last-block, serial) == two-kernel byte for byte: 9 shapes x 5 M x 3 acts x 2 epilogues (all %d tiles to M=128), %d calls (%d mismatches)",
+          k_gemm_tc_config_count() + 1, calls, bad);
     return 0;
 }
 
@@ -1053,6 +1125,8 @@ int main(int argc, char **argv) {
                 if (test_gemm_tc(shapes[i][0], shapes[i][1], names[i], bench_tc) != 0) return 1;
             /* off-model shape: K not a multiple of 8 (the scalar staging path), ragged N */
             if (test_gemm_tc(100, 300, "ragged", 0) != 0) return 1;
+            if (test_gemm_tc(200, 1004, "ragged-split", 0) != 0) return 1;
+            if (test_gemm_tc_fused() != 0) return 1;
         } else {
             printf("SKIP own-tc: %s is sm_%d%d, the arm needs sm_80+\n", p.name, p.major, p.minor);
         }
