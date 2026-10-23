@@ -486,3 +486,20 @@ A PASS / LEVER only licenses a full-horizon pre-registered replicate on another 
   CV 21.18, VP 19.20 (164 clips available); 2 empty. Trainer in-run final (raw EOF): 18.21. Reading band: **<= 25
   strong transfer**. One plain run, no tuning, no stage 2 yet. Beam / oracle / stock zero-shot follow (fr_p1.sh probes).
 - Archive note: dgx2's ~/.cache/huggingface/xet is root-owned -> uploads use HF_HOME=~/ft/hfhome.
+
+### Result: ES-1 full plain qualification (OBSERVED 2026-10-23 11:49 UTC, dgx2) -- archived, plain ES-1 CLOSED
+harness-es (MLS / FLEURS / CV / VP 164), macro WER (CER):
+
+| protocol | MLS | FLEURS | CV | VP | **macro** | oracle@8 |
+|---|---|---|---|---|---|---|
+| ES-1 greedy, 0.5 s flush (primary) | 14.86 | 17.10 | 21.18 | 19.20 | **18.09** (7.43) | - |
+| ES-1 beam 8, 0.5 s flush | 12.86 | 16.20 | 19.98 | 17.18 | 16.55 (6.31) | 12.98 |
+| ES-1 greedy, raw EOF | 15.12 | 17.10 | 21.13 | 19.48 | 18.21 (7.53) | - |
+| ES-1 beam 8, raw EOF | 13.12 | 16.20 | 19.88 | 17.36 | 16.64 (6.43) | 13.14 |
+| stock EOU-120M (English) zero-shot, greedy 0.5 s | 85.40 | 89.48 | 85.91 | 96.29 | 89.27 (60.67) | - |
+
+- Training wall 13,325.6 s (3 h 42 min, GB10), 582.2 audio-h seen, peak reserved 23.4 GB. One run, frozen
+  recipe, no tuning; stage 2 (`<EOU>`) not run (no time today; the pre-registered condition macro <= 30 holds).
+- Hub: `runs/dgx-es1-w4-12670/` (final.nemo 460,072,960 B sha256 172b1539..., metrics, launch, data stats, harness
+  seal, first probe, logs) and `results/dgx-2026-10-23/es1/` (23 files: probes, stock zero-shot, data / VP filter /
+  training logs, scripts), sizes verified against the Hub.
