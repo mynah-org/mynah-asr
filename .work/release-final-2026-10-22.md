@@ -503,3 +503,12 @@ harness-es (MLS / FLEURS / CV / VP 164), macro WER (CER):
 - Hub: `runs/dgx-es1-w4-12670/` (final.nemo 460,072,960 B sha256 172b1539..., metrics, launch, data stats, harness
   seal, first probe, logs) and `results/dgx-2026-10-23/es1/` (23 files: probes, stock zero-shot, data / VP filter /
   training logs, scripts), sizes verified against the Hub.
+
+### Result: ES-1 Mynah qualification (OBSERVED 2026-10-23 12:20 UTC, dgx2 GB10, runtime 7eccdac)
+Pack mynah-es-120m-es1 exported from 172b1539 (Hub runs/dgx-es1-w4-12670/mynah-pack, results/dgx-2026-10-23/es1-mynah);
+harness-es 764 clips, 2 s quiet as PCM16:
+- Mynah CPU f32 == Mynah CUDA f32 on **764 / 764** clips; CUDA engine gate A / B / C PASS; 0 runtime errors.
+- Macro WER: CPU f32 18.07, CUDA f32 18.07, **CUDA bf16 (serving default) 18.09**; NeMo primary 18.09.
+- Per set (bf16): MLS 14.83, FLEURS 17.08, CV 21.23, VP 19.23.
+ES-1 plain is a complete, reproducible artefact: checkpoint + sha256 + launch + data stats + harness seal + probes +
+stock reference + Mynah pack + parity, all on the Hub.
