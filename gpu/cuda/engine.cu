@@ -730,7 +730,7 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
     }
     dm.dout = enc.d_out; dm.np = enc.num_prompts; dm.inter = enc.prompt_inter;
     dm.V = e->pack.dec.vocab; dm.Hdec = e->pack.dec.hidden; dm.pred_layers = e->pack.dec.n_layers;
-    dm.blank = e->pack.dec.blank; dm.max_symbols = e->pack.dec.max_symbols;
+    dm.blank = e->pack.dec.blank; dm.max_symbols = e->pack.dec.max_symbols; dm.qmax = e->pack.qmax;
     if (dm.H * dm.dk != dm.d || dm.Hdec != dm.dout || dm.kmax < dm.left + e->pack.qmax ||
         e->pack.qmax > GPU_QMAX_HARD || dm.left + e->pack.qmax > GPU_KMAX_HARD || !enc.prompt_l1_w) {
         snprintf(err, errcap, "model geometry outside what the kernels serve (H*dk=%d d=%d Hdec=%d dout=%d kmax=%d left=%d qmax=%d prompt=%s)",

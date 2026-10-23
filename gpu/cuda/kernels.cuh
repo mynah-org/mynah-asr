@@ -56,6 +56,7 @@ struct gpu_model_dims {
     int F[GPU_SS_STAGES], Fo[GPU_SS_STAGES];  /* freq in / out per stage       */
     int dout, np, inter;       /* joint dim, prompts, prompt projector inner  */
     int V, Hdec, pred_layers, blank, max_symbols;
+    int qmax;                  /* the pack's largest q (lookahead + 1): sizes the attention tiles; 0 = GPU_QMAX_HARD */
 };
 
 /* Storage of the K/V ring (--kv-dtype). f32 is the reference; bf16 halves the
