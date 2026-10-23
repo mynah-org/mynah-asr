@@ -184,3 +184,16 @@ is reported as such.
 - HYPOTHESIS (not tested): with every step clipped, bucketing changes the per-sample weighting by duration; it
   could explain a domain-specific loss (CV clips are short). The blend mode and a clip reweighting are candidate
   arms to pre-register, not established remedies.
+
+## S1 result (dgx1, 0.6x horizon 7,602 steps, default sampler, seed 0; ended 17:22 CEST)
+- Pre-registered S gate (post 0.5 probe): macro 20.77 vs 18.09 (+2.68), CER +0.41, GPU time -39.3 % -> **FAIL**.
+- Per domain (post 0.5), ES-1 -> S1: MLS 14.86 -> 16.58, FLEURS 17.10 -> 20.06, CV 21.18 -> 25.32, VP 19.20 -> 21.14.
+  Every domain loses 1.7-4.1 WER: a shorter horizon is not a free saving on this recipe.
+- Joint reading with S2: at the same ~40 % GPU saving, bucketing (S2, +0.59) costs about a fifth of what cutting
+  the horizon costs (S1, +2.68). The horizon stays at ES-1's 12,670 steps; bucketing is the lever.
+
+## S2 replicate (seed 1), launched 17:26 CEST on dgx1
+Licensed by the S2 STRONG class (this file: "one replicate seed before adoption"). Code f3161d7 (`SEED=1`, tag
+cfs-s2-s1-es; only --seed changes, which also reseeds the bucket RNG). Same S gate. Reading: if seed 1 is also
+within +1.0, S2 is adopted for the ES recipe; the S2 - ES-1 gap (two S2 seeds vs one ES-1 seed) is reported with
+the S2 seed spread, not as a significance claim.
