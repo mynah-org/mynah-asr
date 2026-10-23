@@ -351,3 +351,29 @@ the macro greedy <= 30 condition stands).
   the decode: VP is a small bank (wide CI); the 4-bank macro weights it equally as pre-registered.
 - Next, unchanged from section 8: ONE decode of RC-FR v1.1 (3130534d): s2_reset natural (primary) + trim
   (secondary), Mynah CUDA bf16 server on the natural banks. v1 is not decoded.
+
+### Result: FINAL-FR-v2, the one-shot of RC-FR v1.1 (OBSERVED 2026-10-23 07:47-08:00 UTC, DGX GB10) -- now SPENT
+Seal verified file by file (2,623) before the decode; checkpoint 3130534d / parent d2062aca and the v1.1 Mynah pack
+(its package SHA256SUMS) verified. Decoded once, nothing changed in response. Hub
+`results/dgx-2026-10-23/final-fr-v2-results` (16 files). **FINAL-FR-v2 is SPENT from this point: no selection,
+tuning or recipe decision may use it.** It is a fresh evaluation bank relative to our process (disjoint from our
+training / DEV / OOD / earlier FINAL banks as far as verifiable), not a universally uncontaminated benchmark.
+
+Primary = NeMo s2_reset frozen protocol, natural endings (greedy, decoder reset after `<EOU>`, 2 s quiet):
+
+| bank | clips | WER | CER | empty | FE | FE_any | recall | latency p50 / p90 | Mynah CUDA bf16 WER |
+|---|---|---|---|---|---|---|---|---|---|
+| cv | 400 | 22.37 | 9.13 | 0 | 6.0 % | 6.5 % | 94.8 % | 0.80 / 1.12 s | 22.42 |
+| mls | 400 | 23.73 | 10.83 | 2 | **20.8 %** | 21.0 % | 97.8 % | 0.64 / 1.36 s | 23.73 |
+| tedx | 400 | 26.23 | 13.89 | 4 | 14.0 % | 14.0 % | 99.2 % | 0.88 / 1.68 s | 26.44 |
+| vp | 107 | 19.68 | 9.96 | 0 | 2.8 % | 2.8 % | 97.2 % | 0.64 / 1.28 s | 19.49 |
+| **macro (4 banks)** | 1,307 | **23.00** | **10.95** | 6 | **12.70 %** | 12.93 % | **97.25 %** | 0.80 / 1.36 s | **23.02** |
+
+- Trim variant (secondary): macro 23.04, FE 12.47 %, recall 97.4 %.
+- Mynah runtime (the CUDA server, bf16 serving default, encoder + decoder reset): macro 23.02 / CER 11.01, FE 12.7 %,
+  recall 96.63 %, 0 runtime errors; +0.02 vs the NeMo protocol.
+- Descriptive only (different banks, never a selection): DEV-fr 22.08, FR-OOD1 24.97; FINAL-FR v1 27.76 is a 6-bank
+  macro of other clips and the v1 model, NOT comparable. The known limitation is confirmed on fresh clips: MLS
+  (long read speech) false endpoints 20.8 % and mTEDx 14.0 %, CV / VP <= 6 %.
+- The Mynah pack's `mynah.json` name field reads `mynah-eou-fr-120m-h2` (cosmetic; the pack files are the v1.1
+  package's, sha-verified).
