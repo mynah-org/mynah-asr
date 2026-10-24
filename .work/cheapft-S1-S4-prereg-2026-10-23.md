@@ -211,3 +211,21 @@ the S2 seed spread, not as a significance claim.
 - **Decision: bucket-pool 32 is ADOPTED** for the ES plain recipe (the pre-registered replicate passed): ~41 %
   less GPU time at the full 12,670-step exposure. Hub: runs/dgx-cfs-s2-es, runs/dgx-cfs-s2-s1-es (final.nemo +
   sha256 + evidence); S1 evidence only in results/dgx-2026-10-23/cfs-s1.
+
+## S5 result (2026-10-24, two seeds; plans/S5-prereg.md on feat/trainer-throughput b4efe59; Hub runs/dgx-cfs-s5-es, runs/dgx-cfs-s5-s1-es)
+S5 = S2 (bucket-pool 32) with an unbucketed decay phase (`--bucket-decay-mode none`, from step 10,144). Probe post-0.5,
+greedy:
+
+| | S5 s0 | S5 s1 | S5 mean | ES-1 | S2 mean (spread) |
+|---|---|---|---|---|---|
+| macro WER / CER | 18.08 / 7.15 | 18.07 / 7.09 | 18.08 / 7.12 | 18.09 / 7.43 | 18.41 (0.55) |
+| CV / FLEURS | 21.98 / 17.04 | 23.03 / 17.24 | 22.51 / 17.14 | 21.18 / 17.10 | 22.41 / 17.85 |
+| MLS / VP | 14.54 / 18.77 | 13.56 / 18.44 | 14.05 / 18.61 | 14.86 / 19.20 | 14.38 / 19.00 |
+| GPU vs ES-1 | -32.4 % | -33.2 % | -32.8 % | 0 | -41 % |
+| pre-registered class | RECOVERS | NULL | | | |
+
+**Conclusion (frozen):** S5 is the preferred compute-efficient factory recipe: across two seeds it matches the
+full-compute ES-1 macro WER (18.08 mean vs 18.09; S5 seed spread 0.01) while reducing training GPU time by ~33 %.
+This is NOT a statistical equivalence claim (ES-1 has one seed). Domain-level recovery is not uniform: FLEURS recovery
+replicates and MLS/VP beat ES-1 on both seeds, but the CV decay-recovery hypothesis did NOT replicate (seed 1 CV 23.03).
+S2 stays as the aggressive/economy profile: ~41 % GPU saving, mean macro ~18.41, larger seed spread.
