@@ -166,7 +166,7 @@ static int bench(const char *model, const char *precision, const char *gemm, con
     for (int i = 0; i < C; i++)
         if (asr_engine_slot_reset(e, i, "auto", 3) != 0) { printf("FAIL slot reset\n"); return 1; }
     double prof[ASR_PROF_STAGES] = {0}, wall = 0.0;
-    unsigned long passes = 0, full = 0;
+    unsigned long passes = 0, full = 0, iters = 0;
     for (int st = 0; st < steps; st++) {
         int nreq = 0;
         for (int i = 0; i < C; i++) {
@@ -186,14 +186,16 @@ static int bench(const char *model, const char *precision, const char *gemm, con
         if (st >= 2 && nreq == C) {
             for (int k = 0; k < ASR_PROF_STAGES; k++) prof[k] += b.prof_ms[k] - a.prof_ms[k];
             passes += b.prof_passes - a.prof_passes;
+            iters += b.decode_iters - a.decode_iters;
             wall += b.step_wall_ms_sum - a.step_wall_ms_sum;
             full++;
         }
     }
     double tot = 0.0;
     for (int k = 0; k < ASR_PROF_STAGES; k++) tot += prof[k];
-    printf("BENCH C=%d full_steps=%lu passes=%lu device_ms_per_pass=%.3f step_wall_ms=%.3f\n", C, full, passes,
-           passes ? tot / (double)passes : 0.0, full ? wall / (double)full : 0.0);
+    printf("BENCH C=%d full_steps=%lu passes=%lu device_ms_per_pass=%.3f step_wall_ms=%.3f decode_iters_per_pass=%.2f\n",
+           C, full, passes, passes ? tot / (double)passes : 0.0, full ? wall / (double)full : 0.0,
+           passes ? (double)iters / (double)passes : 0.0);
     for (int k = 0; k < ASR_PROF_STAGES; k++)
         printf("BENCH   %-10s %8.3f ms/pass\n", ASR_PROF_NAME[k], passes ? prof[k] / (double)passes : 0.0);
     asr_engine_close(e);

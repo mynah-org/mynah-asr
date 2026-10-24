@@ -7,6 +7,8 @@
 #                             run on a device
 #   make -C gpu test-stream   tests/test_cuda_stream (GPU + pack)
 #   make -C gpu bank-transcribe  tests/cuda_bank_transcribe (a bank offline, {clip: text})
+#   make -C gpu gemm-shapes   tests/gemm_shapes_bench (GPU): own-tc vs cuBLAS bf16 vs
+#                             the roofline on the real (M, N, K) of a pass
 #
 # The library (../libmynah_asr.a, `make lib` at the top) and the two reusable
 # server modules (../server/http_util.c, ../server/stream_out.c) are used
@@ -43,7 +45,7 @@ B := $(TOP)/build/gpu
 C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
 CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
 
-.PHONY: all cpu clean test-kernels test-stream bank-transcribe lib
+.PHONY: all cpu clean test-kernels test-stream bank-transcribe gemm-shapes lib
 all: $(TOP)/mynah-asr-server-cuda
 cpu: $(TOP)/mynah-asr-server-cuda-cpuonly
 
@@ -95,6 +97,13 @@ test-kernels: $(TOP)/tests/test_cuda_kernels
 $(TOP)/tests/test_cuda_kernels: $(B)/test_cuda_kernels.o $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o
 	$(NVCC) $(GENCODE) -o $@ $^ $(CUDA_LIBS)
 
+$(B)/gemm_shapes_bench.o: $(TOP)/tests/gemm_shapes_bench.cu cuda/kernels.cuh
+	@mkdir -p $(@D)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+gemm-shapes: $(TOP)/tests/gemm_shapes_bench
+$(TOP)/tests/gemm_shapes_bench: $(B)/gemm_shapes_bench.o $(B)/gemm.o
+	$(NVCC) $(GENCODE) -o $@ $^ $(CUDA_LIBS)
+
 $(B)/test_cuda_stream.o: $(TOP)/tests/test_cuda_stream.c asr_engine.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -111,4 +120,5 @@ $(TOP)/tests/cuda_bank_transcribe: $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/
 
 clean:
 	rm -rf $(B) $(TOP)/mynah-asr-server-cuda $(TOP)/mynah-asr-server-cuda-cpuonly \
-	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe
+	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe \
+	       $(TOP)/tests/gemm_shapes_bench
