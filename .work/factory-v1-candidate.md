@@ -297,7 +297,9 @@ At the same 126.5 h ES-1 mix with the S5 recipe, raising the steps from 12,670 t
 | ES-H3 seed 0 | 23,762 | 15.35 | -2.73 |
 | ES-H3 seed 1 | 23,762 | 15.66 | -2.42 |
 | two-seed mean | | **15.51** | (REPLICATED) |
-| ES-D2 seed 0, 246 h | 23,762 | 15.07 | D2 - H3 = -0.28 |
+| ES-D2 seed 0, 246 h | 23,762 | 15.07 | -3.01 |
+| ES-D2 seed 1, 246 h | 23,762 | 14.81 | -3.27 (REPLICATED) |
+| D2 two-seed mean | | **14.94** | D2 - H3 = -0.57 on the means (BOTH; seed 0 alone read HORIZON) |
 
 - The attribution is HORIZON LEVER: doubling the hours adds about 10 % of the gain.
 - GB10 wall is about 4.6 h with S5, versus 2.5 h at 12,670 steps.
@@ -310,7 +312,9 @@ At the same 126.5 h ES-1 mix with the S5 recipe, raising the steps from 12,670 t
 
 **SLA-A** (< 20 greedy): HIGH confidence on DEV for ES (two seeds at about 15.5). It is still DEV only.
 
-**SLA-B** (< 15): not reached. D2 seed 0 is 15.07; D2 seed 1 is pending. No sealed FINAL-ES exists.
+**SLA-B** (< 15): on DEV, D2 (246 h) reaches a 14.94 two-seed mean, with seed 1 at 14.81. That is a DEV-only
+indication, not a claim: no sealed FINAL-ES exists. A two-tier ladder is suggested (HYPOTHESIS): economy, ~126 h +
+23.8k steps, ~15.5; high accuracy, ~246 h + 23.8k steps, ~14.9.
 
 **EOU:** Stage 2 v4 on H3 is MARGINAL (reset-WER +1.15, recall 93.2 %, FE 11.7 %). No EOU-qualified
 Factory-v1.1 model exists yet. Stage-2 preservation is a separate line, pre-registered before any GPU use.
