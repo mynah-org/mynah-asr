@@ -249,3 +249,25 @@ the v4 identity preflight, and the pre-registration commit. Launching the stage 
 - Whether internal-class FE in ES matches FR. R2 is report only.
 - The ES stage-2 seed spread.
 - Whether the v4 selection rule behaves the same on an S5 parent (which step gets selected).
+
+## CPU prep status (2026-10-26)
+
+CPU only on dgx2 (nice 19 / ionice idle, <= 4 workers, no GPU, no model decode, `~/gpu.lock` untouched, anonymous Hub
+reads). Pre-registration: trainB `finetune/eou/plans/ES-S2Q-prereg.md` (356eec0). **Stage 2 NOT launched.**
+- Commits (trainB, local): 9d2ccad `prepare_eou_v2.py --lang es` (+ SRC / ENDING es; fr unchanged, unit test);
+  6fadfeb `s2_mix.sh` A1 `TIMEOUT_S2` (default 3600) + A2 selection summary; 8c5733a `two_stage.py --device cpu`
+  (audits only, ops amendment A3, needed to audit on a busy-GPU box); 356eec0 pre-registration.
+- v4 identity (OBSERVED, CPU, git 8c5733a): FR G1E mix X 14abd1047c66d1df / Y 5f8b73b686b48e15 = frozen v4,
+  IDENTICAL. ES mix X 716e67088eca5382 / Y 500bc3621129cf16 (4,800 samples, EOU share 1.0); 0 ES clips > 20 s.
+- Banks (mTEDx-es train shards 2-9, 3.51 GB downloaded; test / valid 28 talks and shards 0-1 34 talks reserved):
+  DEV-EOU-ES 258 clips / 57 talks / 0.56 h (internal 50 / 50 / 50 / 8, endpoint 100), SHA256SUMS sha256
+  19713f2fddc1f16cf5036106ba7d8c5c82a83152d84291d3027663dd9dbd6495 (dgx2 `~/ft/eou_es/bank/dev`).
+  **FINAL-EOU-ES SEALED**: 265 clips / 83 talks / 0.61 h (50 / 50 / 50 / 15, endpoint 100),
+  **SEAL.sha256 b8a15e44d92d13d75b1a034c4a944325f4a6f921fc13eea84c80871fef1e51e7**; tgz c148f09b (55.7 MB) in
+  `~/ft/eou_es/sealed/`; local FINAL audio, manifests and raw shards removed. Never decoded.
+- Leakage: 0 text / 0 talk-id / 0 speaker-field overlap of both halves with train_*_es, mix/es train_*, the ES-D2 mix
+  (dgx1, read-only copy) and harness-es; DEV vs FINAL 0; banks vs reserved talks 0. Exclusion list
+  `~/ft/eou_es/bank/exclusions_es.json` (6da7d342).
+- Disk: ~/ft/eou_es 277 MB after cleanup (peak ~3.8 GB); dgx2 1.6 TB free.
+- Pending (need a model): launch-box parent sha256 + `/proc` env; Stage 2 GPU 25-50 min; PROBE ~5 min; s2_reset
+  harness-es CPU 45-70 min; DEV-EOU-ES decode CPU 15-25 min.
