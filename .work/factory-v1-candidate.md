@@ -288,3 +288,29 @@ number does not satisfy an SLA):
 - O1 logged.
 
 The other items are refinements.
+
+## 5. Update 2026-10-26 evening: the horizon result (OBSERVED; trainB plans/SUB15-ESD2-prereg.md)
+At the same 126.5 h ES-1 mix with the S5 recipe, raising the steps from 12,670 to 23,762 gives:
+
+| run | steps | greedy | Δ vs S5 s0 (18.08) |
+|---|---|---|---|
+| ES-H3 seed 0 | 23,762 | 15.35 | -2.73 |
+| ES-H3 seed 1 | 23,762 | 15.66 | -2.42 |
+| two-seed mean | | **15.51** | (REPLICATED) |
+| ES-D2 seed 0, 246 h | 23,762 | 15.07 | D2 - H3 = -0.28 |
+
+- The attribution is HORIZON LEVER: doubling the hours adds about 10 % of the gain.
+- GB10 wall is about 4.6 h with S5, versus 2.5 h at 12,670 steps.
+- The NO-GOOD-HYP mass fell by about 1.8 points: the candidate set improves, not only greedy.
+
+**Exposure contract, proposed v1.1 (supersedes section 2.3's rule for ~126 h pools):**
+- N = 23,762 steps for a ~126 h four-source pool (9.4 passes).
+- The "4.6 passes" rule undersized the horizon at this pool size and is retired as a sizing rule. The horizon above
+  23,762 is still UNKNOWN.
+
+**SLA-A** (< 20 greedy): HIGH confidence on DEV for ES (two seeds at about 15.5). It is still DEV only.
+
+**SLA-B** (< 15): not reached. D2 seed 0 is 15.07; D2 seed 1 is pending. No sealed FINAL-ES exists.
+
+**EOU:** Stage 2 v4 on H3 is MARGINAL (reset-WER +1.15, recall 93.2 %, FE 11.7 %). No EOU-qualified
+Factory-v1.1 model exists yet. Stage-2 preservation is a separate line, pre-registered before any GPU use.
