@@ -161,3 +161,25 @@ recovers, in bench and server step time, while keeping the bytes identical.
 - Both DGX GPUs are training. Every step above waits for ~/gpu.lock.
 - No ncu counters.
 - The lever needs implementing before steps 1-4.
+
+## Implementation gate (2026-10-26)
+
+Gate 0 ran on 2026-10-25 on dgx2: PROCEED (own-tc minus cuBLAS 1.37 ms/pass at lanes 8, 1.58 ms at lanes 16; own-tc
+at 70 / 69 % of roofline). Implementation starts 2026-10-26 ~11:00 CET on branch `feat/smallm-cpasync` from main
+d947275 (local only, not pushed). Gates restated with no threshold change:
+
+1. **Parity.** test_cuda_kernels memcmp of the cp.async variant against the current path: 9 shapes x M in
+   {1, 7, 8, 28, 32, 33, 63, 64} x act {0,1,2} x accumulate {0,1} x vec on/off, NSTAGE 3 and 4; then test_cuda_stream
+   gates A/B/C (`--precision bf16 --gemm own-tc`). Any mismatch = REJECT.
+2. **Kernel A/B.** `tests/gemm_shapes_bench --model nemotron --lanes 8,16,32 --q 4 --dec-iters 10 --reps 20`, A vs B,
+   ABBA. PASS iff B cuts summed own-tc GEMM ms/pass by >= 10 % at lanes 8 AND lanes 16, and every shape is within
+   +3 %. Otherwise NULL/HARM and STOP; the only variation allowed is NSTAGE 3 vs 4.
+
+Gate 3 (device ABBA) only after a gate-2 PASS; gate 4 (server) is out of this session's scope.
+**Time-box:** if the prototype has not reached gate 2 by ~14:00 CET (3 h wall), stop and report where it is.
+
+**Outcome (2026-10-26, dgx2).** Branch feat/smallm-cpasync c71cdf0 + 24ac5fc (local, not pushed). Gate 1 PASS
+(4320 memcmp calls 0 mismatches; stream gates A/B/C PASS, also with --pass-lanes 2). Gate 2 FAIL = **HARM**:
+summed own-tc GEMM ms/pass A -> B, NSTAGE 3: lanes 8 9.80 -> 11.06 (+12.9 %), lanes 16 10.44 -> 11.75 (+12.5 %),
+lanes 32 +4.1 %; NSTAGE 4: +12.7 % / +15.2 % / +3.1 %. Wide shapes (ff_w1/ff_w2, head, ss_lin) +15..33 %; narrow
+1024x1024 shapes within noise. Lever closed; gates 3-4 not run. Raw: HF results/dgx-2026-10-26/serving-cpasync.
