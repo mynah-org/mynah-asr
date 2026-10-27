@@ -318,3 +318,21 @@ indication, not a claim: no sealed FINAL-ES exists. A two-tier ladder is suggest
 
 **EOU:** Stage 2 v4 on H3 is MARGINAL (reset-WER +1.15, recall 93.2 %, FE 11.7 %). No EOU-qualified
 Factory-v1.1 model exists yet. Stage-2 preservation is a separate line, pre-registered before any GPU use.
+
+## 6. Sealed FINAL-ES (2026-10-27; trainB plans/FINAL-ES-prereg.md, seal d33bfac7)
+- **Bank:** held-out, never decoded; the four DEV splits; 663 clips (MLS 200 / CV 200 / VP 140 with 3 speakers /
+  FLEURS 123). Leakage 0.
+- **Results, macro greedy streaming at the 0.5 s flush:**
+  - **H3** (126 h, 23.8k steps, S5): **13.41 / 13.32**, mean **13.37**;
+  - **D2** (246 h): **12.97 / 12.51**, mean **12.74**.
+- **Bands (frozen): SUB15 CONFIRMED on the sealed FINAL for both recipes and every seed.**
+- **The bank is easier:** FINAL is ~2.2 points easier than harness-es, uniformly; no digit texts, 1-20 s clips, VP
+  with 3 speakers. Compare FINAL with FINAL only.
+- **The data step survives:** D2 - H3 = -0.63 on the means (DEV -0.57).
+
+**SLA-B (< 15): MET on the sealed FINAL-ES for ES** (this protocol, read / parliament domains, no OOD, no EOU).
+
+**Still open:**
+- the EOU qualification (Stage 2 MARGINAL);
+- OOD-ES;
+- a second language: the Dutch prospective test.
