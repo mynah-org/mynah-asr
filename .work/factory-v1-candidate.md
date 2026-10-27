@@ -336,3 +336,31 @@ Factory-v1.1 model exists yet. Stage-2 preservation is a separate line, pre-regi
 - the EOU qualification (Stage 2 MARGINAL);
 - OOD-ES;
 - a second language: the Dutch prospective test.
+
+### 6b. FINAL-ES evidence, separated by status
+**PRE-REGISTERED FINAL evidence** (the claim):
+- H3 13.41 / 13.32 (mean 13.37) and D2 12.97 / 12.51 (mean 12.74);
+- SUB15 CONFIRMED on the sealed FINAL-ES protocol.
+
+**POST-SEAL REPORT-ONLY controls** (amendment 1, after the pre-registered decode; never used for any claim or
+selection):
+
+| model | FINAL greedy |
+|---|---|
+| ES-1 | 15.45 |
+| S5 s0 | 15.51 |
+| S5 s1 | 15.79 |
+| S5 mean | 15.65 |
+
+| step | per seed | mean |
+|---|---|---|
+| S5 -> H3, horizon | -2.10 / -2.47 | **-2.28** |
+| H3 -> D2, data | -0.44 / -0.81 | **-0.63** |
+
+- The DEV -> FINAL shift is -1.9 to -2.6 for every model, so FINAL is a uniformly easier bank.
+- **The horizon and data effects reproduce on held-out data.**
+
+**Factory tiers (proposal; nothing frozen yet):**
+- **Economy:** H3, ~126 h, 23.8k steps, S5, ~4.6 GB10-h. FINAL ~13.4.
+- **Accuracy:** D2, ~246 h, 23.8k steps, S5. FINAL ~12.7.
+- **Open:** EOU qualification (Stage 2 MARGINAL), OOD, and the cross-language prospective test (Dutch).
