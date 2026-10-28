@@ -222,8 +222,22 @@ wait_lines() {  # pattern file count timeout_tenths
     done
     grep -cE "$1" "$2" 2>/dev/null || echo 0
 }
-t=$(wait_lines '^\[TOPOLOGY\] v=1 worker=[01] ' "$TMP/pf.log" 2 300)
-[ "$t" = "2" ] || { echo "server-metrics prefork FAIL: $t [TOPOLOGY] lines, expected 2"; fail=1; }
+# Counted as occurrences, not as lines that begin with it: the workers share
+# one stderr, so a line can follow another worker's partial output on the same
+# line. A fleet that starts one worker still counts 1 and fails.
+wait_count() {  # pattern file count timeout_tenths
+    j=0
+    while [ $j -lt "$4" ]; do
+        n=$(grep -oE "$1" "$2" 2>/dev/null | wc -l | tr -d ' ')
+        [ "$n" -ge "$3" ] && { echo "$n"; return 0; }
+        sleep 0.1
+        j=$((j + 1))
+    done
+    grep -oE "$1" "$2" 2>/dev/null | wc -l | tr -d ' '
+}
+t=$(wait_count '\[TOPOLOGY\] v=1 worker=[01] ' "$TMP/pf.log" 2 300)
+[ "$t" = "2" ] || { echo "server-metrics prefork FAIL: $t [TOPOLOGY] lines, expected 2";
+                    grep -n 'TOPOLOGY\|prefork: worker' "$TMP/pf.log" | head -8; fail=1; }
 
 # SIGUSR1 on the parent reaches both workers, and nobody dies
 kill -USR1 "$SRV_PID" 2>/dev/null

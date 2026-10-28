@@ -696,11 +696,23 @@ void mynah_asr_prefork_print_topology(FILE *out, int threads) {
     topo_token(actual, atok, sizeof(atok));
     topo_token(g_configured_mask[0] != '\0' ? g_configured_mask : "inherited",
                ctok, sizeof(ctok));
-    fprintf(out, "[TOPOLOGY] v=1 worker=%d pid=%d configured_mask=%s "
-                 "actual_mask=%s threads=%d pinned=%s\n",
-            g_worker_index, (int)getpid(), ctok, atok, threads,
-            pinned ? "yes" : "no");
+    /* One write(2) for the whole line: every worker of a fleet prints it to
+     * the same inherited stderr, and an unbuffered fprintf may split a line
+     * into several writes that another worker's output can land between. */
+    char line[768];
+    int n = snprintf(line, sizeof(line), "[TOPOLOGY] v=1 worker=%d pid=%d configured_mask=%s "
+                                         "actual_mask=%s threads=%d pinned=%s\n",
+                     g_worker_index, (int)getpid(), ctok, atok, threads,
+                     pinned ? "yes" : "no");
+    if (n < 0) return;
+    if ((size_t)n >= sizeof(line)) { n = (int)sizeof(line) - 1; line[n - 1] = '\n'; }
     fflush(out);
+    for (const char *p = line; n > 0;) {
+        const ssize_t w = write(fileno(out), p, (size_t)n);
+        if (w < 0) { if (errno == EINTR) continue; return; }
+        p += w;
+        n -= (int)w;
+    }
 }
 int mynah_asr_prefork_worker_model(void) { return g_worker_group; }
 const char *mynah_asr_prefork_model_plan(void) { return g_group_plan; }
