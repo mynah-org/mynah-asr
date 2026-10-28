@@ -243,6 +243,10 @@ static const char *cpu_slot_text(const cpu_engine *e, int slot) {
     if (slot < 0 || slot >= e->cap || !e->slots[slot].stream) return "";
     return mynah_asr_stream_text(e->slots[slot].stream);
 }
+static int cpu_slot_tokens(const cpu_engine *e, int slot, const int **tok, const int **frames) {
+    if (slot < 0 || slot >= e->cap || !e->slots[slot].stream) return -1;
+    return mynah_asr_stream_tokens(e->slots[slot].stream, tok, frames);
+}
 static const char *cpu_slot_lang(const cpu_engine *e, int slot) {
     if (slot < 0 || slot >= e->cap) return "";
     return e->slots[slot].lang;
@@ -320,6 +324,7 @@ static int ops_slot_feed(asr_engine *e, int s, const float *p, size_t n) { retur
 static int ops_slot_ready(const asr_engine *e, int s) { return cpu_slot_ready(CCE(e), s); }
 static double ops_slot_audio(const asr_engine *e, int s) { return cpu_slot_audio_s(CCE(e), s); }
 static const char *ops_slot_text(const asr_engine *e, int s) { return cpu_slot_text(CCE(e), s); }
+static int ops_slot_tokens(const asr_engine *e, int s, const int **t, const int **f) { return cpu_slot_tokens(CCE(e), s, t, f); }
 static const char *ops_slot_lang(const asr_engine *e, int s) { return cpu_slot_lang(CCE(e), s); }
 static int ops_step(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { return cpu_step(CE(e), r, n, o); }
 static int ops_dead(const asr_engine *e) { return cpu_dead(CCE(e)); }
@@ -330,5 +335,6 @@ static const asr_engine_ops CPU_OPS = {
     ops_slot_feed, ops_slot_ready, ops_slot_audio, ops_slot_text, ops_slot_lang, ops_step, ops_dead,
     ops_error, ops_dispatch,
     NULL, NULL, NULL,   /* no split step, no feed team: the reference stays serial */
+    ops_slot_tokens,
 };
 static const asr_engine_ops *cpu_ops(void) { return &CPU_OPS; }

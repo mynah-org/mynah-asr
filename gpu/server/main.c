@@ -23,10 +23,13 @@
 #endif
 #include "asr_engine.h"
 #include "hostprof.h"
+#include "recovery_pool.h"
 
 #include "cJSON.h"
 #include "http_util.h"
+#include "recovery.h"
 #include "stream_out.h"
+#include "tokenizer.h"
 #include "ws.h"
 
 #include <arpa/inet.h>
@@ -57,7 +60,8 @@
 #define REQ_HEAD_MAX 8192
 
 enum { SLOT_FREE = 0, SLOT_CLAIMED, SLOT_ACTIVE, SLOT_DONE };
-enum { REQ_FINALIZE = 1, REQ_CLOSE = 2, REQ_CANCEL = 4, REQ_RESET = 8 };
+enum { REQ_FINALIZE = 1, REQ_CLOSE = 2, REQ_CANCEL = 4, REQ_RESET = 8,
+       REQ_SESSION = 16 /* with REQ_RESET: a new session (--empty-recovery only) */ };
 enum { CB_IDLE = 0, CB_PEER, CB_FRAME, CB_PROTOCOL, CB_SHUTDOWN, CB_AUDIO_LIMIT, CB_DECODE, CB_OTHER, CB__N };
 static const char *const CANCEL_NAME[CB__N] = {
     "idle_timeout", "peer_gone", "frame_too_large", "protocol_error",
@@ -92,6 +96,20 @@ typedef struct {
     int done;                     /* the engine thread ended the session */
     int engine_open;              /* the engine slot holds this utterance */
     int abandoned;                /* the ingest gave up waiting: end_session releases */
+    /* --empty-recovery: set by the ingest before the session is ACTIVE */
+    int recover;                  /* the session asked for it (query recover=0|1) */
+    /* --empty-recovery, engine thread only: the current turn's PCM (up to
+     * max_turn_s), a rolling tail of its last replay_frames frames, the
+     * previous turn's tail and transcript, and the held turn */
+    float *rcur, *rtail, *rprev;
+    size_t rcur_n, rtail_pos, rtail_total, rprev_n;
+    int rcur_over;                /* the turn outgrew rcur: not recoverable */
+    char *rprev_text;
+    double turn_t1;               /* t1 of the turn's last delta */
+    int rjob;                     /* recovery job holding this turn's `done` (-1 none) */
+    unsigned rgen;                /* bumped on every cancel: a stale result is dropped */
+    int rclose;                   /* the held turn ends the session */
+    double rt_fin;                /* when the held turn finished */
 } gslot;
 
 /* ---------------------------------------------------------------- global */
@@ -138,6 +156,16 @@ static struct {
     unsigned long windows, window_staged;
     double window_ms_sum;
     double startup_ms;
+    /* --empty-recovery (S18): spare engine slots [cap, cap + rec_slots) */
+    int rec_on, rec_slots, rec_rows, rec_deadline_ms;
+    rpool *rp;
+    mynah_asr_tokenizer rec_tk;
+    size_t rec_max_turn, rec_tail_cap;
+    /* books, under mu */
+    unsigned long rec_empty, rec_attempted, rec_accepted_phase, rec_accepted_replay, rec_rejected,
+                  rec_skipped_busy, rec_skipped_long, rec_deadline, rec_cancelled, rec_lanes, rec_steps,
+                  rec_errors;
+    int rec_pending;
 } g;
 
 static double now_s(void) {
@@ -363,9 +391,7 @@ static void frame_error(gslot *s, const char *code, const char *msg) {
     frame_common(j, s, 0.0, 0.0);
     frame_send(s, j);
 }
-static void frame_delta(gslot *s, const asr_step_out *o, double lag_ms) {
-    const char *lang = asr_engine_slot_lang(g.eng, s->id);
-    if (!lang || !lang[0]) lang = s->lang;
+static void frame_delta_lang(gslot *s, const asr_step_out *o, double lag_ms, const char *lang) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "type", "delta");
     cJSON_AddStringToObject(j, "text", o->text);
@@ -378,8 +404,14 @@ static void frame_delta(gslot *s, const asr_step_out *o, double lag_ms) {
     frame_common(j, s, o->t1, lag_ms);
     frame_send(s, j);
 }
-static void frame_done(gslot *s) {
+static void frame_delta(gslot *s, const asr_step_out *o, double lag_ms) {
     const char *lang = asr_engine_slot_lang(g.eng, s->id);
+    if (!lang || !lang[0]) lang = s->lang;
+    frame_delta_lang(s, o, lag_ms, lang);
+}
+/* recovery: NULL = the plain frame; else the kind of the attempt that won */
+static void frame_done_ex(gslot *s, const char *recovery, const char *lang_override) {
+    const char *lang = lang_override && lang_override[0] ? lang_override : asr_engine_slot_lang(g.eng, s->id);
     if (!lang || !lang[0]) lang = s->lang;
     const double audio_s = asr_engine_slot_audio_s(g.eng, s->id);
     cJSON *j = cJSON_CreateObject();
@@ -392,16 +424,25 @@ static void frame_done(gslot *s) {
     cJSON_AddNumberToObject(j, "lag_p50_ms", hist_quantile(s->lag_hist, 0.5));
     cJSON_AddNumberToObject(j, "lag_max_ms", s->lag_max_ms);
     cJSON_AddNumberToObject(j, "audio_seconds", audio_s);
+    if (recovery) {
+        cJSON_AddBoolToObject(j, "recovered", 1);
+        cJSON_AddStringToObject(j, "recovery", recovery);
+    }
     frame_common(j, s, audio_s, 0.0);
     frame_send(s, j);
 }
+static void frame_done(gslot *s) { frame_done_ex(s, NULL, NULL); }
 
 /* -------------------------------------------------------- engine thread */
+static void rec_cancel(gslot *s);
+static void rec_session_clear(gslot *s);
+
 static void end_session(gslot *s, const char *outcome) {
     /* engine-thread only: records the outcome, closes the writer, wakes the
      * ingest -- or, when the ingest already gave up on this slot, releases the
      * slot and the writer itself (the ingest cannot: the engine was still
      * using both). Exactly one side releases, decided under s->mu. */
+    if (g.rec_on) { rec_cancel(s); rec_session_clear(s); }
     pthread_mutex_lock(&s->mu);
     if (s->outcome == NULL && outcome) s->outcome = outcome;
     s->state = SLOT_DONE;
@@ -444,6 +485,176 @@ static void ring_take(gslot *s, float *dst, size_t n) {
     s->ring_len -= n;
 }
 
+/* ------------------------------------------- empty-turn recovery (S18)
+ * --empty-recovery: a turn that finalizes with no content holds its `done`
+ * while the plan's attempts decode on spare engine slots (recovery_pool.h);
+ * the accepted text is published as one final delta before a `done` marked
+ * "recovered". Everything below is engine-thread only and reached only with
+ * g.rec_on; off, the server never calls it. */
+/* bytes of the previous turn's transcript kept per slot (its tail) */
+#define REC_PREV_TEXT_CAP 1024
+
+/* every slot's retention, carved once at start-up (no allocation on the
+ * engine thread) and released at exit */
+static int rec_alloc(gslot *s) {
+    if (s->rcur) return 0;
+    s->rprev_text = calloc(REC_PREV_TEXT_CAP, 1);
+    if (!s->rprev_text) return -1;
+    s->rcur = malloc((g.rec_max_turn ? g.rec_max_turn : 1) * sizeof(float));
+    s->rtail = malloc((g.rec_tail_cap ? g.rec_tail_cap : 1) * sizeof(float));
+    s->rprev = malloc((g.rec_tail_cap ? g.rec_tail_cap : 1) * sizeof(float));
+    if (!s->rcur || !s->rtail || !s->rprev) {
+        free(s->rcur); free(s->rtail); free(s->rprev); free(s->rprev_text);
+        s->rcur = s->rtail = s->rprev = NULL;
+        s->rprev_text = NULL;
+        return -1;
+    }
+    s->rcur_n = s->rtail_pos = s->rtail_total = s->rprev_n = 0;
+    s->rcur_over = 0;
+    return 0;
+}
+
+/* the samples just handed to the engine for this slot's current turn */
+static void rec_capture(gslot *s, const float *pcm, size_t n) {
+    if (!g.rec_on || !s->recover || n == 0) return;
+    if (rec_alloc(s) != 0) { s->rcur_over = 1; return; }
+    if (!s->rcur_over) {
+        if (s->rcur_n + n <= g.rec_max_turn) { memcpy(s->rcur + s->rcur_n, pcm, n * sizeof(float)); s->rcur_n += n; }
+        else s->rcur_over = 1;
+    }
+    const size_t cap = g.rec_tail_cap;
+    if (cap == 0) return;
+    const float *src = n > cap ? pcm + (n - cap) : pcm;
+    size_t m = n > cap ? cap : n;
+    while (m > 0) {
+        const size_t at = s->rtail_pos % cap, run = cap - at < m ? cap - at : m;
+        memcpy(s->rtail + at, src, run * sizeof(float));
+        s->rtail_pos = (at + run) % cap;
+        src += run; m -= run;
+    }
+    s->rtail_total += n;
+}
+
+static void rec_turn_clear(gslot *s) {
+    s->rcur_n = 0; s->rcur_over = 0; s->rtail_pos = 0; s->rtail_total = 0; s->turn_t1 = 0.0;
+}
+
+static void rec_session_clear(gslot *s) {
+    rec_turn_clear(s);
+    s->rprev_n = 0;
+    if (s->rprev_text) s->rprev_text[0] = '\0';
+}
+
+/* the turn is over (published): it becomes the previous turn of the next */
+static void rec_turn_end(gslot *s, const char *text) {
+    if (s->rprev && s->rtail && g.rec_tail_cap > 0) {
+        const size_t cap = g.rec_tail_cap, m = s->rtail_total < cap ? s->rtail_total : cap;
+        /* the last m samples of the rolling tail, oldest first */
+        const size_t start = (s->rtail_pos + cap - m) % cap;
+        const size_t first = cap - start < m ? cap - start : m;
+        memcpy(s->rprev, s->rtail + start, first * sizeof(float));
+        if (m > first) memcpy(s->rprev + first, s->rtail, (m - first) * sizeof(float));
+        s->rprev_n = m;
+    }
+    /* the END of the transcript is what the echo gate and the ownership rule
+     * read: a long one keeps its tail, cut on a UTF-8 boundary */
+    if (s->rprev_text) {
+        const char *t = text ? text : "";
+        size_t len = strlen(t), off = len > REC_PREV_TEXT_CAP - 1 ? len - (REC_PREV_TEXT_CAP - 1) : 0;
+        while (off < len && ((unsigned char)t[off] & 0xC0) == 0x80) off++;
+        memcpy(s->rprev_text, t + off, len - off + 1);
+    }
+    rec_turn_clear(s);
+}
+
+static void rec_cancel(gslot *s) {
+    if (s->rjob < 0) return;
+    rpool_cancel(g.rp, s->rjob);
+    s->rjob = -1;
+    s->rgen++;
+    pthread_mutex_lock(&g.mu); g.rec_cancelled++; g.rec_pending = rpool_pending(g.rp); pthread_mutex_unlock(&g.mu);
+}
+
+/* An EMPTY turn just finished: start its recovery. 1 = held (its `done`
+ * waits for the result), 0 = publish now. */
+static int rec_start(gslot *s, int close, double now) {
+    /* a finalize with no audio since the last turn (a close after `done`) is
+     * not a turn */
+    if (!s->rcur || (s->rcur_n == 0 && !s->rcur_over)) return 0;
+    pthread_mutex_lock(&g.mu); g.rec_empty++; pthread_mutex_unlock(&g.mu);
+    if (s->rcur_over) {
+        pthread_mutex_lock(&g.mu); g.rec_skipped_long++; pthread_mutex_unlock(&g.mu);
+        return 0;
+    }
+    const int j = rpool_start(g.rp, s->id, s->rgen, s->lang, s->lookahead, s->rcur, s->rcur_n,
+                              s->rprev_n ? s->rprev : NULL, s->rprev_n, s->rprev_text, now);
+    pthread_mutex_lock(&g.mu);
+    if (j >= 0) g.rec_attempted++;
+    else if (j == RP_START_BUSY) g.rec_skipped_busy++;
+    else if (j == RP_START_BOUNDS) g.rec_skipped_long++;
+    else g.rec_errors++;
+    g.rec_pending = rpool_pending(g.rp);
+    pthread_mutex_unlock(&g.mu);
+    if (j < 0) return 0;
+    s->rjob = j;
+    s->rclose = close;
+    s->rt_fin = now;
+    return 1;
+}
+
+/* Publish a held turn: the recovered delta when r accepted it, then `done`,
+ * then the turn's end (close, or the engine slot's reset when do_reset).
+ * Returns 1 when the session ended. */
+static int rec_publish(gslot *s, const rpool_result *r, int do_reset, double now) {
+    pthread_mutex_lock(&s->mu);
+    /* a close that arrived while the turn was held ends the session with this
+     * `done`, as it would have had it arrived before the turn finished */
+    const int close = s->rclose || (s->req & REQ_CLOSE) != 0;
+    if (s->req & REQ_CLOSE) s->req &= ~(REQ_FINALIZE | REQ_CLOSE);
+    pthread_mutex_unlock(&s->mu);
+    const char *text = asr_engine_slot_text(g.eng, s->id);
+    if (r && r->status == RP_ACCEPTED) {
+        asr_step_out o = {.text = r->text, .t0 = s->turn_t1, .t1 = asr_engine_slot_audio_s(g.eng, s->id),
+                          .n_tokens = 0, .finished = 1, .stepped = 0};
+        double lag_ms = (now - s->rt_fin) * 1e3;
+        if (lag_ms < 0.0) lag_ms = 0.0;
+        frame_delta_lang(s, &o, lag_ms, r->lang[0] ? r->lang : (s->lang[0] ? s->lang : "auto"));
+        s->deltas++;
+        pthread_mutex_lock(&g.mu); g.deltas++; pthread_mutex_unlock(&g.mu);
+        frame_done_ex(s, rpool_kind_name(r->kind), r->lang);
+        text = r->text;
+    } else {
+        frame_done(s);
+    }
+    rec_turn_end(s, text);
+    if (close) { end_session(s, NULL); return 1; }
+    if (do_reset && asr_engine_slot_reset(g.eng, s->id, s->lang, s->lookahead) != 0) {
+        frame_error(s, "reset_failed", "the engine could not reset the slot");
+        end_session(s, "other");
+        return 1;
+    }
+    return 0;
+}
+
+/* finished jobs and passed deadlines: publish their turns */
+static void rec_poll(double now) {
+    rpool_result r;
+    while (rpool_next_result(g.rp, now, &r)) {
+        pthread_mutex_lock(&g.mu);
+        if (r.status == RP_ACCEPTED) {
+            if (r.kind == MYNAH_ASR_ATTEMPT_REPLAY) g.rec_accepted_replay++; else g.rec_accepted_phase++;
+        } else if (r.status == RP_REJECTED) g.rec_rejected++;
+        else g.rec_deadline++;
+        g.rec_pending = rpool_pending(g.rp);
+        pthread_mutex_unlock(&g.mu);
+        if (r.owner < 0 || r.owner >= g.cap) continue;
+        gslot *s = &g.slots[r.owner];
+        if (s->rjob != r.job || s->rgen != r.gen) continue;   /* stale: cancelled meanwhile */
+        s->rjob = -1;
+        (void)rec_publish(s, &r, 1, now);
+    }
+}
+
 /* The stage-ahead scan (--stage-ahead 1, or a feed team): every active slot
  * whose ring holds the whole next chunk has it taken and fed, the host mel of
  * all of them in ONE batch the engine may spread over its feed team. It runs
@@ -468,7 +679,7 @@ static int stage_scan(void) {
     for (int i = 0; i < g.cap; i++) {
         gslot *s = &g.slots[i];
         pthread_mutex_lock(&s->mu);
-        if (s->state != SLOT_ACTIVE || (s->req & (REQ_CANCEL | REQ_RESET | REQ_FINALIZE))) { pthread_mutex_unlock(&s->mu); continue; }
+        if (s->state != SLOT_ACTIVE || (s->req & (REQ_CANCEL | REQ_RESET | REQ_FINALIZE)) || s->rjob >= 0) { pthread_mutex_unlock(&s->mu); continue; }
         const size_t need = asr_engine_slot_need_samples(g.eng, s->id);
         if (need == 0 || s->ring_len < need) { pthread_mutex_unlock(&s->mu); continue; }
         if (used + need > g_stage.cap) {
@@ -479,6 +690,7 @@ static int stage_scan(void) {
             g_stage.buf = nb; g_stage.cap = nc;
         }
         ring_take(s, g_stage.buf + used, need);
+        if (g.rec_on) rec_capture(s, g_stage.buf + used, need);
         pthread_cond_broadcast(&s->space);
         /* a slot in flight keeps its cohort's ready_since until publish */
         if (s->ready_since == 0.0) s->ready_since = s->ring_arrival;
@@ -500,10 +712,12 @@ static int stage_scan(void) {
 static void *engine_main(void *arg) {
     (void)arg;
     mynah_asr_thread_set_name("mynah-gpu");
-    asr_step_req *reqs = calloc((size_t)g.cap, sizeof(*reqs));
-    asr_step_out *outs = calloc((size_t)g.cap, sizeof(*outs));
-    gslot **lane = calloc((size_t)g.cap, sizeof(*lane));
-    double *arrival = calloc((size_t)g.cap, sizeof(double));
+    /* live lanes first, then at most --recovery-rows recovery lanes */
+    const size_t nlanes = (size_t)g.cap + (size_t)(g.rec_on ? g.rec_rows : 0);
+    asr_step_req *reqs = calloc(nlanes, sizeof(*reqs));
+    asr_step_out *outs = calloc(nlanes, sizeof(*outs));
+    gslot **lane = calloc(nlanes, sizeof(*lane));
+    double *arrival = calloc(nlanes, sizeof(double));
     float *stage = malloc(((size_t)g.ring_seconds * (size_t)g.facts.sample_rate + 1) * sizeof(float));
     g_stage.slot = calloc((size_t)g.cap, sizeof(int));
     g_stage.pcm = calloc((size_t)g.cap, sizeof(float *));
@@ -529,6 +743,7 @@ static void *engine_main(void *arg) {
 #define HPL(ph) do { if (hpf) hostprof_lap(&hpc, (ph)); } while (0)
 
     while (!atomic_load(&g.shutdown)) {
+        if (g.rec_on) rec_poll(now_s());   /* deadlines, also while idle */
         if (pre) { (void)stage_scan(); HPL(HP_WINDOW); }
         /* 1. requests: cancel / reset / finalize, and staging of ready chunks */
         int n = 0;
@@ -547,12 +762,25 @@ static void *engine_main(void *arg) {
                 continue;
             }
             /* peer gone: hard-only while finalizing (a legal half-close waits for done) */
-            if (s->out && mynah_asr_stream_out_peer_gone_ex(s->out, (req & REQ_FINALIZE) != 0)) {
+            if (s->out && mynah_asr_stream_out_peer_gone_ex(s->out, (req & REQ_FINALIZE) != 0 || s->rjob >= 0)) {
                 pthread_mutex_unlock(&s->mu);
                 end_session(s, "peer_gone");
                 continue;
             }
+            if (s->rjob >= 0) {
+                /* a turn held by its recovery: the next utterance waits for
+                 * its `done`; a reset cancels the recovery and publishes it */
+                if (!(req & REQ_RESET)) { pthread_mutex_unlock(&s->mu); continue; }
+                pthread_mutex_unlock(&s->mu);
+                rec_cancel(s);
+                if (rec_publish(s, NULL, 0, now)) continue;
+                pthread_mutex_lock(&s->mu);
+            }
             if (req & REQ_RESET) {
+                if (g.rec_on) {
+                    if (s->req & REQ_SESSION) rec_session_clear(s); else rec_turn_clear(s);
+                    s->req &= ~REQ_SESSION;
+                }
                 s->req &= ~REQ_RESET;
                 char lang[16];
                 snprintf(lang, sizeof(lang), "%s", s->reset_lang[0] ? s->reset_lang : s->lang);
@@ -579,6 +807,7 @@ static void *engine_main(void *arg) {
             if (take > 0) {
                 HPL(HP_SCAN);
                 ring_take(s, stage, take);
+                if (g.rec_on) rec_capture(s, stage, take);
                 pthread_cond_broadcast(&s->space);
                 if (s->ready_since == 0.0) s->ready_since = s->ring_arrival;
                 HPL(HP_STAGE);
@@ -607,9 +836,24 @@ static void *engine_main(void *arg) {
         }
         HPL(HP_SCAN);
 
+        /* recovery lanes: LOWEST priority, after every ready live lane, at
+         * most --recovery-rows, and only into room a full live cohort would
+         * use (n + nrec <= cap): a recovery never takes a live lane's place
+         * nor makes a step larger than a full live one; when the step is
+         * full they wait. They never start a cohort window of their own:
+         * with live lanes ready they ride the live step, alone they step at
+         * once. */
+        int nrec = 0;
+        if (g.rec_on && g.rec_pending > 0) {
+            int room = g.cap - n;
+            if (room > g.rec_rows) room = g.rec_rows;
+            nrec = rpool_lanes(g.rp, reqs + n, room);
+            if (nrec < 0) engine_dead_exit();
+        }
+
         /* 2. the cohort policy: step when the oldest ready chunk has waited
          * --cohort-ms, or the set is the whole arena; otherwise wait */
-        if (n == 0) {
+        if (n == 0 && nrec == 0) {
             pthread_mutex_lock(&g.mu);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -620,8 +864,8 @@ static void *engine_main(void *arg) {
             pthread_mutex_unlock(&g.mu);
             continue;
         }
-        const double waited_ms = (now - oldest) * 1e3;
-        if (n < g.cap && waited_ms < (double)g.cohort_ms) {
+        const double waited_ms = n > 0 ? (now - oldest) * 1e3 : 0.0;
+        if (n > 0 && n < g.cap && waited_ms < (double)g.cohort_ms) {
             pthread_mutex_lock(&g.mu);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -640,15 +884,16 @@ static void *engine_main(void *arg) {
         const double t_step = now_s();
         double win_ms = 0.0;
         int win_k = 0;
+        const int nstep = n + nrec;
         if (split) {
-            if (asr_engine_step_submit(g.eng, reqs, n, outs) != 0) engine_dead_exit();
+            if (asr_engine_step_submit(g.eng, reqs, nstep, outs) != 0) engine_dead_exit();
             HPL(HP_STEP);
             const double t_w = now_s();
             win_k = stage_scan();                  /* under the encoder pass */
             win_ms = (now_s() - t_w) * 1e3;
             HPL(HP_WINDOW);
             if (asr_engine_step_finish(g.eng, outs) != 0) engine_dead_exit();
-        } else if (asr_engine_step(g.eng, reqs, n, outs) != 0) engine_dead_exit();
+        } else if (asr_engine_step(g.eng, reqs, nstep, outs) != 0) engine_dead_exit();
         const double t_end = now_s();
         double dev_wait_us = 0.0;
         if (hpf) {
@@ -659,6 +904,7 @@ static void *engine_main(void *arg) {
         }
         pthread_mutex_lock(&g.mu);
         if (split) { g.windows++; g.window_ms_sum += win_ms; g.window_staged += (unsigned long)win_k; }
+        if (nrec > 0) { g.rec_lanes += (unsigned long)nrec; g.rec_steps++; }
         g.cohorts++;
         g.cohort_lanes_sum += (unsigned long)n;
         g.cohort_wait_ms_sum += waited_ms;
@@ -680,6 +926,7 @@ static void *engine_main(void *arg) {
                 double lag_ms = arrival[a] > 0.0 ? (t_end - arrival[a]) * 1e3 : 0.0;
                 if (lag_ms < 0.0) lag_ms = 0.0;
                 frame_delta(s, o, lag_ms);
+                s->turn_t1 = o->t1;
                 s->deltas++;
                 s->lag_sum_ms += lag_ms;
                 if (lag_ms > s->lag_max_ms) s->lag_max_ms = lag_ms;
@@ -696,7 +943,15 @@ static void *engine_main(void *arg) {
                 const int close = (s->req & REQ_CLOSE) != 0;
                 s->req &= ~(REQ_FINALIZE | REQ_CLOSE);
                 pthread_mutex_unlock(&s->mu);
-                frame_done(s);
+                if (g.rec_on) {
+                    const char *text = asr_engine_slot_text(g.eng, s->id);
+                    /* an EMPTY turn of a session that asked: held for its recovery */
+                    if (s->recover && text[0] == '\0' && rec_start(s, close, t_end)) continue;
+                    frame_done(s);
+                    rec_turn_end(s, text);
+                } else {
+                    frame_done(s);
+                }
                 if (close) {
                     end_session(s, NULL);
                 } else {
@@ -708,6 +963,10 @@ static void *engine_main(void *arg) {
                     }
                 }
             }
+        }
+        if (nrec > 0) {
+            rpool_stepped(g.rp, reqs + n, outs + n, nrec);
+            rec_poll(now_s());
         }
         if (hpf) {
             hostprof_lap(&hpc, HP_PUBLISH);
@@ -729,14 +988,17 @@ static void *engine_main(void *arg) {
 }
 
 /* ------------------------------------------------------------ WebSocket */
-typedef struct { char lang[16]; int lookahead, f32; } ws_params;
+typedef struct { char lang[16]; int lookahead, f32, recover; } ws_params;
 
 #define WS_QUERY_ACCEPTED "model, lang, lookahead, format, rate"
+/* `recover` is a key only with --empty-recovery: off, the query surface is unchanged */
+#define WS_QUERY_ACCEPTED_REC WS_QUERY_ACCEPTED ", recover"
 
 static int ws_parse_query(const char *query, ws_params *p, const char **code, char *msg, size_t cap) {
     snprintf(p->lang, sizeof(p->lang), "auto");
     p->lookahead = g.facts.default_lookahead;
     p->f32 = 0;
+    p->recover = g.rec_on;
     if (!query || !query[0]) return 0;
     const char *q = query;
     while (*q) {
@@ -791,9 +1053,18 @@ static int ws_parse_query(const char *query, ws_params *p, const char **code, ch
                 snprintf(msg, cap, "rate '%s' is not served; accepted: %s (resample client-side)", tok, want);
                 *code = "unsupported_rate"; return 400;
             }
+        } else if (g.rec_on && strcmp(key, "recover") == 0) {
+            if (strcmp(val, "0") == 0) p->recover = 0;
+            else if (val[0] == '\0' || strcmp(val, "1") == 0) p->recover = 1;
+            else {
+                safe_token(val, tok, sizeof(tok));
+                snprintf(msg, cap, "recover '%s' is not served; accepted: 0, 1", tok);
+                *code = "invalid_request"; return 400;
+            }
         } else {
             safe_token(key, tok, sizeof(tok));
-            snprintf(msg, cap, "unknown query parameter '%s'; accepted: %s", tok, WS_QUERY_ACCEPTED);
+            snprintf(msg, cap, "unknown query parameter '%s'; accepted: %s", tok,
+                     g.rec_on ? WS_QUERY_ACCEPTED_REC : WS_QUERY_ACCEPTED);
             *code = "unknown_query_parameter"; return 400;
         }
         if (!amp) break;
@@ -939,7 +1210,8 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
     pthread_mutex_lock(&slot->mu);
     slot->out = out;
     slot->state = SLOT_ACTIVE;
-    slot->req = REQ_RESET;
+    slot->req = REQ_RESET | (g.rec_on ? REQ_SESSION : 0);
+    slot->recover = g.rec_on ? params.recover : 0;
     slot->reset_lang[0] = '\0';
     pthread_mutex_unlock(&slot->mu);
     pthread_mutex_lock(&g.mu); pthread_cond_broadcast(&g.wake); pthread_mutex_unlock(&g.mu);
@@ -1135,6 +1407,27 @@ static void health_json(cJSON *j) {
         cJSON_AddNumberToObject(st, "passes", (double)es.hprof_passes);
         cJSON_AddNumberToObject(st, "syncs", (double)es.hprof_syncs);
     }
+    if (g.rec_on) {
+        cJSON *rc = cJSON_AddObjectToObject(j, "recovery");
+        cJSON_AddNumberToObject(rc, "spare_slots", g.rec_slots);
+        cJSON_AddNumberToObject(rc, "rows", g.rec_rows);
+        cJSON_AddNumberToObject(rc, "deadline_ms", g.rec_deadline_ms);
+        cJSON_AddNumberToObject(rc, "empty_turns", (double)g.rec_empty);
+        cJSON_AddNumberToObject(rc, "attempted", (double)g.rec_attempted);
+        cJSON *ac = cJSON_AddObjectToObject(rc, "accepted");
+        cJSON_AddNumberToObject(ac, "phase", (double)g.rec_accepted_phase);
+        cJSON_AddNumberToObject(ac, "replay", (double)g.rec_accepted_replay);
+        cJSON_AddNumberToObject(ac, "total", (double)(g.rec_accepted_phase + g.rec_accepted_replay));
+        cJSON_AddNumberToObject(rc, "rejected", (double)g.rec_rejected);
+        cJSON_AddNumberToObject(rc, "skipped_busy", (double)g.rec_skipped_busy);
+        cJSON_AddNumberToObject(rc, "skipped_long", (double)g.rec_skipped_long);
+        cJSON_AddNumberToObject(rc, "deadline", (double)g.rec_deadline);
+        cJSON_AddNumberToObject(rc, "cancelled", (double)g.rec_cancelled);
+        cJSON_AddNumberToObject(rc, "errors", (double)g.rec_errors);
+        cJSON_AddNumberToObject(rc, "lanes_stepped", (double)g.rec_lanes);
+        cJSON_AddNumberToObject(rc, "steps_with_recovery", (double)g.rec_steps);
+        cJSON_AddNumberToObject(rc, "pending", g.rec_pending);
+    }
     cJSON_AddNumberToObject(j, "accept_backoffs", (double)g.accept_backoffs);
     cJSON *refused = cJSON_AddObjectToObject(j, "refused");
     cJSON_AddNumberToObject(refused, "server_at_capacity", (double)g.refused_cap);
@@ -1172,6 +1465,20 @@ static size_t metrics_text(char *b, size_t cap) {
     M("# TYPE mynah_asr_gpu_d2h_bytes_total counter\nmynah_asr_gpu_d2h_bytes_total %.0f\n", es.d2h_bytes);
     M("# TYPE mynah_asr_gpu_device_errors_total counter\nmynah_asr_gpu_device_errors_total %lu\n", es.errors);
     M("# TYPE mynah_asr_accept_backoffs_total counter\nmynah_asr_accept_backoffs_total %lu\n", g.accept_backoffs);
+    if (g.rec_on) {
+        M("# TYPE mynah_asr_recovery_empty_turns_total counter\nmynah_asr_recovery_empty_turns_total %lu\n", g.rec_empty);
+        M("# TYPE mynah_asr_recovery_attempted_total counter\nmynah_asr_recovery_attempted_total %lu\n", g.rec_attempted);
+        M("# TYPE mynah_asr_recovery_accepted_total counter\nmynah_asr_recovery_accepted_total{kind=\"phase\"} %lu\n"
+          "mynah_asr_recovery_accepted_total{kind=\"replay\"} %lu\n", g.rec_accepted_phase, g.rec_accepted_replay);
+        M("# TYPE mynah_asr_recovery_rejected_total counter\nmynah_asr_recovery_rejected_total %lu\n", g.rec_rejected);
+        M("# TYPE mynah_asr_recovery_skipped_total counter\nmynah_asr_recovery_skipped_total{reason=\"busy\"} %lu\n"
+          "mynah_asr_recovery_skipped_total{reason=\"long\"} %lu\n", g.rec_skipped_busy, g.rec_skipped_long);
+        M("# TYPE mynah_asr_recovery_deadline_total counter\nmynah_asr_recovery_deadline_total %lu\n", g.rec_deadline);
+        M("# TYPE mynah_asr_recovery_cancelled_total counter\nmynah_asr_recovery_cancelled_total %lu\n", g.rec_cancelled);
+        M("# TYPE mynah_asr_recovery_lanes_total counter\nmynah_asr_recovery_lanes_total %lu\n", g.rec_lanes);
+        M("# TYPE mynah_asr_recovery_steps_total counter\nmynah_asr_recovery_steps_total %lu\n", g.rec_steps);
+        M("# TYPE mynah_asr_recovery_pending gauge\nmynah_asr_recovery_pending %d\n", g.rec_pending);
+    }
     if (g.profile_host && k < cap)
         k += hostprof_metrics(&g.hp, es.hprof_us, ASR_HPROF_NAME, ASR_HPROF_PHASES, b + k, cap - k);
 #undef M
@@ -1225,6 +1532,13 @@ static void dump_stderr(void) {
         D("[DUMP] worker=0 seq=%lu vram used_mb=%.0f ready_mb=%.0f peak_seen_mb=%.0f total_mb=%.0f accept_backoffs=%lu\n",
           n, used, g.vram_ready_mb, g.vram_peak_mb, (double)f.vram_total / 1048576.0, g.accept_backoffs);
     }
+    if (g.rec_on)
+        D("[DUMP] worker=0 seq=%lu recovery spare_slots=%d rows=%d deadline_ms=%d empty_turns=%lu attempted=%lu "
+          "accepted_phase=%lu accepted_replay=%lu rejected=%lu skipped_busy=%lu skipped_long=%lu deadline=%lu "
+          "cancelled=%lu errors=%lu lanes=%lu steps=%lu pending=%d\n",
+          n, g.rec_slots, g.rec_rows, g.rec_deadline_ms, g.rec_empty, g.rec_attempted, g.rec_accepted_phase,
+          g.rec_accepted_replay, g.rec_rejected, g.rec_skipped_busy, g.rec_skipped_long, g.rec_deadline,
+          g.rec_cancelled, g.rec_errors, g.rec_lanes, g.rec_steps, g.rec_pending);
     D("[DUMP] v=1 worker=0 seq=%lu end\n", n);
 #undef D
     char *hb = NULL;
@@ -1422,6 +1736,12 @@ static void usage(void) {
         "       [--pass-lanes N|cap (lanes per encoder pass; default min(cap, 128))]\n"
         "       [--stage-ahead 0|1] [--host-threads N|auto] [--graphs off|buckets] [--graph-buckets 8,16,32,64,128]\n"
         "       [--warmup 0|1]  (cuda engine defaults: 1, auto, buckets, 8,16,32,64,128, 1; cpu engine: off)\n"
+        "       [--empty-recovery [--recovery-slots 8] [--recovery-rows 4] [--recovery-deadline-ms 400]]\n"
+        "  --empty-recovery: a turn that ends with no content is re-decoded on spare engine slots\n"
+        "  (--recovery-slots, reserved at open, never admitted) behind short noise prefixes plus one\n"
+        "  replay of the previous turn's tail; a text at least two attempts agree on is published as a\n"
+        "  final delta before a `done` with \"recovered\":true. Recovery lanes join the cohort steps\n"
+        "  at lowest priority, at most --recovery-rows per step; per session: query recover=0|1. Off by default.\n"
         "  --stage-ahead 1: stage and feed the next chunks while the encoder pass runs (byte-identical)\n"
         "  --host-threads: threads (engine thread included) for the host mel of a staged batch; auto =\n"
         "  1 up to 8 usable CPUs, 2 up to 16, 4 above (affinity and cgroup quota)\n"
@@ -1443,6 +1763,7 @@ int main(int argc, char **argv) {
     int dispatch_map = 0;
     const double t_start = now_s();
     g.host_threads = 1;
+    g.rec_slots = 8; g.rec_rows = 4; g.rec_deadline_ms = 400;
     const char *host_threads_arg = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1480,6 +1801,10 @@ int main(int argc, char **argv) {
         else if (ARG("--warmup")) { g.warmup = atoi(v); warmup_set = 1; }
         else if (ARG("--kv-dtype")) g.kv_dtype = v;
         else if (ARG("--weights")) g.weights = v;
+        else if (strcmp(a, "--empty-recovery") == 0) g.rec_on = 1;
+        else if (ARG("--recovery-slots")) g.rec_slots = atoi(v);
+        else if (ARG("--recovery-rows")) g.rec_rows = atoi(v);
+        else if (ARG("--recovery-deadline-ms")) g.rec_deadline_ms = atoi(v);
         else if (strcmp(a, "--dispatch-map") == 0) dispatch_map = 1;
         else if (strcmp(a, "--version") == 0) { printf("mynah-asr-server-cuda %s\n", MYNAH_ASR_BUILD); return 0; }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
@@ -1492,6 +1817,14 @@ int main(int argc, char **argv) {
     if (g.ring_seconds < 1) g.ring_seconds = 1;
     if (g.http_threads <= 0) g.http_threads = g.cap + 8;
     if (g.pass_lanes < 0) g.pass_lanes = g.cap;   /* --pass-lanes cap */
+    if (g.rec_on && (g.rec_slots < 1 || g.rec_rows < 1 || g.rec_deadline_ms < 1)) {
+        fprintf(stderr, "mynah-asr-server-cuda: --recovery-slots, --recovery-rows and --recovery-deadline-ms must be >= 1\n");
+        return 2;
+    }
+    if (g.rec_on && g.rec_slots > RPOOL_MAX_SLOTS) {
+        fprintf(stderr, "mynah-asr-server-cuda: --recovery-slots must be <= %d\n", RPOOL_MAX_SLOTS);
+        return 2;
+    }
     const int cuda_engine = strcmp(g.engine_name, "cuda") == 0;
     /* --precision/--gemm auto (the default): the fixed-order bf16 tensor-core
      * GEMM on sm_80+ (S14-8c: batch-invariant, 498-clip bank WER 0.14469 vs
@@ -1533,6 +1866,13 @@ int main(int argc, char **argv) {
                           .graphs = g.graphs, .graph_buckets = g.graph_buckets,
                           .warmup = g.warmup, .host_threads = g.host_threads,
                           .kv_dtype = g.kv_dtype, .weights = g.weights};
+    if (g.rec_on) {
+        /* the spare slots follow the session slots; only they record emission
+         * frames, so a pass without a recovery lane copies nothing extra */
+        cfg.cap = g.cap + g.rec_slots;
+        cfg.record_frames = 1;
+        cfg.record_frames_from = g.cap;
+    }
     if (strcmp(g.engine_name, "cuda") == 0) g.eng = asr_engine_open_cuda(&cfg, err, sizeof(err));
     else if (strcmp(g.engine_name, "cpu") == 0) g.eng = asr_engine_open_cpu(&cfg, err, sizeof(err));
     else { fprintf(stderr, "mynah-asr-server-cuda: --engine must be cuda or cpu\n"); return 2; }
@@ -1541,6 +1881,26 @@ int main(int argc, char **argv) {
         return strstr(err, "not compiled") ? 78 : 1;
     }
     asr_engine_get_facts(g.eng, &g.facts);
+    if (g.rec_on) {
+        char tp[1200];
+        snprintf(tp, sizeof(tp), "%s/tokens.json", g.model_dir);
+        if (mynah_asr_tokenizer_load(&g.rec_tk, tp) != 0) {
+            fprintf(stderr, "mynah-asr-server-cuda: --empty-recovery needs the pack's tokens.json (%s)\n", tp);
+            return 1;
+        }
+        rpool_cfg rc;
+        memset(&rc, 0, sizeof(rc));
+        rc.first_slot = g.cap;
+        rc.n_slots = g.rec_slots;
+        rc.deadline_s = (double)g.rec_deadline_ms / 1000.0;
+        rc.sample_rate = g.facts.sample_rate;
+        rc.frame_samples = (int)(g.facts.frame_sec * (double)g.facts.sample_rate + 0.5);
+        mynah_asr_recover_cfg_default(&rc.cfg);
+        g.rp = rpool_open(g.eng, &g.rec_tk, &rc);
+        if (!g.rp) { fprintf(stderr, "mynah-asr-server-cuda: the recovery pool did not open\n"); return 1; }
+        g.rec_max_turn = rpool_max_turn_samples(g.rp);
+        g.rec_tail_cap = (size_t)rc.cfg.replay_frames * (size_t)rc.frame_samples;
+    }
     /* what resolved: the reference engine has no feed team */
     if (g.facts.host_threads < 1) g.facts.host_threads = 1;
     g.host_threads = g.facts.host_threads;
@@ -1558,13 +1918,14 @@ int main(int argc, char **argv) {
     if (!g.slots) return 1;
     for (int i = 0; i < g.cap; i++) {
         gslot *s = &g.slots[i];
-        s->id = i; s->state = SLOT_FREE;
+        s->id = i; s->state = SLOT_FREE; s->rjob = -1;
         pthread_mutex_init(&s->mu, NULL);
         pthread_cond_init(&s->done_cv, NULL);
         pthread_cond_init(&s->space, NULL);
         s->ring_cap = (size_t)g.ring_seconds * (size_t)g.facts.sample_rate;
         s->ring = malloc(s->ring_cap * sizeof(float));
         if (!s->ring) return 1;
+        if (g.rec_on && rec_alloc(s) != 0) return 1;
     }
     pthread_mutex_init(&g.mu, NULL);
     pthread_cond_init(&g.wake, NULL);
@@ -1597,6 +1958,11 @@ int main(int argc, char **argv) {
         const size_t tn = host_topology_line(g.facts.pci_bus_id, topo, sizeof(topo));
         fwrite(topo, 1, tn, stderr);
         g.startup_ms = (now_s() - t_start) * 1e3;
+        if (g.rec_on)
+            fprintf(stderr, "[SERVER-CONFIG] empty-recovery on: spare_slots=%d (engine slots %d..%d, never admitted) rows=%d "
+                            "deadline_ms=%d max_turn_s=%.1f attempts=phase{3,4,6 frames}+replay{6 frames} min_votes=2 rule=text\n",
+                    g.rec_slots, g.cap, g.cap + g.rec_slots - 1, g.rec_rows, g.rec_deadline_ms,
+                    (double)g.rec_max_turn / (double)g.facts.sample_rate);
         fprintf(stderr, "[SERVER-CONFIG] serving-loop stage_ahead=%d split=%s host_threads=%d usable_cpus=%d graphs=%d "
                         "graph_capture_ms=%.0f warmup=%d warmup_ms=%.0f vram_used_mb=%.0f vram_total_mb=%.0f startup_ms=%.0f\n",
                 g.stage_ahead, asr_engine_can_split(g.eng) ? "yes" : "no", g.host_threads, cpus, g.facts.graphs,
@@ -1670,6 +2036,12 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&g_q.mu); pthread_cond_broadcast(&g_q.cv); pthread_mutex_unlock(&g_q.mu);
     for (int i = 0; i < g.http_threads; i++) pthread_join(pool[i], NULL);
     dump_stderr();
+    rpool_close(g.rp);
     asr_engine_close(g.eng);
+    if (g.rec_on) mynah_asr_tokenizer_free(&g.rec_tk);
+    for (int i = 0; i < g.cap; i++) {
+        free(g.slots[i].rcur); free(g.slots[i].rtail); free(g.slots[i].rprev);
+        free(g.slots[i].rprev_text);
+    }
     return 0;
 }

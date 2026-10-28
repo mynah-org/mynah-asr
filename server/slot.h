@@ -139,6 +139,30 @@ typedef struct mynah_asr_slot {
     unsigned char *frame;          /* scratch for one outgoing WS frame */
     size_t frame_cap;
     float *take;                   /* scratch for one chunk of PCM */
+    /* EMPTY-turn recovery (--empty-recovery, opt-in; server/recover_lane.h).
+     * NULL buffers when the server flag is off, and then none of this is ever
+     * read. `rec_opt` is written by the ingest between claim and arm (the
+     * scheduler ignores a slot until it is armed); everything else is the
+     * scheduler's alone, like the fields above.
+     *   rec_cur    this turn's samples as the scheduler takes them, up to the
+     *              recovery's max turn; past it `rec_over` and the turn is not
+     *              recoverable (one memcpy per take, nothing else);
+     *   rec_tail   once over, a rolling copy of the last replay-tail samples,
+     *              so the NEXT turn still has the previous turn's tail;
+     *   rec_prev   the previous turn's tail (replay vote), rec_prev_text its
+     *              transcript (bounded, the end kept: the echo gate and the
+     *              ownership rule read the end);
+     *   rec_held   this turn's `done` is held while a lane re-decodes it, until
+     *              rec_deadline; rec_gen names the turn, so a result for a turn
+     *              that is no longer held (deadline, cancel, close) is dropped. */
+    int rec_opt;
+    float *rec_cur, *rec_tail, *rec_prev;
+    size_t rec_n, rec_tail_pos, rec_tail_n, rec_prev_n;
+    int rec_over;
+    char *rec_prev_text;
+    int rec_held, rec_held_close;
+    unsigned rec_gen;
+    double rec_deadline;
     /* Who holds this slot's mutex, where they took it, and since when.
      *
      * The 2026-09-20 stall froze the scheduler inside its poll pass for 26 s and
@@ -233,6 +257,11 @@ void mynah_asr_slot_request(mynah_asr_slot *s, int flags, const char *lang,
  * NOT cleared: it is terminal and every later look must still see it. */
 int mynah_asr_slot_take_requests(mynah_asr_slot *s, char *lang,
                                  mynah_asr_slot_cancel *reason);
+
+/* The pending request flags, NOT cleared: what a scheduler holding a session's
+ * turn (empty-turn recovery) reads to honour a cancel without consuming the
+ * finalize/reset that must wait for the held `done`. */
+int mynah_asr_slot_peek_requests(mynah_asr_slot *s);
 
 /* Moves the slot to a state the ingest can observe. The scheduler uses DONE to
  * say "I am finished with this session"; FINISHING is bookkeeping for /health. */

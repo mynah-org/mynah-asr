@@ -139,6 +139,12 @@ static int check_model_name(const char *want, char *msg, size_t cap);
 static int g_idle_ms = 60000;                      /* --idle-ms */
 static int g_ping_ms = 20000;                      /* --ping-ms, 0 = no ping */
 static int g_ring_seconds = 30;                    /* --ring-seconds */
+/* --empty-recovery and its two bounds (sched.h). Off by default; when off the
+ * `recover` query key is unknown, exactly as before the feature existed. */
+static int g_empty_recovery = 0;
+static int g_recovery_deadline_ms = 400;
+static int g_recovery_lanes = 1;
+static double g_recovery_max_duty = 0.8;
 static double g_max_audio_seconds = 14400.0;       /* --max-audio-seconds */
 static size_t g_max_frame_bytes = 1024u * 1024u;   /* --max-frame-bytes */
 static int g_max_pending;                          /* --max-pending, 2*threads */
@@ -581,11 +587,14 @@ static int handle_transcribe(int fd, const char *headers, const uint8_t *body,
 /* The accepted query keys in ONE place, so the 400 that refuses an unknown one
  * names exactly what the server will read. */
 #define WS_QUERY_ACCEPTED "model, lang, lookahead, format, rate"
+/* With --empty-recovery the per-session opt-out joins the set. */
+#define WS_QUERY_ACCEPTED_RECOVERY WS_QUERY_ACCEPTED ", recover"
 
 typedef struct {
     char lang[MYNAH_ASR_SLOT_LANG_CAP];
     int lookahead;               /* -1 = the model's default preset */
     int f32;                     /* format=f32le; the default is s16le */
+    int recover;                 /* recover=0|1, default 1; read only with --empty-recovery */
 } ws_params;
 
 /* Parses and VALIDATES the query of GET /v1/audio/stream. Returns 0, or the HTTP
@@ -616,6 +625,7 @@ static int ws_parse_query(const char *query, ws_params *p, const char **code,
      * default, which is what a group that named none gets. */
     p->lookahead = g_groups[g_group].lookahead;
     p->f32 = 0;
+    p->recover = 1;
     if (query == NULL || query[0] == '\0') return 0;
 
     const char *q = query;
@@ -703,10 +713,23 @@ static int ws_parse_query(const char *query, ws_params *p, const char **code,
                 *code = "unsupported_rate";
                 return 400;
             }
+        } else if (g_empty_recovery && strcmp(key, "recover") == 0) {
+            /* Only a server started with --empty-recovery knows this key;
+             * without it the key is unknown and refused like any other. */
+            if (strcmp(val, "0") == 0) {
+                p->recover = 0;
+            } else if (val[0] == '\0' || strcmp(val, "1") == 0) {
+                p->recover = 1;
+            } else {
+                refuse_token(val, tok, sizeof(tok));
+                snprintf(msg, msgcap, "recover '%s' is not a value; accepted: 0, 1", tok);
+                *code = "invalid_recover";
+                return 400;
+            }
         } else {
             refuse_token(key, tok, sizeof(tok));
             snprintf(msg, msgcap, "unknown query parameter '%s'; accepted: %s",
-                     tok, WS_QUERY_ACCEPTED);
+                     tok, g_empty_recovery ? WS_QUERY_ACCEPTED_RECOVERY : WS_QUERY_ACCEPTED);
             *code = "unknown_query_parameter";
             return 400;
         }
@@ -936,6 +959,8 @@ static int handle_ws_stream(int fd, const char *headers, const char *query) {
         return 0;
     }
     ws_ingest w = {.fd = rfd, .f32 = params.f32, .slot = slot, .out = out};
+    /* Before the arm: the scheduler does not look at a slot until it is armed. */
+    mynah_asr_sched_set_recovery(slot, params.recover);
     mynah_asr_slot_arm(slot, out);
     mynah_asr_thread_set_name("mynah-ingest");
 
@@ -1610,6 +1635,16 @@ static void usage(void) {
         "                            the set it was priced for (0 = step as soon as\n"
         "                            anything is ready). Never waits for a stream's first\n"
         "                            chunk or for one that is finalizing\n"
+        "       [--empty-recovery]   re-decode a finalized turn whose transcript is EMPTY on a\n"
+        "                            low-priority recovery lane before its `done` goes out;\n"
+        "                            publish only when two attempts agree (opt-in, off by\n"
+        "                            default; a session opts out with ?recover=0)\n"
+        "       [--recovery-deadline-ms 400]  longest a `done` is held for a recovery\n"
+        "       [--recovery-lanes 1]  recovery lanes per worker: at most this many turns in\n"
+        "                            recovery at once, more are skipped (never queued)\n"
+        "       [--recovery-max-duty 0.8]  skip recovery while the step wall is above this\n"
+        "                            fraction of the chunk period (a saturated worker;\n"
+        "                            the lane is its own low-priority thread)\n"
         "       [--idle-ms 60000]    a stream silent for this long is cancelled (idle_timeout)\n"
         "       [--ping-ms 20000]    server-side WebSocket ping period (0 = never)\n"
         "       [--max-audio-seconds 14400]  audio one stream may send (0 = no cap)\n"
@@ -1686,6 +1721,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--metrics-port") == 0 && i + 1 < argc) metrics_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--metrics-bind") == 0 && i + 1 < argc) metrics_bind = argv[++i];
         else if (strcmp(argv[i], "--prefork-plan") == 0) plan_only = 1;
+        else if (strcmp(argv[i], "--empty-recovery") == 0) g_empty_recovery = 1;
+        else if (strcmp(argv[i], "--recovery-deadline-ms") == 0 && i + 1 < argc)
+            g_recovery_deadline_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--recovery-lanes") == 0 && i + 1 < argc)
+            g_recovery_lanes = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--recovery-max-duty") == 0 && i + 1 < argc)
+            g_recovery_max_duty = atof(argv[++i]);
         else { usage(); return 2; }
     }
     if (g_max_batch < 1) g_max_batch = 1;
@@ -1699,6 +1741,10 @@ int main(int argc, char **argv) {
     if (g_ring_seconds < 1) g_ring_seconds = 1;
     if (g_max_frame_bytes < 4096) g_max_frame_bytes = 4096;
     if (g_max_pending <= 0) g_max_pending = 2 * n_threads;
+    if (g_recovery_deadline_ms < 1) g_recovery_deadline_ms = 1;
+    if (g_recovery_lanes < 1) g_recovery_lanes = 1;
+    if (g_recovery_lanes > 16) g_recovery_lanes = 16;
+    if (!(g_recovery_max_duty > 0.0)) g_recovery_max_duty = 0.8;
 
     /* A plan is about the machine, not the model: it must work before anyone
      * has downloaded the weights. */
@@ -2027,6 +2073,21 @@ int main(int argc, char **argv) {
     sc.max_batch = g_max_batch;
     sc.max_pending = g_max_pending;
     sc.batch_window_ms = batch_window_ms;
+    sc.empty_recovery = g_empty_recovery;
+    sc.recovery_deadline_ms = g_recovery_deadline_ms;
+    sc.recovery_lanes = g_recovery_lanes;
+    sc.recovery_max_duty = g_recovery_max_duty;
+    sc.recovery_lookahead = -1;
+    if (g_empty_recovery) {
+        /* A session that names no preset gets the group's, else the pack's
+         * default: the lanes open their recoverer for that one up front. */
+        int la[8];
+        const int nla = mynah_asr_lookaheads(g_model, la);
+        if (g_groups[g_group].lookahead >= 0) sc.recovery_lookahead = g_groups[g_group].lookahead;
+        else if (nla > 0)
+            sc.recovery_lookahead = la[g_default_preset_index >= 0 &&
+                                       g_default_preset_index < nla ? g_default_preset_index : 0];
+    }
     if (mynah_asr_sched_start(&sc) != 0) {
         fprintf(stderr, "mynah-asr-server: the scheduler failed to start\n");
         return 1;
@@ -2075,6 +2136,10 @@ int main(int argc, char **argv) {
         oc.prefork_threads = mynah_asr_prefork_worker_threads();
         oc.metrics_port = metrics_port;
         oc.metrics_bind = metrics_bind;
+        oc.recovery_on = g_empty_recovery && mynah_asr_sched_streaming();
+        oc.recovery_deadline_ms = g_recovery_deadline_ms;
+        oc.recovery_lanes = g_recovery_lanes;
+        oc.recovery_max_duty = g_recovery_max_duty;
         oc.listen_backlog = backlog;
         oc.listen_somaxconn = somaxconn;
         mynah_asr_obs_init(&oc);

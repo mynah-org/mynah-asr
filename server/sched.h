@@ -9,6 +9,12 @@
  * serial path: socket writes went to `stream_out`, and here the model has one
  * owner, so a step is a step and never a queue behind another step.
  *
+ * The one exception is opt-in: with --empty-recovery a low-priority recovery
+ * lane (server/recover_lane.h) re-decodes an EMPTY finished turn on a spare
+ * stream of its own, through the single-stream path only, serially, while the
+ * scheduler keeps stepping. It never touches a slot's stream or the batch
+ * scratch; the scheduler alone decides what is published.
+ *
  * What runs on this thread: stream chunks (one per ready slot per step, and the
  * whole ready set in ONE mynah_asr_stream_step_batch call -- S2-2b) and the
  * offline REST jobs (at most one batched call per step).
@@ -54,6 +60,24 @@ typedef struct {
      * skipped entirely for a stream's first chunk and for a finalizing stream,
      * so neither first-partial latency nor a close pays for it. */
     int batch_window_ms;
+    /* --empty-recovery (opt-in, default off; .work/empty-turn-recovery.md).
+     * When 0 nothing below is read, no buffer is carved, no lane exists and the
+     * server's behaviour and output are the ones it had without the feature.
+     * When 1: a finalized turn whose transcript has no letter or digit is
+     * re-decoded on a recovery lane (server/recover_lane.h) before its `done`
+     * goes out, bounded by recovery_deadline_ms, and skipped when every lane is
+     * busy or the worker is under pressure. A session opts out with
+     * `recover=0`. */
+    int empty_recovery;
+    int recovery_deadline_ms;    /* --recovery-deadline-ms, default 400 */
+    int recovery_lanes;          /* --recovery-lanes, default 1 per worker */
+    int recovery_lookahead;      /* the explicit preset of a session that asked for none */
+    /* --recovery-max-duty F: a turn is not handed to a lane while the batched
+     * step's recent wall is above F x the session's chunk period (default
+     * 0.8). The lane is a separate low-priority thread, so a BUSY worker can
+     * still afford it; the skip exists for a SATURATED one, whose steps already
+     * fill the period. <= 0 means the default. */
+    double recovery_max_duty;
 } mynah_asr_sched_config;
 
 typedef enum {
@@ -111,6 +135,10 @@ int mynah_asr_sched_sample_rate(void);
  * answers 503 before the 101). The returned slot is not yet armed: the caller
  * completes the handshake, starts its writer and calls mynah_asr_slot_arm. */
 mynah_asr_slot *mynah_asr_sched_claim(const char *lang, int lookahead);
+
+/* Per-session opt-in to EMPTY-turn recovery, set by the ingest between claim
+ * and arm. Ignored (always off) when the server runs without --empty-recovery. */
+void mynah_asr_sched_set_recovery(mynah_asr_slot *slot, int on);
 
 /* Wakes the scheduler. Cheap and idempotent. */
 void mynah_asr_sched_wake(void);
@@ -270,6 +298,21 @@ typedef struct {
     double phase_s;
     unsigned long window_entered, window_filled;
     double window_wait_ms_sum;
+    /* EMPTY-turn recovery (all 0 and not rendered when the feature is off).
+     * Every turn handed to a lane ends in exactly one of accepted (by the kind
+     * of the attempt that won), rejected (no two attempts agreed), failed (a
+     * decode error), deadline (`done` released unrecovered) or cancelled (the
+     * session ended while the turn was held):
+     *   attempted == accepted + rejected + failed + deadline + cancelled + held.
+     * `late` counts lane results that arrived for a turn no longer held (they
+     * are dropped); `skipped_busy` EMPTY turns that never reached a lane
+     * because every lane was busy or the worker was under pressure. */
+    int recovery_enabled;
+    unsigned long rec_attempted, rec_accepted_phase, rec_accepted_replay;
+    unsigned long rec_rejected, rec_failed, rec_skipped_busy, rec_deadline;
+    unsigned long rec_cancelled, rec_late;
+    int rec_held;
+    double rec_seconds;
 } mynah_asr_sched_stats;
 
 /* One live slot, as the scheduler sees it. The aggregate counters say the fleet

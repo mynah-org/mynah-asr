@@ -379,6 +379,52 @@ client just sent, not about the audio.
 `audio_limit` is announced and then **finalised**: the audio already accepted is
 still owed a transcript, so the cap flushes the tail, emits `done` and closes.
 
+**EMPTY-turn recovery (opt-in, `--empty-recovery`, off by default).** Without
+the flag nothing below exists: the `recover` query key is an unknown key (400
+`unknown_query_parameter`, as before), `done` has its usual fields, and
+`/v1/health`, `/metrics` and the banner are unchanged. With it, a finalized turn
+whose transcript holds no letter or digit, of at most 4 s, is re-decoded on a
+**recovery lane** before its `done` goes out (.work/empty-turn-recovery.md):
+three phase-shifted attempts (240/320/480 ms of -60 dBFS noise in front of the
+turn) plus one replay of the previous turn's last 480 ms, and a text is
+published only when two attempts agree on its words. When it is, the client
+gets one final `delta` covering the whole turn, `(0, audio_s]`, then
+
+```json
+{"type":"done", ..., "recovered":true, "recovery":"phase", "seq":4}
+```
+
+(`recovery` is `phase` or `replay`, the kind of the attempt that won). Every
+other outcome is the plain `done`, with no new field.
+
+| flag / key | default | what it does |
+|---|---|---|
+| `--empty-recovery` | off | enables the feature for the whole server |
+| `--recovery-deadline-ms N` | 400 | longest a `done` is held; past it `done` goes out unrecovered and the lane's late answer is dropped |
+| `--recovery-max-duty F` | 0.8 | skip recovery while the batched step's recent wall is above F x the chunk period. The lane is its own low-priority thread, so a busy worker can afford it; the skip is for a saturated one (one stream alone steps ~150 ms of a 320 ms period on a 1-thread x86 int8 worker, so 0.5 would skip everything) |
+| `--recovery-lanes N` | 1 | lanes per worker (max 16); each holds one turn, a turn finding all busy is **skipped, never queued** |
+| `?recover=0\|1` | 1 | per session; `0` opts out. Only accepted with `--empty-recovery` (otherwise unknown); any other value is 400 `invalid_recover` |
+
+A lane is a thread of its own, at lower priority (Linux: nice +10 on the
+thread; macOS: the utility QoS class), running only the single-stream path on
+a spare stream it owns, serially: it never takes the thread pool from the
+scheduler's step and never touches a slot's stream or the batch scratch (the
+server refuses to start with `MYNAH_ASR_FIN_STACK=1`, which would route a plain
+feed through that scratch). Memory: one ~13 MB stream per lane and per lookahead
+preset in use, plus 4 s of PCM retention per slot. While a turn is held the
+session's next audio waits in its ring and the next utterance starts only after
+that `done`; other sessions are not affected. A turn is also skipped when the
+worker is saturated: the batched step's recent wall (EWMA) above
+`--recovery-max-duty` of the session's chunk period. Counters (`/v1/health` `recovery`, `/metrics`
+`mynah_asr_recovery_*`): `attempted == accepted{phase,replay} + rejected +
+failed + deadline + cancelled + held`; `skipped_busy`, `late` (answers dropped
+because the turn was no longer held) and `seconds_total` (lane wall time), `lane_jobs` and `seconds_per_job` beside
+them. Measured on the development Mac (int8, one serial lane): about 0.8 s of
+lane time for a 0.4 s turn, so at the default 400 ms deadline the turn is
+released unrecovered there; the deadline is the bound, not a promise of a
+recovery. Gate: `tests/ws_probe.py recovery`, case 10 of
+`tests/test_server_protocol.sh`.
+
 **Refusals happen before the upgrade**, as HTTP statuses, so a client reads a
 status and not a transport error: `503` with `error.code` `server_at_capacity`
 and `Retry-After` when every slot of this worker is taken, `400` with

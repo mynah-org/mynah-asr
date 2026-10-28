@@ -65,6 +65,8 @@ tests/test_batch
 tests/test_align
 tests/test_vadseg
 tests/test_tokenize
+tests/test_recovery
+tests/recovery_lab
 tests/test_stream_out
 tests/test_stream_batch
 tests/test_kv_layout
@@ -95,4 +97,7 @@ mynah-asr-server-cuda-cpuonly
 tests/test_cuda_kernels
 tests/test_cuda_stream
 tests/cuda_bank_transcribe
+tests/cuda_recovery_lab
 tests/gemm_shapes_bench
+tests/test_cuda_empty_recovery
+tests/test_cuda_empty_recovery_cpuonly

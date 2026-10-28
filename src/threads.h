@@ -41,6 +41,16 @@ int mynah_asr_pool_spin_us(void);
  * With n <= 1, or a single thread, it runs in place without spawning. */
 void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
 
+/* Makes every mynah_asr_parallel_for issued FROM THE CALLING THREAD run in
+ * place, serially, without ever touching the pool (1), or restores the default
+ * (0). For a low-priority helper thread that shares the process with the
+ * serving scheduler (the server's empty-turn recovery lane): the pool takes one
+ * dispatch at a time and a busy pool makes the other caller run inline, so a
+ * helper that took the pool would push the scheduler's own step onto one core.
+ * Serial work is the same floats (tasks write disjoint regions). Default 0;
+ * no other thread is affected. */
+void mynah_asr_thread_set_serial(int on);
+
 /* BLAS thread budget — how many threads ONE inference may ask of BLAS.
  *
  * Default = mynah_asr_num_threads(): a single inference owns every core, which

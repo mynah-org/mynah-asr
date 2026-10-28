@@ -13,7 +13,10 @@
 #include <time.h>
 
 #include "http_util.h"
+#include "recover_lane.h"
 #include "stream_out.h"
+#include "../src/flags.h"
+#include "../src/recover.h"
 
 #define SCHED_MAX_OFFLINE_BATCH 64
 
@@ -220,6 +223,23 @@ static struct {
     _Atomic unsigned long long rows_stacked;
     _Atomic unsigned long step_b_count[MYNAH_ASR_SCHED_B_BUCKETS];
     _Atomic unsigned long step_b_wall_us[MYNAH_ASR_SCHED_B_BUCKETS];
+
+    /* EMPTY-turn recovery (cfg.empty_recovery). rec_on == 0 is the server
+     * without the feature: every rec_* path below returns at its first test. */
+    int rec_on;
+    double rec_deadline_s;
+    double rec_max_duty;       /* --recovery-max-duty */
+    size_t rec_max_turn;       /* samples of a turn that can still be recovered */
+    size_t rec_tail_cap;       /* samples of the previous turn's replay tail     */
+    int rec_frame_samples;
+    int rec_held_n;            /* slots whose `done` is held right now           */
+    /* The admission signal: an EWMA of the batched step's wall (scheduler-only).
+     * See rec_under_pressure. */
+    double rec_step_ewma_s, rec_last_step;
+    _Atomic unsigned long rec_attempted, rec_acc_phase, rec_acc_replay, rec_rejected;
+    _Atomic unsigned long rec_failed, rec_skipped_busy, rec_deadline, rec_cancelled;
+    _Atomic unsigned long rec_late, rec_us;
+    _Atomic int rec_held_pub;  /* rec_held_n, published for the snapshot        */
 } g;
 
 /* ------------------------------------------------------- cancel buckets */
@@ -489,6 +509,241 @@ static void sched_on_result(const mynah_asr_result *res, void *ud) {
     if (s->t_first_queued == 0.0 && s->deltas > 0) s->t_first_queued = mynah_asr_now();
 }
 
+/* ------------------------------------------------- EMPTY-turn recovery
+ *
+ * Opt-in (--empty-recovery). The healthy path pays one memcpy of the audio it
+ * takes (rec_retain) and nothing else; everything below runs only for a turn
+ * whose transcript has no letter or digit, and the decode itself runs on a
+ * recovery lane (recover_lane.h), never here. What this thread does: retain,
+ * hand off, hold the turn's `done`, and publish or drop what comes back. */
+
+#define REC_TEXT_CAP 512
+/* The admission threshold (--recovery-max-duty, default 0.8): a turn is not
+ * handed to a lane while the batched step's recent wall (EWMA, alpha 1/4) is
+ * above this fraction of the session's chunk period. The step wall over the
+ * period is this worker's model duty, the number the capacity curve is drawn
+ * in, read from the same `batch.step_wall_ms` /v1/health exports. The lane is a
+ * separate low-priority thread running serially, so a busy worker can still
+ * afford it: one stream alone already steps at ~150 ms of a 320 ms period on a
+ * one-thread x86 int8 worker, and a threshold at one half would skip every
+ * turn in production. The skip is for a SATURATED worker, whose steps already
+ * fill the period and whose cores the lane would take. */
+#define REC_PRESSURE_DUTY_DEFAULT 0.8
+
+static void sched_end_turn(mynah_asr_slot *s, int close_after, const char *kind,
+                           const char *text);
+
+static void rec_tail_push(mynah_asr_slot *s, const float *x, size_t n) {
+    const size_t cap = g.rec_tail_cap;
+    if (cap == 0 || n == 0) return;
+    if (n > cap) { x += n - cap; n = cap; }
+    const size_t first = n < cap - s->rec_tail_pos ? n : cap - s->rec_tail_pos;
+    memcpy(s->rec_tail + s->rec_tail_pos, x, first * sizeof(float));
+    if (first < n) memcpy(s->rec_tail, x + first, (n - first) * sizeof(float));
+    s->rec_tail_pos = (s->rec_tail_pos + n) % cap;
+    s->rec_tail_n = s->rec_tail_n + n > cap ? cap : s->rec_tail_n + n;
+}
+
+/* The samples the scheduler just took for this turn. Up to the recoverable
+ * length they are the turn itself; past it the turn can no longer be recovered
+ * and only its tail is kept, for the next turn's replay vote. */
+static void rec_retain(mynah_asr_slot *s, const float *x, size_t n) {
+    if (n == 0) return;
+    if (!s->rec_over) {
+        if (s->rec_n + n <= g.rec_max_turn) {
+            memcpy(s->rec_cur + s->rec_n, x, n * sizeof(float));
+            s->rec_n += n;
+            return;
+        }
+        s->rec_over = 1;
+        s->rec_tail_pos = s->rec_tail_n = 0;
+        rec_tail_push(s, s->rec_cur, s->rec_n);
+    }
+    rec_tail_push(s, x, n);
+}
+
+/* This turn's audio is not a turn any more (a reset mid-utterance). */
+static void rec_drop_turn(mynah_asr_slot *s) {
+    s->rec_n = 0;
+    s->rec_over = 0;
+    s->rec_tail_pos = s->rec_tail_n = 0;
+}
+
+/* A turn ended with `text` published: it becomes the previous turn. */
+static void rec_turn_end(mynah_asr_slot *s, const char *text) {
+    const size_t cap = g.rec_tail_cap;
+    if (!s->rec_over) {
+        const size_t k = s->rec_n < cap ? s->rec_n : cap;
+        if (k > 0) memcpy(s->rec_prev, s->rec_cur + (s->rec_n - k), k * sizeof(float));
+        s->rec_prev_n = k;
+    } else {
+        const size_t k = s->rec_tail_n;
+        const size_t start = cap > 0 ? (s->rec_tail_pos + cap - k) % cap : 0;
+        const size_t first = k < cap - start ? k : cap - start;
+        if (first > 0) memcpy(s->rec_prev, s->rec_tail + start, first * sizeof(float));
+        if (first < k) memcpy(s->rec_prev + first, s->rec_tail, (k - first) * sizeof(float));
+        s->rec_prev_n = k;
+    }
+    /* The END of the transcript is what the echo gate and the ownership rule
+     * read, so a long one keeps its tail, cut on a UTF-8 boundary. */
+    const char *t = text != NULL ? text : "";
+    const size_t len = strlen(t);
+    if (len >= REC_TEXT_CAP) {
+        t += len - (REC_TEXT_CAP - 1);
+        while ((*t & 0xC0) == 0x80) t++;
+    }
+    snprintf(s->rec_prev_text, REC_TEXT_CAP, "%s", t);
+    rec_drop_turn(s);
+}
+
+/* The session is over: nothing of it may reach the next one, and a turn still
+ * held is dropped (its lane result will be counted `late`). */
+static void rec_session_end(mynah_asr_slot *s) {
+    if (s->rec_held) {
+        s->rec_held = 0;
+        s->rec_gen++;
+        g.rec_held_n--;
+        atomic_store_explicit(&g.rec_held_pub, g.rec_held_n, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g.rec_cancelled, 1, memory_order_relaxed);
+    }
+    rec_drop_turn(s);
+    s->rec_prev_n = 0;
+    if (s->rec_prev_text) s->rec_prev_text[0] = '\0';
+}
+
+static int rec_under_pressure(const mynah_asr_slot *s, double now) {
+    /* A worker that has not stepped for a second is not under pressure, however
+     * slow its last step was. */
+    if (g.rec_last_step <= 0.0 || now - g.rec_last_step > 1.0) return 0;
+    const int sr = g.sample_rate > 0 ? g.sample_rate : 16000;
+    const double chunk_s = (double)mynah_asr_stream_chunk_frames(s->stream) *
+                           (double)g.rec_frame_samples / (double)sr;
+    return chunk_s > 0.0 && g.rec_step_ewma_s > g.rec_max_duty * chunk_s;
+}
+
+/* Called right after mynah_asr_stream_finish. Returns 1 when the turn was handed
+ * to a lane and its `done` is now held, 0 when the caller ends it as usual. */
+static int rec_try_hold(mynah_asr_slot *s, int close_after) {
+    if (!s->rec_opt) return 0;
+    /* Only a turn that published NOTHING: deltas are final and append-only, so
+     * a primary that sent "?" or "." (no letter, yet published) is not held --
+     * a recovered text would follow it as "? Hello." */
+    if (mynah_asr_stream_text(s->stream)[0] != '\0') return 0;
+    /* No audio, or more than the recoverable length: not a candidate. */
+    if (s->rec_n == 0 || s->rec_over) return 0;
+    const double now = mynah_asr_now();
+    const unsigned gen = s->rec_gen + 1;
+    const int la = s->lookahead >= 0 ? s->lookahead : g.cfg.recovery_lookahead;
+    if (rec_under_pressure(s, now) ||
+        mynah_asr_rlanes_submit(s->id, gen, la, s->lang, s->rec_cur, s->rec_n,
+                                s->rec_prev_n > 0 ? s->rec_prev : NULL, s->rec_prev_n,
+                                s->rec_prev_text[0] != '\0' ? s->rec_prev_text : NULL)
+            != 0) {
+        atomic_fetch_add_explicit(&g.rec_skipped_busy, 1, memory_order_relaxed);
+        return 0;
+    }
+    s->rec_gen = gen;
+    s->rec_held = 1;
+    s->rec_held_close = close_after;
+    s->rec_deadline = now + g.rec_deadline_s;
+    g.rec_held_n++;
+    atomic_store_explicit(&g.rec_held_pub, g.rec_held_n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g.rec_attempted, 1, memory_order_relaxed);
+    /* Audio that arrives meanwhile is the NEXT utterance and waits in the ring;
+     * a zero need keeps the slot out of the ready count while it waits, so the
+     * idle accounting does not report a held turn as runnable work. */
+    mynah_asr_slot_set_need(s, 0);
+    return 1;
+}
+
+/* The held turn ends: with the recovered text as a final delta and the
+ * recovery fields on `done` when kind != NULL, as a plain `done` otherwise. */
+static void rec_release(mynah_asr_slot *s, const char *kind, const char *text,
+                        const char *lang) {
+    s->rec_held = 0;
+    s->rec_gen++;
+    g.rec_held_n--;
+    atomic_store_explicit(&g.rec_held_pub, g.rec_held_n, memory_order_relaxed);
+    if (kind != NULL) {
+        /* One final delta covering the whole turn, (0, audio_s], dated like
+         * the tail: from the turn's last sample, so its lag includes the hold. */
+        mynah_asr_result r;
+        memset(&r, 0, sizeof(r));
+        r.text = text;
+        r.t0 = 0.0;
+        r.t1 = mynah_asr_stream_audio_seconds(s->stream);
+        r.is_final = true;
+        r.lang = (lang != NULL && lang[0] != '\0') ? lang : NULL;
+        emit_ctx c = {.slot = s, .arrival = s->last_arrival};
+        sched_on_result(&r, &c);
+    }
+    sched_end_turn(s, s->rec_held_close, kind, kind != NULL ? text : NULL);
+}
+
+static void rec_on_result(const mynah_asr_rlane_result *r, void *ud) {
+    (void)ud;
+    atomic_fetch_add_explicit(&g.rec_us, (unsigned long)(r->seconds * 1e6 + 0.5),
+                              memory_order_relaxed);
+    mynah_asr_slot *s = (r->slot_id >= 0 && r->slot_id < g.n_slots)
+                            ? &g.slots[r->slot_id] : NULL;
+    if (s == NULL || !s->rec_held || s->rec_gen != r->gen) {
+        atomic_fetch_add_explicit(&g.rec_late, 1, memory_order_relaxed);
+        return;
+    }
+    if (r->rc != 0) {
+        atomic_fetch_add_explicit(&g.rec_failed, 1, memory_order_relaxed);
+        rec_release(s, NULL, NULL, NULL);
+    } else if (!r->accepted || !mynah_asr_text_has_content(r->text)) {
+        atomic_fetch_add_explicit(&g.rec_rejected, 1, memory_order_relaxed);
+        rec_release(s, NULL, NULL, NULL);
+    } else {
+        const int replay = r->kind == MYNAH_ASR_ATTEMPT_REPLAY;
+        atomic_fetch_add_explicit(replay ? &g.rec_acc_replay : &g.rec_acc_phase, 1,
+                                  memory_order_relaxed);
+        rec_release(s, replay ? "replay" : "phase", r->text, r->lang);
+    }
+}
+
+/* Top of every scheduler pass: publish what the lanes finished, then release
+ * every held turn past its deadline. Two loads when nothing is held. */
+static int rec_poll(void) {
+    int did = mynah_asr_rlanes_collect(rec_on_result, NULL) > 0;
+    if (g.rec_held_n <= 0) return did;
+    const double now = mynah_asr_now();
+    for (int i = 0; i < g.n_slots; i++) {
+        mynah_asr_slot *s = &g.slots[i];
+        if (!s->rec_held || now < s->rec_deadline) continue;
+        atomic_fetch_add_explicit(&g.rec_deadline, 1, memory_order_relaxed);
+        rec_release(s, NULL, NULL, NULL);
+        did = 1;
+    }
+    return did;
+}
+
+/* The earliest deadline of a held turn, as an absolute CLOCK_REALTIME instant
+ * for the park's timed wait. 0 when nothing is held. */
+static int rec_next_deadline(struct timespec *ts) {
+    if (g.rec_held_n <= 0) return 0;
+    double first = 0.0;
+    for (int i = 0; i < g.n_slots; i++) {
+        const mynah_asr_slot *s = &g.slots[i];
+        if (s->rec_held && (first == 0.0 || s->rec_deadline < first)) first = s->rec_deadline;
+    }
+    if (first == 0.0) return 0;
+    double wait = first - mynah_asr_now();
+    if (wait < 0.0) wait = 0.0;
+    clock_gettime(CLOCK_REALTIME, ts);
+    const long ns = (long)(wait * 1e9) + 1000000L;   /* +1 ms: wake past it, not on it */
+    ts->tv_sec += ns / 1000000000L;
+    ts->tv_nsec += ns % 1000000000L;
+    if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
+    return 1;
+}
+
+void mynah_asr_sched_set_recovery(mynah_asr_slot *slot, int on) {
+    slot->rec_opt = g.rec_on && on;
+}
+
 /* ---------------------------------------------------------- slot lifecycle */
 
 /* The pooled stream. Opened on first use and kept for the life of the slot;
@@ -523,6 +778,7 @@ static int sched_ensure_stream(mynah_asr_slot *s) {
  * it, so the scheduler does: the output writer's producer reference is dropped
  * here, after the finish above has handed the socket to the writer. */
 static void sched_close_session(mynah_asr_slot *s, const char *outcome) {
+    if (g.rec_on) rec_session_end(s);
     sched_enqueue(s, 0x8, "", 0);
     mynah_asr_stream_out *out = s->out;
     mynah_asr_stream_out_finish(out);
@@ -576,7 +832,7 @@ static int sched_trace_steps(void) {
     return g_trace_steps;
 }
 
-static void sched_emit_done(mynah_asr_slot *s) {
+static void sched_emit_done(mynah_asr_slot *s, const char *recovered) {
     const char *lang = mynah_asr_stream_lang(s->stream);
     if (lang == NULL || lang[0] == '\0') lang = s->lang;
     cJSON *j = cJSON_CreateObject();
@@ -590,6 +846,12 @@ static void sched_emit_done(mynah_asr_slot *s) {
     cJSON_AddNumberToObject(j, "lag_max_ms", s->lag_max_ms);
     const double audio_s = mynah_asr_stream_audio_seconds(s->stream);
     cJSON_AddNumberToObject(j, "audio_seconds", audio_s);   /* v1 field */
+    /* Only on a turn whose text came from a recovery lane: a plain `done` keeps
+     * exactly the fields it always had. */
+    if (recovered != NULL) {
+        cJSON_AddBoolToObject(j, "recovered", 1);
+        cJSON_AddStringToObject(j, "recovery", recovered);
+    }
     frame_common(j, s, audio_s, 0.0);
     sched_send_json(s, j);
     if (sched_trace_steps() > 0) {
@@ -638,6 +900,7 @@ static int sched_stage(mynah_asr_slot *s, size_t avail, int B) {
     if (got == 0) return 0;
     if (c->arrival > 0.0) s->last_arrival = c->arrival;
     else c->arrival = s->last_arrival;
+    if (g.rec_on) rec_retain(s, s->take, got);
 
     s->steps++;
     s->t_last_step = mynah_asr_now();
@@ -826,6 +1089,10 @@ static void sched_step_batch(int B) {
     const int bb = B < MYNAH_ASR_SCHED_B_BUCKETS ? B : MYNAH_ASR_SCHED_B_BUCKETS - 1;
     atomic_fetch_add_explicit(&g.step_b_count[bb], 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.step_b_wall_us[bb], us, memory_order_relaxed);
+    if (g.rec_on) {
+        g.rec_step_ewma_s += 0.25 * ((t_end - t0) - g.rec_step_ewma_s);
+        g.rec_last_step = t_end;
+    }
 
     if (rc == 0) return;
     for (int j = 0; j < B; j++) {
@@ -851,6 +1118,7 @@ static int sched_feed_tail(mynah_asr_slot *s, size_t avail) {
     if (got == 0) return 0;
     if (ctx.arrival > 0.0) s->last_arrival = ctx.arrival;
     else ctx.arrival = s->last_arrival;
+    if (g.rec_on) rec_retain(s, s->take, got);
     s->steps++;
     atomic_fetch_add_explicit(&g.steps, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g.audio_samples, (unsigned long)got,
@@ -880,7 +1148,24 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
     const double t_fin1 = mynah_asr_now();
     g.fin_model_s += t_fin1 - t_fin0;
     g.fin_calls++;
-    sched_emit_done(s);
+    /* An EMPTY turn of a session that opted in goes to a recovery lane and its
+     * `done` is held (rec_release sends it); anything else ends here. */
+    if (g.rec_on && rec_try_hold(s, close_after)) {
+        g.fin_rest_s += mynah_asr_now() - t_fin1;
+        return;
+    }
+    sched_end_turn(s, close_after, NULL, NULL);
+    g.fin_rest_s += mynah_asr_now() - t_fin1;
+}
+
+/* The end of a finalized turn: `done` (with the recovery fields when `kind` is
+ * set), the finalization-lag accounting, then a close or a stream ready for the
+ * next utterance. `text` is what the turn published, for the next turn's
+ * recovery context (NULL: the stream's own transcript). */
+static void sched_end_turn(mynah_asr_slot *s, int close_after, const char *kind,
+                           const char *text) {
+    if (g.rec_on) rec_turn_end(s, text != NULL ? text : mynah_asr_stream_text(s->stream));
+    sched_emit_done(s, kind);
     /* Finalization lag as the client measures it: the last sample's arrival to
      * `done` being queued. Only utterances that were finalized, so a cancel
      * can never make this look faster. */
@@ -901,7 +1186,6 @@ static void sched_finalize(mynah_asr_slot *s, int close_after) {
         s->needs_reset = 1;
         mynah_asr_slot_set_state(s, MYNAH_ASR_SLOT_ACTIVE);
     }
-    g.fin_rest_s += mynah_asr_now() - t_fin1;
 }
 
 /* ------------------------------------------------------------ offline work */
@@ -1040,6 +1324,11 @@ static void *sched_main(void *arg) {
         atomic_fetch_add_explicit(&g.loops, 1, memory_order_relaxed);
         SCHED_PHASE(1);
 
+        /* (0) EMPTY-turn recovery, when enabled: what the lanes finished and
+         * the held turns past their deadline, before the passes below see the
+         * slots (a released slot takes part in this very pass). */
+        if (g.rec_on && rec_poll()) did = 1;
+
         /* (1) Cancellation, before any other policy. A slot the client has
          * abandoned must not pay for a finish it will never read. */
         for (int i = 0; i < g.n_slots; i++) {
@@ -1051,6 +1340,32 @@ static void *sched_main(void *arg) {
             if ((st != MYNAH_ASR_SLOT_ACTIVE && st != MYNAH_ASR_SLOT_FINISHING) ||
                 g.req_out[i] == NULL)
                 continue;
+            if (s->rec_held) {
+                /* A held turn: its `done` has not gone out, so a finalize or
+                 * a reset posted since must wait for it and is left pending.
+                 * Only the end of the session is honoured now. */
+                SCHED_PHASE_AT(9, i);
+                if ((mynah_asr_slot_peek_requests(s) & MYNAH_ASR_SLOT_REQ_CANCEL) != 0) {
+                    g.req[i] = mynah_asr_slot_take_requests(s, g.req_lang[i],
+                                                            &g.req_reason[i]);
+                    sched_cancel(s, mynah_asr_slot_cancel_code(g.req_reason[i]),
+                                 "the stream was cancelled");
+                    did = 1;
+                } else if ((mynah_asr_slot_peek_requests(s) & MYNAH_ASR_SLOT_REQ_RESET) != 0) {
+                    /* The client moved on to the next utterance without waiting
+                     * for `done`: the recovery is abandoned (as on the GPU
+                     * server) and the held turn ends with a plain `done`; the
+                     * reset is taken on the next pass. */
+                    atomic_fetch_add_explicit(&g.rec_cancelled, 1, memory_order_relaxed);
+                    rec_release(s, NULL, NULL, NULL);
+                    did = 1;
+                } else if (mynah_asr_stream_out_failed(g.req_out[i]) ||
+                           mynah_asr_stream_out_peer_gone_ex(g.req_out[i], 1)) {
+                    sched_close_session(s, mynah_asr_slot_cancel_code(MYNAH_ASR_SLOT_CANCEL_PEER));
+                    did = 1;
+                }
+                continue;
+            }
             SCHED_PHASE_AT(8, i);
             g.req[i] = mynah_asr_slot_take_requests(s, g.req_lang[i], &g.req_reason[i]);
             g.req_live[i] = 1;
@@ -1096,6 +1411,9 @@ static void *sched_main(void *arg) {
             s->lag_sum_ms = s->lag_max_ms = 0.0;
             s->t_first_delta = 0.0;
             memset(s->lag_hist, 0, sizeof(s->lag_hist));
+            /* The audio taken so far is not a turn any more; the previous
+             * finished turn stays the context of the next one. */
+            if (g.rec_on) rec_drop_turn(s);
             if (sched_ensure_stream(s) != 0) {
                 sched_cancel(s, "reset_failed", "the language is not supported");
                 g.req_live[i] = 0;
@@ -1258,10 +1576,16 @@ static void *sched_main(void *arg) {
             else g.park_idle++;
         }
         SCHED_PHASE(7);
+        /* A held turn bounds the park: its deadline must fire even when no
+         * audio and no lane result ever wakes the scheduler. */
+        struct timespec rec_dl;
+        const int rec_timed = g.rec_on && rec_next_deadline(&rec_dl);
         pthread_mutex_lock(&g.mu);
         while (!did && !g.woken && g.q_head == NULL &&
-               !atomic_load_explicit(&g.stop, memory_order_acquire))
-            pthread_cond_wait(&g.wake, &g.mu);
+               !atomic_load_explicit(&g.stop, memory_order_acquire)) {
+            if (!rec_timed) pthread_cond_wait(&g.wake, &g.mu);
+            else if (pthread_cond_timedwait(&g.wake, &g.mu, &rec_dl) == ETIMEDOUT) break;
+        }
         pthread_mutex_unlock(&g.mu);
     }
 
@@ -1347,6 +1671,47 @@ int mynah_asr_sched_start(const mynah_asr_sched_config *cfg) {
     const size_t take = 4u * (size_t)g.sample_rate;
     for (int i = 0; i < g.n_slots; i++)
         if (mynah_asr_slot_init(&g.slots[i], i, ring, take) != 0) return -1;
+
+    /* EMPTY-turn recovery: every buffer carved here, once, and the lanes started
+     * before the scheduler thread exists. Without the flag none of this runs. */
+    if (g.cfg.empty_recovery && g.streaming) {
+        /* The lane's plain feed must stay off the model's batch scratch, which
+         * the scheduler's step owns; MYNAH_ASR_FIN_STACK=1 routes a plain feed
+         * through it. Two owners of one scratch is a contradiction, refused
+         * (ENGINEERING.md §7). */
+        if (mynah_asr_flag_int("MYNAH_ASR_FIN_STACK", 0) == 1) {
+            fprintf(stderr, "mynah-asr-server: --empty-recovery cannot run with "
+                            "MYNAH_ASR_FIN_STACK=1 (the recovery lane would share the "
+                            "batched step's scratch)\n");
+            return -1;
+        }
+        mynah_asr_recover_cfg rc;
+        mynah_asr_recover_cfg_default(&rc);
+        g.rec_frame_samples = mynah_asr_frame_samples(g.cfg.model);
+        g.rec_max_turn = (size_t)(rc.max_turn_s * (double)g.sample_rate);
+        g.rec_tail_cap = (size_t)(rc.replay_frames > 0 ? rc.replay_frames : 0) *
+                         (size_t)g.rec_frame_samples;
+        g.rec_max_duty = g.cfg.recovery_max_duty > 0.0 ? g.cfg.recovery_max_duty
+                                                       : REC_PRESSURE_DUTY_DEFAULT;
+        g.rec_deadline_s = (g.cfg.recovery_deadline_ms > 0 ? g.cfg.recovery_deadline_ms
+                                                            : 400) / 1000.0;
+        for (int i = 0; i < g.n_slots; i++) {
+            mynah_asr_slot *sl = &g.slots[i];
+            sl->rec_cur = (float *)malloc((g.rec_max_turn + 1) * sizeof(float));
+            sl->rec_tail = (float *)malloc((g.rec_tail_cap + 1) * sizeof(float));
+            sl->rec_prev = (float *)malloc((g.rec_tail_cap + 1) * sizeof(float));
+            sl->rec_prev_text = (char *)calloc(REC_TEXT_CAP, 1);
+            if (!sl->rec_cur || !sl->rec_tail || !sl->rec_prev || !sl->rec_prev_text)
+                return -1;
+        }
+        if (mynah_asr_rlanes_start(g.cfg.model,
+                                   g.cfg.recovery_lanes > 0 ? g.cfg.recovery_lanes : 1,
+                                   g.cfg.recovery_lookahead, &rc, mynah_asr_sched_wake) != 0) {
+            fprintf(stderr, "mynah-asr-server: the recovery lanes failed to start\n");
+            return -1;
+        }
+        g.rec_on = 1;
+    }
 
     /* Pre-carve the batched step's scratch for the whole slot cap, ONCE, here:
      * after this the step path allocates nothing of its own. Called before the
@@ -1578,6 +1943,19 @@ void mynah_asr_sched_stats_read(mynah_asr_sched_stats *out) {
     out->offline_pending = g.q_len;
     out->offline_max_pending = g.cfg.max_pending;
     pthread_mutex_unlock(&g.mu);
+    out->recovery_enabled = g.rec_on;
+    out->rec_attempted = atomic_load_explicit(&g.rec_attempted, memory_order_relaxed);
+    out->rec_accepted_phase = atomic_load_explicit(&g.rec_acc_phase, memory_order_relaxed);
+    out->rec_accepted_replay = atomic_load_explicit(&g.rec_acc_replay, memory_order_relaxed);
+    out->rec_rejected = atomic_load_explicit(&g.rec_rejected, memory_order_relaxed);
+    out->rec_failed = atomic_load_explicit(&g.rec_failed, memory_order_relaxed);
+    out->rec_skipped_busy = atomic_load_explicit(&g.rec_skipped_busy, memory_order_relaxed);
+    out->rec_deadline = atomic_load_explicit(&g.rec_deadline, memory_order_relaxed);
+    out->rec_cancelled = atomic_load_explicit(&g.rec_cancelled, memory_order_relaxed);
+    out->rec_late = atomic_load_explicit(&g.rec_late, memory_order_relaxed);
+    out->rec_held = atomic_load_explicit(&g.rec_held_pub, memory_order_relaxed);
+    out->rec_seconds =
+        (double)atomic_load_explicit(&g.rec_us, memory_order_relaxed) / 1e6;
 }
 
 double mynah_asr_sched_lag_quantile(const unsigned long *hist, double q) {
@@ -1675,6 +2053,32 @@ void mynah_asr_sched_health(cJSON *into) {
     cJSON_AddNumberToObject(sw, "count", (double)st.step_wall_count);
     cJSON_AddNumberToObject(sw, "mean",
         st.step_wall_count ? st.step_wall_ms_sum / (double)st.step_wall_count : 0.0);
+    if (st.recovery_enabled) {
+        /* Only when --empty-recovery is on: without it /v1/health is the page
+         * it always was. */
+        cJSON *rv = cJSON_AddObjectToObject(into, "recovery");
+        cJSON_AddNumberToObject(rv, "attempted", (double)st.rec_attempted);
+        cJSON *acc = cJSON_AddObjectToObject(rv, "accepted");
+        cJSON_AddNumberToObject(acc, "phase", (double)st.rec_accepted_phase);
+        cJSON_AddNumberToObject(acc, "replay", (double)st.rec_accepted_replay);
+        cJSON_AddNumberToObject(rv, "rejected", (double)st.rec_rejected);
+        cJSON_AddNumberToObject(rv, "failed", (double)st.rec_failed);
+        cJSON_AddNumberToObject(rv, "skipped_busy", (double)st.rec_skipped_busy);
+        cJSON_AddNumberToObject(rv, "deadline", (double)st.rec_deadline);
+        cJSON_AddNumberToObject(rv, "cancelled", (double)st.rec_cancelled);
+        cJSON_AddNumberToObject(rv, "late", (double)st.rec_late);
+        cJSON_AddNumberToObject(rv, "held", st.rec_held);
+        cJSON_AddNumberToObject(rv, "seconds_total", st.rec_seconds);
+        cJSON_AddNumberToObject(rv, "deadline_ms", g.rec_deadline_s * 1e3);
+        cJSON_AddNumberToObject(rv, "max_duty", g.rec_max_duty);
+        /* Lane wall per finished lane job: every result the lanes returned,
+         * published or not, is in seconds_total, and is one of these four. */
+        const unsigned long jobs = st.rec_accepted_phase + st.rec_accepted_replay +
+                                   st.rec_rejected + st.rec_failed + st.rec_late;
+        cJSON_AddNumberToObject(rv, "lane_jobs", (double)jobs);
+        cJSON_AddNumberToObject(rv, "seconds_per_job",
+                                jobs > 0 ? st.rec_seconds / (double)jobs : 0.0);
+    }
     cJSON *byb = cJSON_AddObjectToObject(bt, "by_b");
     for (int i = 1; i < MYNAH_ASR_SCHED_B_BUCKETS; i++) {
         if (st.step_b_count[i] == 0) continue;
@@ -1694,6 +2098,9 @@ void mynah_asr_sched_stop(void) {
     mynah_asr_sched_wake();
     pthread_join(g.thread, NULL);
     g.started = 0;
+    /* After the scheduler: nothing collects a lane's result any more, and a
+     * lane in the middle of a turn finishes it before the join returns. */
+    if (g.rec_on) mynah_asr_rlanes_stop();
     mynah_asr_slot_set_notify(NULL);
 
     /* The ingest threads are detached and hold pointers into this table. Give

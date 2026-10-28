@@ -18,6 +18,11 @@ void mynah_asr_tokenizer_free(mynah_asr_tokenizer *tk);
  * each sub-vocab: the specials live in the first one). -1 when absent. */
 int mynah_asr_tok_find(const mynah_asr_tokenizer *tk, const char *piece);
 
+/* A special <...> piece (language tag or control marker): not text. */
+int mynah_asr_piece_is_special(const char *piece);
+/* Does the piece start with the word mark ▁ (U+2581)? */
+int mynah_asr_piece_has_mark(const char *piece);
+
 /* Encode text -> piece ids, for FORCED ALIGNMENT: the aligner needs the text in
  * ITS own vocabulary, which is not the one that produced the text (canary emits
  * with its vocab, the CTC aligner has a different 16k one).

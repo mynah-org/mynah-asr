@@ -54,6 +54,14 @@ static int piece_starts_word(const char *p) {
            (unsigned char)p[2] == 0x81;
 }
 
+int mynah_asr_piece_is_special(const char *piece) {
+    return piece_is_special(piece, strlen(piece));
+}
+
+int mynah_asr_piece_has_mark(const char *piece) {
+    return strlen(piece) >= 3 && piece_starts_word(piece);
+}
+
 /* Longest piece that matches at `text`; -1 when none does. `want_start` selects
  * the ▁-prefixed variant (word start) or the continuation one. */
 static int longest_match(const mynah_asr_tokenizer *tk, const char *text, int want_start,
