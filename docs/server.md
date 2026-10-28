@@ -400,7 +400,7 @@ other outcome is the plain `done`, with no new field.
 | flag / key | default | what it does |
 |---|---|---|
 | `--empty-recovery` | off | enables the feature for the whole server |
-| `--recovery-deadline-ms N` | 400 | longest a `done` is held; past it `done` goes out unrecovered and the lane's late answer is dropped |
+| `--recovery-deadline-ms N` | 2000 | longest a `done` is held; past it `done` goes out unrecovered and the lane's late answer is dropped |
 | `--recovery-max-duty F` | 0.8 | skip recovery while the batched step's recent wall is above F x the chunk period. The lane is its own low-priority thread, so a busy worker can afford it; the skip is for a saturated one (one stream alone steps ~150 ms of a 320 ms period on a 1-thread x86 int8 worker, so 0.5 would skip everything) |
 | `--recovery-lanes N` | 1 | lanes per worker (max 16); each holds one turn, a turn finding all busy is **skipped, never queued** |
 | `?recover=0\|1` | 1 | per session; `0` opts out. Only accepted with `--empty-recovery` (otherwise unknown); any other value is 400 `invalid_recover` |
@@ -419,10 +419,13 @@ worker is saturated: the batched step's recent wall (EWMA) above
 `mynah_asr_recovery_*`): `attempted == accepted{phase,replay} + rejected +
 failed + deadline + cancelled + held`; `skipped_busy`, `late` (answers dropped
 because the turn was no longer held) and `seconds_total` (lane wall time), `lane_jobs` and `seconds_per_job` beside
-them. Measured on the development Mac (int8, one serial lane): about 0.8 s of
-lane time for a 0.4 s turn, so at the default 400 ms deadline the turn is
-released unrecovered there; the deadline is the bound, not a promise of a
-recovery. Gate: `tests/ws_probe.py recovery`, case 10 of
+them. Measured on the development Mac (int8, one serial lane, 78 EMPTY short
+turns of the recovery lab, early decision on): 0.92 s per recovery at p50,
+1.36 s at p90, 1.96 s at most; 3 attempts in 73 % of them (rejected without
+the fourth). An x86 core at one thread decodes about 1.4x slower, so the 2 s
+default covers roughly the p90 there (an estimate: re-measure on the target).
+The deadline delays only the `done` of a turn that would otherwise be EMPTY,
+never a healthy turn; it is the bound, not a promise of a recovery. Gate: `tests/ws_probe.py recovery`, case 10 of
 `tests/test_server_protocol.sh`.
 
 **Refusals happen before the upgrade**, as HTTP statuses, so a client reads a

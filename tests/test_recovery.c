@@ -322,6 +322,39 @@ int main(void) {
         CHECK(mynah_asr_recover_vote(v3, 4, 2) == -1, "vote: contentless texts never vote");
         const char *v4[] = {"Uh.", "uh", "Uh?"};
         CHECK(mynah_asr_recover_vote(v4, 3, 3) == 0, "vote: three of three");
+        /* early decision == the full vote, exhaustively: every sequence of 4
+         * attempts over {empty, a, b, c} and every prefix the partial vote
+         * calls final must give the full vote's answer for EVERY completion */
+        {
+            const char *alpha[4] = {"", "a", "b", "c"};
+            int bad = 0, final_early = 0, reject_early = 0;
+            for (int code = 0; code < 256; code++) {
+                const char *seq[4];
+                for (int i = 0; i < 4; i++) seq[i] = alpha[(code >> (2 * i)) & 3];
+                for (int k = 0; k <= 4; k++) {
+                    const int d = mynah_asr_recover_vote_partial(seq, k, 4, 2);
+                    if (d == MYNAH_ASR_RECOVER_OPEN) { if (k == 4) bad++; continue; }
+                    if (k < 4) { final_early += d >= 0; reject_early += d == -1; }
+                    for (int rest = 0; rest < (1 << (2 * (4 - k))); rest++) {
+                        const char *full[4];
+                        for (int i = 0; i < 4; i++)
+                            full[i] = i < k ? seq[i] : alpha[(rest >> (2 * (i - k))) & 3];
+                        if (mynah_asr_recover_vote(full, 4, 2) != d) bad++;
+                    }
+                    break;
+                }
+            }
+            snprintf(msg, sizeof(msg), "partial vote is exact: 256 sequences, %d early accepts, "
+                     "%d early rejects, %d mismatches", final_early, reject_early, bad);
+            CHECK(bad == 0 && final_early > 0 && reject_early > 0, msg);
+            const char *e3[] = {"", "", ""};
+            CHECK(mynah_asr_recover_vote_partial(e3, 3, 4, 2) == -1, "three empty attempts of four: rejected without the fourth");
+            const char *a2[] = {"Yes.", "yes"};
+            CHECK(mynah_asr_recover_vote_partial(a2, 2, 4, 2) == 0, "the first two agree: accepted after two");
+            const char *xy[] = {"x", "y", "y"};
+            CHECK(mynah_asr_recover_vote_partial(xy, 3, 4, 2) == MYNAH_ASR_RECOVER_OPEN,
+                  "x y y: still open (a fourth x would make x the winner)");
+        }
         CHECK(mynah_asr_text_same_words("Yes, please.", "yes please") && !mynah_asr_text_same_words("yes", "yes please") &&
               !mynah_asr_text_same_words("", ""), "same_words");
     }

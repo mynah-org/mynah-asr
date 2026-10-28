@@ -136,4 +136,13 @@ size_t mynah_asr_recover_build(const mynah_asr_attempt *a, int frame_samples, co
  * vote. Returns its index, or -1 when no text has the votes. */
 int mynah_asr_recover_vote(const char *const *texts, int n, int min_votes);
 
+/* The same decision taken early: after the first k of n attempts, is the
+ * outcome of mynah_asr_recover_vote over all n already fixed whatever the
+ * remaining attempts return? Returns the winner's index when it is (so the
+ * rest need not run), -1 when no text can reach min_votes any more (early
+ * reject: e.g. three empty attempts of four), -2 when it is still open.
+ * Exact by construction, pinned exhaustively by tests/test_recovery.c. */
+#define MYNAH_ASR_RECOVER_OPEN (-2)
+int mynah_asr_recover_vote_partial(const char *const *texts, int k, int n, int min_votes);
+
 #endif

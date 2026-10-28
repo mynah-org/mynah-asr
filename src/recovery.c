@@ -296,3 +296,24 @@ int mynah_asr_recover_vote(const char *const *texts, int n, int min_votes) {
     }
     return -1;
 }
+
+int mynah_asr_recover_vote_partial(const char *const *texts, int k, int n, int min_votes) {
+    const int left = n - k;
+    /* votes so far of the text of attempt i (0 when it carries no content) */
+    int votes[MYNAH_ASR_RECOVER_MAX_ATTEMPTS] = {0};
+    for (int i = 0; i < k; i++) {
+        if (!mynah_asr_text_has_content(texts[i])) continue;
+        for (int j = 0; j < k; j++)
+            votes[i] += mynah_asr_text_has_content(texts[j]) && mynah_asr_text_same_words(texts[i], texts[j]);
+    }
+    /* the full vote takes the FIRST index reaching min_votes: attempt i is the
+     * final winner once it has the votes and no earlier contentful attempt can
+     * still reach them with the attempts left */
+    for (int i = 0; i < k; i++) {
+        if (!mynah_asr_text_has_content(texts[i])) continue;
+        if (votes[i] >= min_votes) return i;
+        if (votes[i] + left >= min_votes) return MYNAH_ASR_RECOVER_OPEN;
+    }
+    /* nobody so far can win; a text not seen yet needs min_votes fresh attempts */
+    return left >= min_votes ? MYNAH_ASR_RECOVER_OPEN : -1;
+}

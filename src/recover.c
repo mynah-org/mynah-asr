@@ -61,7 +61,8 @@ int mynah_asr_recover_turn(mynah_asr_recoverer *r, const char *lang, const float
     mynah_asr_attempt plan[MYNAH_ASR_RECOVER_MAX_ATTEMPTS];
     const int n = mynah_asr_recover_plan(&r->cfg, prev ? n_prev : 0, r->frame_samples, plan);
     const mynah_asr_tokenizer *tk = mynah_asr_model_tokenizer(r->m);
-    for (int a = 0; a < n; a++) {
+    int decided = MYNAH_ASR_RECOVER_OPEN;
+    for (int a = 0; a < n && decided == MYNAH_ASR_RECOVER_OPEN; a++) {
         const size_t len = mynah_asr_recover_build(&plan[a], r->frame_samples, cur, n_cur,
                                                    prev, n_prev, r->buf);
         if (mynah_asr_stream_reset(r->s, lang) != 0) return -1;
@@ -78,13 +79,18 @@ int mynah_asr_recover_turn(mynah_asr_recoverer *r, const char *lang, const float
             text[0] = '\0';   /* a rejected attempt keeps no vote */
         r->texts[a] = text;
         res->attempts++;
+        /* stop as soon as the outcome is fixed: the remaining attempts could
+         * not change it (mynah_asr_recover_vote_partial is exact) */
+        decided = mynah_asr_recover_vote_partial((const char *const *)r->texts, a + 1, n,
+                                                 r->cfg.min_votes);
     }
-    const int w = mynah_asr_recover_vote((const char *const *)r->texts, n, r->cfg.min_votes);
+    const int w = decided >= 0 ? decided : decided == -1 ? -1
+                : mynah_asr_recover_vote((const char *const *)r->texts, n, r->cfg.min_votes);
     if (w < 0) return 0;
     r->winner = res->winner = w;
     res->accepted = 1;
     res->winner_kind = plan[w].kind;
-    for (int a = 0; a < n; a++)
+    for (int a = 0; a < res->attempts; a++)
         res->votes += mynah_asr_text_has_content(r->texts[a]) &&
                       mynah_asr_text_same_words(r->texts[w], r->texts[a]);
     snprintf(res->lang, sizeof(res->lang), "%s", r->langs[w]);

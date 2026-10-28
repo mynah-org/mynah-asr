@@ -142,7 +142,7 @@ static int g_ring_seconds = 30;                    /* --ring-seconds */
 /* --empty-recovery and its two bounds (sched.h). Off by default; when off the
  * `recover` query key is unknown, exactly as before the feature existed. */
 static int g_empty_recovery = 0;
-static int g_recovery_deadline_ms = 400;
+static int g_recovery_deadline_ms = 2000;
 static int g_recovery_lanes = 1;
 static double g_recovery_max_duty = 0.8;
 static double g_max_audio_seconds = 14400.0;       /* --max-audio-seconds */
@@ -1639,7 +1639,7 @@ static void usage(void) {
         "                            low-priority recovery lane before its `done` goes out;\n"
         "                            publish only when two attempts agree (opt-in, off by\n"
         "                            default; a session opts out with ?recover=0)\n"
-        "       [--recovery-deadline-ms 400]  longest a `done` is held for a recovery\n"
+        "       [--recovery-deadline-ms 2000] longest a `done` is held for a recovery\n"
         "       [--recovery-lanes 1]  recovery lanes per worker: at most this many turns in\n"
         "                            recovery at once, more are skipped (never queued)\n"
         "       [--recovery-max-duty 0.8]  skip recovery while the step wall is above this\n"

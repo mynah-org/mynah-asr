@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../src/audio.h"
 #include "../src/mynah_asr.h"
@@ -211,8 +212,13 @@ int main(int argc, char **argv) {
         printf(",\"empty\":%d", empty);
         if (rec && empty) {
             mynah_asr_recover_result rr;
-            if (mynah_asr_recover_turn(rec, lang, cur, n_cur, ctx, n_ctx_s, ctx_text, &rr) == 0) {
-                printf(",\"recover\":{\"accepted\":%d,\"votes\":%d,\"attempts\":%d,\"kind\":\"%s\",\"text\":",
+            struct timespec r0, r1;
+            clock_gettime(CLOCK_MONOTONIC, &r0);
+            const int rrc = mynah_asr_recover_turn(rec, lang, cur, n_cur, ctx, n_ctx_s, ctx_text, &rr);
+            clock_gettime(CLOCK_MONOTONIC, &r1);
+            if (rrc == 0) {
+                printf(",\"recover\":{\"seconds\":%.4f,\"accepted\":%d,\"votes\":%d,\"attempts\":%d,\"kind\":\"%s\",\"text\":",
+                       (double)(r1.tv_sec - r0.tv_sec) + (double)(r1.tv_nsec - r0.tv_nsec) * 1e-9,
                        rr.accepted, rr.votes, rr.attempts,
                        !rr.accepted ? "" : rr.winner_kind == MYNAH_ASR_ATTEMPT_REPLAY ? "replay" : "phase");
                 json_str(stdout, mynah_asr_recover_text(rec));
