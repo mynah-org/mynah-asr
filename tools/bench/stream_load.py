@@ -979,7 +979,15 @@ def _self_test_faults(check, port) -> None:
     check(all(key(u["abort"]) == key(fault_plan(11, 50.0, u["stream"], u["rep"]))
               for u in utts),
           "each utterance carries exactly the plan of its (stream, rep), or none")
-    pts = sorted({u["abort"]["point"] for u in aborted})
+    pts = {u["abort"]["point"] for u in aborted}
+    # idle_open WAITS by design (up to --abort-idle-max-s, 3 s here) before it
+    # closes: on a slow runner the 9 s soak can close its collection while that
+    # wait is still running. Such an utterance is cut_at_deadline with the plan
+    # on its record and the client already silent -- the fault was exercised,
+    # only its wait was cut. The six other points end at once and must execute.
+    pts |= {u["abort"]["point"] for u in planned
+            if u["outcome"] == "cut_at_deadline" and u["abort"]["point"] == "idle_open"}
+    pts = sorted(pts)
     check(pts == sorted(M.ABORT_POINTS), f"all seven points exercised: {pts}")
     # Method coverage is a property of the PLAN, checked on the plan itself: how many
     # utterances a 9 s soak gets through depends on the machine, and the FIN half of
