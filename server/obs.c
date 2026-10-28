@@ -156,6 +156,19 @@ static void print_server_config(FILE *out) {
                      "group_plan=%s\n",
                 g_cfg.prefork_workers, g_cfg.prefork_threads, plan);
     }
+    if (g_cfg.recovery_on)
+        fprintf(out, "[SERVER-CONFIG] v=1 empty_recovery=on recovery_lanes=%d "
+                     "recovery_deadline_ms=%d recovery_max_duty=%.2f "
+                     "recovery_lane_priority=%s\n",
+                g_cfg.recovery_lanes, g_cfg.recovery_deadline_ms, g_cfg.recovery_max_duty,
+#if defined(__linux__)
+                "nice+10"
+#elif defined(__APPLE__)
+                "qos-utility"
+#else
+                "default"
+#endif
+                );
     if (g_cfg.metrics_port > 0)
         fprintf(out, "[SERVER-CONFIG] v=1 metrics_bind=%s metrics_port=%d\n",
                 g_cfg.metrics_bind ? g_cfg.metrics_bind : "127.0.0.1",
@@ -431,6 +444,47 @@ void mynah_asr_obs_render_metrics(mynah_asr_metrics_buf *b, void *unused) {
         "# TYPE mynah_asr_step_wall_ms_count counter\n"
         "mynah_asr_step_wall_ms_count{worker=\"%s\"} %lu\n",
         wl, st.step_wall_ms_sum, wl, st.step_wall_count);
+
+    /* EMPTY-turn recovery, only on a server started with --empty-recovery. The
+     * books: attempted == accepted + rejected + failed + deadline + cancelled +
+     * held; `late` are lane results dropped because their turn was no longer
+     * held. */
+    if (st.recovery_enabled)
+        mynah_asr_metrics_addf(b,
+            "# HELP mynah_asr_recovery_attempted_total EMPTY turns handed to a recovery lane.\n"
+            "# TYPE mynah_asr_recovery_attempted_total counter\n"
+            "mynah_asr_recovery_attempted_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_accepted_total recovered turns published, by the kind\n"
+            "# of the attempt that won the vote.\n"
+            "# TYPE mynah_asr_recovery_accepted_total counter\n"
+            "mynah_asr_recovery_accepted_total{worker=\"%s\",kind=\"phase\"} %lu\n"
+            "mynah_asr_recovery_accepted_total{worker=\"%s\",kind=\"replay\"} %lu\n"
+            "# HELP mynah_asr_recovery_rejected_total turns where no two attempts agreed.\n"
+            "# TYPE mynah_asr_recovery_rejected_total counter\n"
+            "mynah_asr_recovery_rejected_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_failed_total turns whose recovery decode failed.\n"
+            "# TYPE mynah_asr_recovery_failed_total counter\n"
+            "mynah_asr_recovery_failed_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_skipped_busy_total EMPTY turns not tried: every lane\n"
+            "# busy, or the step duty above the admission threshold.\n"
+            "# TYPE mynah_asr_recovery_skipped_busy_total counter\n"
+            "mynah_asr_recovery_skipped_busy_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_deadline_total held turns released unrecovered at\n"
+            "# --recovery-deadline-ms.\n"
+            "# TYPE mynah_asr_recovery_deadline_total counter\n"
+            "mynah_asr_recovery_deadline_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_cancelled_total held turns whose session ended first.\n"
+            "# TYPE mynah_asr_recovery_cancelled_total counter\n"
+            "mynah_asr_recovery_cancelled_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_late_total lane results dropped: turn no longer held.\n"
+            "# TYPE mynah_asr_recovery_late_total counter\n"
+            "mynah_asr_recovery_late_total{worker=\"%s\"} %lu\n"
+            "# HELP mynah_asr_recovery_seconds_total wall seconds the lanes spent decoding.\n"
+            "# TYPE mynah_asr_recovery_seconds_total counter\n"
+            "mynah_asr_recovery_seconds_total{worker=\"%s\"} %.3f\n",
+            wl, st.rec_attempted, wl, st.rec_accepted_phase, wl, st.rec_accepted_replay,
+            wl, st.rec_rejected, wl, st.rec_failed, wl, st.rec_skipped_busy,
+            wl, st.rec_deadline, wl, st.rec_cancelled, wl, st.rec_late, wl, st.rec_seconds);
 
     /* The collection window, as a pair. `entered` alone says nothing: a window
      * that always fills is free (the streams share a cadence and it is a

@@ -1,4 +1,5 @@
 #include "mynah_asr.h"
+#include "recover.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -763,6 +764,7 @@ struct mynah_asr_stream {
     int mel_have;
     float *enc_buf;             /* [q, d_out] encoder output per chunk */
     int *tokens;
+    int *frames;                /* absolute encoder frame of each token's emission */
     int n_tokens, cap_tokens;
     float *dec_scr;             /* greedy-decode scratch (joint input + logits) */
     mynah_asr_detok detok;      /* incremental transcript: no re-decode per chunk */
@@ -861,9 +863,10 @@ mynah_asr_stream *mynah_asr_stream_open(mynah_asr_model *m, const char *lang, in
     s->enc_buf = malloc((size_t)s->es.q * (size_t)m->enc.d_out * sizeof(float));
     s->cap_tokens = 4096;
     s->tokens = malloc((size_t)s->cap_tokens * sizeof(int));
+    s->frames = malloc((size_t)s->cap_tokens * sizeof(int));
     /* per-chunk scratch carved once (S1-3): after warm-up a chunk allocates nothing */
     s->dec_scr = malloc(mynah_asr_greedy_scratch_floats(&m->dec) * sizeof(float));
-    if (!s->mel_buf || !s->enc_buf || !s->tokens || !s->dec_scr ||
+    if (!s->mel_buf || !s->enc_buf || !s->tokens || !s->frames || !s->dec_scr ||
         mynah_asr_detok_init(&s->detok, STREAM_TEXT_RESERVE) != 0) {
         mynah_asr_stream_close(s);
         return NULL;
@@ -890,7 +893,7 @@ void mynah_asr_stream_close(mynah_asr_stream *s) {
     mynah_asr_enc_stream_free(&s->es);
     mynah_asr_vad_close(s->vad);
     mynah_asr_detok_free(&s->detok);
-    free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->vbuf); free(s->dec_scr);
+    free(s->mel_buf); free(s->enc_buf); free(s->tokens); free(s->frames); free(s->vbuf); free(s->dec_scr);
     free(s);
 }
 
@@ -907,6 +910,20 @@ const char *mynah_asr_stream_lang(const mynah_asr_stream *s) { return s->lang; }
  * exists so the quality gate can compare the two instead of assuming. */
 const char *mynah_asr_stream_text(const mynah_asr_stream *s) {
     return s->detok.buf ? s->detok.buf : "";
+}
+
+const mynah_asr_tokenizer *mynah_asr_model_tokenizer(const mynah_asr_model *m) { return &m->tok; }
+
+int mynah_asr_frame_samples(const mynah_asr_model *m) {
+    return m->feat.hop_length * m->enc.ss.sub_factor;
+}
+
+int mynah_asr_stream_chunk_frames(const mynah_asr_stream *s) { return s->es.q; }
+
+int mynah_asr_stream_tokens(const mynah_asr_stream *s, const int **tokens, const int **frames) {
+    if (tokens) *tokens = s->tokens;
+    if (frames) *frames = s->frames;
+    return s->n_tokens;
 }
 
 int mynah_asr_stream_reset(mynah_asr_stream *s, const char *lang) {
@@ -969,14 +986,20 @@ static int stream_decode(mynah_asr_stream *s, int q, int trace_audio, const char
     mynah_asr_model *m = s->m;
     *text_out = NULL;
     if (s->n_tokens + q * m->dec.max_symbols > s->cap_tokens) {
-        s->cap_tokens = (s->cap_tokens + q * m->dec.max_symbols) * 2;
-        int *nb = realloc(s->tokens, (size_t)s->cap_tokens * sizeof(int));
+        /* the capacity is committed only once BOTH arrays hold it: a pooled
+         * stream keeps cap_tokens across resets */
+        const int cap = (s->cap_tokens + q * m->dec.max_symbols) * 2;
+        int *nb = realloc(s->tokens, (size_t)cap * sizeof(int));
         if (!nb) return -1;
         s->tokens = nb;
+        int *nf = realloc(s->frames, (size_t)cap * sizeof(int));
+        if (!nf) return -1;
+        s->frames = nf;
+        s->cap_tokens = cap;
     }
     if (trace_audio) mynah_asr_dec_trace_audio((double)s->samples_fed / (double)m->feat.sample_rate);
     const int added = mynah_asr_greedy_decode_scratch(&m->dec, &s->dec, s->enc_buf, q,
-                                                 s->tokens + s->n_tokens, NULL,
+                                                 s->tokens + s->n_tokens, s->frames + s->n_tokens,
                                                  s->cap_tokens - s->n_tokens, s->dec_scr);
     s->mel_have = 0;
 

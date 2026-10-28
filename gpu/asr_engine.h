@@ -72,6 +72,16 @@ typedef struct {
     const char *weights;     /* cuda: "f32" (default, NULL) or "int8": the large
                                 encoder linears and the joint head stored as the
                                 CPU's per-row int8 codes, own int8-weight GEMM */
+    int record_frames;       /* cuda: 1 = also bring each step's emission frames
+                                back to the host and keep them per slot, for
+                                asr_engine_slot_tokens (one extra D2H per pass
+                                that holds a recording slot); 0 (default) = no
+                                extra copy */
+    int record_frames_from;  /* cuda, with record_frames: only slots >= this
+                                index record (0 = every slot). A pass with no
+                                such slot copies nothing extra, and a pass with
+                                one copies only that slot range: the empty-turn
+                                recovery records its spare slots only */
 } asr_engine_cfg;
 
 /* What one step produced for one requested slot. */
@@ -182,6 +192,8 @@ typedef struct {
     /* optional: slot_feed for several DISTINCT slots, possibly in parallel */
     int (*slot_feed_batch)(asr_engine *e, int n, const int *slots, const float *const *pcm,
                            const size_t *ns);
+    /* optional: the utterance's token ids and their absolute emission frames */
+    int (*slot_tokens)(const asr_engine *e, int slot, const int **tokens, const int **frames);
 } asr_engine_ops;
 
 struct asr_engine { const asr_engine_ops *ops; };
@@ -236,6 +248,14 @@ static inline int asr_engine_slot_feed_batch(asr_engine *e, int n, const int *sl
     for (int i = 0; i < n; i++)
         if (e->ops->slot_feed(e, slots[i], pcm[i], ns[i]) != 0) return -1;
     return 0;
+}
+/* The current utterance's token ids and, for each, the absolute encoder frame
+ * it was emitted at (counted from the slot's reset). Returns the count, or -1
+ * when the engine does not offer it (cuda: only with cfg.record_frames, and
+ * only for slots >= cfg.record_frames_from). The
+ * arrays are engine-owned, valid until the slot's next step or reset. */
+static inline int asr_engine_slot_tokens(const asr_engine *e, int slot, const int **tok, const int **frames) {
+    return e->ops->slot_tokens ? e->ops->slot_tokens(e, slot, tok, frames) : -1;
 }
 static inline int asr_engine_dead(const asr_engine *e) { return e->ops->dead(e); }
 static inline const char *asr_engine_error(const asr_engine *e) { return e->ops->error(e); }

@@ -20,6 +20,10 @@ the assertions next to the bytes that produced them.
                (SIGTERM -> `error shutting_down`)
   idle         say nothing after the handshake and be cancelled
   ping         read for a while and count the server's pings
+  recovery     --empty-recovery (opt-in): starts its own two servers, flag off
+               and flag on, and checks the protocol -- off is a plain `done`,
+               noise never recovers, a healthy turn is byte-identical, an
+               EMPTY-prone turn recovers or ends within the deadline
 
 Usage: python3 tests/ws_probe.py <command> [options]
 """
@@ -31,7 +35,10 @@ import base64
 import json
 import os
 import queue
+import random
 import socket
+import subprocess
+import urllib.request
 import struct
 import sys
 import threading
@@ -444,6 +451,293 @@ def cmd_ping(a) -> int:
                    f"the server pings (>= {a.min_pings} in {a.wait} s)")
 
 
+# ------------------------------------------------------- empty-turn recovery
+
+# Fields that carry wall-clock timing: the only ones allowed to differ between
+# two runs of the same turn.
+TIMING_KEYS = ("lag_ms", "lag_p50_ms", "lag_max_ms")
+
+
+def has_content(text: str) -> bool:
+    """The server's own notion of a non-empty turn: a letter or a digit."""
+    return any(ch.isalnum() for ch in text)
+
+
+def speech_onset(pcm: bytes, thr: float = 600.0) -> int:
+    """Byte offset of the first 10 ms window above `thr` RMS, minus 50 ms."""
+    n = len(pcm) // 2
+    s = struct.unpack("<%dh" % n, pcm[:n * 2])
+    for i in range(0, n - 160, 160):
+        w = s[i:i + 160]
+        if (sum(v * v for v in w) / 160.0) ** 0.5 > thr:
+            return max(0, i - 800) * 2
+    return 0
+
+
+def noise_pcm(seconds: float, sigma: float, seed: int) -> bytes:
+    rng = random.Random(seed)
+    n = int(16000 * seconds)
+    return struct.pack("<%dh" % n, *[max(-32768, min(32767, int(rng.gauss(0.0, sigma))))
+                                     for _ in range(n)])
+
+
+def turn_frames(sess: Session, timeout: float):
+    """Reads one utterance's frames, through `done`. Returns (frames, t_done)."""
+    frames = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = sess.next_msg(timeout=max(0.1, deadline - time.monotonic()))
+        if msg is None:
+            break
+        frames.append(msg)
+        if msg.get("type") in ("done", "error"):
+            return frames, time.monotonic()
+    return frames, None
+
+
+def run_turns(host, port, path, clips, timeout):
+    """Sends each clip then a finalize on ONE socket without waiting in between
+    (a second turn queues behind a held one), and reads every turn's frames.
+    Returns [(frames, seconds from that turn's finalize to its done)]."""
+    sess = Session(host, port, path)
+    out = []
+    try:
+        t_fin = []
+        for pcm in clips:
+            send_clip(sess, pcm)
+            sess.send_text({"type": "finalize"})
+            t_fin.append(time.monotonic())
+        for i in range(len(clips)):
+            frames, t_done = turn_frames(sess, timeout)
+            out.append((frames, None if t_done is None else t_done - t_fin[i]))
+        sess.send_close()
+    finally:
+        sess.close()
+    return out
+
+
+def strip_timing(frames):
+    return [{k: v for k, v in f.items() if k not in TIMING_KEYS} for f in frames]
+
+
+def text_of(frames) -> str:
+    return "".join(f.get("text", "") for f in frames if f.get("type") == "delta")
+
+
+def health(host, port) -> dict:
+    with urllib.request.urlopen(f"http://{host}:{port}/v1/health", timeout=10) as r:
+        return json.loads(r.read())
+
+
+class Server:
+    """One mynah-asr-server for the duration of a `with`, stopped by its pid."""
+
+    def __init__(self, a, port, extra):
+        self.port = port
+        cmd = [a.server_bin, "-m", a.model_dir, "-p", str(port), "--threads", "4",
+               "--batch", "1", "--cap", "2", "--idle-ms", "30000", "--ping-ms", "0"]
+        if a.quant:
+            cmd += ["--quant", a.quant]
+        self.log = open(os.path.join(a.log_dir, f"recovery_srv_{port}.log"), "w")
+        self.p = subprocess.Popen(cmd + extra, stdout=self.log, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL)
+        t_end = time.monotonic() + 60
+        while time.monotonic() < t_end:
+            if self.p.poll() is not None:
+                raise RuntimeError(f"server on {port} exited with {self.p.returncode}")
+            try:
+                health(a.host, port)
+                return
+            except OSError:
+                time.sleep(0.2)
+        self.stop()
+        raise RuntimeError(f"server on {port} never became ready")
+
+    def stop(self):
+        if self.p.poll() is None:
+            self.p.terminate()
+            try:
+                self.p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait(timeout=5)
+        self.log.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+
+
+def wait_held(a, port, want: int, timeout: float) -> bool:
+    """Polls /v1/health until recovery.held == want."""
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        rv = health(a.host, port).get("recovery") or {}
+        if rv.get("held") == want:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def check_books(rv, bad, where):
+    if not isinstance(rv, dict):
+        bad.append(f"{where}: /v1/health has no recovery block")
+        return
+    acc = rv["accepted"]["phase"] + rv["accepted"]["replay"]
+    ends = acc + rv["rejected"] + rv["failed"] + rv["deadline"] + rv["cancelled"] + rv["held"]
+    if rv["attempted"] != ends:
+        bad.append(f"{where}: recovery books do not balance: {rv}")
+    acc = rv["accepted"]["phase"] + rv["accepted"]["replay"]
+    print(f"     {where} health recovery: {json.dumps(rv, sort_keys=True)}")
+    print(f"     {where} lane: attempted={rv['attempted']} accepted={acc} "
+          f"skipped_busy={rv['skipped_busy']} lane_jobs={rv['lane_jobs']} "
+          f"seconds_total={rv['seconds_total']:.3f} "
+          f"seconds_per_job={rv['seconds_per_job']:.3f}")
+
+
+def check_empty_turn(frames, secs, limit, bad, where):
+    """The protocol of an EMPTY-prone turn on a server with recovery on: either
+    a final delta with text then `done` with recovered/recovery, or a plain
+    `done` within `limit` seconds (None = no time bound)."""
+    d = frames[-1] if frames else {}
+    if d.get("type") != "done":
+        bad.append(f"{where}: no done: {frames}")
+    elif d.get("recovered") is True:
+        finals = [f for f in frames if f.get("type") == "delta" and f.get("final")]
+        if d.get("recovery") not in ("phase", "replay") or not finals or \
+                not has_content(finals[-1].get("text", "")):
+            bad.append(f"{where}: recovered done without a final delta with text: {frames}")
+    else:
+        if "recovered" in d or "recovery" in d:
+            bad.append(f"{where}: unrecovered done carries recovery fields: {d}")
+        if limit is not None and (secs is None or secs > limit):
+            bad.append(f"{where}: plain done after {secs} s, over {limit:.3f} s")
+    print(f"     {where}: EMPTY-prone turn -> {text_of(frames)!r}, recovered="
+          f"{d.get('recovered', False)}/{d.get('recovery', '-')} in "
+          f"{secs if secs is None else round(secs, 3)} s")
+
+
+def cmd_recovery(a) -> int:
+    bad = []
+    a.log_dir = a.log_dir or os.environ.get("TMPDIR", "/tmp")
+    full = load_pcm(a.clip)
+    on = speech_onset(full)
+    empty_prone = full[on:on + int(16000 * a.cut) * 2]
+    healthy = load_pcm(a.healthy)
+    noise = noise_pcm(1.0, 30.0, 7)          # about -60 dBFS
+    silence = bytes(2 * int(16000 * 0.6))
+    q = f"/v1/audio/stream?lang={a.lang}&lookahead={a.lookahead}"
+    t_out = a.timeout
+
+    # ---- flag off: the server as it was
+    with Server(a, a.port, []) as srv:
+        st, _, body = http_request(a.host, srv.port, q + "&recover=1")
+        if " 400 " not in st + " " or b"unknown_query_parameter" not in body:
+            bad.append(f"off: recover=1 should be an unknown key, got {st!r}")
+        run_turns(a.host, srv.port, q, [healthy], t_out)        # warm-up, not timed
+        (off_empty, off_empty_s), = run_turns(a.host, srv.port, q, [empty_prone], t_out)
+        (off_healthy, _), = run_turns(a.host, srv.port, q, [healthy], t_out)
+        if "recovery" in health(a.host, srv.port):
+            bad.append("off: /v1/health has a recovery block")
+    done = off_empty[-1] if off_empty else {}
+    if done.get("type") != "done" or "recovered" in done or "recovery" in done:
+        bad.append(f"(a) off: expected a plain done, got {done}")
+    empty_primary = not has_content(text_of(off_empty))
+    if not empty_primary:
+        print(f"     note: the primary decoded the {a.cut} s cut as {text_of(off_empty)!r};"
+              " the EMPTY-turn cases then exercise nothing")
+    print(f"     (a) off: EMPTY-prone turn {text_of(off_empty)!r}, plain done in "
+          f"{off_empty_s if off_empty_s is None else round(off_empty_s, 3)} s")
+
+    # ---- flag on, a deadline long enough for the lane to answer and the duty
+    # admission out of the way (1000 x the chunk period), so the recovery path
+    # itself runs on any host, a loaded or slow one included (a single stream
+    # stepping slower than real time is a SATURATED worker, which the default
+    # admission rightly skips): the accept / reject path, the ordering behind a
+    # held turn, the opt-out
+    extra = ["--empty-recovery", "--recovery-deadline-ms", str(a.long_deadline_ms),
+             "--recovery-max-duty", "1000"]
+    with Server(a, a.port + 1, extra) as srv:
+        st, _, body = http_request(a.host, srv.port, q + "&recover=2")
+        if " 400 " not in st + " " or b"invalid_recover" not in body:
+            bad.append(f"on: recover=2 should be a 400 invalid_recover, got {st!r}")
+        run_turns(a.host, srv.port, q, [healthy], t_out)        # warm-up
+        # (c) a healthy turn: every frame identical but its timing fields
+        (on_healthy, _), = run_turns(a.host, srv.port, q, [healthy], t_out)
+        same = strip_timing(on_healthy) == strip_timing(off_healthy)
+        if not same:
+            bad.append(f"(c) healthy turn differs: {strip_timing(on_healthy)} != "
+                       f"{strip_timing(off_healthy)}")
+        print(f"     (c) on: healthy turn {text_of(on_healthy)!r}, {len(on_healthy)} frames, "
+              f"identical to off but timing: {same}")
+        # (b) noise and silence, each given a free lane, never yield text
+        for name, pcm in (("noise", noise), ("silence", silence)):
+            (fr, _), = run_turns(a.host, srv.port, q, [pcm], t_out)
+            d = fr[-1] if fr else {}
+            if d.get("type") != "done" or d.get("recovered") or has_content(text_of(fr)):
+                bad.append(f"(b) {name}: {text_of(fr)!r} done={d}")
+            print(f"     (b) on: {name} -> {text_of(fr)!r}, recovered={d.get('recovered', False)}")
+        # (d) the EMPTY-prone turn, with a lane free
+        before = health(a.host, srv.port)["recovery"]["attempted"]
+        (t1, t1_s), = run_turns(a.host, srv.port, q, [empty_prone], t_out)
+        check_empty_turn(t1, t1_s, None, bad, "(d) FORCED (admission off) on/long")
+        if empty_primary and health(a.host, srv.port)["recovery"]["attempted"] != before + 1:
+            bad.append("(d) the EMPTY turn did not reach a lane")
+        # ordering: the next turn is sent WHILE the first one is held, and must
+        # come out after its `done`, decoded on its own
+        sess = Session(a.host, srv.port, q)
+        try:
+            send_clip(sess, empty_prone)
+            sess.send_text({"type": "finalize"})
+            held = wait_held(a, srv.port, 1, 15.0) if empty_primary else False
+            send_clip(sess, healthy)
+            sess.send_text({"type": "finalize"})
+            f1, _ = turn_frames(sess, t_out)
+            f2, _ = turn_frames(sess, t_out)
+            sess.send_close()
+        finally:
+            sess.close()
+        seqs = [f["seq"] for f in f1 + f2 if "seq" in f]
+        if empty_primary and not held:
+            bad.append("(e) never saw the first turn held")
+        if not f1 or f1[-1].get("type") != "done" or not f2 or f2[-1].get("type") != "done":
+            bad.append(f"(e) two dones expected: {f1} / {f2}")
+        if text_of(f2) != text_of(off_healthy):
+            bad.append(f"(e) the turn behind the held one: {text_of(f2)!r} != "
+                       f"{text_of(off_healthy)!r}")
+        if seqs != sorted(seqs):
+            bad.append(f"(e) frames out of order across the two turns: {seqs}")
+        print(f"     (e) on: held={held}, first {text_of(f1)!r}, then {text_of(f2)!r}")
+        # recover=0: the session opted out, the off answer
+        (o0, _), = run_turns(a.host, srv.port, q + "&recover=0", [empty_prone], t_out)
+        if strip_timing(o0) != strip_timing(off_empty):
+            bad.append(f"recover=0: expected the off frames, got {o0}")
+        wait_held(a, srv.port, 0, 15.0)
+        rv = health(a.host, srv.port).get("recovery")
+        check_books(rv, bad, "FORCED on/long")
+        # a run where every turn was skipped proves nothing about recovery
+        if empty_primary and isinstance(rv, dict) and rv["attempted"] < 1:
+            bad.append(f"FORCED on/long: no turn reached a lane (attempted 0): {rv}")
+
+    # ---- flag on, the default deadline: recovered or a plain done in bound
+    extra = ["--empty-recovery", "--recovery-deadline-ms", str(a.deadline_ms)]
+    with Server(a, a.port + 2, extra) as srv:
+        run_turns(a.host, srv.port, q, [healthy], t_out)        # warm-up
+        (t1, t1_s), = run_turns(a.host, srv.port, q, [empty_prone], t_out)
+        limit = (off_empty_s or 0.0) + a.deadline_ms / 1000.0 + a.slack
+        check_empty_turn(t1, t1_s, limit, bad, f"(d) on/{a.deadline_ms} ms")
+        time.sleep(0.2)
+        check_books(health(a.host, srv.port).get("recovery"), bad, f"on/{a.deadline_ms} ms")
+
+    for b in bad:
+        print("     " + b)
+    return verdict(not bad, "--empty-recovery: off is unchanged, noise never recovers, "
+                            "healthy turns identical, EMPTY turn recovered or bounded, "
+                            "the next turn waits for the held done")
+
+
 # ------------------------------------------------------------------ main
 
 def main() -> int:
@@ -496,6 +790,22 @@ def main() -> int:
     p.add_argument("--wait", type=float, default=3.0)
     p.add_argument("--min-pings", type=int, default=2)
     p.set_defaults(fn=cmd_ping)
+
+    p = sub.add_parser("recovery")
+    p.add_argument("--server-bin", default="./mynah-asr-server")
+    p.add_argument("--model-dir", required=True)
+    p.add_argument("--quant", default="int8")
+    p.add_argument("--clip", default="tests/audio/test_en.wav",
+                   help="its first --cut seconds of speech are the EMPTY-prone turn")
+    p.add_argument("--cut", type=float, default=0.4)
+    p.add_argument("--healthy", default="tests/audio/test_en.wav")
+    p.add_argument("--deadline-ms", type=int, default=400)
+    p.add_argument("--long-deadline-ms", type=int, default=10000,
+                   help="the second server's deadline: long enough for a lane to answer")
+    p.add_argument("--slack", type=float, default=1.0,
+                   help="seconds of scheduling slack on top of off-time + deadline")
+    p.add_argument("--log-dir")
+    p.set_defaults(fn=cmd_recovery)
 
     a = ap.parse_args()
     try:

@@ -7,6 +7,9 @@
 #                             run on a device
 #   make -C gpu test-stream   tests/test_cuda_stream (GPU + pack)
 #   make -C gpu bank-transcribe  tests/cuda_bank_transcribe (a bank offline, {clip: text})
+#   make -C gpu recovery-lab  tests/cuda_recovery_lab (the S18 empty-turn recovery lab)
+#   make -C gpu test-empty-recovery  tests/test_cuda_empty_recovery (S18: the server's
+#                             recovery pool on the engine vs the CPU reference)
 #   make -C gpu gemm-shapes   tests/gemm_shapes_bench (GPU): own-tc vs cuBLAS bf16 vs
 #                             the roofline on the real (M, N, K) of a pass
 #
@@ -42,10 +45,10 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 
 B := $(TOP)/build/gpu
 
-C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/http_util.o $(B)/stream_out.o
+C_OBJ    := $(B)/pack.o $(B)/engine_cpu.o $(B)/server_main.o $(B)/ws.o $(B)/hostprof.o $(B)/recovery_pool.o $(B)/http_util.o $(B)/stream_out.o
 CU_OBJ   := $(B)/gemm.o $(B)/gemm_w8.o $(B)/kernels.o $(B)/engine.o
 
-.PHONY: all cpu clean test-kernels test-stream bank-transcribe gemm-shapes lib
+.PHONY: all cpu clean test-kernels test-stream bank-transcribe recovery-lab test-empty-recovery test-empty-recovery-cpu gemm-shapes lib
 all: $(TOP)/mynah-asr-server-cuda
 cpu: $(TOP)/mynah-asr-server-cuda-cpuonly
 
@@ -67,6 +70,10 @@ $(B)/ws.o: server/ws.c
 $(B)/hostprof.o: server/hostprof.c server/hostprof.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/recovery_pool.o: server/recovery_pool.c server/recovery_pool.h asr_engine.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/server_main.o: server/recovery_pool.h
 $(B)/http_util.o: $(TOP)/server/http_util.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -118,7 +125,26 @@ bank-transcribe: $(TOP)/tests/cuda_bank_transcribe
 $(TOP)/tests/cuda_bank_transcribe: $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
 	$(NVCC) $(GENCODE) -o $@ $(B)/cuda_bank_transcribe.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
 
+$(B)/cuda_recovery_lab.o: $(TOP)/tests/cuda_recovery_lab.c asr_engine.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+recovery-lab: $(TOP)/tests/cuda_recovery_lab
+$(TOP)/tests/cuda_recovery_lab: $(B)/cuda_recovery_lab.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
+	$(NVCC) $(GENCODE) -o $@ $(B)/cuda_recovery_lab.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
+
+$(B)/test_cuda_empty_recovery.o: $(TOP)/tests/test_cuda_empty_recovery.c asr_engine.h server/recovery_pool.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -iquote server -c $< -o $@
+test-empty-recovery: $(TOP)/tests/test_cuda_empty_recovery
+$(TOP)/tests/test_cuda_empty_recovery: $(B)/test_cuda_empty_recovery.o $(B)/recovery_pool.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(TOP)/libmynah_asr.a
+	$(NVCC) $(GENCODE) -o $@ $(B)/test_cuda_empty_recovery.o $(B)/recovery_pool.o $(B)/pack.o $(B)/engine_cpu.o $(CU_OBJ) $(LDLIBS) $(CUDA_LIBS)
+# the same test with the cpu reference engine only (no nvcc)
+test-empty-recovery-cpu: $(TOP)/tests/test_cuda_empty_recovery_cpuonly
+$(TOP)/tests/test_cuda_empty_recovery_cpuonly: $(B)/test_cuda_empty_recovery.o $(B)/recovery_pool.o $(B)/pack.o $(B)/engine_cpu.o $(B)/engine_stub.o $(TOP)/libmynah_asr.a
+	$(CC) $(CFLAGS) -o $@ $(B)/test_cuda_empty_recovery.o $(B)/recovery_pool.o $(B)/pack.o $(B)/engine_cpu.o $(B)/engine_stub.o $(LDLIBS)
+
 clean:
 	rm -rf $(B) $(TOP)/mynah-asr-server-cuda $(TOP)/mynah-asr-server-cuda-cpuonly \
-	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe \
+	       $(TOP)/tests/test_cuda_kernels $(TOP)/tests/test_cuda_stream $(TOP)/tests/cuda_bank_transcribe $(TOP)/tests/cuda_recovery_lab \
+	       $(TOP)/tests/test_cuda_empty_recovery $(TOP)/tests/test_cuda_empty_recovery_cpuonly \
 	       $(TOP)/tests/gemm_shapes_bench

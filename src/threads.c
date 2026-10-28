@@ -343,10 +343,16 @@ void mynah_asr_blas_set_concurrency(int n_inflight) {
     blas_apply(budget);
 }
 
+/* See mynah_asr_thread_set_serial. Per thread, so the scheduler's own calls are
+ * never affected by a helper thread that set it. */
+static _Thread_local int t_serial;
+
+void mynah_asr_thread_set_serial(int on) { t_serial = on ? 1 : 0; }
+
 void mynah_asr_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
     const int nth = mynah_asr_num_threads();
-    if (nth <= 1 || n == 1) {
+    if (t_serial || nth <= 1 || n == 1) {
         for (int i = 0; i < n; i++) fn(ctx, i);
         return;
     }

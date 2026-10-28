@@ -152,7 +152,9 @@ void mynah_asr_slot_destroy(mynah_asr_slot *s) {
     free(s->arr);
     free(s->take);
     free(s->frame);
+    free(s->rec_cur); free(s->rec_tail); free(s->rec_prev); free(s->rec_prev_text);
     s->ring = NULL; s->arr = NULL; s->take = NULL; s->frame = NULL;
+    s->rec_cur = s->rec_tail = s->rec_prev = NULL; s->rec_prev_text = NULL;
     pthread_cond_destroy(&s->space);
     pthread_mutex_destroy(&s->mu);
 }
@@ -412,6 +414,13 @@ int mynah_asr_slot_take_requests(mynah_asr_slot *s, char *lang,
     if (reason) *reason = s->cancel_reason;
     /* CANCEL survives: it is terminal, and a later poll must still see it. */
     s->req &= MYNAH_ASR_SLOT_REQ_CANCEL;
+    slot_unlock(s);
+    return req;
+}
+
+int mynah_asr_slot_peek_requests(mynah_asr_slot *s) {
+    slot_lock(s, "mynah_asr_slot_peek_requests");
+    const int req = s->req;
     slot_unlock(s);
     return req;
 }

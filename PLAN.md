@@ -280,6 +280,12 @@ stream_out). Target: C=128 on a 4-vCPU, 24 GB-class cloud GPU instance
 - [~] S14-14 **2026-10-08 L4: 55 graph execs captured in 0.19 s, warm-up 1.06 s, start-up 0.65 -> 1.93 s, +244 MiB VRAM; byte-identical; default off, knee A/B owed.** CUDA graphs of the encoder pass per lane x row bucket (`--graphs buckets`, padding lanes q = 0 on a scratch slot, padding rows owned by no lane), traffic-shaped start-up warm-up (`--warmup 1`); the label loop stays eager → [`.work/cuda-stage-ahead-graphs.md`](.work/cuda-stage-ahead-graphs.md)
 - [ ] S14-9 Multi-GPU: one process per GPU behind the v2 router (SCM_RIGHTS handoff exists); not before S14-7 → [`.work/cuda-batched-streaming-server.md`](.work/cuda-batched-streaming-server.md)
 
+### S18 — Recovery for streaming turns that end EMPTY (opt-in, default off) → [`.work/empty-turn-recovery.md`](.work/empty-turn-recovery.md)
+- [x] S18-1 **DONE 2026-10-28 (E1-E13).** Mechanism first on CPU: pure boundary/gate module with model-free tests (context ends `.` `?` `!`), a lab binary that dumps replay tokens/frames/`keep_from`, FLEURS en/fr items; pre-registered gate decides whether the replay is built → [`.work/empty-turn-recovery.md`](.work/empty-turn-recovery.md)
+- [x] S18-2 **DONE 2026-10-28: `src/recover.c` + `src/recover.h`, pure plan/build/vote in `src/recovery.h`.** Library API after S18-1 passes: pooled recovery stream, emission frames in the stream decode, byte-identical with recovery off → [`.work/empty-turn-recovery.md`](.work/empty-turn-recovery.md)
+- [~] S18-3 **V1 2026-10-28 (E14); open: default deadline, early reject.** CPU server opt-in: flag + query key, preallocated per-slot PCM history, admission budget, counters, `ws_probe` check → [`.work/empty-turn-recovery.md`](.work/empty-turn-recovery.md)
+- [~] S18-4 **V1 2026-10-28 (E9-E10, E14), awaiting review.** CUDA server, only after S18-3 and on request → [`.work/empty-turn-recovery.md`](.work/empty-turn-recovery.md)
+
 ## Durable contract (changes only when a decision changes)
 
 1. Config-driven: every model number comes from the converted pack's

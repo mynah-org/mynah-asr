@@ -685,7 +685,10 @@ __global__ void dec_decide_kernel(gpu_model_dims dm, gpu_arena ar, const gpu_row
     } else {
         if (m->dec_ntok < ar.tok_cap) {
             ar.tok[(size_t)r.slot * ar.tok_cap + m->dec_ntok] = tok;
-            ar.tok_frame[(size_t)r.slot * ar.tok_cap + m->dec_ntok] = (int)(m->t_abs + m->dec_t);
+            /* kv_advance already moved t_abs past this chunk (+= r.q) before the
+             * label loop: the chunk's first frame is t_abs - r.q, as on the CPU
+             * (src/decoder.c: frames = t_abs + t, t_abs advanced after decode) */
+            ar.tok_frame[(size_t)r.slot * ar.tok_cap + m->dec_ntok] = (int)(m->t_abs - r.q + m->dec_t);
             m->dec_ntok++;
         }
         m->n_emitted++;

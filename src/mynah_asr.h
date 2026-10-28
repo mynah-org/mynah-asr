@@ -45,6 +45,10 @@ enum { MYNAH_ASR_QUANT_F32 = 0, MYNAH_ASR_QUANT_INT8 = 1, MYNAH_ASR_QUANT_INT4 =
 mynah_asr_model *mynah_asr_load_quant(const char *model_dir, int quant);
 void mynah_asr_free(mynah_asr_model *m);
 
+/* Input samples per encoder frame (hop x subsampling, 1280 on Nemotron): the
+ * unit of the emission frames mynah_asr_stream_tokens reports. */
+int mynah_asr_frame_samples(const mynah_asr_model *m);
+
 /* Resolve a language tag ("it-IT", "auto", ...) into a prompt id. -1 if unknown. */
 int mynah_asr_lang_id(const mynah_asr_model *m, const char *lang);
 
@@ -243,6 +247,13 @@ const char *mynah_asr_stream_lang(const mynah_asr_stream *s);
  * client's concatenation SHOULD equal this. Nothing enforces that: the quality
  * gate compares them. Valid until the next feed. */
 const char *mynah_asr_stream_text(const mynah_asr_stream *s);
+/* The token ids of the current utterance and, for each, the absolute encoder
+ * frame (mynah_asr_frame_sec apart, counted from the last open/reset) at which
+ * the decoder emitted it. Returns the count; both arrays are owned by the
+ * stream and valid until the next feed/finish/reset. Language tags included. */
+int mynah_asr_stream_tokens(const mynah_asr_stream *s, const int **tokens, const int **frames);
+/* Encoder frames per streaming chunk (lookahead + 1): the stream's time grid. */
+int mynah_asr_stream_chunk_frames(const mynah_asr_stream *s);
 
 /* A new utterance on the SAME stream object: every cache, the decoder state,
  * the VAD state and the emitted-text bookkeeping go back to what open() gave,

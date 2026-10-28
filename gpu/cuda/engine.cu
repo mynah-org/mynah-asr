@@ -49,6 +49,7 @@ struct slot_host {
     double emitted_t1 = 0.0;
     char lang[16] = {0};
     std::vector<int> tokens;
+    std::vector<int> frames;    /* emission frame per token (cfg.record_frames only) */
     int reset_pending = 0;
 };
 
@@ -127,6 +128,9 @@ struct cuda_engine {
     int *d_active = nullptr, *d_n_active = nullptr, *d_am = nullptr, *d_emit = nullptr,
         *d_resets = nullptr;
     int *h_n_active = nullptr, *h_resets = nullptr, *h_tok = nullptr;
+    int *h_tok_frame = nullptr; /* pinned, slots [rf_from, cap), only with record_frames */
+    int record_frames = 0;
+    int rf_from = 0;            /* first slot that records its emission frames */
     gpu_slot_meta *h_meta = nullptr;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
@@ -461,6 +465,8 @@ static int alloc_scratch(cuda_engine *e) {
     e->passes.resize(NP);
     for (auto &p : e->passes) p.lanes.reserve(B);
     CK(e, "pinned tok", cudaHostAlloc((void **)&e->h_tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
+    if (e->record_frames)
+        CK(e, "pinned tok frame", cudaHostAlloc((void **)&e->h_tok_frame, (size_t)(e->cap - e->rf_from) * e->ar.tok_cap * sizeof(int), cudaHostAllocPortable));
     CK(e, "pinned meta", cudaHostAlloc((void **)&e->h_meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaHostAllocPortable));
     return 0;
 }
@@ -664,6 +670,12 @@ extern "C" asr_engine *asr_engine_open_cuda(const asr_engine_cfg *cfg, char *err
         delete e; return nullptr;
     }
     e->hprof = cfg->profile_host ? 1 : 0;
+    e->record_frames = cfg->record_frames ? 1 : 0;
+    if (e->record_frames && (cfg->record_frames_from < 0 || cfg->record_frames_from >= e->cap)) {
+        snprintf(err, errcap, "record_frames_from %d outside 0..cap-1 (%d)", cfg->record_frames_from, e->cap - 1);
+        delete e; return nullptr;
+    }
+    e->rf_from = e->record_frames ? cfg->record_frames_from : e->cap;
     /* the label loop's lane compaction is one block over at most 1024 lanes */
     if (cfg->pass_lanes < 0 || cfg->pass_lanes > 1024) {
         snprintf(err, errcap, "pass lanes %d outside 1..1024 (0 = the default min(cap, 128))", cfg->pass_lanes);
@@ -791,6 +803,7 @@ static void cuda_close(cuda_engine *e) {
     if (e->h_n_active) cudaFreeHost(e->h_n_active);
     if (e->h_resets) cudaFreeHost(e->h_resets);
     if (e->h_tok) cudaFreeHost(e->h_tok);
+    if (e->h_tok_frame) cudaFreeHost(e->h_tok_frame);
     if (e->h_meta) cudaFreeHost(e->h_meta);
     asr_pack_close(&e->pack);
     cudaDeviceReset();
@@ -881,6 +894,7 @@ static int cuda_slot_reset(cuda_engine *e, int slot, const char *lang, int looka
     mynah_asr_detok_reset(&s.detok);
     s.chars_emitted = 0; s.emitted_t1 = 0.0; s.lang[0] = '\0';
     s.tokens.clear();
+    s.frames.clear();
     /* once per slot until the next step applies it: repeated resets of an
      * idle slot must not grow the list past the pinned buffer (cap entries) */
     if (!s.reset_pending) { s.reset_pending = 1; e->pending_resets.push_back(slot); }
@@ -939,6 +953,13 @@ static const char *cuda_slot_text(const cuda_engine *e, int slot) {
     if (slot < 0 || slot >= e->cap) return "";
     const slot_host &s = e->slots[(size_t)slot];
     return s.detok.buf ? s.detok.buf : "";
+}
+static int cuda_slot_tokens(const cuda_engine *e, int slot, const int **tok, const int **frames) {
+    if (!e->record_frames || slot < e->rf_from || slot >= e->cap) return -1;
+    const slot_host &s = e->slots[(size_t)slot];
+    if (tok) *tok = s.tokens.data();
+    if (frames) *frames = s.frames.data();
+    return (int)s.tokens.size();
 }
 static const char *cuda_slot_lang(const cuda_engine *e, int slot) {
     if (slot < 0 || slot >= e->cap) return "";
@@ -1150,6 +1171,15 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     /* results: tokens and metadata of every slot (small), once */
     prof_mark(e, PS_D2H);
     CK(e, "d2h tok", cudaMemcpyAsync(e->h_tok, e->ar.tok, (size_t)e->cap * e->ar.tok_cap * sizeof(int), cudaMemcpyDeviceToHost, e->stream));
+    /* emission frames: only when this pass holds a recording slot, and only
+     * the recording range, so a pass without one is the same as without
+     * record_frames */
+    int rf_pass = 0;
+    if (e->record_frames)
+        for (int a = 0; a < B && !rf_pass; a++) rf_pass = ps.lanes[(size_t)a].slot >= e->rf_from;
+    const size_t rf_bytes = (size_t)(e->cap - e->rf_from) * e->ar.tok_cap * sizeof(int);
+    if (rf_pass)
+        CK(e, "d2h tok frame", cudaMemcpyAsync(e->h_tok_frame, e->ar.tok_frame + (size_t)e->rf_from * e->ar.tok_cap, rf_bytes, cudaMemcpyDeviceToHost, e->stream));
     CK(e, "d2h meta", cudaMemcpyAsync(e->h_meta, e->ar.meta, (size_t)e->cap * sizeof(gpu_slot_meta), cudaMemcpyDeviceToHost, e->stream));
     prof_mark(e, PS_OTHER);
     hp = hp_lap(e, ASR_HP_DEC_LAUNCH, hp);
@@ -1158,6 +1188,7 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
     if (e->hprof) { e->st.hprof_syncs++; e->st.hprof_passes++; }
     prof_collect(e);
     e->st.d2h_bytes += (double)e->cap * e->ar.tok_cap * sizeof(int) + (double)e->cap * sizeof(gpu_slot_meta);
+    if (rf_pass) e->st.d2h_bytes += (double)rf_bytes;
     e->st.rows += (unsigned long)ps.R;
     e->st.lanes += (unsigned long)B;
 
@@ -1171,6 +1202,10 @@ static int pass_decode(cuda_engine *e, int p, asr_step_out *outs) {
         const size_t before = s.chars_emitted;
         const char *text = mynah_asr_detok_append(&s.detok, &e->pack.tok, tok, ntok, lang_tmp);
         for (int k = 0; k < ntok; k++) s.tokens.push_back(tok[k]);
+        if (rf_pass && l.slot >= e->rf_from) {
+            const int *fr = e->h_tok_frame + (size_t)(l.slot - e->rf_from) * e->ar.tok_cap;
+            for (int k = 0; k < ntok; k++) s.frames.push_back(fr[k]);
+        }
         if (lang_tmp[0]) memcpy(s.lang, lang_tmp, sizeof(s.lang));
         o.n_tokens = ntok;
         o.stepped = 1;
@@ -1488,6 +1523,7 @@ static int slots_reset_all(cuda_engine *e) {
         mynah_asr_detok_reset(&s.detok);
         s.chars_emitted = 0; s.emitted_t1 = 0.0; s.lang[0] = '\0';
         s.tokens.clear();
+        s.frames.clear();
         s.reset_pending = 0;
     }
     e->pending_resets.clear();
@@ -1566,6 +1602,7 @@ static int ops_slot_ready(const asr_engine *e, int s) { return cuda_slot_ready(C
 static double ops_slot_audio(const asr_engine *e, int s) { return cuda_slot_audio_s(CCE(e), s); }
 static const char *ops_slot_text(const asr_engine *e, int s) { return cuda_slot_text(CCE(e), s); }
 static const char *ops_slot_lang(const asr_engine *e, int s) { return cuda_slot_lang(CCE(e), s); }
+static int ops_slot_tokens(const asr_engine *e, int s, const int **t, const int **f) { return cuda_slot_tokens(CCE(e), s, t, f); }
 static int ops_step(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { bind_device(CE(e)); return cuda_step(CE(e), r, n, o); }
 static int ops_submit(asr_engine *e, const asr_step_req *r, int n, asr_step_out *o) { bind_device(CE(e)); return cuda_step_submit(CE(e), r, n, o); }
 static int ops_finish(asr_engine *e, asr_step_out *o) { bind_device(CE(e)); return cuda_step_finish(CE(e), o); }
@@ -1576,6 +1613,6 @@ static size_t ops_dispatch(const asr_engine *e, char *b, size_t c) { return cuda
 static const asr_engine_ops CUDA_OPS = {
     ops_close, ops_facts, ops_stats, ops_lang_id, ops_lookahead_ok, ops_slot_reset, ops_slot_need,
     ops_slot_feed, ops_slot_ready, ops_slot_audio, ops_slot_text, ops_slot_lang, ops_step, ops_dead,
-    ops_error, ops_dispatch, ops_submit, ops_finish, ops_feed_batch,
+    ops_error, ops_dispatch, ops_submit, ops_finish, ops_feed_batch, ops_slot_tokens,
 };
 static const asr_engine_ops *cuda_ops(void) { return &CUDA_OPS; }

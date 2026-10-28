@@ -77,6 +77,9 @@ typedef struct {
     int   listen_somaxconn;
     int   metrics_port;
     const char *metrics_bind;
+    /* --empty-recovery: printed (and its counters exported) only when on */
+    int   recovery_on, recovery_deadline_ms, recovery_lanes;
+    double recovery_max_duty;
 } mynah_asr_obs_config;
 
 /* Copies `cfg` and starts the uptime clock. Call once, before the banner. */

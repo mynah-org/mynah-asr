@@ -21,6 +21,10 @@
 #      readable body and Retry-After -- not an ECONNRESET.
 #   9. SIGTERM with a live stream: an `error shutting_down` frame, exit 0, and
 #      no survivors.
+#  10. --empty-recovery (opt-in): off is unchanged, noise never recovers, a
+#      healthy turn is frame-identical, an EMPTY-prone turn is recovered or ends
+#      within the deadline, and the next turn waits for the held `done`
+#      (tests/ws_probe.py recovery starts and stops its own three servers).
 #
 # Usage: test_server_protocol.sh [model_dir] [port]
 # Exit: 0 ok, 1 fail, 77 skip (model, binaries or python missing).
@@ -207,5 +211,8 @@ else
     pkill -9 -f "mynah-asr-server -m $MODEL_DIR -p $PORT4"
     fail=1
 fi
+
+# ---- 10: EMPTY-turn recovery, opt-in --------------------------------------
+probe empty-recovery --port $((PORT + 4)) --lang en-US recovery --model-dir "$MODEL_DIR" --log-dir "$TMP"
 
 exit $fail
