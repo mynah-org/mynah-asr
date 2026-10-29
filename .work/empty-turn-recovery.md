@@ -350,6 +350,43 @@ gives n. `tests/test_recovery` cases 18-21 (130/130). The old and new rules
 give identical WORD and TEXT output on all 587 E12 replays (a C driver over the
 dumped tokens and frames, linked once with each `recovery.c`).
 
+E16 Unspaced scripts and language tags on real audio (2026-10-29, rented RTX
+6000 Ada, sm_89, f32, `tests/cuda_recovery_lab --dump-tokens 1`, the E15 tree
+vs the previous main, the same binaries except `src/recovery.c`). New public
+items, same shape as E1 (15 current clips x {0.4, 0.7, 1.0 s, whole, lead-in
+only} per set): MINDS-14 zh-CN with questions as the previous turn (8 kHz ->
+16 kHz, sox), FLEURS test zh (cmn_hans_cn) and ja (ja_jp); each set with its
+language and with "auto" (the decoder emits language tags), plus the first
+bank (en/fr, MINDS-q and FLEURS) with "auto". 864 + 864 + 552 replays.
+- en/fr with "auto": WORD and TEXT identical between the old and new rule (no
+  replay starts with an unmarked piece after a tag in this data).
+- zh/ja: the old WORD rule handed the leading unmarked run to the context, so
+  the current turn lost its first characters ("你好, 我想查询..." -> "我想查询...",
+  "买一张万能卡也有不少好处, ..." -> "带着这张卡, ...") or ended EMPTY. E15 keeps
+  them, but WORD has no transcript: when the context's last characters are
+  emitted 1-3 frames past keep_from ("直接" | "付" "款" "," "▁请", context
+  transcript "...直接付款。") they stay with the turn, also on a lead-in-only
+  (silence) turn ("付款。").
+Fix: TEXT, in a script written without spaces, gives back the leading unmarked
+characters equal to the context transcript's last characters, the first one
+emitted inside the lag window (`tests/test_recovery` case 22, 142/142; the two
+TEXT give-back cases fail on the E15 code).
+Result, TEXT (the library default), fixed language, zh/ja 864 replays: accepted
+472 (old) -> 506; all 14 context-tail replays of the previous run go back (the
+three lead-in-only ones are EMPTY again); the added text is the current turn's
+own audio (first words, homophones such as 你好/您好, fillers such as 哦/啊, and
+misrecognised 0.4 s cuts), one residual: a 960 ms replay where the decoder
+dropped the context's last character, so "付" alone does not match "付款".
+Lead-in-only turns accepted: 1 -> 1. en/fr banks: identical. Known limits:
+with "auto" a context transcript decoded in the wrong language (zh heard as
+Russian) gives no match, so WORD's keep stands (3 lead-in-only replays of 216
+items accept "付款。"; the library's vote of >= 2 attempts is what rejects such a
+single replay); a whole context word emitted far past the window (16 frames on
+a 960 ms replay, "谢谢" | "你好") stays, as in spaced scripts.
+GPU gates on this tree: `test_cuda_stream` A/B/C PASS; `test_cuda_empty_recovery`
+MINDS-q 98/98 decisions equal to the CPU reference, silence/noise 0/32, live
+lanes 8/8 identical; identical to the previous main.
+
 ## Next action
 
 S18-1a: the pure boundary/gate module and its model-free test.

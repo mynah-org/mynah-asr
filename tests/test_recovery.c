@@ -27,11 +27,13 @@ static const char *const VOCAB[] = {
     "?", ".", "!", WM "Yes", WM "please", WM ".", WM, "J", "o", "<en-US>", WM "account",
     ",", WM "Bonjour", WM "\xc2\xbf", "Qu\xc3\xa9", WM "?",
     "ye", "s", "\xe6\x88\x91", "\xe5\xa5\xbd", "\xe7\x9a\x84", "3",
+    "\xe4\xbb\x98", "\xe6\xac\xbe", "\xe8\xaf\xb7", "\xe4\xbd\xa0", "\xe8\xb0\xa2",
 };
 enum {
     UNK, HOW, DO, I_, OPEN, A, JOINT, ACC, OUNT, QM, DOT, EXCL, YES, PLEASE, WM_DOT, WM_BARE,
     J, O, TAG_EN, ACCOUNT, COMMA, BONJOUR, WM_INVQ, QUE, WM_QM,
-    YE, S_, ZH_WO, ZH_HAO, ZH_DE, DIGIT3, NVOCAB
+    YE, S_, ZH_WO, ZH_HAO, ZH_DE, DIGIT3,
+    ZH_FU, ZH_KUAN, ZH_QING, ZH_NI, ZH_XIE, NVOCAB
 };
 
 static int load_vocab(mynah_asr_tokenizer *tk, char *path) {
@@ -303,6 +305,34 @@ int main(void) {
         const int f[] = {1, 2, 10, 10, 11};
         expect(&tk, "only the context's tail past the boundary -> nothing", t, f, N(t), 10, ctx_q,
                "ount? ?", "", "");
+    }
+
+    /* 22. a script written without spaces, TEXT: the context's last characters
+     *     emitted past the boundary ("我" | "付" "款" "," "▁请", the context's
+     *     transcript ending "我付款") are given back by the transcript; WORD has no
+     *     transcript and keeps them. A turn that does not continue the transcript
+     *     ("谢" | "你" "好") is kept; a match whose first piece is emitted past the
+     *     lag window stays (the window's cost); the tail alone gives nothing. */
+    {
+        const char *ctx_zh = "\xe6\x88\x91\xe4\xbb\x98\xe6\xac\xbe\xe3\x80\x82";
+        const int t[] = {ZH_WO, ZH_FU, ZH_KUAN, COMMA, WM_BARE, ZH_QING};
+        const int f[] = {2, 11, 14, 15, 16, 16};
+        expect(&tk, "unspaced TEXT: the context's characters past the boundary go back", t, f, N(t), 10,
+               ctx_zh, "\xe4\xbb\x98\xe6\xac\xbe, \xe8\xaf\xb7", "\xe4\xbb\x98\xe6\xac\xbe, \xe8\xaf\xb7",
+               "\xe8\xaf\xb7");
+        const int t2[] = {ZH_XIE, ZH_NI, ZH_HAO};
+        const int f2[] = {2, 14, 15};
+        expect(&tk, "unspaced TEXT: a turn that does not continue the transcript is kept", t2, f2, N(t2), 10,
+               "\xe8\xb0\xa2\xe8\xb0\xa2\xe3\x80\x82", "\xe4\xbd\xa0\xe5\xa5\xbd", "\xe4\xbd\xa0\xe5\xa5\xbd",
+               "\xe4\xbd\xa0\xe5\xa5\xbd");
+        const int f3[] = {2, 14, 15, 15, 16, 16};
+        expect(&tk, "unspaced TEXT: a match opened past the lag window stays", t, f3, N(t), 10,
+               ctx_zh, "\xe4\xbb\x98\xe6\xac\xbe, \xe8\xaf\xb7", "\xe4\xbb\x98\xe6\xac\xbe, \xe8\xaf\xb7",
+               "\xe4\xbb\x98\xe6\xac\xbe, \xe8\xaf\xb7");
+        const int t4[] = {ZH_WO, ZH_FU, ZH_KUAN, DOT};
+        const int f4[] = {2, 11, 12, 13};
+        expect(&tk, "unspaced TEXT: only the context's characters past the boundary -> nothing", t4, f4,
+               N(t4), 10, ctx_zh, "\xe4\xbb\x98\xe6\xac\xbe.", "\xe4\xbb\x98\xe6\xac\xbe.", "");
     }
 
     /* ---- gate ---------------------------------------------------------- */

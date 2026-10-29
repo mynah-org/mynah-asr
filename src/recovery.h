@@ -38,8 +38,12 @@
  *   own transcript AND whose first piece was emitted less than lag_frames after
  *   keep_from is given back to the context (and so on, word by word): the
  *   transducer's emission lag at a turn end, measured at 0-1 frames on every
- *   such word (.work/empty-turn-recovery.md E12). Needs that transcript;
- *   without one it is WORD.
+ *   such word (.work/empty-turn-recovery.md E12). In a script written without
+ *   spaces there is no word to compare: the leading unmarked characters that
+ *   equal the transcript's last characters go back, when the first of them was
+ *   emitted inside the same window ("直接" | "付" "款" ", 请": "请" is the
+ *   turn's; E16). Needs that transcript; without one it is WORD, which in such
+ *   a script keeps the context's late characters with the current turn.
  *
  * The invariant (E12): ownership is per word; a word belongs to the turn in
  * which its first piece is emitted and its pieces and trailing punctuation

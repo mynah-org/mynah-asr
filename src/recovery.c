@@ -180,11 +180,62 @@ static int tail_words(const char *text, nword *out, int cap, int *total) {
     return n;
 }
 
+/* The last up-to-cap content code points of a text, in order. */
+static int tail_cps(const char *text, unsigned *out, int cap) {
+    int n = 0;
+    for (const char *s = text ? text : "", *end = s + strlen(s); s < end;) {
+        unsigned cp;
+        s += utf8_next(s, end, &cp);
+        if (!cp_is_content(cp)) continue;
+        if (n == cap) { memmove(out, out + 1, (size_t)(cap - 1) * sizeof(unsigned)); n--; }
+        out[n++] = cp;
+    }
+    return n;
+}
+
 /* ------------------------------------------------------------ ownership */
 
 /* At most this many context words are looked for past the boundary: a
  * transducer's emission lag is a fraction of a second, a few words at most. */
 #define TEXT_STRIP_MAX 4
+/* ... and at most this many characters of a script written without spaces. */
+#define TEXT_STRIP_CPS 8
+
+/* TEXT in a script written without spaces: the unmarked pieces from i on carry
+ * no word boundary, so the context's last characters emitted past the boundary
+ * ("直接" | "付" "款" "," "▁请") are told from the current turn's by the
+ * context's transcript: the longest run of leading pieces whose characters equal
+ * the transcript's last characters is given back. The first of them must be
+ * emitted inside the lag window. Returns the first token the turn owns, or -1
+ * when nothing is given back. */
+static int unspaced_give_back(const mynah_asr_tokenizer *tk, const int *tokens, const int *frames,
+                              int n, int i, int keep_from, const char *context_text,
+                              int lag_frames) {
+    const char *p0 = piece_of(tk, tokens[i]);
+    if (!is_text(p0) || mynah_asr_piece_has_mark(p0) || !run_has(tk, tokens, i, i + 1, 1)) return -1;
+    if (lag_frames > 0 && frames[i] >= keep_from + lag_frames) return -1;
+    unsigned ctx[TEXT_STRIP_CPS], kc[TEXT_STRIP_CPS];
+    const int m = tail_cps(context_text, ctx, TEXT_STRIP_CPS);
+    int nk = 0, best = -1;
+    for (int t = i; t < n; t++) {
+        const char *p = piece_of(tk, tokens[t]);
+        if (!is_text(p) || mynah_asr_piece_has_mark(p)) break;
+        int over = 0;
+        for (const char *s = p, *end = p + strlen(p); s < end;) {
+            unsigned cp;
+            s += utf8_next(s, end, &cp);
+            if (!cp_is_content(cp)) continue;
+            if (!cp_is_unspaced(cp) || nk == TEXT_STRIP_CPS) { over = 1; break; }
+            kc[nk++] = cp;
+        }
+        if (over) break;
+        if (nk > 0 && nk <= m && memcmp(kc, ctx + m - nk, (size_t)nk * sizeof(unsigned)) == 0)
+            best = t + 1;
+    }
+    if (best < 0) return -1;
+    while (best < n && !run_has(tk, tokens, best, best + 1, 0)) best++;
+    return best;
+}
 
 int mynah_asr_replay_keep_from(const mynah_asr_tokenizer *tk, const int *tokens,
                                const int *frames, int n, int keep_from,
@@ -197,6 +248,8 @@ int mynah_asr_replay_keep_from(const mynah_asr_tokenizer *tk, const int *tokens,
     }
     i = word_start(tk, tokens, frames, n, keep_from);
     if (rule == MYNAH_ASR_KEEP_WORD || i == n || !context_text) return i;
+    const int u = unspaced_give_back(tk, tokens, frames, n, i, keep_from, context_text, lag_frames);
+    if (u >= 0) return u;
 
     /* TEXT: the first words the current turn owns, w0..; give back the
      * longest prefix w0..wj-1 equal to the context's last j words. A word is
