@@ -26,10 +26,12 @@ static const char *const VOCAB[] = {
     "<unk>", WM "How", WM "do", WM "I", WM "open", WM "a", WM "joint", WM "acc", "ount",
     "?", ".", "!", WM "Yes", WM "please", WM ".", WM, "J", "o", "<en-US>", WM "account",
     ",", WM "Bonjour", WM "\xc2\xbf", "Qu\xc3\xa9", WM "?",
+    "ye", "s", "\xe6\x88\x91", "\xe5\xa5\xbd", "\xe7\x9a\x84", "3",
 };
 enum {
     UNK, HOW, DO, I_, OPEN, A, JOINT, ACC, OUNT, QM, DOT, EXCL, YES, PLEASE, WM_DOT, WM_BARE,
-    J, O, TAG_EN, ACCOUNT, COMMA, BONJOUR, WM_INVQ, QUE, WM_QM, NVOCAB
+    J, O, TAG_EN, ACCOUNT, COMMA, BONJOUR, WM_INVQ, QUE, WM_QM,
+    YE, S_, ZH_WO, ZH_HAO, ZH_DE, DIGIT3, NVOCAB
 };
 
 static int load_vocab(mynah_asr_tokenizer *tk, char *path) {
@@ -250,6 +252,57 @@ int main(void) {
         char *got = mynah_asr_detokenize(&tk, t + k0, N(t) - k0, NULL);
         CHECK(got && strcmp(got, "please") == 0, "TEXT without a window (lag 0) gives back any repeat");
         free(got);
+    }
+    /* 18. the current turn's first word opens with a bare ▁ emitted one frame
+     *     BEFORE the boundary (the chunk's lookahead lets the decoder start it
+     *     early) and its letters after it: "▁" | "ye" "s". The word is the
+     *     current turn's: a mark with no content yet does not make the context's
+     *     last word open. Without this, WORD skips the unmarked "ye" "s". */
+    {
+        const int t[] = {JOINT, ACCOUNT, QM, WM_BARE, YE, S_, PLEASE};
+        const int f[] = {1, 2, 3, 9, 10, 10, 12};
+        expect(&tk, "bare ▁ before the boundary, letters after: 'yes' is kept", t, f, N(t), 10,
+               ctx_q, "yes please", "yes please", "yes please");
+        /* ... while a lexical context word's tail after the boundary still goes back */
+        const int t2[] = {JOINT, ACC, OUNT, QM, YES};
+        const int f2[] = {1, 2, 10, 10, 12};
+        expect(&tk, "a lexical context word's tail is still given back", t2, f2, N(t2), 10, ctx_q,
+               "ount? Yes", "Yes", "Yes");
+    }
+    /* 19. a language tag ends the context's word: the unmarked piece after it
+     *     opens the current turn's word ("." "<en-US>" | "J" "o"). */
+    {
+        const int t[] = {ACCOUNT, DOT, TAG_EN, J, O, PLEASE};
+        const int f[] = {1, 2, 3, 10, 10, 12};
+        expect(&tk, "a tag ends the context's word: 'Jo' after it is kept", t, f, N(t), 10, NULL,
+               "Jo please", "Jo please", "Jo please");
+        const int t2[] = {ACCOUNT, QM, WM_BARE, TAG_EN, J, O};
+        const int f2[] = {1, 10, 10, 10, 11, 11};
+        expect(&tk, "'?' + bare ▁ + tag past the boundary open nothing", t2, f2, N(t2), 10, NULL,
+               "? Jo", "Jo", "Jo");
+    }
+    /* 20. a script written without spaces: the kept chunks are the inside of one
+     *     long run, so its unmarked pieces are the current turn's, also when a
+     *     later mark (before a digit) follows. */
+    {
+        const int t[] = {WM_BARE, ZH_WO, ZH_HAO, ZH_DE};
+        const int f[] = {1, 2, 10, 11};
+        expect(&tk, "unspaced script: the run after the boundary is kept", t, f, N(t), 10,
+               "\xe6\x88\x91", "\xe5\xa5\xbd\xe7\x9a\x84", "\xe5\xa5\xbd\xe7\x9a\x84",
+               "\xe5\xa5\xbd\xe7\x9a\x84");
+        const int t2[] = {WM_BARE, ZH_WO, ZH_HAO, ZH_DE, WM_BARE, DIGIT3};
+        const int f2[] = {1, 2, 10, 11, 12, 12};
+        expect(&tk, "unspaced script with a later mark: the leading run is kept", t2, f2, N(t2), 10,
+               "\xe6\x88\x91", "\xe5\xa5\xbd\xe7\x9a\x84 3", "\xe5\xa5\xbd\xe7\x9a\x84 3",
+               "\xe5\xa5\xbd\xe7\x9a\x84 3");
+    }
+    /* 21. only the context's tail after the boundary: the current turn owns
+     *     nothing (EMPTY), as before -- no fallback to the whole slice. */
+    {
+        const int t[] = {JOINT, ACC, OUNT, QM, WM_QM};
+        const int f[] = {1, 2, 10, 10, 11};
+        expect(&tk, "only the context's tail past the boundary -> nothing", t, f, N(t), 10, ctx_q,
+               "ount? ?", "", "");
     }
 
     /* ---- gate ---------------------------------------------------------- */

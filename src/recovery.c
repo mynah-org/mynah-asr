@@ -65,18 +65,79 @@ static const char *piece_of(const mynah_asr_tokenizer *tk, int id) {
 
 static int is_text(const char *p) { return p && !mynah_asr_piece_is_special(p); }
 
-/* Does token i open a WORD (recovery.h): a marked piece whose run, up to the
- * next marked piece, holds content? */
-static int opens_word(const mynah_asr_tokenizer *tk, const int *tokens, int n, int i) {
+/* Scripts written without spaces between words: there an unmarked piece is no
+ * word's tail, the mark only comes before a digit, a Latin word or a sentence. */
+static int cp_is_unspaced(unsigned c) {
+    return (c >= 0x0E00 && c <= 0x0EFF) ||  /* Thai, Lao */
+           (c >= 0x1000 && c <= 0x109F) ||  /* Myanmar */
+           (c >= 0x1780 && c <= 0x17FF) ||  /* Khmer */
+           (c >= 0x3040 && c <= 0x30FF) ||  /* Hiragana, Katakana */
+           (c >= 0x3400 && c <= 0x4DBF) ||  /* CJK Extension A */
+           (c >= 0x4E00 && c <= 0x9FFF) ||  /* CJK Unified Ideographs */
+           (c >= 0xF900 && c <= 0xFAFF);    /* CJK Compatibility Ideographs */
+}
+
+/* Does token i start a word run: a marked text piece, or the text piece right
+ * after a special one (a language tag ends whatever was before it)? */
+static int starts_run(const mynah_asr_tokenizer *tk, const int *tokens, int i) {
     const char *p = piece_of(tk, tokens[i]);
-    if (!is_text(p) || !mynah_asr_piece_has_mark(p)) return 0;
-    for (int j = i; j < n; j++) {
+    if (!is_text(p)) return 0;
+    return mynah_asr_piece_has_mark(p) || (i > 0 && !is_text(piece_of(tk, tokens[i - 1])));
+}
+
+/* Do the text pieces of tokens[a..b) hold content (unspaced: content of an
+ * unspaced script)? */
+static int run_has(const mynah_asr_tokenizer *tk, const int *tokens, int a, int b, int unspaced) {
+    for (int j = a; j < b; j++) {
         const char *q = piece_of(tk, tokens[j]);
         if (!is_text(q)) continue;
-        if (j > i && mynah_asr_piece_has_mark(q)) return 0;
-        if (span_has_content(q, q + strlen(q))) return 1;
+        for (const char *s = q, *end = q + strlen(q); s < end;) {
+            unsigned cp;
+            s += utf8_next(s, end, &cp);
+            if (unspaced ? cp_is_unspaced(cp) : cp_is_content(cp)) return 1;
+        }
     }
     return 0;
+}
+
+/* The end of the run that token i starts: the next run start, or n. */
+static int run_end(const mynah_asr_tokenizer *tk, const int *tokens, int n, int i) {
+    int j = i + 1;
+    while (j < n && !starts_run(tk, tokens, j)) j++;
+    return j;
+}
+
+/* Does token i open a WORD (recovery.h): a run start whose run holds content? */
+static int opens_word(const mynah_asr_tokenizer *tk, const int *tokens, int n, int i) {
+    return starts_run(tk, tokens, i) && run_has(tk, tokens, i, run_end(tk, tokens, n, i), 0);
+}
+
+/* Is the word that tokens[0..f) end on still open and lexical, so that the
+ * unmarked pieces from f on continue it? Not when nothing comes before f, when a
+ * special piece ends it, or when its run holds no content yet: a bare mark
+ * emitted just before the boundary opened the CURRENT turn's first word. */
+static int context_word_open(const mynah_asr_tokenizer *tk, const int *tokens, int f) {
+    if (f == 0 || !is_text(piece_of(tk, tokens[f - 1]))) return 0;
+    int j = f - 1;
+    while (j > 0 && !starts_run(tk, tokens, j)) j--;
+    return run_has(tk, tokens, j, f, 0);
+}
+
+/* WORD: the first token the current turn owns. */
+static int word_start(const mynah_asr_tokenizer *tk, const int *tokens, const int *frames,
+                      int n, int keep_from) {
+    int f = 0;
+    while (f < n && frames[f] < keep_from) f++;
+    if (f == n) return n;
+    /* the unmarked pieces before the first run start at or after the boundary */
+    int b = f;
+    while (b < n && !starts_run(tk, tokens, b)) b++;
+    if (b > f && run_has(tk, tokens, f, b, 0) &&
+        (!context_word_open(tk, tokens, f) || run_has(tk, tokens, f, b, 1)))
+        return f;  /* they are the current turn's (its word opened before the boundary) */
+    for (int i = b; i < n; i++)
+        if (opens_word(tk, tokens, n, i)) return i;
+    return n;
 }
 
 /* A word reduced for comparison: its content bytes, ASCII lower-cased.
@@ -134,7 +195,7 @@ int mynah_asr_replay_keep_from(const mynah_asr_tokenizer *tk, const int *tokens,
         while (i < n && !(frames[i] >= keep_from && is_text(piece_of(tk, tokens[i])))) i++;
         return i;
     }
-    while (i < n && !(frames[i] >= keep_from && opens_word(tk, tokens, n, i))) i++;
+    i = word_start(tk, tokens, frames, n, keep_from);
     if (rule == MYNAH_ASR_KEEP_WORD || i == n || !context_text) return i;
 
     /* TEXT: the first words the current turn owns, w0..; give back the
@@ -143,7 +204,8 @@ int mynah_asr_replay_keep_from(const mynah_asr_tokenizer *tk, const int *tokens,
     nword ctx[TEXT_STRIP_MAX], kw[TEXT_STRIP_MAX];
     const int m = tail_words(context_text, ctx, TEXT_STRIP_MAX, NULL);
     int start[TEXT_STRIP_MAX + 1], k = 0;
-    for (int t = i; t < n && k <= TEXT_STRIP_MAX; t++)
+    start[k++] = i;  /* the first owned word, which may open with an unmarked piece */
+    for (int t = i + 1; t < n && k <= TEXT_STRIP_MAX; t++)
         if (opens_word(tk, tokens, n, t)) start[k++] = t;
     /* only words opened inside the lag window may be given back */
     int in_window = k;

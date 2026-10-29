@@ -335,6 +335,21 @@ measurement.
   V1: precision first (E13, E14), recall about 13 % of the EMPTY turns, no
   silence or noise ever accepted, healthy turns untouched.
 
+E15 WORD refinement (2026-10-29). Three boundary shapes the WORD rule handled
+wrongly by construction, none present in the E12 bank (587 CUDA f32 replays,
+en/fr only):
+- the current turn's first word started by a bare ▁ one frame before keep_from
+  (chunk lookahead) with its letters after it: "▁" | "ye" "s" lost "yes";
+- an unmarked piece after a language tag ("." "<en-US>" | "J" "o");
+- scripts written without spaces (zh/ja/th...): no ▁ after the boundary, so
+  WORD returned n and the turn was EMPTY.
+Fix: unmarked pieces from keep_from on continue the context's last word only
+when that word already holds content and is not ended by a special piece; in
+an unspaced script they are the current turn's. A context tail alone still
+gives n. `tests/test_recovery` cases 18-21 (130/130). The old and new rules
+give identical WORD and TEXT output on all 587 E12 replays (a C driver over the
+dumped tokens and frames, linked once with each `recovery.c`).
+
 ## Next action
 
 S18-1a: the pure boundary/gate module and its model-free test.

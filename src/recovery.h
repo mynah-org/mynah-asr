@@ -17,9 +17,10 @@
 
 /* Ownership of the replayed tokens.
  *
- * A WORD is a piece carrying the mark ▁ plus the unmarked pieces after it, and
- * it must hold a letter or digit; a marked run without one ("▁." , "▁" "?") is
- * punctuation and belongs to the word before it.
+ * A WORD is a piece carrying the mark ▁ (or the piece right after a special
+ * <...> one: a language tag ends whatever was before it) plus the unmarked
+ * pieces after it, and it must hold a letter or digit; a marked run without one
+ * ("▁." , "▁" "?") is punctuation and belongs to the word before it.
  *
  * FRAME: a token belongs to the current turn when it was emitted at an encoder
  *   frame >= keep_from. The naive rule, kept as the baseline: a transducer emits
@@ -27,7 +28,12 @@
  *   second half of a word that started in the context.
  * WORD:  a WORD belongs to the turn in which its FIRST piece was emitted: the
  *   current turn starts at the first word opened at a frame >= keep_from.
- *   Punctuation and continuation pieces follow their word's owner.
+ *   Punctuation and continuation pieces follow their word's owner. Two cases
+ *   keep the unmarked pieces emitted from keep_from on with the current turn:
+ *   the context ends on a mark with no content yet (the current turn's first
+ *   word, started a frame early: "▁" | "ye" "s") or on a special piece, and
+ *   a script written without spaces (CJK, kana, Thai, Lao, Khmer, Myanmar),
+ *   where an unmarked piece is no word's tail.
  * TEXT:  WORD, then a leading current-turn word that completes the context's
  *   own transcript AND whose first piece was emitted less than lag_frames after
  *   keep_from is given back to the context (and so on, word by word): the
